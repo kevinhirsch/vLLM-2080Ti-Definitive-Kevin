@@ -77,3 +77,8 @@ backups/
 .cursor/
 *.swp
 *.swo
+
+# Kevin deploy layer: keep deploy/env tracked despite root env/ rule (real shim.env still ignored via deploy/.gitignore)
+!deploy/env/
+!deploy/env/*
+deploy/env/shim.env
