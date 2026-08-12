@@ -32,12 +32,12 @@ ARGS=(
   --generation-config
   /home/kevin/.local/share/vllm-qwen27b/gencfg
   --gpu-memory-utilization
-  0.88
+  0.82
   --max-model-len
   256000
   --enable-chunked-prefill
   --max-num-seqs
-  4
+  8
   --max-num-batched-tokens
   2560
   --quantization
