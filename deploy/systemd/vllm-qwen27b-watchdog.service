@@ -1,0 +1,14 @@
+[Unit]
+Description=vllm-qwen27b generation watchdog (probe; restart only on confirmed alive-but-not-generating wedge)
+Documentation=file:///home/kevin/Desktop/vLLM-2080Ti-Definitive/WEDGE-ROOTCAUSE-2026-08-10.md
+After=vllm-qwen27b.service
+Wants=vllm-qwen27b.service
+
+[Service]
+Type=oneshot
+User=kevin
+Group=kevin
+ExecStart=/home/kevin/.local/share/vllm-qwen27b/vllm-watchdog.sh
+# Belt-and-suspenders timeout so a stuck probe (e.g. curl somehow not honoring -m) can't wedge
+# the watchdog itself; the script's own curl -m budgets are the primary control.
+TimeoutStartSec=300
