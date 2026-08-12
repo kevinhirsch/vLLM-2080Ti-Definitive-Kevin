@@ -53,14 +53,28 @@ single-stream speed.
 | `setup/` | Original build/serve runbook + phase scripts (`fix-cuda128-glibc.sh`, `phase1-driver.sh`, `phase2-build-serve.sh`) |
 | `archive/` | Historical `serve-tqk8v4-fg.sh` variants (qwen36, qwythos, fable, pre-router, direct8000) |
 
+## Status dashboard
+
+The gateway serves a live one-page dashboard (built into `bin/keepalive-shim.py`):
+
+- **`http://<host>:8000/gateway/dashboard`** — real-time lanes-in-use, local-vs-overflow %,
+  per-GPU util/VRAM, and a feed of recent requests (which client, routed local or overflow, wait time).
+- **`http://<host>:8000/gateway/stats`** — the same data as JSON (poll it yourself).
+
+Requests self-identify if the client sends an `X-Client:` header; otherwise they show by source IP.
+
 ## Restore onto a host
 
+**One-shot:** from this dir, `./install.sh` (copies runtime files + systemd units, enables services,
+never overwrites an existing `shim.env`). Then set your DeepSeek key in `~/.local/share/vllm-qwen27b/shim.env`.
+
+Manual equivalent:
 1. Build the engine per the repo root (weicj build), into `~/Desktop/vLLM-2080Ti-Definitive/.venv`.
 2. `cp bin/* ~/.local/share/vllm-qwen27b/` ; `cp -r templates/* ~/.local/share/vllm-qwen27b/` (adjust paths).
 3. `cp env/vllm-qwen27b.env ~/.local/share/vllm-qwen27b/` ; `cp env/shim.env.example ~/.local/share/vllm-qwen27b/shim.env`, add your DeepSeek key, `chmod 600 shim.env`.
 4. `sudo cp -r systemd/* /etc/systemd/system/` ; `sudo systemctl daemon-reload`.
 5. `sudo systemctl enable --now vllm-qwen27b vllm-keepalive-shim vllm-qwen27b-watchdog.timer`.
-6. Verify: `curl -s localhost:8000/v1/models` and a test chat.
+6. Verify: `curl -s localhost:8000/v1/models`, then open `/gateway/dashboard`.
 
 ## ⚠️ Secrets
 
