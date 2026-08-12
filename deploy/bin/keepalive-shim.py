@@ -21,7 +21,7 @@ Cost-first: a single request is always local (free); only real overflow costs mo
 
 NEVER manages the vLLM process (that's vllm-qwen27b.service + its watchdog).
 """
-import asyncio, os, sys, json, time, logging
+import asyncio, os, sys, json, time, logging, collections, subprocess
 import aiohttp
 from aiohttp import web
 
@@ -62,6 +62,51 @@ _inflight = 0            # local capacity units currently in flight
 _backoff_until = 0.0
 _health = {"ok": False, "at": 0.0}
 REMOTE_ENABLED = bool(REMOTE_BASE and REMOTE_KEY)
+
+# ---------------- live metrics (for the /gateway/dashboard status page) ----------------
+_stats = {"started": time.time(), "total": 0, "local": 0, "remote": 0,
+          "waited_total": 0.0, "waited_n": 0, "peak_inflight": 0}
+_remote_reasons = collections.Counter()
+_events = collections.deque(maxlen=200)   # most-recent-first ring buffer of routing decisions
+_gpu_cache = {"at": 0.0, "data": []}
+
+def _client_label(request):
+    # harness self-id via X-Client/X-Title header, else source IP
+    return request.headers.get("X-Client") or request.headers.get("X-Title") \
+        or getattr(request, "remote", None) or "?"
+
+def record_event(decision, reason, request, units, waited):
+    _stats["total"] += 1
+    if decision == "local":
+        _stats["local"] += 1
+    else:
+        _stats["remote"] += 1
+        _remote_reasons[reason] += 1
+    if waited and waited > 0:
+        _stats["waited_total"] += waited
+        _stats["waited_n"] += 1
+    _stats["peak_inflight"] = max(_stats["peak_inflight"], _inflight)
+    _events.appendleft({"t": round(time.time(), 1), "d": decision, "r": reason,
+                        "client": _client_label(request), "units": units,
+                        "waited": round(waited or 0, 1),
+                        "ep": request.path.rsplit("/", 1)[-1]})
+
+def _gpu_stats():
+    now = time.time()
+    if now - _gpu_cache["at"] < 1.5:
+        return _gpu_cache["data"]
+    data = []
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.used,memory.free,utilization.gpu",
+                              "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=2).stdout.strip()
+        for line in out.splitlines():
+            u, f, g = [int(x) for x in line.split(", ")]
+            data.append({"used": u, "free": f, "util": g})
+    except Exception:
+        pass
+    _gpu_cache.update(at=now, data=data)
+    return data
 
 
 def effective_budget():
@@ -306,12 +351,14 @@ async def handle_completions(request):
     # size cap: too-big-for-this-box requests OOM local even at budget=1 -> send straight to remote
     if REMOTE_ENABLED and over_local_cap(body):
         log.info("route %s est prompt+max > %d -> remote(size)", path, MAX_LOCAL_TOKENS)
+        record_event("remote", "size", request, units, 0)
         return await _forward_remote(request, path, body, streaming)
 
     # local DOWN -> overflow immediately (waiting for a slot won't help a dead engine)
     if not await local_healthy():
         if REMOTE_ENABLED:
             log.info("route %s local unhealthy -> remote(local-down)", path)
+            record_event("remote", "local-down", request, units, 0)
             return await _forward_remote(request, path, body, streaming)
 
     # local UP: claim a slot, WAITING up to LOCAL_WAIT for capacity instead of instant-overflow.
@@ -334,6 +381,7 @@ async def handle_completions(request):
         where = "remote(cap)" if REMOTE_ENABLED else "remote(none)"
         log.info("route %s units=%d inflight=%d budget=%d waited=%.1fs -> %s",
                  path, units, _inflight, effective_budget(), waited, where)
+        record_event("remote", "cap", request, units, waited)
         return await _forward_remote(request, path, body, streaming)
 
     log.info("route %s units=%d inflight=%d/%d waited=%.1fs -> local",
@@ -341,11 +389,13 @@ async def handle_completions(request):
     try:
         kind, payload = await _relay(request, LOCAL, path, body, None, streaming)
         if kind == "ok":
+            record_event("local", "-", request, units, waited)
             return payload
         status, text, oom = payload
         if oom:
             trigger_backoff(f"local {status}: {text[:120]}")
         log.warning("local failed (%s) -> failover to remote", status)
+        record_event("remote", "failover", request, units, waited)
         return await _forward_remote(request, path, body, streaming)
     finally:
         _inflight -= units
@@ -383,12 +433,93 @@ async def h_catchall(request):
         return web.json_response({"error": {"message": f"gateway: {e}"}}, status=502)
 
 
+async def gateway_stats(request):
+    up = _health["ok"] if (time.time() - _health["at"] < HEALTH_TTL) else await local_healthy()
+    total = _stats["total"] or 1
+    return web.json_response({
+        "uptime": int(time.time() - _stats["started"]),
+        "local_healthy": up,
+        "budget": effective_budget(), "configured_budget": BUDGET,
+        "inflight": _inflight, "peak_inflight": _stats["peak_inflight"],
+        "backoff": max(0, int(_backoff_until - time.time())),
+        "remote_model": REMOTE_MODEL, "remote_enabled": REMOTE_ENABLED,
+        "local_wait": LOCAL_WAIT,
+        "total": _stats["total"], "local": _stats["local"], "remote": _stats["remote"],
+        "local_pct": round(100 * _stats["local"] / total, 1),
+        "remote_pct": round(100 * _stats["remote"] / total, 1),
+        "avg_wait": round(_stats["waited_total"] / (_stats["waited_n"] or 1), 1),
+        "remote_reasons": dict(_remote_reasons),
+        "gpu": _gpu_stats(),
+        "events": list(_events)[:60],
+    })
+
+async def gateway_dashboard(request):
+    return web.Response(text=DASHBOARD_HTML, content_type="text/html")
+
+DASHBOARD_HTML = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>vLLM Gateway Status</title>
+<style>
+:root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--dim:#8b949e;--grn:#3fb950;--amb:#d29922;--red:#f85149;--blu:#58a6ff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
+.wrap{max-width:1000px;margin:0 auto;padding:18px}
+h1{font-size:16px;margin:0 0 2px;font-weight:600}.sub{color:var(--dim);font-size:12px;margin-bottom:16px}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;vertical-align:middle}
+.up{background:var(--grn);box-shadow:0 0 6px var(--grn)}.down{background:var(--red);box-shadow:0 0 6px var(--red)}
+.grid{display:grid;gap:10px}.g4{grid-template-columns:repeat(4,1fr)}.g2{grid-template-columns:repeat(2,1fr)}
+@media(max-width:640px){.g4{grid-template-columns:repeat(2,1fr)}}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:12px 14px}
+.k{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.04em}.v{font-size:22px;font-weight:600;margin-top:2px}
+.v small{font-size:12px;color:var(--dim);font-weight:400}
+.bar{height:8px;border-radius:4px;background:#21262d;overflow:hidden;display:flex;margin-top:8px}
+.bar i{display:block;height:100%}.bl{background:var(--grn)}.br{background:var(--amb)}
+table{width:100%;border-collapse:collapse;font-size:12px}th{text-align:left;color:var(--dim);font-weight:500;padding:6px 8px;border-bottom:1px solid var(--bd)}
+td{padding:5px 8px;border-bottom:1px solid #21262d;white-space:nowrap}
+.tag{padding:1px 7px;border-radius:10px;font-size:11px;font-weight:600}
+.tl{background:rgba(63,185,80,.15);color:var(--grn)}.tr{background:rgba(210,153,34,.15);color:var(--amb)}
+.rz{color:var(--dim)}.mono{font-variant-numeric:tabular-nums}h2{font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.04em;margin:20px 0 8px}
+.pill{display:inline-block;background:#21262d;border-radius:10px;padding:1px 8px;margin:0 4px 4px 0;font-size:12px}
+</style></head><body><div class=wrap>
+<h1>vLLM Gateway <span id=live></span></h1>
+<div class=sub>:8000 capacity-routing gateway → local :8001 · overflow <span id=rm></span> · refresh 1.5s · <span id=err style="color:var(--red)"></span></div>
+<div class="grid g4" id=status></div>
+<h2>Routing (local vs overflow)</h2><div class=card><div class=bar id=lrbar></div><div id=lrtxt class=sub style=margin-top:8px></div><div id=reasons></div></div>
+<h2>GPU</h2><div class="grid g2" id=gpu></div>
+<h2>Recent requests</h2><div class=card style=overflow-x:auto><table><thead><tr><th>time</th><th>ep</th><th>client</th><th>route</th><th>reason</th><th>waited</th></tr></thead><tbody id=ev></tbody></table></div>
+</div><script>
+const $=s=>document.querySelector(s);let model="?";
+async function models(){try{const r=await fetch('/v1/models');const d=await r.json();model=(d.data&&d.data[0]&&d.data[0].id)||"?";}catch(e){}}
+function fmtAgo(t){const s=Math.max(0,Date.now()/1000-t);return s<60?s.toFixed(0)+'s':(s/60).toFixed(0)+'m';}
+function tile(k,v){return `<div class=card><div class=k>${k}</div><div class=v>${v}</div></div>`;}
+async function tick(){
+ let s;try{const r=await fetch('/gateway/stats');s=await r.json();$('#err').textContent='';}catch(e){$('#err').textContent='gateway unreachable';return;}
+ $('#live').innerHTML=`<span class="dot up"></span>`;$('#rm').textContent=s.remote_model;
+ const uh=Math.floor(s.uptime/3600),um=Math.floor(s.uptime%3600/60);
+ const bk=s.backoff>0?`<div class=k style=color:var(--amb)>OOM backoff ${s.backoff}s</div>`:'';
+ $('#status').innerHTML=[
+  `<div class=card><div class=k>Local engine</div><div class=v><span class="dot ${s.local_healthy?'up':'down'}"></span>${s.local_healthy?'up':'DOWN'}</div><div class=k style=margin-top:4px title="${model}">${model.slice(0,22)}</div></div>`,
+  `<div class=card><div class=k>Lanes in use</div><div class=v class=mono>${s.inflight}<small>/${s.budget}</small></div><div class=bar><i class=bl style=width:${100*s.inflight/Math.max(1,s.budget)}%></i></div>${bk}</div>`,
+  tile('Total requests',`<span class=mono>${s.total}</span>`),
+  `<div class=card><div class=k>Served local</div><div class=v class=mono style=color:var(--grn)>${s.local_pct}<small>%</small></div><div class=k style=margin-top:4px>overflow ${s.remote_pct}% · avg wait ${s.avg_wait}s</div></div>`,
+ ].join('');
+ const lp=s.local_pct,rp=s.remote_pct;
+ $('#lrbar').innerHTML=`<i class=bl style=width:${lp}%></i><i class=br style=width:${rp}%></i>`;
+ $('#lrtxt').innerHTML=`<span style=color:var(--grn)>■</span> local ${s.local} (${lp}%) &nbsp; <span style=color:var(--amb)>■</span> overflow ${s.remote} (${rp}%) &nbsp; peak lanes ${s.peak_inflight} &nbsp; uptime ${uh}h${um}m`;
+ $('#reasons').innerHTML=Object.keys(s.remote_reasons||{}).length?('overflow reasons: '+Object.entries(s.remote_reasons).map(([k,v])=>`<span class=pill>${k}: ${v}</span>`).join('')):'';
+ $('#gpu').innerHTML=(s.gpu||[]).map((g,i)=>`<div class=card><div class=k>GPU ${i}</div><div class=v class=mono>${g.util}<small>% util</small></div><div class=bar><i class=bl style="width:${100*g.used/(g.used+g.free)}%;background:var(--blu)"></i></div><div class=k style=margin-top:4px>${(g.used/1024).toFixed(1)}G used · ${(g.free/1024).toFixed(1)}G free</div></div>`).join('')||'<div class=card><div class=k>no GPU data</div></div>';
+ $('#ev').innerHTML=(s.events||[]).map(e=>`<tr><td class="rz mono">${fmtAgo(e.t)} ago</td><td>${e.ep}</td><td>${e.client}</td><td><span class="tag ${e.d=='local'?'tl':'tr'}">${e.d}</span></td><td class=rz>${e.r}</td><td class=mono>${e.waited?e.waited+'s':''}</td></tr>`).join('');
+}
+models();tick();setInterval(tick,1500);setInterval(models,15000);
+</script></body></html>"""
+
 def make_app():
     app = web.Application(client_max_size=1024**3)
     app.router.add_get("/health", h_health)
     app.router.add_get("/v1/models", h_models)
     app.router.add_post("/v1/chat/completions", handle_completions)
     app.router.add_post("/v1/completions", handle_completions)
+    app.router.add_get("/gateway/stats", gateway_stats)
+    app.router.add_get("/gateway/dashboard", gateway_dashboard)
+    app.router.add_get("/gateway", lambda r: web.HTTPFound("/gateway/dashboard"))
     app.router.add_route("*", "/{tail:.*}", h_catchall)
     return app
 
