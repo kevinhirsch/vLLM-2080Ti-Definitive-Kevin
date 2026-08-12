@@ -27,6 +27,8 @@ from aiohttp import web
 
 PORT         = int(os.environ.get("SHIM_PORT", "8000"))
 LOCAL        = os.environ.get("SHIM_UPSTREAM", "http://127.0.0.1:8001").rstrip("/")
+# where live config edits (via the dashboard) are persisted so they survive a restart
+SHIM_ENV_FILE = os.environ.get("SHIM_ENV_FILE", "/home/kevin/.local/share/vllm-qwen27b/shim.env")
 REMOTE_BASE  = os.environ.get("SHIM_REMOTE_BASE", "").rstrip("/")
 REMOTE_KEY   = os.environ.get("SHIM_REMOTE_KEY", "")
 REMOTE_MODEL = os.environ.get("SHIM_REMOTE_MODEL", "deepseek-v4-flash")
@@ -50,6 +52,10 @@ PREFILL_TPS      = float(os.environ.get("SHIM_PREFILL_TPS", "500"))
 # budget=1 (context + generation peaks past this box's tiny free VRAM), so route it straight
 # to remote. Prevents single-big-request OOM crashes. (2026-08-12: observed a solo OOM here.)
 MAX_LOCAL_TOKENS = int(os.environ.get("SHIM_MAX_LOCAL_TOKENS", "80000"))
+# Size-aware admission: cap TOTAL in-flight prompt tokens across local lanes (activation ∝
+# concurrent context). Benchmark (2026-08-12, util 0.82) held 4x170K=680K with 611MB margin;
+# 500K default leaves comfortable headroom while allowing generous concurrency. 0 = disabled.
+TOKEN_BUDGET     = int(os.environ.get("SHIM_TOKEN_BUDGET", "500000"))
 DEFAULT_MAX_OUT  = int(os.environ.get("SHIM_DEFAULT_MAX_OUT", "8192"))
 # vLLM-only params that a remote OpenAI endpoint would reject — stripped on overflow.
 REMOTE_STRIP = ("chat_template_kwargs", "mamba_cache_mode", "guided_decoding_backend")
@@ -59,13 +65,17 @@ logging.basicConfig(level=logging.INFO, stream=sys.stdout,
 log = logging.getLogger("gateway-shim")
 
 _inflight = 0            # local capacity units currently in flight
+_inflight_tokens = 0    # sum of est prompt tokens of in-flight local requests (size-aware cap)
+_waiting  = 0           # requests currently blocked in the queue-first wait loop (backlog)
 _backoff_until = 0.0
 _health = {"ok": False, "at": 0.0}
 REMOTE_ENABLED = bool(REMOTE_BASE and REMOTE_KEY)
+STATS_FILE = os.environ.get("SHIM_STATS_FILE", "/home/kevin/.local/share/vllm-qwen27b/gateway-stats.json")
 
 # ---------------- live metrics (for the /gateway/dashboard status page) ----------------
 _stats = {"started": time.time(), "total": 0, "local": 0, "remote": 0,
-          "waited_total": 0.0, "waited_n": 0, "peak_inflight": 0}
+          "waited_total": 0.0, "waited_n": 0, "peak_inflight": 0, "peak_waiting": 0,
+          "overflowed_after_wait": 0}
 _remote_reasons = collections.Counter()
 _events = collections.deque(maxlen=200)   # most-recent-first ring buffer of routing decisions
 _gpu_cache = {"at": 0.0, "data": []}
@@ -75,7 +85,7 @@ def _client_label(request):
     return request.headers.get("X-Client") or request.headers.get("X-Title") \
         or getattr(request, "remote", None) or "?"
 
-def record_event(decision, reason, request, units, waited):
+def record_event(decision, reason, request, units, waited, ptok=0, maxtok=0, stream=False):
     _stats["total"] += 1
     if decision == "local":
         _stats["local"] += 1
@@ -89,7 +99,8 @@ def record_event(decision, reason, request, units, waited):
     _events.appendleft({"t": round(time.time(), 1), "d": decision, "r": reason,
                         "client": _client_label(request), "units": units,
                         "waited": round(waited or 0, 1),
-                        "ep": request.path.rsplit("/", 1)[-1]})
+                        "ep": request.path.rsplit("/", 1)[-1],
+                        "ptok": ptok, "maxtok": maxtok, "stream": stream})
 
 def _gpu_stats():
     now = time.time()
@@ -107,6 +118,109 @@ def _gpu_stats():
         pass
     _gpu_cache.update(at=now, data=data)
     return data
+
+# ---------------- metrics persistence (survive gateway restarts) ----------------
+def _save_stats():
+    try:
+        with open(STATS_FILE + ".tmp", "w") as f:
+            json.dump({"stats": _stats, "reasons": dict(_remote_reasons), "events": list(_events)}, f)
+        os.replace(STATS_FILE + ".tmp", STATS_FILE)
+    except Exception as e:
+        log.warning("save stats failed: %s", e)
+
+def _load_stats():
+    try:
+        if not os.path.exists(STATS_FILE):
+            return
+        d = json.load(open(STATS_FILE))
+        st = d.get("stats", {})
+        for k in list(_stats.keys()):
+            if k in st:
+                _stats[k] = st[k]          # includes original "started" -> cumulative uptime
+        _remote_reasons.update(d.get("reasons", {}))
+        for e in reversed(d.get("events", [])):
+            _events.appendleft(e)
+        log.info("restored stats: total=%d (%d events)", _stats.get("total", 0), len(_events))
+    except Exception as e:
+        log.warning("load stats failed: %s", e)
+
+async def _stats_saver():
+    while True:
+        await asyncio.sleep(10)
+        _save_stats()
+
+
+# ---------------- live config (editable from the dashboard, no restart) ----------------
+# env-var name -> (global name, caster). Only these are runtime-tunable.
+_CFG = {
+    "SHIM_REMOTE_BASE":     ("REMOTE_BASE",  lambda v: str(v).rstrip("/")),
+    "SHIM_REMOTE_KEY":      ("REMOTE_KEY",   str),
+    "SHIM_REMOTE_MODEL":    ("REMOTE_MODEL", str),
+    "SHIM_LOCAL_BUDGET":    ("BUDGET",       int),
+    "SHIM_LOCAL_WAIT_SECS": ("LOCAL_WAIT",   float),
+    "SHIM_BIG_TOKENS":      ("BIG_TOKENS",   int),
+    "SHIM_OOM_BACKOFF_SECS":("OOM_BACKOFF",  int),
+    "SHIM_MAX_LOCAL_TOKENS":("MAX_LOCAL_TOKENS", int),
+    "SHIM_TOKEN_BUDGET":    ("TOKEN_BUDGET",  int),
+}
+# form-field key <-> env-var (what the dashboard sends)
+_FIELD_ENV = {"remote_base":"SHIM_REMOTE_BASE","remote_key":"SHIM_REMOTE_KEY","remote_model":"SHIM_REMOTE_MODEL",
+              "budget":"SHIM_LOCAL_BUDGET","local_wait":"SHIM_LOCAL_WAIT_SECS","big_tokens":"SHIM_BIG_TOKENS",
+              "oom_backoff":"SHIM_OOM_BACKOFF_SECS","max_local_tokens":"SHIM_MAX_LOCAL_TOKENS",
+              "token_budget":"SHIM_TOKEN_BUDGET"}
+
+def current_config(masked=True):
+    g = globals()
+    k = g["REMOTE_KEY"]
+    kd = ("set (" + k[:5] + "…" + k[-4:] + ")") if (masked and k and len(k) > 12) else ("set" if k else "")
+    return {"remote_base": g["REMOTE_BASE"], "remote_model": g["REMOTE_MODEL"],
+            "remote_key_display": kd, "remote_key_set": bool(k),
+            "budget": g["BUDGET"], "local_wait": g["LOCAL_WAIT"], "big_tokens": g["BIG_TOKENS"],
+            "oom_backoff": g["OOM_BACKOFF"], "max_local_tokens": g["MAX_LOCAL_TOKENS"],
+            "token_budget": g["TOKEN_BUDGET"]}
+
+def apply_config(fields):
+    """fields = dashboard form dict (subset). Reassigns globals live + persists to SHIM_ENV_FILE."""
+    g = globals()
+    changed = []
+    for fk, val in fields.items():
+        env = _FIELD_ENV.get(fk)
+        if not env or val in (None, ""):
+            continue
+        gname, cast = _CFG[env]
+        try:
+            g[gname] = cast(val)
+            changed.append(fk)
+        except Exception as e:
+            log.warning("config: bad value for %s: %r (%s)", fk, val, e)
+    g["REMOTE_ENABLED"] = bool(g["REMOTE_BASE"] and g["REMOTE_KEY"])
+    if changed:
+        _persist_config()
+    return changed
+
+def _persist_config():
+    """Rewrite SHIM_ENV_FILE with current tunable values (atomic, mode 600)."""
+    g = globals()
+    vals = {env: str(g[gname]) for env, (gname, _) in _CFG.items()}
+    try:
+        lines, seen = [], set()
+        if os.path.exists(SHIM_ENV_FILE):
+            for ln in open(SHIM_ENV_FILE):
+                key = ln.split("=", 1)[0].strip()
+                if key in vals:
+                    lines.append(f"{key}={vals[key]}\n"); seen.add(key)
+                else:
+                    lines.append(ln)
+        for k, v in vals.items():
+            if k not in seen:
+                lines.append(f"{k}={v}\n")
+        tmp = SHIM_ENV_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            f.write("".join(lines))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, SHIM_ENV_FILE)
+    except Exception as e:
+        log.warning("config persist failed: %s", e)
 
 
 def effective_budget():
@@ -342,23 +456,29 @@ async def _forward_remote(request, path, body, streaming):
 
 
 async def handle_completions(request):
-    global _inflight
+    global _inflight, _waiting, _inflight_tokens
     path = request.path
     body = await request.read()
     units = estimate_units(body)
     streaming = wants_stream(body)
+    ptok = _est_tokens(body)
+    try:
+        maxtok = int(json.loads(body).get("max_tokens") or 0)
+    except Exception:
+        maxtok = 0
+    ev = dict(ptok=ptok, maxtok=maxtok, stream=streaming)
 
     # size cap: too-big-for-this-box requests OOM local even at budget=1 -> send straight to remote
     if REMOTE_ENABLED and over_local_cap(body):
         log.info("route %s est prompt+max > %d -> remote(size)", path, MAX_LOCAL_TOKENS)
-        record_event("remote", "size", request, units, 0)
+        record_event("remote", "size", request, units, 0, **ev)
         return await _forward_remote(request, path, body, streaming)
 
     # local DOWN -> overflow immediately (waiting for a slot won't help a dead engine)
     if not await local_healthy():
         if REMOTE_ENABLED:
             log.info("route %s local unhealthy -> remote(local-down)", path)
-            record_event("remote", "local-down", request, units, 0)
+            record_event("remote", "local-down", request, units, 0, **ev)
             return await _forward_remote(request, path, body, streaming)
 
     # local UP: claim a slot, WAITING up to LOCAL_WAIT for capacity instead of instant-overflow.
@@ -366,22 +486,37 @@ async def handle_completions(request):
     deadline = time.time() + (LOCAL_WAIT if REMOTE_ENABLED else 1e9)
     admitted = False
     waited = 0.0
-    while True:
-        if _health["ok"] and (_inflight + units) <= effective_budget():
-            _inflight += units
-            admitted = True
-            break
-        if time.time() >= deadline:
-            break
-        await asyncio.sleep(SLOT_POLL)
-        waited += SLOT_POLL
-        await local_healthy()  # refresh cached health while waiting
+    queued = False
+    try:
+        while True:
+            if _health["ok"] and (_inflight + units) <= effective_budget() \
+                    and (TOKEN_BUDGET <= 0 or _inflight_tokens + ptok <= TOKEN_BUDGET or _inflight == 0):
+                _inflight += units
+                _inflight_tokens += ptok
+                admitted = True
+                break
+            if time.time() >= deadline:
+                break
+            if not queued:                       # first time we couldn't get a slot -> we're backlogged
+                queued = True
+                _waiting += 1
+                _stats["peak_waiting"] = max(_stats["peak_waiting"], _waiting)
+            await asyncio.sleep(SLOT_POLL)
+            waited += SLOT_POLL
+            await local_healthy()  # refresh cached health while waiting
+    finally:
+        if queued:
+            _waiting -= 1
 
     if not admitted:
-        where = "remote(cap)" if REMOTE_ENABLED else "remote(none)"
-        log.info("route %s units=%d inflight=%d budget=%d waited=%.1fs -> %s",
-                 path, units, _inflight, effective_budget(), waited, where)
-        record_event("remote", "cap", request, units, waited)
+        # distinguish WHY we couldn't admit: lane-count vs total-context (size-aware) cap
+        reason = "tokens" if ((_inflight + units) <= effective_budget()) else "cap"
+        where = f"remote({reason})" if REMOTE_ENABLED else "remote(none)"
+        log.info("route %s units=%d inflight=%d/%d tok=%d/%d waited=%.1fs -> %s",
+                 path, units, _inflight, effective_budget(), _inflight_tokens, TOKEN_BUDGET, waited, where)
+        if queued:
+            _stats["overflowed_after_wait"] += 1
+        record_event("remote", reason, request, units, waited, **ev)
         return await _forward_remote(request, path, body, streaming)
 
     log.info("route %s units=%d inflight=%d/%d waited=%.1fs -> local",
@@ -389,16 +524,17 @@ async def handle_completions(request):
     try:
         kind, payload = await _relay(request, LOCAL, path, body, None, streaming)
         if kind == "ok":
-            record_event("local", "-", request, units, waited)
+            record_event("local", "-", request, units, waited, **ev)
             return payload
         status, text, oom = payload
         if oom:
             trigger_backoff(f"local {status}: {text[:120]}")
         log.warning("local failed (%s) -> failover to remote", status)
-        record_event("remote", "failover", request, units, waited)
+        record_event("remote", "failover", request, units, waited, **ev)
         return await _forward_remote(request, path, body, streaming)
     finally:
         _inflight -= units
+        _inflight_tokens -= ptok
 
 
 # ---------------- passthrough (dynamic; no hardcoded models) ----------------
@@ -441,6 +577,9 @@ async def gateway_stats(request):
         "local_healthy": up,
         "budget": effective_budget(), "configured_budget": BUDGET,
         "inflight": _inflight, "peak_inflight": _stats["peak_inflight"],
+        "waiting": _waiting, "peak_waiting": _stats["peak_waiting"],
+        "overflowed_after_wait": _stats["overflowed_after_wait"],
+        "inflight_tokens": _inflight_tokens, "token_budget": TOKEN_BUDGET,
         "backoff": max(0, int(_backoff_until - time.time())),
         "remote_model": REMOTE_MODEL, "remote_enabled": REMOTE_ENABLED,
         "local_wait": LOCAL_WAIT,
@@ -452,6 +591,17 @@ async def gateway_stats(request):
         "gpu": _gpu_stats(),
         "events": list(_events)[:60],
     })
+
+async def gateway_config(request):
+    if request.method == "GET":
+        return web.json_response(current_config(masked=True))
+    try:
+        fields = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid json"}, status=400)
+    changed = apply_config(fields if isinstance(fields, dict) else {})
+    log.info("config updated via dashboard: %s", ",".join(changed) or "(none)")
+    return web.json_response({"changed": changed, "config": current_config(masked=True)})
 
 async def gateway_dashboard(request):
     return web.Response(text=DASHBOARD_HTML, content_type="text/html")
@@ -478,26 +628,43 @@ td{padding:5px 8px;border-bottom:1px solid #21262d;white-space:nowrap}
 .tl{background:rgba(63,185,80,.15);color:var(--grn)}.tr{background:rgba(210,153,34,.15);color:var(--amb)}
 .rz{color:var(--dim)}.mono{font-variant-numeric:tabular-nums}h2{font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.04em;margin:20px 0 8px}
 .pill{display:inline-block;background:#21262d;border-radius:10px;padding:1px 8px;margin:0 4px 4px 0;font-size:12px}
+label{display:flex;flex-direction:column;gap:3px}input{background:#0d1117;border:1px solid var(--bd);color:var(--fg);border-radius:6px;padding:6px 8px;font:13px ui-monospace,monospace}
+button{background:var(--blu);color:#04101f;border:0;border-radius:6px;padding:7px 16px;font-weight:600;cursor:pointer;font-size:13px}button:hover{opacity:.9}
 </style></head><body><div class=wrap>
 <h1>vLLM Gateway <span id=live></span></h1>
 <div class=sub>:8000 capacity-routing gateway → local :8001 · overflow <span id=rm></span> · refresh 1.5s · <span id=err style="color:var(--red)"></span></div>
 <div class="grid g4" id=status></div>
 <h2>Routing (local vs overflow)</h2><div class=card><div class=bar id=lrbar></div><div id=lrtxt class=sub style=margin-top:8px></div><div id=reasons></div></div>
 <h2>GPU</h2><div class="grid g2" id=gpu></div>
-<h2>Recent requests</h2><div class=card style=overflow-x:auto><table><thead><tr><th>time</th><th>ep</th><th>client</th><th>route</th><th>reason</th><th>waited</th></tr></thead><tbody id=ev></tbody></table></div>
+<h2>Recent requests</h2><div class=card style=overflow-x:auto><table><thead><tr><th>time</th><th>ep</th><th>client</th><th>route</th><th>reason</th><th>size (in→out)</th><th>waited</th></tr></thead><tbody id=ev></tbody></table></div>
+<h2>Settings — remote overflow endpoint &amp; tuning</h2>
+<div class=card>
+<div class=sub>Applied live (no restart) and saved to shim.env. ⚠️ this page has no auth — anyone on the LAN can change these.</div>
+<div class="grid g2" style=gap:10px>
+ <label class=k>Remote base URL<input id=f_base placeholder=https://api.deepseek.com></label>
+ <label class=k>Remote model<input id=f_model placeholder=deepseek-v4-flash></label>
+ <label class=k>Remote API key <span id=keystate class=rz></span><input id=f_key type=password placeholder="leave blank to keep current"></label>
+ <label class=k>Local budget (lanes)<input id=f_budget type=number min=1 max=8></label>
+ <label class=k>Queue wait secs<input id=f_wait type=number min=0 step=0.5></label>
+ <label class=k>Total context cap (tok, size-aware)<input id=f_tokbud type=number min=0 step=50000></label>
+ <label class=k>Max single-request tokens<input id=f_maxlocal type=number min=1000 step=10000></label>
+ <label class=k>Big-request threshold (tok)<input id=f_big type=number min=1000 step=1000></label>
+</div>
+<div style=margin-top:10px><button id=save>Save settings</button> <span id=savemsg class=rz></span></div>
+</div>
 </div><script>
 const $=s=>document.querySelector(s);let model="?";
 async function models(){try{const r=await fetch('/v1/models');const d=await r.json();model=(d.data&&d.data[0]&&d.data[0].id)||"?";}catch(e){}}
 function fmtAgo(t){const s=Math.max(0,Date.now()/1000-t);return s<60?s.toFixed(0)+'s':(s/60).toFixed(0)+'m';}
 function tile(k,v){return `<div class=card><div class=k>${k}</div><div class=v>${v}</div></div>`;}
 async function tick(){
- let s;try{const r=await fetch('/gateway/stats');s=await r.json();$('#err').textContent='';}catch(e){$('#err').textContent='gateway unreachable';return;}
+ let s;try{const r=await fetch('/gateway/stats');s=await r.json();$('#err').textContent='';}catch(e){$('#err').textContent='reconnecting… (showing last data)';$('#live').innerHTML='<span class="dot down"></span>';return;}
  $('#live').innerHTML=`<span class="dot up"></span>`;$('#rm').textContent=s.remote_model;
  const uh=Math.floor(s.uptime/3600),um=Math.floor(s.uptime%3600/60);
  const bk=s.backoff>0?`<div class=k style=color:var(--amb)>OOM backoff ${s.backoff}s</div>`:'';
  $('#status').innerHTML=[
   `<div class=card><div class=k>Local engine</div><div class=v><span class="dot ${s.local_healthy?'up':'down'}"></span>${s.local_healthy?'up':'DOWN'}</div><div class=k style=margin-top:4px title="${model}">${model.slice(0,22)}</div></div>`,
-  `<div class=card><div class=k>Lanes in use</div><div class=v class=mono>${s.inflight}<small>/${s.budget}</small></div><div class=bar><i class=bl style=width:${100*s.inflight/Math.max(1,s.budget)}%></i></div>${bk}</div>`,
+  `<div class=card><div class=k>Lanes / backlog</div><div class=v class=mono>${s.inflight}<small>/${s.budget}</small>${s.waiting?` <span style=color:var(--amb)>+${s.waiting} queued</span>`:''}</div><div class=bar><i class=bl style=width:${100*s.inflight/Math.max(1,s.budget)}%></i>${s.waiting?`<i class=br style=width:${Math.min(100,100*s.waiting/Math.max(1,s.budget))}%></i>`:''}</div><div class=k style=margin-top:4px>ctx in flight ${((s.inflight_tokens||0)/1000).toFixed(0)}K/${((s.token_budget||0)/1000).toFixed(0)}K · peak backlog ${s.peak_waiting} · overflowed ${s.overflowed_after_wait}</div>${bk}</div>`,
   tile('Total requests',`<span class=mono>${s.total}</span>`),
   `<div class=card><div class=k>Served local</div><div class=v class=mono style=color:var(--grn)>${s.local_pct}<small>%</small></div><div class=k style=margin-top:4px>overflow ${s.remote_pct}% · avg wait ${s.avg_wait}s</div></div>`,
  ].join('');
@@ -506,18 +673,46 @@ async function tick(){
  $('#lrtxt').innerHTML=`<span style=color:var(--grn)>■</span> local ${s.local} (${lp}%) &nbsp; <span style=color:var(--amb)>■</span> overflow ${s.remote} (${rp}%) &nbsp; peak lanes ${s.peak_inflight} &nbsp; uptime ${uh}h${um}m`;
  $('#reasons').innerHTML=Object.keys(s.remote_reasons||{}).length?('overflow reasons: '+Object.entries(s.remote_reasons).map(([k,v])=>`<span class=pill>${k}: ${v}</span>`).join('')):'';
  $('#gpu').innerHTML=(s.gpu||[]).map((g,i)=>`<div class=card><div class=k>GPU ${i}</div><div class=v class=mono>${g.util}<small>% util</small></div><div class=bar><i class=bl style="width:${100*g.used/(g.used+g.free)}%;background:var(--blu)"></i></div><div class=k style=margin-top:4px>${(g.used/1024).toFixed(1)}G used · ${(g.free/1024).toFixed(1)}G free</div></div>`).join('')||'<div class=card><div class=k>no GPU data</div></div>';
- $('#ev').innerHTML=(s.events||[]).map(e=>`<tr><td class="rz mono">${fmtAgo(e.t)} ago</td><td>${e.ep}</td><td>${e.client}</td><td><span class="tag ${e.d=='local'?'tl':'tr'}">${e.d}</span></td><td class=rz>${e.r}</td><td class=mono>${e.waited?e.waited+'s':''}</td></tr>`).join('');
+ $('#ev').innerHTML=(s.events||[]).map(e=>`<tr><td class="rz mono">${fmtAgo(e.t)} ago</td><td>${e.ep}</td><td>${e.client}</td><td><span class="tag ${e.d=='local'?'tl':'tr'}">${e.d}</span></td><td class=rz>${e.r}</td><td class=mono>${(e.ptok||0)}→${(e.maxtok||0)}${e.stream?' ⚡':''}</td><td class=mono>${e.waited?e.waited+'s':''}</td></tr>`).join('');
 }
-models();tick();setInterval(tick,1500);setInterval(models,15000);
+async function loadCfg(){try{const c=await(await fetch('/gateway/config')).json();
+ $('#f_base').value=c.remote_base||'';$('#f_model').value=c.remote_model||'';
+ $('#f_budget').value=c.budget;$('#f_wait').value=c.local_wait;$('#f_big').value=c.big_tokens;
+ $('#f_tokbud').value=c.token_budget;$('#f_maxlocal').value=c.max_local_tokens;
+ $('#keystate').textContent=c.remote_key_display?('· '+c.remote_key_display):'· not set';}catch(e){}}
+async function saveCfg(){const b={remote_base:$('#f_base').value.trim(),remote_model:$('#f_model').value.trim(),
+ budget:$('#f_budget').value,local_wait:$('#f_wait').value,big_tokens:$('#f_big').value,
+ token_budget:$('#f_tokbud').value,max_local_tokens:$('#f_maxlocal').value};
+ const k=$('#f_key').value.trim();if(k)b.remote_key=k;
+ $('#savemsg').textContent='saving…';
+ try{const r=await fetch('/gateway/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
+  const d=await r.json();$('#savemsg').textContent='✓ saved: '+(d.changed||[]).join(', ');$('#f_key').value='';loadCfg();}
+ catch(e){$('#savemsg').textContent='✗ '+e;}}
+document.getElementById('save').addEventListener('click',saveCfg);
+models();loadCfg();tick();setInterval(tick,1500);setInterval(models,15000);
 </script></body></html>"""
+
+async def _on_startup(app):
+    _load_stats()
+    app["saver"] = asyncio.create_task(_stats_saver())
+
+async def _on_cleanup(app):
+    t = app.get("saver")
+    if t:
+        t.cancel()
+    _save_stats()
 
 def make_app():
     app = web.Application(client_max_size=1024**3)
+    app.on_startup.append(_on_startup)
+    app.on_cleanup.append(_on_cleanup)
     app.router.add_get("/health", h_health)
     app.router.add_get("/v1/models", h_models)
     app.router.add_post("/v1/chat/completions", handle_completions)
     app.router.add_post("/v1/completions", handle_completions)
     app.router.add_get("/gateway/stats", gateway_stats)
+    app.router.add_get("/gateway/config", gateway_config)
+    app.router.add_post("/gateway/config", gateway_config)
     app.router.add_get("/gateway/dashboard", gateway_dashboard)
     app.router.add_get("/gateway", lambda r: web.HTTPFound("/gateway/dashboard"))
     app.router.add_route("*", "/{tail:.*}", h_catchall)
