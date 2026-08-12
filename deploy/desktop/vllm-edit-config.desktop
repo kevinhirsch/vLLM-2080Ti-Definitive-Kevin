@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=vLLM - Edit Config
+Comment=Open env file + launch args in Kate (restart vLLM after editing)
+Exec=kate /home/kevin/.local/share/vllm-qwen27b/vllm-qwen27b.env /home/kevin/.local/share/vllm-qwen27b/serve-tqk8v4-fg.sh /etc/systemd/system/vllm-qwen27b.service
+Icon=document-edit
+Terminal=false
+Categories=System;

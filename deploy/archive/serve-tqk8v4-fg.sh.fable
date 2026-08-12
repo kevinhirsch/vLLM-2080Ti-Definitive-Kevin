@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Boot-persistent daily driver: DavidAU Qwen3.6-27B Fable-Fusion-711 (W4A16, MTP) on the
+# 2080Ti fork. Swapped in 2026-07-30 (best all-rounder: 4/5 frontier + closest on P5,
+# strongest creative prose, ~72 tok/s, full 262K). See ~/Desktop/qwythos-quant/RUNBOOK.md.
+# Rollback: cp serve-tqk8v4-fg.sh.qwythos (or .qwen36) over this file + restart.
+# Env from systemd EnvironmentFile (vllm-qwen27b.env: TurboQuant + gcc-13 pin).
+#
+# W4A16 = compressed-tensors pack-quantized 4-bit (marlin kernel on SM75). Model already
+# ships YaRN-off (rope=default, native 262K) + MTP in-shards. num_speculative_tokens 3.
+# No --chat-template override (ships its own Qwen3.6 template).
+set -euo pipefail
+
+ARGS=(
+  /home/kevin/Desktop/vLLM-2080Ti-Definitive/.venv/bin/python
+  -m
+  vllm.entrypoints.openai.api_server
+  --host
+  0.0.0.0
+  --port
+  8000
+  --model
+  /home/kevin/Desktop/models/fable-w4a16
+  --served-model-name
+  fable-fusion
+  qwen3.6:27b
+  --dtype
+  half
+  --tensor-parallel-size
+  2
+  --generation-config
+  vllm
+  --gpu-memory-utilization
+  0.88
+  --max-model-len
+  262144
+  --enable-chunked-prefill
+  --max-num-seqs
+  2
+  --max-num-batched-tokens
+  2560
+  --quantization
+  compressed-tensors
+  --kv-cache-dtype
+  turboquant_k8v4
+  --mamba-cache-mode
+  align
+  --enable-prefix-caching
+  --enable-prompt-tokens-details
+  --language-model-only
+  --skip-mm-profiling
+  --disable-log-stats
+  --reasoning-parser
+  qwen3
+  --tool-call-parser
+  qwen3_xml
+  --enable-auto-tool-choice
+  --additional-config
+  '{"gdn_prefill_backend":"flashqla_legacy"}'
+  --speculative-config
+  '{"method":"mtp","num_speculative_tokens":3}'
+  --compilation-config
+  '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[4],"max_cudagraph_capture_size":4}'
+)
+
+exec "${ARGS[@]}"

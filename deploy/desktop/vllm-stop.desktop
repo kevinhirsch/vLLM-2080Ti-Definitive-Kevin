@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=vLLM - Stop
+Comment=Stop the vLLM server and free ~40 GB VRAM (asks for password)
+Exec=konsole -e /home/kevin/.local/share/vllm-qwen27b/vllm-stop.sh
+Icon=process-stop
+Terminal=false
+Categories=System;
