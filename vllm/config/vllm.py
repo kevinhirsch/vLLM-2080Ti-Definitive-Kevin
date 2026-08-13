@@ -866,6 +866,16 @@ class VllmConfig:
                 self.scheduler_config.async_scheduling = False
             elif (
                 self.speculative_config is not None
+                and os.environ.get("VLLM_SUFFIX_OVERLAY", "0") == "1"
+            ):
+                # Suffix overlay (2080Ti fork): merged CPU-list drafts are incompatible
+                # with async scheduling's on-device draft scatter, same as method=suffix.
+                logger.warning_once(
+                    "Async scheduling disabled: suffix overlay produces CPU drafts."
+                )
+                self.scheduler_config.async_scheduling = False
+            elif (
+                self.speculative_config is not None
                 and self.speculative_config.disable_padded_drafter_batch
             ):
                 logger.warning_once(

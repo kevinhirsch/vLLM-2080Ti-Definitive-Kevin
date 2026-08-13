@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
+import os
 import gc
 import itertools
 import threading
@@ -572,6 +573,23 @@ class GPUModelRunner(
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
             elif self.speculative_config.use_eagle():
                 self.drafter = EagleProposer(self.vllm_config, self.device, self)
+                # LAYERED SPECULATION overlay (2080Ti fork, 2026-08-13): with
+                # VLLM_SUFFIX_OVERLAY=1, ALSO run Suffix Decoding's CPU suffix-tree
+                # proposer each step and use its draft per-request whenever it finds a
+                # longer match than the MTP/EAGLE head produced (repetitive/agentic
+                # spans -> near-1.0 acceptance), falling back to the learned drafter
+                # otherwise. Combines the two methods upstream only supports one-of.
+                if os.environ.get("VLLM_SUFFIX_OVERLAY", "0") == "1":
+                    try:
+                        self.suffix_overlay = SuffixDecodingProposer(self.vllm_config)
+                        logger.info(
+                            "Suffix overlay ENABLED on top of %s (min-win length=%s)",
+                            self.speculative_config.method,
+                            os.environ.get("VLLM_SUFFIX_OVERLAY_MIN", "2"),
+                        )
+                    except Exception as e:
+                        self.suffix_overlay = None
+                        logger.warning("Suffix overlay unavailable: %s", e)
                 if self.speculative_config.method == "eagle3":
                     self.use_aux_hidden_state_outputs = (
                         self.drafter.eagle3_use_aux_hidden_state
@@ -4854,7 +4872,60 @@ class GPUModelRunner(
                 slot_mappings=slot_mappings,
             )
 
+            if getattr(self, "suffix_overlay", None) is not None:
+                draft_token_ids = self._apply_suffix_overlay(
+                    draft_token_ids, sampled_token_ids
+                )
+
         return draft_token_ids
+
+    def _apply_suffix_overlay(
+        self,
+        draft_token_ids: list[list[int]] | torch.Tensor,
+        sampled_token_ids: torch.Tensor | list[list[int]],
+    ) -> list[list[int]]:
+        """LAYERED SPECULATION: per-request, prefer the suffix-tree draft over the
+        MTP/EAGLE draft when the suffix match is longer (repetitive spans accept at
+        ~1.0). Also keeps the suffix cache fed every step. Fail-safe: any error
+        returns the original drafts untouched."""
+        try:
+            if isinstance(sampled_token_ids, torch.Tensor):
+                sampled_list = [
+                    [t for t in row if t != -1] for row in sampled_token_ids.tolist()
+                ]
+            else:
+                sampled_list = sampled_token_ids
+            suffix_drafts = self.suffix_overlay.propose(self.input_batch, sampled_list)
+            if isinstance(draft_token_ids, torch.Tensor):
+                base = draft_token_ids.tolist()
+            else:
+                base = draft_token_ids
+            min_win = int(os.environ.get("VLLM_SUFFIX_OVERLAY_MIN", "2"))
+            merged: list[list[int]] = []
+            n_swap = 0
+            for i in range(len(base)):
+                sd = suffix_drafts[i] if i < len(suffix_drafts) else []
+                bd = base[i]
+                if len(sd) >= max(min_win, len(bd)):
+                    merged.append(list(sd))
+                    n_swap += 1
+                else:
+                    merged.append(bd)
+            if n_swap and self._suffix_overlay_log_countdown > 0:
+                self._suffix_overlay_log_countdown -= 1
+                logger.info("suffix-overlay used for %d/%d reqs", n_swap, len(base))
+            return merged
+        except Exception as e:
+            if self._suffix_overlay_log_countdown > 0:
+                self._suffix_overlay_log_countdown -= 1
+                logger.warning("suffix overlay skipped: %s", e)
+            return (
+                draft_token_ids.tolist()
+                if isinstance(draft_token_ids, torch.Tensor)
+                else draft_token_ids
+            )
+
+    _suffix_overlay_log_countdown = 20
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         allowed_config_names = {"load_config", "model_config"}
