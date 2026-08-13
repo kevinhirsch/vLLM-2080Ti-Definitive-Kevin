@@ -4754,6 +4754,23 @@ class GPUModelRunner(
                 EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,
             )
 
+            # LAYERED SPECULATION v2 (conditional drafting): consult the CPU suffix
+            # tree FIRST. If every active request got a strong suffix draft, skip the
+            # learned drafter's GPU chain entirely this step (repetitive/agentic spans
+            # accept ~1.0 and MTP work would be discarded anyway). Otherwise fall
+            # through to MTP/EAGLE and merge per-request at the end.
+            _suffix_drafts = None
+            if getattr(self, "suffix_overlay", None) is not None:
+                _suffix_drafts, _covered = self._suffix_early(sampled_token_ids)
+                if _suffix_drafts is not None and _covered:
+                    if self._suffix_overlay_log_countdown > 0:
+                        self._suffix_overlay_log_countdown -= 1
+                        logger.info(
+                            "suffix-covered batch: skipped learned drafter (%d reqs)",
+                            len(_suffix_drafts),
+                        )
+                    return _suffix_drafts
+
             if spec_config.disable_padded_drafter_batch:
                 # When padded-batch is disabled, the sampled_token_ids should be
                 # the cpu-side list[list[int]] of valid sampled tokens for each
@@ -4872,22 +4889,22 @@ class GPUModelRunner(
                 slot_mappings=slot_mappings,
             )
 
-            if getattr(self, "suffix_overlay", None) is not None:
-                draft_token_ids = self._apply_suffix_overlay(
-                    draft_token_ids, sampled_token_ids
+            if _suffix_drafts is not None:
+                draft_token_ids = self._merge_suffix_drafts(
+                    draft_token_ids, _suffix_drafts
                 )
 
         return draft_token_ids
 
-    def _apply_suffix_overlay(
+    def _suffix_early(
         self,
-        draft_token_ids: list[list[int]] | torch.Tensor,
         sampled_token_ids: torch.Tensor | list[list[int]],
-    ) -> list[list[int]]:
-        """LAYERED SPECULATION: per-request, prefer the suffix-tree draft over the
-        MTP/EAGLE draft when the suffix match is longer (repetitive spans accept at
-        ~1.0). Also keeps the suffix cache fed every step. Fail-safe: any error
-        returns the original drafts untouched."""
+    ) -> tuple[list[list[int]] | None, bool]:
+        """LAYERED SPECULATION v2: run the CPU suffix-tree proposer (also feeds its
+        cache — call exactly once per step). Returns (drafts, covered) where covered
+        means every active request got a draft of >= VLLM_SUFFIX_COVER_MIN tokens, so
+        the learned drafter's GPU chain can be skipped this step. Fail-safe: (None,
+        False) on any error -> pure MTP/EAGLE path."""
         try:
             if isinstance(sampled_token_ids, torch.Tensor):
                 sampled_list = [
@@ -4895,35 +4912,47 @@ class GPUModelRunner(
                 ]
             else:
                 sampled_list = sampled_token_ids
-            suffix_drafts = self.suffix_overlay.propose(self.input_batch, sampled_list)
-            if isinstance(draft_token_ids, torch.Tensor):
-                base = draft_token_ids.tolist()
-            else:
-                base = draft_token_ids
-            min_win = int(os.environ.get("VLLM_SUFFIX_OVERLAY_MIN", "2"))
-            merged: list[list[int]] = []
-            n_swap = 0
-            for i in range(len(base)):
-                sd = suffix_drafts[i] if i < len(suffix_drafts) else []
-                bd = base[i]
-                if len(sd) >= max(min_win, len(bd)):
-                    merged.append(list(sd))
-                    n_swap += 1
-                else:
-                    merged.append(bd)
-            if n_swap and self._suffix_overlay_log_countdown > 0:
-                self._suffix_overlay_log_countdown -= 1
-                logger.info("suffix-overlay used for %d/%d reqs", n_swap, len(base))
-            return merged
+            drafts = self.suffix_overlay.propose(self.input_batch, sampled_list)
+            cover_min = int(os.environ.get("VLLM_SUFFIX_COVER_MIN", "4"))
+            covered = all(
+                len(d) >= cover_min
+                for d, s in zip(drafts, sampled_list)
+                if s  # requests with no sampled tokens need no draft
+            )
+            return drafts, covered
         except Exception as e:
             if self._suffix_overlay_log_countdown > 0:
                 self._suffix_overlay_log_countdown -= 1
                 logger.warning("suffix overlay skipped: %s", e)
-            return (
-                draft_token_ids.tolist()
-                if isinstance(draft_token_ids, torch.Tensor)
-                else draft_token_ids
-            )
+            return None, False
+
+    def _merge_suffix_drafts(
+        self,
+        draft_token_ids: list[list[int]] | torch.Tensor,
+        suffix_drafts: list[list[int]],
+    ) -> list[list[int]]:
+        """Per-request, prefer the suffix draft when its match is at least as long as
+        the learned drafter's (suffix matches accept ~1.0 on repetitive spans)."""
+        base = (
+            draft_token_ids.tolist()
+            if isinstance(draft_token_ids, torch.Tensor)
+            else draft_token_ids
+        )
+        min_win = int(os.environ.get("VLLM_SUFFIX_OVERLAY_MIN", "2"))
+        merged: list[list[int]] = []
+        n_swap = 0
+        for i in range(len(base)):
+            sd = suffix_drafts[i] if i < len(suffix_drafts) else []
+            bd = base[i]
+            if len(sd) >= max(min_win, len(bd)):
+                merged.append(list(sd))
+                n_swap += 1
+            else:
+                merged.append(bd)
+        if n_swap and self._suffix_overlay_log_countdown > 0:
+            self._suffix_overlay_log_countdown -= 1
+            logger.info("suffix-overlay merged %d/%d reqs", n_swap, len(base))
+        return merged
 
     _suffix_overlay_log_countdown = 20
 

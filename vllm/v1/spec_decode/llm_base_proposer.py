@@ -72,6 +72,14 @@ class SpecDecodeBaseProposer:
         self.max_model_len = vllm_config.model_config.max_model_len
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
+        # Layered speculation (2080Ti fork): cap the LEARNED drafter's chain length
+        # independently of the scheduler's draft slots, so a CPU suffix-tree overlay can
+        # propose long drafts (up to num_speculative_tokens) while MTP/EAGLE only chains
+        # a short, high-acceptance prefix when the suffix tree misses. 0 = no cap.
+        import os as _os
+        _cap = int(_os.environ.get("VLLM_MTP_DRAFT_CAP", "0"))
+        if _cap > 0:
+            self.num_speculative_tokens = min(self.num_speculative_tokens, _cap)
 
         # We need to get the hidden size from the draft model config because
         # the draft model's hidden size can be different from the target model's
