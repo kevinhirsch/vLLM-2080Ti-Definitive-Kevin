@@ -180,7 +180,42 @@ def _copy_tensor_tree(src: Any, dst: Any) -> None:
     if dst is None:
         return
     if isinstance(src, torch.Tensor) and isinstance(dst, torch.Tensor):
-        dst.copy_(src)
+        # At batch>1 the live forward-context tensor can be a VIEW aliasing the captured
+        # static buffer (same storage, overlapping elements); torch raises on overlapping
+        # copy_. Identical views need no copy at all; otherwise break the overlap by
+        # cloning the source first (semantically identical, one extra copy only when aliased).
+        if (
+            dst.data_ptr() == src.data_ptr()
+            and dst.shape == src.shape
+            and dst.stride() == src.stride()
+        ):
+            return
+        try:
+            if dst.shape == src.shape:
+                dst.copy_(src)
+            elif (
+                dst.ndim == src.ndim
+                and dst.ndim >= 1
+                and dst.shape[1:] == src.shape[1:]
+                and dst.shape[0] >= src.shape[0]
+            ):
+                # Captured buffer is PADDED to the cudagraph capture size (e.g. batch
+                # padded 20 -> 24). Refresh the live prefix; the padded tail is masked
+                # out at replay by the actual batch/token counts.
+                dst[: src.shape[0]].copy_(src)
+            else:
+                dst.copy_(src)  # let torch broadcast or raise
+        except RuntimeError:
+            try:
+                dst.copy_(src.clone())
+            except RuntimeError as e:
+                logger.error(
+                    "CUDAGRAPH-REFRESH mismatch dst shape=%s stride=%s dtype=%s | "
+                    "src shape=%s stride=%s | %s",
+                    tuple(dst.shape), tuple(dst.stride()), dst.dtype,
+                    tuple(src.shape), tuple(src.stride()), e,
+                )
+                raise
         return
     if dataclasses.is_dataclass(src) and not isinstance(src, type):
         src = {field.name: getattr(src, field.name) for field in dataclasses.fields(src)}
