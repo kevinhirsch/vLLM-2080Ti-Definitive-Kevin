@@ -48,6 +48,25 @@ CHARS_PER_TOK = 3.5
 # connection but never emits a token) still fails over in ~base seconds instead of hanging.
 FIRST_TOKEN_BASE = float(os.environ.get("SHIM_FIRST_TOKEN_BASE", "15"))
 PREFILL_TPS      = float(os.environ.get("SHIM_PREFILL_TPS", "500"))
+# Hard ceiling on the first-token deadline: no matter prompt size / concurrency, if local hasn't
+# produced a token within this many seconds, fail the request over to remote. Keeps interactive
+# clients (Hermes) responsive on a saturated box instead of hanging for minutes. (2026-08-13)
+FIRST_TOKEN_MAX  = float(os.environ.get("SHIM_FIRST_TOKEN_MAX", "45"))
+# Big-OUTPUT requests (max_tokens >= this) are long generations that saturate this slow box and
+# starve everything else — route them straight to remote (DeepSeek is far faster for them anyway).
+# Hermes fires max_tokens=65536; pi uses <=8192, so this cleanly separates them. 0 = disabled.
+BIG_OUTPUT       = int(os.environ.get("SHIM_BIG_OUTPUT", "32000"))
+# Big-PROMPT requests (est. prompt tokens >= this) can't prefill within the first-token cap on this
+# slow box (~PREFILL_TPS tok/s), so they'd waste a local lane then fail over anyway — AND a client
+# whose context GROWS over a long session (e.g. pi) would otherwise silently start saturating/OOM-ing
+# local. Route them straight to remote up front. Default ≈ FIRST_TOKEN_MAX×PREFILL_TPS (what local
+# can actually prefill in time). 0 = disabled. Raise it (with FIRST_TOKEN_MAX) to keep more on local.
+BIG_PROMPT       = int(os.environ.get("SHIM_BIG_PROMPT", "24000"))
+# Bound local generation: a request with max_tokens ABSENT or 0 is unbounded (vLLM would generate up
+# to the context limit) — a runaway long generation on local that saturates the box. When we route
+# such a request to LOCAL, inject this cap so local only ever does bounded generations. Explicit
+# max_tokens the client set (and < BIG_OUTPUT) are respected. pi + Hermes both send max_tokens=0.
+LOCAL_MAX_OUT    = int(os.environ.get("SHIM_LOCAL_MAX_OUT", "8192"))
 # A single request whose est. (prompt + max_tokens) exceeds this will OOM local even at
 # budget=1 (context + generation peaks past this box's tiny free VRAM), so route it straight
 # to remote. Prevents single-big-request OOM crashes. (2026-08-12: observed a solo OOM here.)
@@ -57,6 +76,28 @@ MAX_LOCAL_TOKENS = int(os.environ.get("SHIM_MAX_LOCAL_TOKENS", "80000"))
 # 500K default leaves comfortable headroom while allowing generous concurrency. 0 = disabled.
 TOKEN_BUDGET     = int(os.environ.get("SHIM_TOKEN_BUDGET", "500000"))
 DEFAULT_MAX_OUT  = int(os.environ.get("SHIM_DEFAULT_MAX_OUT", "8192"))
+# --- TINY fast-lane (2026-08-13) ---
+# Micro-calls (title-gen, classification, keepalive probes: est. prompt+max_out <= TINY_TOKENS)
+# are VRAM-negligible. Give them a fast-lane: they SKIP the queue-first wait and may use up to
+# TINY_EXTRA_LANES slots BEYOND the big-request budget (staying within the engine's max-num-seqs),
+# so a trivial call never eats a 15s wait or gets starved behind big generations / during a
+# budget=1 backoff. If local is busy past that headroom, they fast-overflow to remote immediately
+# (a tiny call on DeepSeek is near-free + fast) rather than waiting.
+TINY_TOKENS       = int(os.environ.get("SHIM_TINY_TOKENS", "1500"))
+TINY_EXTRA_LANES  = int(os.environ.get("SHIM_TINY_EXTRA_LANES", "2"))
+# --- concurrency-aware first-token deadline (2026-08-13) ---
+# Prefill compute is SHARED across concurrent requests on this box, so a big request queued behind
+# N others emits its first token only after ~N prefills complete. Scaling the wedge-detection
+# deadline by in-flight concurrency stops legit slow prefills being misread as a wedged backend
+# (which was needlessly failing big requests over to DeepSeek AND tripping a 120s budget=1 backoff
+# that cascaded tiny requests to overflow). 1 = scale by concurrency (default); 0 = old flat behavior.
+FT_CONCURRENCY_SCALE = int(os.environ.get("SHIM_FT_CONCURRENCY_SCALE", "1"))
+# --- per-request logging (2026-08-13) ---
+# Log source (ip/UA), model, size and a short prompt preview for each completion, to attribute
+# traffic (which client fires the tiny bursts / the slow big prefills). Set SHIM_LOG_REQUESTS=0
+# to disable (e.g. for prompt privacy).
+LOG_REQUESTS      = os.environ.get("SHIM_LOG_REQUESTS", "1") not in ("0", "false", "")
+LOG_PREVIEW_CHARS = int(os.environ.get("SHIM_LOG_PREVIEW_CHARS", "70"))
 # vLLM-only params that a remote OpenAI endpoint would reject — stripped on overflow.
 REMOTE_STRIP = ("chat_template_kwargs", "mamba_cache_mode", "guided_decoding_backend")
 
@@ -258,8 +299,39 @@ def estimate_units(body):
     return effective_budget() if _est_tokens(body) >= BIG_TOKENS else 1
 
 
-def first_token_timeout(body):
-    return FIRST_TOKEN_BASE + _est_tokens(body) / PREFILL_TPS
+def first_token_timeout(body, concurrency=1):
+    # Prefill throughput is shared across concurrent local requests, so time-to-first-token scales
+    # with how many are in flight. Without this, a legit big prefill queued behind others is misread
+    # as a "wedged backend" (false failover + a 120s budget=1 backoff cascade). concurrency=1 for
+    # remote/uncontended calls preserves the original tight deadline.
+    factor = max(1, concurrency) if FT_CONCURRENCY_SCALE else 1
+    return min(FIRST_TOKEN_MAX, FIRST_TOKEN_BASE + (_est_tokens(body) / PREFILL_TPS) * factor)
+
+
+def is_tiny(body):
+    """VRAM-negligible micro-call: est. prompt + max_out <= TINY_TOKENS. Eligible for the fast-lane."""
+    try:
+        mt = int(json.loads(body).get("max_tokens") or DEFAULT_MAX_OUT)
+    except Exception:
+        mt = DEFAULT_MAX_OUT
+    return (_est_tokens(body) + mt) <= TINY_TOKENS
+
+
+def _preview(body):
+    """Short, single-line preview of the last user message (for source-attribution logging)."""
+    try:
+        msgs = json.loads(body).get("messages") or []
+        for m in reversed(msgs):
+            c = m.get("content")
+            if isinstance(c, str) and c.strip():
+                return c.replace("\n", " ")[:LOG_PREVIEW_CHARS]
+            if isinstance(c, list):
+                t = " ".join(b.get("text", "") for b in c if isinstance(b, dict)).strip()
+                if t:
+                    return t.replace("\n", " ")[:LOG_PREVIEW_CHARS]
+    except Exception:
+        pass
+    return ""
 
 
 def over_local_cap(body):
@@ -268,6 +340,23 @@ def over_local_cap(body):
     except Exception:
         mt = DEFAULT_MAX_OUT
     return (_est_tokens(body) + mt) > MAX_LOCAL_TOKENS
+
+
+def bound_local_output(body):
+    """Ensure a request routed to LOCAL has a bounded max_tokens. If it's absent or 0 (unbounded ->
+    could run away generating on the slow box), inject LOCAL_MAX_OUT. Explicit client values are kept.
+    Returns (possibly-rewritten) body bytes."""
+    if LOCAL_MAX_OUT <= 0:
+        return body
+    try:
+        j = json.loads(body)
+    except Exception:
+        return body
+    mt = j.get("max_tokens")
+    if not mt or int(mt) <= 0:
+        j["max_tokens"] = LOCAL_MAX_OUT
+        return json.dumps(j).encode()
+    return body
 
 
 def wants_stream(body):
@@ -340,7 +429,7 @@ def _looks_meaningful(text):
     return False
 
 
-async def _relay(request, base, path, body, key, streaming):
+async def _relay(request, base, path, body, key, streaming, concurrency=1):
     """
     Forward to (base) and relay the response to the client.
     Returns ("ok", web.Response|StreamResponse) on success,
@@ -354,12 +443,14 @@ async def _relay(request, base, path, body, key, streaming):
             # bound time-to-response-headers for streaming so a backend that accepts the
             # connection but never responds (a wedge) fails over instead of hanging.
             up = await asyncio.wait_for(_open(session, base, path, body, key, streaming),
-                                        timeout=first_token_timeout(body))
+                                        timeout=first_token_timeout(body, concurrency))
         else:
             up = await _open(session, base, path, body, key, streaming)
     except asyncio.TimeoutError:
         await session.close()
-        return "fail", (0, "no response headers within first-token deadline (wedged backend)", True)
+        # slow/wedged under load -> fail over, but do NOT flag as OOM (no 120s budget backoff:
+        # local is busy, not crashed; a real crash returns 5xx/EngineDead below and DOES backoff).
+        return "fail", (0, "no response headers within first-token deadline (busy/wedged)", False)
     except Exception as e:
         await session.close()
         return "fail", (0, f"connect error: {e}", False)
@@ -408,13 +499,13 @@ async def _relay(request, base, path, body, key, streaming):
         return "clean_end"
 
     # Adaptive first-token deadline: fail over from a wedged backend without stalling, while
-    # allowing a legit big-context prefill the time it actually needs.
-    deadline = first_token_timeout(body)
+    # allowing a legit big-context prefill the time it actually needs (scaled by concurrency).
+    deadline = first_token_timeout(body, concurrency)
     try:
         phase = await asyncio.wait_for(_read_until_commit(), timeout=deadline)
     except asyncio.TimeoutError:
         await session.close()
-        return "fail", (up.status, f"no first token within {deadline:.0f}s (wedged backend)", True)
+        return "fail", (up.status, f"no first token within {deadline:.0f}s (busy/wedged)", False)
     except Exception as e:
         await session.close()
         return "fail", (up.status, f"pre-commit stream error: {e}", True)
@@ -467,11 +558,35 @@ async def handle_completions(request):
     except Exception:
         maxtok = 0
     ev = dict(ptok=ptok, maxtok=maxtok, stream=streaming)
+    tiny = is_tiny(body)
+
+    if LOG_REQUESTS:
+        try:
+            model_req = json.loads(body).get("model", "?")
+        except Exception:
+            model_req = "?"
+        log.info("REQ ip=%s ua=%r model=%s ptok=%d maxtok=%d stream=%s tiny=%s preview=%r",
+                 getattr(request, "remote", "?"), request.headers.get("User-Agent", "?")[:45],
+                 model_req, ptok, maxtok, streaming, tiny, _preview(body))
 
     # size cap: too-big-for-this-box requests OOM local even at budget=1 -> send straight to remote
     if REMOTE_ENABLED and over_local_cap(body):
         log.info("route %s est prompt+max > %d -> remote(size)", path, MAX_LOCAL_TOKENS)
         record_event("remote", "size", request, units, 0, **ev)
+        return await _forward_remote(request, path, body, streaming)
+
+    # big-OUTPUT requests (e.g. Hermes max_tokens=65536): long generations that saturate this slow
+    # box and hang interactive clients -> straight to remote (DeepSeek serves them far faster).
+    if REMOTE_ENABLED and BIG_OUTPUT > 0 and maxtok >= BIG_OUTPUT:
+        log.info("route %s maxtok=%d >= %d -> remote(big-out)", path, maxtok, BIG_OUTPUT)
+        record_event("remote", "big-out", request, units, 0, **ev)
+        return await _forward_remote(request, path, body, streaming)
+
+    # big-PROMPT requests (e.g. a pi session whose context has grown huge): can't prefill within the
+    # first-token cap on this slow box and would saturate/OOM local -> straight to remote up front.
+    if REMOTE_ENABLED and BIG_PROMPT > 0 and ptok >= BIG_PROMPT:
+        log.info("route %s ptok=%d >= %d -> remote(big-prompt)", path, ptok, BIG_PROMPT)
+        record_event("remote", "big-prompt", request, units, 0, **ev)
         return await _forward_remote(request, path, body, streaming)
 
     # local DOWN -> overflow immediately (waiting for a slot won't help a dead engine)
@@ -481,10 +596,42 @@ async def handle_completions(request):
             record_event("remote", "local-down", request, units, 0, **ev)
             return await _forward_remote(request, path, body, streaming)
 
+    # TINY fast-lane: negligible-VRAM micro-calls skip the queue-first wait and use headroom slots
+    # BEYOND the big-request budget (bounded by TINY_EXTRA_LANES, staying within max-num-seqs), so a
+    # trivial call never eats a 15s wait or gets starved during a budget=1 backoff. If even that
+    # headroom is full, fast-overflow immediately (a tiny call on DeepSeek is cheap + fast).
+    if tiny:
+        if _health["ok"] and (_inflight + units) <= (effective_budget() + TINY_EXTRA_LANES):
+            _inflight += units
+            _inflight_tokens += ptok
+            log.info("route %s TINY units=%d inflight=%d/%d(+%d) -> local(tiny)",
+                     path, units, _inflight, effective_budget(), TINY_EXTRA_LANES)
+            try:
+                kind, payload = await _relay(request, LOCAL, path, bound_local_output(body), None, streaming, concurrency=1)
+                if kind == "ok":
+                    record_event("local", "tiny", request, units, 0, **ev)
+                    return payload
+                status, text, oom = payload
+                if oom:
+                    trigger_backoff(f"local {status}: {text[:120]}")
+                log.warning("local(tiny) failed (%s) -> failover to remote", status)
+                record_event("remote", "failover", request, units, 0, **ev)
+                return await _forward_remote(request, path, body, streaming)
+            finally:
+                _inflight -= units
+                _inflight_tokens -= ptok
+        elif REMOTE_ENABLED:
+            log.info("route %s TINY inflight=%d/%d(+%d) full -> remote(tiny-fast)",
+                     path, _inflight, effective_budget(), TINY_EXTRA_LANES)
+            record_event("remote", "tiny-fast", request, units, 0, **ev)
+            return await _forward_remote(request, path, body, streaming)
+        # no remote configured -> fall through to the normal local wait loop
+
     # local UP: claim a slot, WAITING up to LOCAL_WAIT for capacity instead of instant-overflow.
     # The check-and-increment is done with no await in between, so it's race-free under asyncio.
     deadline = time.time() + (LOCAL_WAIT if REMOTE_ENABLED else 1e9)
     admitted = False
+    admitted_conc = 1        # local concurrency at admission -> scales the first-token deadline
     waited = 0.0
     queued = False
     try:
@@ -493,6 +640,7 @@ async def handle_completions(request):
                     and (TOKEN_BUDGET <= 0 or _inflight_tokens + ptok <= TOKEN_BUDGET or _inflight == 0):
                 _inflight += units
                 _inflight_tokens += ptok
+                admitted_conc = _inflight
                 admitted = True
                 break
             if time.time() >= deadline:
@@ -522,7 +670,7 @@ async def handle_completions(request):
     log.info("route %s units=%d inflight=%d/%d waited=%.1fs -> local",
              path, units, _inflight, effective_budget(), waited)
     try:
-        kind, payload = await _relay(request, LOCAL, path, body, None, streaming)
+        kind, payload = await _relay(request, LOCAL, path, bound_local_output(body), None, streaming, concurrency=admitted_conc)
         if kind == "ok":
             record_event("local", "-", request, units, waited, **ev)
             return payload
@@ -722,4 +870,8 @@ def make_app():
 if __name__ == "__main__":
     log.info("gateway-shim on :%d | local=%s | remote=%s model=%s | budget=%d big=%dtok backoff=%ds",
              PORT, LOCAL, REMOTE_BASE or "(none)", REMOTE_MODEL, BUDGET, BIG_TOKENS, OOM_BACKOFF)
+    log.info("  tiny-lane<=%dtok +%d lanes | ft-concurrency-scale=%d | req-logging=%s",
+             TINY_TOKENS, TINY_EXTRA_LANES, FT_CONCURRENCY_SCALE, LOG_REQUESTS)
+    log.info("  guards: big-out>=%dtok big-prompt>=%dtok size-cap>=%dtok first-token-max=%.0fs local-out-cap=%dtok -> remote",
+             BIG_OUTPUT, BIG_PROMPT, MAX_LOCAL_TOKENS, FIRST_TOKEN_MAX, LOCAL_MAX_OUT)
     web.run_app(make_app(), host="0.0.0.0", port=PORT)

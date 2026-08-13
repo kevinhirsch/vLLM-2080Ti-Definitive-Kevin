@@ -6,6 +6,8 @@
 #   formatting / reasoning-hallucination bugs. ROLLBACK: delete the two --chat-template
 #   lines below and restart; the model's own chat_template.jinja takes over again.
 set -euo pipefail
+export VLLM_SUFFIX_OVERLAY=0
+export VLLM_SUFFIX_OVERLAY_MIN=2
 
 # 2026-07-17 chaos-tested envelope (2x2080Ti, util 0.88, WORKSPACE_RESERVE 262144):
 #   - gpu-memory-utilization 0.88 (0.92 OOM'd under 2-concurrent: 19 MiB free).
@@ -61,8 +63,7 @@ ARGS=(
   --additional-config
   '{"gdn_prefill_backend":"flashqla_legacy"}'
   --speculative-config
-  '{"method":"mtp","num_speculative_tokens":2}'
-  --enforce-eager
+  '{"method":"mtp","num_speculative_tokens":3}'
 )
 
 exec "${ARGS[@]}"
