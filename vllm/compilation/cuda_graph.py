@@ -200,9 +200,19 @@ def _copy_tensor_tree(src: Any, dst: Any) -> None:
                 and dst.shape[0] >= src.shape[0]
             ):
                 # Captured buffer is PADDED to the cudagraph capture size (e.g. batch
-                # padded 20 -> 24). Refresh the live prefix; the padded tail is masked
-                # out at replay by the actual batch/token counts.
-                dst[: src.shape[0]].copy_(src)
+                # padded 20 -> 24). Refresh the live prefix — and NEUTRALIZE the padded
+                # tail for integer index tensors (slot_mapping etc.): a stale tail can
+                # point replayed kernels at invalid slots -> CUDA illegal memory access
+                # (observed in production 2026-08-13). Repeating the last valid entry is
+                # always a safe target and stays on-device (no host sync).
+                n = src.shape[0]
+                dst[:n].copy_(src)
+                if (
+                    n > 0
+                    and dst.shape[0] > n
+                    and dst.dtype in (torch.int32, torch.int64)
+                ):
+                    dst[n:] = src[-1]
             else:
                 dst.copy_(src)  # let torch broadcast or raise
         except RuntimeError:
