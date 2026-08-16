@@ -69,21 +69,12 @@ if TYPE_CHECKING:
     VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE: Literal["off", "on", "auto"] = "auto"
     VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE_MIN_TOKENS: int = 20480
     VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS: int = 0
-    VLLM_TURBOQUANT_FLASHINFER_PREFILL_PLAN_CACHE_MAXSIZE: int = 16
     VLLM_TURBOQUANT_CONTINUATION_SDPA_Q_CHUNK: int = 0
     VLLM_TURBOQUANT_CONTINUATION_SDPA_MAX_QK_CELLS: int = 0
     VLLM_TURBOQUANT_FORCE_DECODE_SDPA: bool = False
     VLLM_TURBOQUANT_FORCE_CONTINUATION_SDPA: bool = False
     VLLM_TURBOQUANT_FORCE_DECODE_SDPA_MAX_QK_CELLS: int = 131072
     VLLM_TURBOQUANT_MAX_KV_SPLITS: int | None = None
-    # [FORK] Reserve VRAM for the speculative-decode verify working set that KV
-    # profiling under-counts at large num_speculative_tokens (see
-    # vllm/v1/core/spec_decode_workspace.py). Default on; auto no-op when no
-    # speculative_config or num_speculative_tokens<=1.
-    VLLM_SPEC_RESERVE_VERIFY_WORKSPACE: bool = True
-    # [FORK] Peak-overshoot multiplier for that reserve (concurrent full-vocab
-    # fp32 verify buffers + un-instrumented residual). 0 disables the reserve.
-    VLLM_SPEC_VERIFY_OVERSHOOT_MULT: int = 24
     VLLM_TURBOQUANT_DECODE_BLOCK_KV: int = 2
     VLLM_TURBOQUANT_K8V4_FP8_FORMAT: str = "auto"
     VLLM_TURBOQUANT_CUDAGRAPH_SPEC_DECODE_SAFE: bool = False
@@ -253,7 +244,6 @@ if TYPE_CHECKING:
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
     VLLM_LOOPBACK_IP: str = ""
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
-    VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
     VLLM_ENABLE_RESPONSES_API_STORE: bool = False
     VLLM_NVFP4_GEMM_BACKEND: str | None = None
     VLLM_HAS_FLASHINFER_CUBIN: bool = False
@@ -291,10 +281,6 @@ if TYPE_CHECKING:
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
-    # [FORK] Retain the final aligned Mamba state under MTP (mamba_cache_mode=
-    # align): the uncached prompt tail still runs and produces the proposer's
-    # hidden states, so that boundary state is valid and reusable. Default off.
-    VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK: bool = False
     VLLM_USE_V2_MODEL_RUNNER: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
@@ -854,17 +840,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS": lambda: int(
         os.getenv("VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS", "0")
-    ),
-    "VLLM_TURBOQUANT_FLASHINFER_PREFILL_PLAN_CACHE_MAXSIZE": lambda: int(
-        os.getenv("VLLM_TURBOQUANT_FLASHINFER_PREFILL_PLAN_CACHE_MAXSIZE", "16")
-    ),
-    # [FORK] Speculative-decode verify working-set reserve (see
-    # vllm/v1/core/spec_decode_workspace.py).
-    "VLLM_SPEC_RESERVE_VERIFY_WORKSPACE": lambda: bool(
-        int(os.getenv("VLLM_SPEC_RESERVE_VERIFY_WORKSPACE", "1"))
-    ),
-    "VLLM_SPEC_VERIFY_OVERSHOOT_MULT": lambda: int(
-        os.getenv("VLLM_SPEC_VERIFY_OVERSHOOT_MULT", "24")
     ),
     "VLLM_TURBOQUANT_CONTINUATION_SDPA_Q_CHUNK": lambda: int(
         os.getenv("VLLM_TURBOQUANT_CONTINUATION_SDPA_Q_CHUNK", "0")
@@ -1723,20 +1698,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE": lambda: bool(
         int(os.getenv("VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE", "1"))
     ),
-    # Retain local Mamba/linear-attention state-snapshot checkpoints for
-    # prefix caching. Unset (default) preserves the dense per-block-boundary
-    # checkpointing behavior. `0` retains only the latest completed prompt
-    # boundary. Positive values (must be a multiple of the Mamba KV cache
-    # group's block_size) retain checkpoints at that interval instead of
-    # every boundary, freeing up cache-pool headroom at small block sizes.
-    # Ported from upstream vLLM #45845; applies only to Mamba/linear
-    # attention groups in this fork (sliding-window retention from upstream
-    # #43447 was not ported).
-    "VLLM_PREFIX_CACHE_RETENTION_INTERVAL": lambda: (
-        int(os.environ["VLLM_PREFIX_CACHE_RETENTION_INTERVAL"])
-        if "VLLM_PREFIX_CACHE_RETENTION_INTERVAL" in os.environ
-        else None
-    ),
     # Enables support for the "store" option in the OpenAI Responses API.
     # When set to 1, vLLM's OpenAI server will retain the input and output
     # messages for those requests in memory. By default, this is disabled (0),
@@ -1906,12 +1867,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_COMPILE_CACHE_SAVE_FORMAT", "binary", ["binary", "unpacked"]
     ),
     # Flag to enable v2 model runner.
-    "VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK": lambda: os.getenv(
-        "VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK", "0"
-    )
-    .strip()
-    .lower()
-    in ("1", "true", "yes", "on"),
     "VLLM_USE_V2_MODEL_RUNNER": lambda: bool(
         int(os.getenv("VLLM_USE_V2_MODEL_RUNNER", "0"))
     ),
