@@ -61,7 +61,7 @@ class CustomAllreduce:
         self,
         group: ProcessGroup,
         device: int | str | torch.device,
-        max_size=8192 * 1024,
+        max_size=32 * 1024 * 1024,  # EXP-040: SM75 (not in size table) → 32MiB custom-AR cap; >8MiB was NCCL-fallback (slow + overnight-crash path). Revert to 8192*1024 if wrong/crash.
         symm_mem_enabled=False,
     ) -> None:
         """
