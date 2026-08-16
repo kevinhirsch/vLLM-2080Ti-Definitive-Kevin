@@ -32,7 +32,10 @@ cp -v "$HERE"/desktop/swap-model.sh "$HERE"/desktop/*.desktop "$D"/ 2>/dev/null 
 echo "==> [4/5] systemd units -> $SYS (sudo)"
 sudo cp -v "$HERE"/systemd/*.service "$HERE"/systemd/*.timer "$SYS"/
 sudo mkdir -p "$SYS/vllm-qwen27b.service.d"
-sudo cp -v "$HERE"/systemd/vllm-qwen27b.service.d/oom.conf "$SYS/vllm-qwen27b.service.d/"
+# every real drop-in ships; *.conf.example files (e.g. mtp-requal) are opt-in
+for f in "$HERE"/systemd/vllm-qwen27b.service.d/*.conf; do
+  sudo cp -v "$f" "$SYS/vllm-qwen27b.service.d/"
+done
 sudo systemctl daemon-reload
 
 echo "==> [5/5] enable services (reboot-persistent)"
