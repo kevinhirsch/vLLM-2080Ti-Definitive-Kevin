@@ -2169,6 +2169,15 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         getattr(layer, "layer_name", None),
                     )
                     cached_len = width * block_size
+                    # Keep the seq_len == cached_len + q_len invariant that the
+                    # downstream concat relies on (k_full is sized to seq_len and
+                    # filled as [ :cached_len ] = cached, [ cached_len: ] =
+                    # key_chunk, which requires seq_len - cached_len == q_len).
+                    # Truncating cached_len without shrinking seq_len would make
+                    # that assignment a shape mismatch and crash the non-prefix-
+                    # combine (flash / SDPA) path instead of continuing. Attention
+                    # then runs over the truncated-but-in-bounds context.
+                    seq_len = cached_len + q_len
 
             BLOCK_D = triton.next_power_of_2(D)
 
