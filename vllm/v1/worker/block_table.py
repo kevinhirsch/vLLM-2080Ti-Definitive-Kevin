@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import numpy as np
 import torch
 
+from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
@@ -13,6 +16,13 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
 logger = init_logger(__name__)
+
+# Same flag as the pre-launch reader guard in turboquant_attn.py's
+# _continuation_prefill (Xid31 candidate-1 instrumentation). Default off;
+# zero overhead when unset since the check happens before any array op.
+_BT_APPEND_BOUNDS_CHECK = (
+    os.getenv("VLLM_TURBOQUANT_CONTINUATION_BOUNDS_CHECK", "0") == "1"
+)
 
 
 class BlockTable:
@@ -112,10 +122,64 @@ class BlockTable:
                 np.array(block_ids), self.blocks_per_kv_block, self._kernel_block_arange
             )
 
+        if _BT_APPEND_BOUNDS_CHECK:
+            block_ids = self._check_and_clamp_write_bounds(block_ids, row_idx)
+
         num_blocks = len(block_ids)
         start = self.num_blocks_per_row[row_idx]
         self.num_blocks_per_row[row_idx] += num_blocks
         self.block_table.np[row_idx, start : start + num_blocks] = block_ids
+
+    def _check_and_clamp_write_bounds(self, block_ids, row_idx: int):
+        """Env-gated write-side guard (VLLM_TURBOQUANT_CONTINUATION_BOUNDS_CHECK).
+
+        Mirrors the read-side pre-launch guard in
+        turboquant_attn.py's _continuation_prefill: verify the
+        (post-scaling) kernel-block ids about to be written into this row
+        stay within [0, num_kernel_blocks) before they ever reach the
+        table, so a poisoned/stale id can't later resolve to an
+        out-of-bounds KV cache offset inside the unmasked triton dequant
+        load. BlockTable itself is constructed before the KV cache is
+        sized (num_kernel_blocks isn't known until after GPU memory
+        profiling), so the bound is looked up lazily from the live vLLM
+        config -- the same num_gpu_blocks the KV cache tensors
+        (kv_cache.shape[0]) are actually allocated with.
+        """
+        ids_arr = np.asarray(block_ids)
+        if ids_arr.size == 0:
+            return block_ids
+
+        bound = self._num_kernel_blocks()
+        if bound is None:
+            # KV cache not sized yet (e.g. pre-profiling) or config
+            # unavailable (e.g. unit tests) -- nothing to validate against.
+            return block_ids
+
+        mn = int(ids_arr.min())
+        mx = int(ids_arr.max())
+        if mn < 0 or mx >= bound:
+            logger.error(
+                "BLOCK-TABLE OOB WRITE: row=%s req_delta=%s mn=%s mx=%s "
+                "bound=%s num_blocks_per_row=%s",
+                row_idx,
+                ids_arr.size,
+                mn,
+                mx,
+                bound,
+                self.num_blocks_per_row[row_idx],
+            )
+            ids_arr = np.clip(ids_arr, 0, bound - 1)
+            return ids_arr
+
+        return block_ids
+
+    @staticmethod
+    def _num_kernel_blocks() -> int | None:
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is None:
+            return None
+        num_blocks = getattr(vllm_config.cache_config, "num_gpu_blocks", None)
+        return int(num_blocks) if num_blocks else None
 
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
         self.num_blocks_per_row[row_idx] = 0
