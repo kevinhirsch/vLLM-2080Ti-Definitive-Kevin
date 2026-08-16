@@ -1784,6 +1784,24 @@ class GPUModelRunner(
         # so convert draft_token_ids to torch.int32 here.
         draft_token_ids = self._draft_token_ids.to(dtype=torch.int32)
 
+        # -1 is the "no token" sentinel used throughout the spec-decode path (see
+        # num_accepted_tokens = (output_token_ids != -1).sum(...)). Those ids are
+        # scattered straight into input_ids and then used as an embedding index, and a
+        # NEGATIVE index is an illegal memory access. Eager execution happens to hide
+        # this; with CUDA graphs the replay reads the draft buffer at a different point
+        # relative to the proposer, -1 reaches the kernel, and the engine dies with
+        # cudaErrorIllegalAddress. Observed 2026-08-14: FULL cudagraphs + MTP died in
+        # ~2 min with scheduled_spec_decode_tokens=[-1,-1] in the dump, while FULL
+        # cudagraphs with speculation DISABLED ran 20 min / 621 requests clean.
+        #
+        # Clamping to 0 is safe rather than merely defensive: these positions are
+        # speculative, and the target model verifies and rejects whatever token sits
+        # there. A bogus draft was going to be rejected anyway -- the only thing that
+        # changes is that it no longer corrupts the address computation first.
+        # NOTE: not in-place. `.to()` returns self when the dtype already matches, so
+        # clamp_() would mutate the caller's buffer.
+        draft_token_ids = torch.clamp(draft_token_ids, min=0)
+
         self.input_ids.gpu.scatter_(
             dim=0,
             index=draft_tokens_index_tensor,
