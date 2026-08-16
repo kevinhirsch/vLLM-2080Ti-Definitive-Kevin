@@ -3,15 +3,39 @@
 This changelog tracks the fork release version for vLLM 2080 Ti Definitive
 Edition. It is separate from the upstream vLLM package version.
 
+## v0.1.15 - 2026-08-15
+
+- Validates the official
+  [Qwen/Qwen3.8-27B-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8) checkpoint
+  end to end on the dual RTX 2080 Ti TP=2 runtime. The Qwen3.x 27B FP8 route
+  now explicitly covers official Qwen3.6 and Qwen3.8 checkpoints.
+- Merges [PR #85](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/85),
+  improving build download-route preflight, PyTorch fallback
+  behavior, and automatic `MAX_JOBS` limits for reliable source builds.
+- Merges [PR #89](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/89),
+  preserving hybrid Mamba prefix-cache correctness when MTP
+  speculative decoding is enabled.
+- Merges [PR #91](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/91),
+  adding native CPU KV offload support for the Mamba align
+  cache path.
+- Merges [PR #93](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/93),
+  preserving the GDN causal-convolution state slot zero during
+  SM75 decode and adding its regression coverage.
+- Merges [PR #98](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/98),
+  completing named tool-choice response handling for full and
+  streaming OpenAI-compatible chat completions, including Mistral-compliant
+  IDs and empty-argument handling.
+- Release credit: @weicj, @YuYue1208, and @0xYYP.
+
 ## v0.1.14 - 2026-07-07
 
-- Merges [PR #78](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/78)
-  from @0xYYP, improving the validated SM75 TurboQuant long-context route with
+- Merges [PR #78](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/78),
+  improving the validated SM75 TurboQuant long-context route with
   the tested continuation prefix-combine path, tuned decode `BLOCK_KV=2`
   defaults, reproducible long-context benchmark controls, and launcher/runtime
   plumbing for the shipped TurboQuant throughput lane.
-- Merges [PR #81](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/81)
-  from @weicj, finalizing the non-interactive launcher override path with
+- Merges [PR #81](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/81),
+  finalizing the non-interactive launcher override path with
   explicit `CLI > ENV > PROFILE > default` precedence, `CUDA_VISIBLE_DEVICES`
   mapping, mode-derived override hygiene, and matching English / Simplified
   Chinese launcher documentation.
@@ -19,11 +43,11 @@ Edition. It is separate from the upstream vLLM package version.
 
 ## v0.1.13 - 2026-07-04
 
-- Merges [PR #71](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/71)
-  from @0xYYP, fixing the SM75 TurboQuant TQK8V4 FP8 key-format path and the
+- Merges [PR #71](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/71),
+  fixing the SM75 TurboQuant TQK8V4 FP8 key-format path and the
   launcher submenu numeric-selection regression.
-- Merges [PR #72](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/72)
-  from @hotwa, adding the first validated Docker runtime packaging path for
+- Merges [PR #72](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/72),
+  adding the first validated Docker runtime packaging path for
   the SM75 fork, including the runtime Dockerfile, compose example, entrypoint
   flow, and packaged helper assets needed to launch the shipped profiles
   inside a container.

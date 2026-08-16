@@ -8,11 +8,12 @@
 这是一个硬件定向的 vLLM fork，用来保存已经跑通的 2080 Ti vLLM
 栈：补丁源码、启动 profile、运行时说明和稳定环境记录。
 
-Fork 发布版本：`v0.1.14`
+Fork 发布版本：`v0.1.15`
 基础 vLLM：`0.21.0`
 
-核心实测：双 2080 Ti TP=2 runtime 下，Qwen3.6 27B 单请求 decode 达到
-`100+ tok/s`；官方 Qwen3.6 35B FP8 现已跑通 256K 纯文本 normal/aggressive
+核心实测：双 2080 Ti TP=2 runtime 下，Qwen3.x 27B FP8 路线已在官方
+Qwen3.6 和 Qwen3.8 权重上验证，其中 Qwen3.6 基线单请求 decode 达到
+`100+ tok/s`；Qwen3.x 35B 路线也已跑通 256K 纯文本 normal/aggressive
 noMTP、136K 图文 normal/aggressive，以及 178K fast/MTP3 路线。
 
 语言：[English](README.md) | 简体中文
@@ -63,9 +64,9 @@ FlashQLA/FlashInfer、TurboQuant/INT8 KV、MTP 和 CUDAGraph 集成，
 
 状态：🟢 已验证支持；🟡 实验或部分支持；🔴 已知失败或明显退化；⚪ 非目标预设或尚未验证。
 
-### Qwen3.6 27B 成熟主线
+### Qwen3.x 27B 成熟主线
 
-Qwen 系 27B 是这个 fork 的主要生产路线，在 FP8/INT4/NVFP4 权重、MTP、
+Qwen3.x 系 27B 是这个 fork 的主要生产路线，在 FP8/INT4/NVFP4 权重、MTP、
 FP16/INT8/TurboQuant KV、256K 原生上下文、YaRN 容量和图像多模态上覆盖最完整。
 
 | 功能 | FP16 KV | INT8 KV | TurboQuant KV |
@@ -79,9 +80,9 @@ FP16/INT8/TurboQuant KV、256K 原生上下文、YaRN 容量和图像多模态�
 | 图像多模态 | 🟢 支持 | 🟢 支持 | 🟢 支持 |
 | 当前预设状态 | 🟢 normal / fast / safe | 🟢 normal / safe | 🟢 fast |
 
-### Qwen3.6 35B 成熟第二主线
+### Qwen3.x 35B 成熟第二主线
 
-Qwen3.6 35B FP8 MoE 是同一套双 2080 Ti 已验证 runtime 上的成熟第二主线。
+Qwen3.x 35B MoE 是同一套双 2080 Ti 已验证 runtime 上的成熟第二主线。
 它整体上继承了 27B 主线的大部分支持能力：MTP、FP16 KV 长上下文服务、
 FlashQLA / FlashInfer 快速 prefill，以及图像多模态都已经支持。
 
@@ -108,17 +109,18 @@ FP16/default KV 空间。
 
 这一节记录 checkpoint 级别的验证结果。这里的标准比“vLLM 能加载”更严格：
 支持表示可以启动并生成；推荐表示在双 2080 Ti 上同时具备有意义的速度 /
-上下文权衡。
+上下文权衡。当前 Qwen3.x 27B FP8 泛化路线覆盖下方列出的官方 Qwen3.6
+和 Qwen3.8 权重；其它量化行仍按具体 checkpoint 记录。
 
 | 模型路线 | 权重路线 | 模型卡 | 状态 |
 |---|---|---|---|
-| Qwen3.6 27B FP8 | FP8 | [Qwen/Qwen3.6-27B-FP8](https://huggingface.co/Qwen/Qwen3.6-27B-FP8)<br>[Jackrong/Qwopus3.6-27B-v2-FP8](https://huggingface.co/Jackrong/Qwopus3.6-27B-v2-FP8) | 🟢 推荐 |
-| Qwen3.6 35B FP8 | FP8 | [Qwen/Qwen3.6-35B-A3B-FP8](https://huggingface.co/Qwen/Qwen3.6-35B-A3B-FP8)<br>[Jackrong/Qwopus3.6-35B-A3B-Coder-FP8](https://huggingface.co/Jackrong/Qwopus3.6-35B-A3B-Coder-FP8)<br>[kyr0/Ornith-35B-FP8-E4M3-MTP](https://huggingface.co/kyr0/Ornith-35B-FP8-E4M3-MTP) | 🟢 推荐 |
-| Qwen3.6 27B AWQ | AWQ-INT4 | [QuantTrio/Qwen3.6-27B-AWQ](https://huggingface.co/QuantTrio/Qwen3.6-27B-AWQ)<br>[mconcat/Qwopus3.6-27B-v2-AWQ-4bit](https://huggingface.co/mconcat/Qwopus3.6-27B-v2-AWQ-4bit) | 🟢 推荐 |
-| Qwen3.6 27B GPTQ | GPTQ-INT4 | [llmfan46/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-GPTQ-Int4](https://huggingface.co/llmfan46/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-GPTQ-Int4) | 🟢 推荐 |
-| Qwen3.6 27B NVFP4 | NVFP4 | [unsloth/Qwen3.6-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-27B-NVFP4) | 🟡 支持 |
-| Qwen3.6 27B Quark INT8 | Quark-INT8 | [nameistoken/Qwen3.6-27B-Quark-W8A8-INT8](https://huggingface.co/nameistoken/Qwen3.6-27B-Quark-W8A8-INT8) | 🟡 支持 |
-| Qwen3.6 27B AutoRound | AutoGPTQ-INT8 | [Minachist/Qwen3.6-27B-INT8-AutoRound](https://huggingface.co/Minachist/Qwen3.6-27B-INT8-AutoRound)<br>[Minachist/Qwen3.6-27B-INT8-AutoRound W8A16-GS128](https://huggingface.co/Minachist/Qwen3.6-27B-INT8-AutoRound/tree/W8A16-GS128) | 🟡 支持 |
+| Qwen3.x 27B | FP8 | [Qwen/Qwen3.8-27B-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8)<br>[Qwen/Qwen3.6-27B-FP8](https://huggingface.co/Qwen/Qwen3.6-27B-FP8)<br>[Jackrong/Qwopus3.6-27B-v2-FP8](https://huggingface.co/Jackrong/Qwopus3.6-27B-v2-FP8) | 🟢 推荐 |
+| Qwen3.x 35B | FP8 | [Qwen/Qwen3.6-35B-A3B-FP8](https://huggingface.co/Qwen/Qwen3.6-35B-A3B-FP8)<br>[Jackrong/Qwopus3.6-35B-A3B-Coder-FP8](https://huggingface.co/Jackrong/Qwopus3.6-35B-A3B-Coder-FP8)<br>[kyr0/Ornith-35B-FP8-E4M3-MTP](https://huggingface.co/kyr0/Ornith-35B-FP8-E4M3-MTP) | 🟢 推荐 |
+| Qwen3.x 27B | AWQ-INT4 | [QuantTrio/Qwen3.6-27B-AWQ](https://huggingface.co/QuantTrio/Qwen3.6-27B-AWQ)<br>[mconcat/Qwopus3.6-27B-v2-AWQ-4bit](https://huggingface.co/mconcat/Qwopus3.6-27B-v2-AWQ-4bit) | 🟢 推荐 |
+| Qwen3.x 27B | GPTQ-INT4 | [llmfan46/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-GPTQ-Int4](https://huggingface.co/llmfan46/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-GPTQ-Int4) | 🟢 推荐 |
+| Qwen3.x 27B | NVFP4 | [unsloth/Qwen3.6-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-27B-NVFP4) | 🟡 支持 |
+| Qwen3.x 27B | Quark-INT8 | [nameistoken/Qwen3.6-27B-Quark-W8A8-INT8](https://huggingface.co/nameistoken/Qwen3.6-27B-Quark-W8A8-INT8) | 🟡 支持 |
+| Qwen3.x 27B | AutoGPTQ-INT8 | [Minachist/Qwen3.6-27B-INT8-AutoRound](https://huggingface.co/Minachist/Qwen3.6-27B-INT8-AutoRound)<br>[Minachist/Qwen3.6-27B-INT8-AutoRound W8A16-GS128](https://huggingface.co/Minachist/Qwen3.6-27B-INT8-AutoRound/tree/W8A16-GS128) | 🟡 支持 |
 | Gemma4 31B QAT | QAT + QAT assistant draft | [google/gemma-4-31B-it-qat-w4a16-ct](https://huggingface.co/google/gemma-4-31B-it-qat-w4a16-ct)<br>[google/gemma-4-31B-it-qat-q4_0-unquantized-assistant](https://huggingface.co/google/gemma-4-31B-it-qat-q4_0-unquantized-assistant) | 🟡 支持 |
 | Gemma4 31B GPTQ | GPTQ-INT4 + assistant draft | [ebircak/gemma-4-31B-it-4bit-W4A16-GPTQ](https://huggingface.co/ebircak/gemma-4-31B-it-4bit-W4A16-GPTQ) | 🟡 支持 |
 
@@ -128,7 +130,7 @@ FP16/default KV 空间。
   size 2
 - 已验证主机系统：Ubuntu 22.04/24.04 LTS 或 Debian 12，Linux kernel 6.x
 - CUDA/PyTorch：CUDA 12.8，`torch 2.11.0+cu128`
-- Fork 发布版本：`v0.1.14`
+- Fork 发布版本：`v0.1.15`
 - 基础 vLLM：`0.21.0`
 - 仓库身份：`vllm-2080ti-definitive`
 - 运行时身份：`vllm-sm75-tp2-cu128`
@@ -138,11 +140,11 @@ FP16/default KV 空间。
 
 ## 🚀 如何使用
 
-源码 checkout 后分两步使用。
-
-1. 编译 runtime：
+下载仓库后直接编译 runtime：
 
 ```bash
+git clone https://github.com/weicj/vLLM-2080Ti-Definitive.git
+cd vLLM-2080Ti-Definitive
 ./build.sh
 ```
 
@@ -150,7 +152,7 @@ FP16/default KV 空间。
 成功或失败，同时给出 build log 路径。真正开始安装前，它还会先对 PyPI、Git、
 PyTorch wheel 下载链路做测速，需要时自动切到更快的镜像路径。
 
-2. 启动并管理服务：
+随后启动并管理服务：
 
 ```bash
 ./launcher.sh
