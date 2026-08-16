@@ -109,6 +109,39 @@ class BlockTable:
             self.dcp_rank = 0
         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
 
+        # Capture a *reference* to the live CacheConfig for the env-gated append
+        # guard (VLLM_TURBOQUANT_CONTINUATION_BOUNDS_CHECK). The reference is
+        # grabbed HERE, at construction, because that is the only point where
+        # the vLLM config is reliably reachable: BlockTable is (re)built inside
+        # a set_current_vllm_config() context (worker init / kv-cache profiling
+        # / real initialize_from_config). The serving path
+        # (execute_model -> _update_states -> append_row) runs OUTSIDE any such
+        # context, so get_current_vllm_config_or_none() returns None there and a
+        # lazy per-append *lookup* would silently no-op.
+        #
+        # We store the reference (not the value) on purpose: the serving
+        # BlockTable can be constructed during cudagraph profiling, before
+        # cache_config.num_gpu_blocks is sized, and the real initialize_kv_cache
+        # then skips rebuilding it (same block sizes). num_gpu_blocks is
+        # mutated in place on this same CacheConfig object once profiling is
+        # done (gpu_worker sets it before serving), so reading it lazily off the
+        # captured reference always yields the final value regardless of which
+        # construction pass built this table.
+        #
+        # num_gpu_blocks counts *kv-manager* blocks, but the ids written into
+        # this table are *kernel*-block ids (map_to_kernel_blocks scales manager
+        # ids by blocks_per_kv_block), so the valid exclusive bound is
+        # num_gpu_blocks * blocks_per_kv_block == kv_cache.shape[0] -- exactly
+        # the num_blocks the read-side guard in turboquant_attn.py uses. Using
+        # num_gpu_blocks alone would be too small by blocks_per_kv_block (33x on
+        # the live 2112-token-block / 64-token-kernel Qwen3.5 hybrid config) and
+        # would clamp healthy ids, corrupting the table on normal traffic.
+        self._append_cache_config = None
+        if _BT_APPEND_BOUNDS_CHECK:
+            vllm_config = get_current_vllm_config_or_none()
+            if vllm_config is not None:
+                self._append_cache_config = vllm_config.cache_config
+
     def append_row(
         self,
         block_ids: list[int],
@@ -122,7 +155,7 @@ class BlockTable:
                 np.array(block_ids), self.blocks_per_kv_block, self._kernel_block_arange
             )
 
-        if _BT_APPEND_BOUNDS_CHECK:
+        if _BT_APPEND_BOUNDS_CHECK and self._append_cache_config is not None:
             block_ids = self._check_and_clamp_write_bounds(block_ids, row_idx)
 
         num_blocks = len(block_ids)
@@ -133,53 +166,55 @@ class BlockTable:
     def _check_and_clamp_write_bounds(self, block_ids, row_idx: int):
         """Env-gated write-side guard (VLLM_TURBOQUANT_CONTINUATION_BOUNDS_CHECK).
 
-        Mirrors the read-side pre-launch guard in
-        turboquant_attn.py's _continuation_prefill: verify the
-        (post-scaling) kernel-block ids about to be written into this row
-        stay within [0, num_kernel_blocks) before they ever reach the
-        table, so a poisoned/stale id can't later resolve to an
-        out-of-bounds KV cache offset inside the unmasked triton dequant
-        load. BlockTable itself is constructed before the KV cache is
-        sized (num_kernel_blocks isn't known until after GPU memory
-        profiling), so the bound is looked up lazily from the live vLLM
-        config -- the same num_gpu_blocks the KV cache tensors
-        (kv_cache.shape[0]) are actually allocated with.
+        Mirrors the read-side pre-launch guard in turboquant_attn.py's
+        _continuation_prefill: verify the (post-scaling) kernel-block ids about
+        to be written into this row stay within [0, kernel_num_blocks) before
+        they ever reach the table, so a poisoned/stale id can't later resolve to
+        an out-of-bounds KV cache offset inside the unmasked triton dequant
+        load. The bound (num_gpu_blocks * blocks_per_kv_block == kv_cache.shape[0])
+        is read lazily off the CacheConfig reference captured at construction, so
+        it reflects the final num_gpu_blocks even when this table was built
+        during profiling. Wrapped defensively so a bug in the instrumentation
+        can never take down the engine on the hot append path -- on any
+        unexpected error the original ids pass through unchanged.
         """
-        ids_arr = np.asarray(block_ids)
-        if ids_arr.size == 0:
-            return block_ids
-
-        bound = self._num_kernel_blocks()
-        if bound is None:
-            # KV cache not sized yet (e.g. pre-profiling) or config
-            # unavailable (e.g. unit tests) -- nothing to validate against.
-            return block_ids
-
-        mn = int(ids_arr.min())
-        mx = int(ids_arr.max())
-        if mn < 0 or mx >= bound:
-            logger.error(
-                "BLOCK-TABLE OOB WRITE: row=%s req_delta=%s mn=%s mx=%s "
-                "bound=%s num_blocks_per_row=%s",
-                row_idx,
-                ids_arr.size,
-                mn,
-                mx,
-                bound,
-                self.num_blocks_per_row[row_idx],
+        try:
+            num_gpu_blocks = getattr(
+                self._append_cache_config, "num_gpu_blocks", None
             )
-            ids_arr = np.clip(ids_arr, 0, bound - 1)
-            return ids_arr
+            if not num_gpu_blocks:
+                # KV cache not sized yet (e.g. during early profiling) --
+                # nothing to validate against.
+                return block_ids
+            bound = int(num_gpu_blocks) * self.blocks_per_kv_block
 
+            ids_arr = np.asarray(block_ids)
+            if ids_arr.size == 0:
+                return block_ids
+
+            mn = int(ids_arr.min())
+            mx = int(ids_arr.max())
+            if mn < 0 or mx >= bound:
+                logger.error(
+                    "BLOCK-TABLE OOB WRITE: row=%s req_delta=%s mn=%s mx=%s "
+                    "bound=%s num_blocks_per_row=%s",
+                    row_idx,
+                    ids_arr.size,
+                    mn,
+                    mx,
+                    bound,
+                    self.num_blocks_per_row[row_idx],
+                )
+                # Clamp into range so serving continues; the log above is the
+                # smoking gun. np.clip returns an ndarray, safe for the
+                # downstream len()/assignment in append_row.
+                return np.clip(ids_arr, 0, bound - 1)
+        except Exception:
+            logger.exception(
+                "BLOCK-TABLE append bounds-check failed (ignored, row=%s)",
+                row_idx,
+            )
         return block_ids
-
-    @staticmethod
-    def _num_kernel_blocks() -> int | None:
-        vllm_config = get_current_vllm_config_or_none()
-        if vllm_config is None:
-            return None
-        num_blocks = getattr(vllm_config.cache_config, "num_gpu_blocks", None)
-        return int(num_blocks) if num_blocks else None
 
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
         self.num_blocks_per_row[row_idx] = 0
