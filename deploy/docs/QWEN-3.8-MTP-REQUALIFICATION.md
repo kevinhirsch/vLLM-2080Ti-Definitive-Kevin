@@ -38,8 +38,30 @@ None of this is proven on the box yet — that is what this procedure does.
 
 ## Procedure (run on HNET00, in this order)
 
-**0. Prereq — rebuild the engine on this branch.** The v0.1.15 merge touched
-GDN/mamba kernels and the scheduler; the running venv predates it.
+**0. Prereq A — fresh reboot, and know about the Xid31 confounder.** The
+2026-08-16 frontier session (branch `frontier-pastnative-20260816`, and
+`fix-xid31-guard`) documents an **open, unattributed Xid 31 GPU memory-fault
+hunt in the TurboQuant continuation dequant path** — the exact path this
+ladder exercises at long context — and observed that the crash floor descends
+across successive un-rebooted crash cycles. Therefore:
+
+- Reboot the box before the ladder, and re-reboot after any crash before
+  re-testing — otherwise a descending Xid31 floor masquerades as an MTP
+  regression at ever-lower context.
+- Export `VLLM_TURBOQUANT_CONTINUATION_BOUNDS_CHECK=1` for the duration of
+  qualification (env-gated reader guard from `fix-xid31-guard`; requires that
+  branch's guard commits if not yet merged — skip the env if the running build
+  predates them).
+- On any crash, check `dmesg -T | grep -i xid` FIRST. Paired Xid 31 on both
+  GPUs = the pre-existing fault hunt, NOT automatically an MTP verdict; file it
+  against the Xid31 investigation and re-run the stage after a reboot. Only a
+  crash without Xid 31 (or a reproducible garble) counts against MTP.
+
+**0. Prereq B — rebuild the engine on this branch.** The v0.1.15 merge touched
+GDN/mamba kernels and the scheduler; the running venv predates it. (Note the
+frontier experiments were run on the pre-merge base — the host session banked
+its own identical v0.1.15 merge as `merged-v0115-regression` without promoting
+it; this branch IS the promoted version, carrying the same upstream content.)
 
 ```bash
 cd ~/Desktop/vLLM-2080Ti-Definitive && git fetch && git checkout claude/qwen-3.8-27b-tuning-isbc7k

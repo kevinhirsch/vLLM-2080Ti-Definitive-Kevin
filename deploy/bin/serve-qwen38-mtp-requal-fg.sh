@@ -41,6 +41,12 @@ export VLLM_SUFFIX_OVERLAY_MIN=2
 
 MTP_K="${MTP_K:-3}"
 
+# During qualification: surface the open Xid31 TQ-continuation fault hunt
+# (see fix-xid31-guard / QWEN-3.8-MTP-REQUALIFICATION.md prereq A) instead of
+# letting it masquerade as an MTP failure. Harmless no-op on builds without
+# the guard commits.
+export VLLM_TURBOQUANT_CONTINUATION_BOUNDS_CHECK="${VLLM_TURBOQUANT_CONTINUATION_BOUNDS_CHECK:-1}"
+
 ARGS=(
   /home/kevin/Desktop/vLLM-2080Ti-Definitive/.venv/bin/python
   -m
