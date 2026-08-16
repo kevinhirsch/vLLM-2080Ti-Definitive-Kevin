@@ -66,6 +66,7 @@ from vllm.utils.torch_utils import (
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 # Optional ROCm AITER Triton kernels for the GDN decode fast-path.
 # Availability is checked centrally via rocm_aiter_ops; the actual function
@@ -1330,6 +1331,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                     : attn_metadata.num_spec_decodes  # type: ignore[attr-defined]
                 ],
                 num_accepted_tokens=num_accepted_tokens,
+                null_block_id=PAD_SLOT_ID,
                 query_start_loc=spec_query_start_loc,
                 max_query_len=spec_state_indices_tensor.size(-1),
                 validate_data=False,
@@ -1350,6 +1352,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 has_initial_state=has_initial_state,
                 cache_indices=non_spec_state_indices_tensor,
                 query_start_loc=non_spec_query_start_loc,
+                null_block_id=PAD_SLOT_ID,
                 metadata=attn_metadata,
             ).transpose(0, 1)
         elif attn_metadata.num_decodes > 0:
@@ -1364,6 +1367,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                     : attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
                 ],
                 validate_data=True,
+                null_block_id=PAD_SLOT_ID,
             )
         else:
             mixed_qkv_non_spec = None
@@ -1448,6 +1452,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                     ssm_state_indices=spec_state_indices_tensor,
                     num_accepted_tokens=num_accepted_tokens,
                     use_qk_l2norm_in_kernel=True,
+                    null_block_id=PAD_SLOT_ID,
                 )
             )
         else:
@@ -1478,6 +1483,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 ],
                 ssm_state_indices=decode_state_indices,
                 use_qk_l2norm_in_kernel=True,
+                null_block_id=PAD_SLOT_ID,
             )
         else:
             core_attn_out_decode = None
@@ -1565,6 +1571,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                     ],
                     ssm_state_indices=non_spec_state_indices_tensor,
                     use_qk_l2norm_in_kernel=True,
+                    null_block_id=PAD_SLOT_ID,
                 )
             )
         else:
@@ -1743,6 +1750,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 self.activation,
                 conv_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
                 validate_data=False,
+                null_block_id=PAD_SLOT_ID,
             )
         out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
         fused_recurrent_gated_delta_rule_packed_decode(
@@ -1756,6 +1764,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             out=out_buf,
             ssm_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
             use_qk_l2norm_in_kernel=True,
+            null_block_id=PAD_SLOT_ID,
         )
         if (
             (_GDN_DEBUG_SPLIT or _GDN_DEBUG_COMPARE)
@@ -1830,6 +1839,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             ),
             ssm_state_indices=local_state_indices,
             use_qk_l2norm_in_kernel=True,
+            null_block_id=PAD_SLOT_ID,
         )
         err = (core_attn_out - ref).abs()
         _, ref_state = fused_sigmoid_gating_delta_rule_update(
@@ -1850,6 +1860,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             ),
             ssm_state_indices=local_state_indices,
             use_qk_l2norm_in_kernel=True,
+            null_block_id=PAD_SLOT_ID,
         )
         state_err = (ssm_state_after - ref_state).abs()
         _GDN_DEBUG_COMPARE_USED += 1
@@ -1927,6 +1938,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             ),
             ssm_state_indices=local_state_indices,
             use_qk_l2norm_in_kernel=True,
+            null_block_id=PAD_SLOT_ID,
         )
         recurrent_err = (core_attn_out - recurrent_ref).abs()
         recurrent_state_err = (ssm_state_after - recurrent_state).abs()

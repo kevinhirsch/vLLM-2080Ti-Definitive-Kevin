@@ -28,7 +28,7 @@
 - Profile 按 `profiles/<model>/<mode>/<weight>/<route>.env` 组织。
 - `normal` 是当前推荐生产路线；`fast` 只保留质量 smoke 通过的高性能路线；
   `safe` 是 launcher 的 eager 回退档，不作为当前正式 profile 目录。
-- 同一套双 2080 Ti runtime 也已经验证了 Qwen3.6 35B FP8 MoE 路线。正式
+- 同一套双 2080 Ti runtime 也已经验证了 Qwen3.x 35B MoE 路线。正式
   预设现在覆盖 256K `normal` / `aggressive` noMTP 纯文本路线、136K
   `normal` / `aggressive` noMTP 图文路线，以及一条 178K `fast` MTP3
   速度预设。

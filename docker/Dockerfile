@@ -121,7 +121,7 @@ RUN bash docker/fetch_git_with_mirrors.sh \
 
 # Build vLLM (editable install so __file__ resolves correctly)
 # SETUPTOOLS_SCM_PRETEND_VERSION needed because .git is excluded by .dockerignore
-ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.1.14
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.1.15
 RUN uv pip install --no-build-isolation --no-deps -e .
 
 # Fix editable install paths: /build -> /opt/vllm (for runtime stage)
