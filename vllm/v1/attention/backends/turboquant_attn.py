@@ -217,6 +217,9 @@ _TQ_CONTINUATION_SDPA_Q_CHUNK = int(
 _TQ_CONTINUATION_SDPA_MAX_QK_CELLS = int(
     os.getenv("VLLM_TURBOQUANT_CONTINUATION_SDPA_MAX_QK_CELLS", "0")
 )
+_TQ_CONTINUATION_BOUNDS_CHECK = (
+    os.getenv("VLLM_TURBOQUANT_CONTINUATION_BOUNDS_CHECK", "0") == "1"
+)
 _TQ_FORCE_DECODE_SDPA_MAX_QK_CELLS = int(
     os.getenv("VLLM_TURBOQUANT_FORCE_DECODE_SDPA_MAX_QK_CELLS", "131072")
 )
@@ -2199,9 +2202,26 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     )
                 except Exception:
                     logger.exception("Gemma4 TQ continuation debug logging failed")
+            safe_block_table = block_table
+            if _TQ_CONTINUATION_BOUNDS_CHECK and cached_len > 0:
+                pages = math.ceil(cached_len / block_size)
+                num_blocks = kv_cache.shape[0]
+                bt_slice = block_table[0, :pages]
+                bt_max = int(bt_slice.max().item())
+                bt_min = int(bt_slice.min().item())
+                if bt_min < 0 or bt_max >= num_blocks:
+                    logger.error(
+                        "TQ continuation dequant block_table OOB (pre-launch): layer=%s "
+                        "cached_len=%s pages=%s block_size=%s num_blocks=%s bt_min=%s "
+                        "bt_max=%s q_len=%s seq_len=%s -- clamping to avoid MMU fault",
+                        getattr(layer, "layer_name", None), cached_len, pages, block_size,
+                        num_blocks, bt_min, bt_max, q_len, seq_len,
+                    )
+                    safe_block_table = block_table.clone()
+                    safe_block_table[0, :pages].clamp_(0, num_blocks - 1)
             _tq_full_dequant_kv[grid](
                 kv_cache,
-                block_table,
+                safe_block_table,
                 centroids,
                 k_cached,
                 v_cached,
