@@ -2095,6 +2095,38 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     logger.exception("Gemma4 FP16 shared-cache debug logging failed")
         else:
             block_size = kv_cache.shape[1]
+
+            # Structural guard, always on (not gated by
+            # _TQ_CONTINUATION_BOUNDS_CHECK): the missing sibling of the
+            # pages>width check at _shared_fp16_decode_triton's
+            # `if pages > block_table.shape[1]: return None`. Unlike that
+            # site, this dequant path has no clean "return None and let the
+            # caller fall back" option (_continuation_prefill's contract is
+            # to return a tensor, not Optional), so if the pages needed to
+            # cover cached_len exceed this row's block_table width, clamp
+            # cached_len down to what the table can actually address and
+            # continue with the truncated-but-in-bounds read -- the
+            # unmasked triton load below has no per-page masking, so
+            # letting page_idx run past the table width would read
+            # adjacent-row garbage and resolve to a bogus KV cache offset.
+            if cached_len > 0:
+                pages = math.ceil(cached_len / block_size)
+                width = block_table.shape[1]
+                if pages > width:
+                    logger.error(
+                        "TQ continuation pages>width: pages=%s width=%s "
+                        "cached_len=%s block_size=%s seq_len=%s q_len=%s "
+                        "layer=%s",
+                        pages,
+                        width,
+                        cached_len,
+                        block_size,
+                        seq_len,
+                        q_len,
+                        getattr(layer, "layer_name", None),
+                    )
+                    cached_len = width * block_size
+
             BLOCK_D = triton.next_power_of_2(D)
 
             mse_bytes = self._mse_bytes
@@ -2163,7 +2195,31 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             if _TQ_CONTINUATION_BOUNDS_CHECK and cached_len > 0:
                 pages = math.ceil(cached_len / block_size)
                 num_blocks = kv_cache.shape[0]
-                bt_slice = block_table[0, :pages]
+                width = block_table.shape[1]
+                if pages > width:
+                    # Belt-and-suspenders: the structural early-out above
+                    # already clamps cached_len so pages should never
+                    # exceed width here, but guard the slice anyway in
+                    # case a future caller reaches this point without
+                    # going through that clamp. Plain `[0, :pages]`
+                    # slicing silently truncates to `width` instead of
+                    # raising when pages > width, which would otherwise
+                    # hide this exact condition from the bt_min/bt_max
+                    # check below.
+                    logger.error(
+                        "TQ continuation pages>width: pages=%s width=%s "
+                        "cached_len=%s block_size=%s seq_len=%s q_len=%s "
+                        "layer=%s",
+                        pages,
+                        width,
+                        cached_len,
+                        block_size,
+                        seq_len,
+                        q_len,
+                        getattr(layer, "layer_name", None),
+                    )
+                pages_eff = min(pages, width)
+                bt_slice = block_table[0, :pages_eff]
                 bt_max = int(bt_slice.max().item())
                 bt_min = int(bt_slice.min().item())
                 if bt_min < 0 or bt_max >= num_blocks:
@@ -2175,7 +2231,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         num_blocks, bt_min, bt_max, q_len, seq_len,
                     )
                     safe_block_table = block_table.clone()
-                    safe_block_table[0, :pages].clamp_(0, num_blocks - 1)
+                    safe_block_table[0, :pages_eff].clamp_(0, num_blocks - 1)
             _tq_full_dequant_kv[grid](
                 kv_cache,
                 safe_block_table,
