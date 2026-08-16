@@ -58,6 +58,12 @@ ARGS=(
   --enable-prompt-tokens-details
   --language-model-only
   --skip-mm-profiling
+  # Pin structured outputs to llguidance. Default "auto" can select xgrammar,
+  # which has the documented crash with spec-decode + Int4 (vLLM #11484) — a
+  # trap that re-arms itself the day MTP comes back. guidance handles named
+  # tool_choice / guided_json on both the MTP-off and requal variants.
+  --structured-outputs-config
+  '{"backend":"guidance"}'
   --chat-template
   /home/kevin/.local/share/vllm-qwen27b/chat_template-froggeric-v22-official.jinja
   --reasoning-parser
