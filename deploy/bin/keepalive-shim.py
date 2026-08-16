@@ -22,6 +22,7 @@ Cost-first: a single request is always local (free); only real overflow costs mo
 NEVER manages the vLLM process (that's vllm-qwen27b.service + its watchdog).
 """
 import asyncio, os, sys, json, time, logging, collections, subprocess
+import urllib.request
 import aiohttp
 from aiohttp import web
 
@@ -43,6 +44,10 @@ LOCAL_WAIT   = float(os.environ.get("SHIM_LOCAL_WAIT_SECS", "8"))
 SLOT_POLL    = float(os.environ.get("SHIM_SLOT_POLL_SECS", "0.05"))
 HEALTH_TTL   = 5
 CHARS_PER_TOK = 3.5
+# Exact tokenisation for routing decisions. See _tokenize_exact().
+EXACT_TOKENS      = os.environ.get("SHIM_EXACT_TOKENS", "1") not in ("0", "false", "")
+MIN_CHARS_PER_TOK = float(os.environ.get("SHIM_MIN_CHARS_PER_TOK", "2.0"))
+TOKENIZE_TIMEOUT  = float(os.environ.get("SHIM_TOKENIZE_TIMEOUT", "5"))
 # Adaptive first-token deadline: base + est_prompt_tokens/prefill_rate. Big-context prefills
 # legitimately take a while, so this scales with prompt size; a WEDGED backend (accepts the
 # connection but never emits a token) still fails over in ~base seconds instead of hanging.
@@ -67,6 +72,56 @@ BIG_PROMPT       = int(os.environ.get("SHIM_BIG_PROMPT", "24000"))
 # such a request to LOCAL, inject this cap so local only ever does bounded generations. Explicit
 # max_tokens the client set (and < BIG_OUTPUT) are respected. pi + Hermes both send max_tokens=0.
 LOCAL_MAX_OUT    = int(os.environ.get("SHIM_LOCAL_MAX_OUT", "8192"))
+# --- PRIORITY LANES (2026-08-13): interactive-first ---
+# The user runs 1-2 INTERACTIVE agents; the latency pain comes from BACKGROUND cron jobs
+# (Hermes fires one every ~2 min) saturating all lanes so interactive turns queue behind
+# robot busywork and decode at 4-way shared bandwidth. Classify background requests
+# (X-Client containing "cron", or a prompt carrying a BG marker like Hermes's literal
+# "scheduled cron job" preamble) and make them YIELD: they may only use lanes beyond
+# FG_RESERVED (kept free for interactive), and they wait only BG_WAIT before overflowing
+# to the cheap remote. Interactive traffic keeps the full budget and queue-first wait.
+BG_MARKERS  = [m for m in os.environ.get("SHIM_BG_MARKERS", "scheduled cron job").split("|") if m]
+FG_RESERVED = int(os.environ.get("SHIM_FG_RESERVED", "2"))
+BG_WAIT     = float(os.environ.get("SHIM_BG_WAIT_SECS", "5"))
+# Background turns don't need chain-of-thought: thinking mode makes a cron status report
+# generate 2-3K reasoning tokens and hold a local lane for minutes. Injecting
+# enable_thinking=false for LOCAL background requests cuts their lane-hold ~10x.
+BG_NO_THINK = os.environ.get("SHIM_BG_NO_THINK", "1") not in ("0", "false", "")
+# thinking-budget guard: below THINK_OFF_UNDER tokens disable thinking entirely, below
+# THINK_LOW_UNDER downgrade to reasoning_effort=low. Measured starvation point ~1315 tok.
+THINK_GUARD     = os.environ.get("SHIM_THINK_GUARD", "1") not in ("0", "false", "")
+EMPTY_RETRY     = os.environ.get("SHIM_EMPTY_RETRY", "1") not in ("0", "false", "")
+REP_GUARD       = os.environ.get("SHIM_REP_GUARD", "1") not in ("0", "false", "")
+REP_MIN_PATTERN = int(os.environ.get("SHIM_REP_MIN_PATTERN", "8"))
+REP_MAX_PATTERN = int(os.environ.get("SHIM_REP_MAX_PATTERN", "64"))
+REP_MIN_COUNT   = int(os.environ.get("SHIM_REP_MIN_COUNT", "6"))
+THINK_BUDGET_FRAC = float(os.environ.get("SHIM_THINK_BUDGET_FRAC", "0.5"))
+THINK_BUDGET_MIN  = int(os.environ.get("SHIM_THINK_BUDGET_MIN", "128"))
+THINK_BUDGET_MAX  = int(os.environ.get("SHIM_THINK_BUDGET_MAX", "4096"))
+THINK_OFF_UNDER = int(os.environ.get("SHIM_THINK_OFF_UNDER", "600"))
+THINK_LOW_UNDER = int(os.environ.get("SHIM_THINK_LOW_UNDER", "1400"))
+# MASTER SWITCH: 1 = FULL REMOTE (every completion -> DeepSeek; local engine untouched —
+# for maintenance/repro/debugging), 0 = normal local-first. Toggle live from the dashboard.
+FORCE_REMOTE = 1 if os.environ.get("SHIM_FORCE_REMOTE", "0").lower() in ("1", "true", "on") else 0
+# PEAK-AWARE overflow bias (2026-08-13, DeepSeek peak/off-peak pricing eff. Aug 16):
+# during remote-provider PEAK hours (UTC ranges like "1-4,6-10"), BACKGROUND requests
+# wait the full LOCAL_WAIT for a local lane instead of fast-overflowing at BG_WAIT —
+# biasing robot busywork away from 2x-priced remote. Interactive routing unchanged.
+PEAK_HOURS = os.environ.get("SHIM_PEAK_HOURS_UTC", "1-4,6-10")
+
+def is_peak():
+    try:
+        h = time.gmtime().tm_hour
+        for part in PEAK_HOURS.split(","):
+            a, b = (part.split("-") + [part])[:2]
+            if int(a) <= h < int(b):
+                return True
+    except Exception:
+        pass
+    return False
+# Also strip thinking for LOCAL requests from these client IPs (comma-separated; e.g. the
+# Hermes boxes, whose 1-3K-token chain-of-thought per turn is the user-felt latency).
+NO_THINK_IPS = {ip.strip() for ip in os.environ.get("SHIM_NO_THINK_IPS", "").split(",") if ip.strip()}
 # A single request whose est. (prompt + max_tokens) exceeds this will OOM local even at
 # budget=1 (context + generation peaks past this box's tiny free VRAM), so route it straight
 # to remote. Prevents single-big-request OOM crashes. (2026-08-12: observed a solo OOM here.)
@@ -194,31 +249,195 @@ async def _stats_saver():
 # ---------------- live config (editable from the dashboard, no restart) ----------------
 # env-var name -> (global name, caster). Only these are runtime-tunable.
 _CFG = {
-    "SHIM_REMOTE_BASE":     ("REMOTE_BASE",  lambda v: str(v).rstrip("/")),
-    "SHIM_REMOTE_KEY":      ("REMOTE_KEY",   str),
-    "SHIM_REMOTE_MODEL":    ("REMOTE_MODEL", str),
-    "SHIM_LOCAL_BUDGET":    ("BUDGET",       int),
-    "SHIM_LOCAL_WAIT_SECS": ("LOCAL_WAIT",   float),
-    "SHIM_BIG_TOKENS":      ("BIG_TOKENS",   int),
-    "SHIM_OOM_BACKOFF_SECS":("OOM_BACKOFF",  int),
-    "SHIM_MAX_LOCAL_TOKENS":("MAX_LOCAL_TOKENS", int),
-    "SHIM_TOKEN_BUDGET":    ("TOKEN_BUDGET",  int),
+    # remote overflow provider (any OpenAI-compatible endpoint)
+    "SHIM_REMOTE_BASE":      ("REMOTE_BASE",  lambda v: str(v).rstrip("/")),
+    "SHIM_REMOTE_KEY":       ("REMOTE_KEY",   str),
+    "SHIM_REMOTE_MODEL":     ("REMOTE_MODEL", str),
+    "SHIM_FORCE_REMOTE":     ("FORCE_REMOTE", lambda v: 1 if str(v).lower() in ("1","true","on") else 0),
+    # local capacity
+    "SHIM_LOCAL_BUDGET":     ("BUDGET",       int),
+    "SHIM_LOCAL_WAIT_SECS":  ("LOCAL_WAIT",   float),
+    "SHIM_TOKEN_BUDGET":     ("TOKEN_BUDGET", int),
+    "SHIM_OOM_BACKOFF_SECS": ("OOM_BACKOFF",  int),
+    # routing guards
+    "SHIM_BIG_TOKENS":       ("BIG_TOKENS",       int),
+    "SHIM_BIG_OUTPUT":       ("BIG_OUTPUT",       int),
+    "SHIM_BIG_PROMPT":       ("BIG_PROMPT",       int),
+    "SHIM_MAX_LOCAL_TOKENS": ("MAX_LOCAL_TOKENS", int),
+    "SHIM_LOCAL_MAX_OUT":    ("LOCAL_MAX_OUT",    int),
+    "SHIM_FIRST_TOKEN_MAX":  ("FIRST_TOKEN_MAX",  float),
+    "SHIM_PREFILL_TPS":      ("PREFILL_TPS",      float),
+    # lanes / priority
+    "SHIM_TINY_TOKENS":      ("TINY_TOKENS",      int),
+    "SHIM_TINY_EXTRA_LANES": ("TINY_EXTRA_LANES", int),
+    "SHIM_FG_RESERVED":      ("FG_RESERVED",      int),
+    "SHIM_BG_WAIT_SECS":     ("BG_WAIT",          float),
+    "SHIM_BG_MARKERS":       ("BG_MARKERS", lambda v: [m for m in str(v).split("|") if m]),
+    "SHIM_PEAK_HOURS_UTC":   ("PEAK_HOURS",       str),
+    # behaviour toggles
+    "SHIM_BG_NO_THINK":      ("BG_NO_THINK",  lambda v: str(v).lower() not in ("0","false","")),
+    "SHIM_THINK_GUARD":      ("THINK_GUARD",  lambda v: str(v).lower() not in ("0","false","")),
+    "SHIM_EMPTY_RETRY":      ("EMPTY_RETRY",  lambda v: str(v).lower() not in ("0","false","")),
+    "SHIM_REP_GUARD":        ("REP_GUARD",    lambda v: str(v).lower() not in ("0","false","")),
+    "SHIM_REP_MIN_PATTERN":  ("REP_MIN_PATTERN", int),
+    "SHIM_REP_MAX_PATTERN":  ("REP_MAX_PATTERN", int),
+    "SHIM_REP_MIN_COUNT":    ("REP_MIN_COUNT", int),
+    "SHIM_THINK_BUDGET_FRAC":("THINK_BUDGET_FRAC", float),
+    "SHIM_THINK_BUDGET_MIN": ("THINK_BUDGET_MIN", int),
+    "SHIM_THINK_BUDGET_MAX": ("THINK_BUDGET_MAX", int),
+    "SHIM_THINK_OFF_UNDER":  ("THINK_OFF_UNDER", int),
+    "SHIM_THINK_LOW_UNDER":  ("THINK_LOW_UNDER", int),
+    "SHIM_NO_THINK_IPS":     ("NO_THINK_IPS", lambda v: {i.strip() for i in str(v).split(",") if i.strip()}),
+    "SHIM_LOG_REQUESTS":     ("LOG_REQUESTS", lambda v: str(v).lower() not in ("0","false","")),
 }
+# A single request whose est. (prompt + max_tokens) exceeds this will OOM local even at
+# budget=1 (context + generation peaks past this box's tiny free VRAM), so route it straight
+# to remote. Prevents single-big-request OOM crashes. (2026-08-12: observed a solo OOM here.)
+MAX_LOCAL_TOKENS = int(os.environ.get("SHIM_MAX_LOCAL_TOKENS", "80000"))
+# Size-aware admission: cap TOTAL in-flight prompt tokens across local lanes (activation ∝
+# concurrent context). Benchmark (2026-08-12, util 0.82) held 4x170K=680K with 611MB margin;
+# 500K default leaves comfortable headroom while allowing generous concurrency. 0 = disabled.
+TOKEN_BUDGET     = int(os.environ.get("SHIM_TOKEN_BUDGET", "500000"))
+DEFAULT_MAX_OUT  = int(os.environ.get("SHIM_DEFAULT_MAX_OUT", "8192"))
+# --- TINY fast-lane (2026-08-13) ---
+# Micro-calls (title-gen, classification, keepalive probes: est. prompt+max_out <= TINY_TOKENS)
+# are VRAM-negligible. Give them a fast-lane: they SKIP the queue-first wait and may use up to
+# TINY_EXTRA_LANES slots BEYOND the big-request budget (staying within the engine's max-num-seqs),
+# so a trivial call never eats a 15s wait or gets starved behind big generations / during a
+# budget=1 backoff. If local is busy past that headroom, they fast-overflow to remote immediately
+# (a tiny call on DeepSeek is near-free + fast) rather than waiting.
+TINY_TOKENS       = int(os.environ.get("SHIM_TINY_TOKENS", "1500"))
+TINY_EXTRA_LANES  = int(os.environ.get("SHIM_TINY_EXTRA_LANES", "2"))
+# --- concurrency-aware first-token deadline (2026-08-13) ---
+# Prefill compute is SHARED across concurrent requests on this box, so a big request queued behind
+# N others emits its first token only after ~N prefills complete. Scaling the wedge-detection
+# deadline by in-flight concurrency stops legit slow prefills being misread as a wedged backend
+# (which was needlessly failing big requests over to DeepSeek AND tripping a 120s budget=1 backoff
+# that cascaded tiny requests to overflow). 1 = scale by concurrency (default); 0 = old flat behavior.
+FT_CONCURRENCY_SCALE = int(os.environ.get("SHIM_FT_CONCURRENCY_SCALE", "1"))
+# --- per-request logging (2026-08-13) ---
+# Log source (ip/UA), model, size and a short prompt preview for each completion, to attribute
+# traffic (which client fires the tiny bursts / the slow big prefills). Set SHIM_LOG_REQUESTS=0
+# to disable (e.g. for prompt privacy).
+LOG_REQUESTS      = os.environ.get("SHIM_LOG_REQUESTS", "1") not in ("0", "false", "")
+LOG_PREVIEW_CHARS = int(os.environ.get("SHIM_LOG_PREVIEW_CHARS", "70"))
+# vLLM-only params that a remote OpenAI endpoint would reject — stripped on overflow.
+REMOTE_STRIP = ("chat_template_kwargs", "mamba_cache_mode", "guided_decoding_backend")
+
+logging.basicConfig(level=logging.INFO, stream=sys.stdout,
+                    format="%(asctime)s [gateway] %(levelname)s %(message)s")
+log = logging.getLogger("gateway-shim")
+
+_inflight = 0            # local capacity units currently in flight
+_inflight_tokens = 0    # sum of est prompt tokens of in-flight local requests (size-aware cap)
+_waiting  = 0           # requests currently blocked in the queue-first wait loop (backlog)
+_backoff_until = 0.0
+_health = {"ok": False, "at": 0.0}
+REMOTE_ENABLED = bool(REMOTE_BASE and REMOTE_KEY)
+STATS_FILE = os.environ.get("SHIM_STATS_FILE", "/home/kevin/.local/share/vllm-qwen27b/gateway-stats.json")
+
+# ---------------- live metrics (for the /gateway/dashboard status page) ----------------
+_stats = {"started": time.time(), "total": 0, "local": 0, "remote": 0,
+          "waited_total": 0.0, "waited_n": 0, "peak_inflight": 0, "peak_waiting": 0,
+          "overflowed_after_wait": 0}
+_remote_reasons = collections.Counter()
+_events = collections.deque(maxlen=200)   # most-recent-first ring buffer of routing decisions
+_gpu_cache = {"at": 0.0, "data": []}
+
+def _client_label(request):
+    # harness self-id via X-Client/X-Title header, else source IP
+    return request.headers.get("X-Client") or request.headers.get("X-Title") \
+        or getattr(request, "remote", None) or "?"
+
+def record_event(decision, reason, request, units, waited, ptok=0, maxtok=0, stream=False):
+    _stats["total"] += 1
+    if decision == "local":
+        _stats["local"] += 1
+    else:
+        _stats["remote"] += 1
+        _remote_reasons[reason] += 1
+    if waited and waited > 0:
+        _stats["waited_total"] += waited
+        _stats["waited_n"] += 1
+    _stats["peak_inflight"] = max(_stats["peak_inflight"], _inflight)
+    _events.appendleft({"t": round(time.time(), 1), "d": decision, "r": reason,
+                        "client": _client_label(request), "units": units,
+                        "waited": round(waited or 0, 1),
+                        "ep": request.path.rsplit("/", 1)[-1],
+                        "ptok": ptok, "maxtok": maxtok, "stream": stream})
+
+def _gpu_stats():
+    now = time.time()
+    if now - _gpu_cache["at"] < 1.5:
+        return _gpu_cache["data"]
+    data = []
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.used,memory.free,utilization.gpu",
+                              "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=2).stdout.strip()
+        for line in out.splitlines():
+            u, f, g = [int(x) for x in line.split(", ")]
+            data.append({"used": u, "free": f, "util": g})
+    except Exception:
+        pass
+    _gpu_cache.update(at=now, data=data)
+    return data
+
+# ---------------- metrics persistence (survive gateway restarts) ----------------
+def _save_stats():
+    try:
+        with open(STATS_FILE + ".tmp", "w") as f:
+            json.dump({"stats": _stats, "reasons": dict(_remote_reasons), "events": list(_events)}, f)
+        os.replace(STATS_FILE + ".tmp", STATS_FILE)
+    except Exception as e:
+        log.warning("save stats failed: %s", e)
+
+def _load_stats():
+    try:
+        if not os.path.exists(STATS_FILE):
+            return
+        d = json.load(open(STATS_FILE))
+        st = d.get("stats", {})
+        for k in list(_stats.keys()):
+            if k in st:
+                _stats[k] = st[k]          # includes original "started" -> cumulative uptime
+        _remote_reasons.update(d.get("reasons", {}))
+        for e in reversed(d.get("events", [])):
+            _events.appendleft(e)
+        log.info("restored stats: total=%d (%d events)", _stats.get("total", 0), len(_events))
+    except Exception as e:
+        log.warning("load stats failed: %s", e)
+
+async def _stats_saver():
+    while True:
+        await asyncio.sleep(10)
+        _save_stats()
+
+
+# ---------------- live config (editable from the dashboard, no restart) ----------------
+# env-var name -> (global name, caster). Only these are runtime-tunable.
 # form-field key <-> env-var (what the dashboard sends)
-_FIELD_ENV = {"remote_base":"SHIM_REMOTE_BASE","remote_key":"SHIM_REMOTE_KEY","remote_model":"SHIM_REMOTE_MODEL",
-              "budget":"SHIM_LOCAL_BUDGET","local_wait":"SHIM_LOCAL_WAIT_SECS","big_tokens":"SHIM_BIG_TOKENS",
-              "oom_backoff":"SHIM_OOM_BACKOFF_SECS","max_local_tokens":"SHIM_MAX_LOCAL_TOKENS",
-              "token_budget":"SHIM_TOKEN_BUDGET"}
+_FIELD_ENV = {k.lower().replace("shim_", ""): k for k in _CFG}
 
 def current_config(masked=True):
+    """Every runtime-tunable knob, keyed by dashboard field name (env minus SHIM_)."""
     g = globals()
+    out = {}
+    for env, (gname, _) in _CFG.items():
+        field = env.lower().replace("shim_", "")
+        v = g[gname]
+        if isinstance(v, (set, list)):
+            v = ",".join(sorted(v)) if isinstance(v, set) else "|".join(v)
+        elif isinstance(v, bool):
+            v = 1 if v else 0
+        out[field] = v
     k = g["REMOTE_KEY"]
-    kd = ("set (" + k[:5] + "…" + k[-4:] + ")") if (masked and k and len(k) > 12) else ("set" if k else "")
-    return {"remote_base": g["REMOTE_BASE"], "remote_model": g["REMOTE_MODEL"],
-            "remote_key_display": kd, "remote_key_set": bool(k),
-            "budget": g["BUDGET"], "local_wait": g["LOCAL_WAIT"], "big_tokens": g["BIG_TOKENS"],
-            "oom_backoff": g["OOM_BACKOFF"], "max_local_tokens": g["MAX_LOCAL_TOKENS"],
-            "token_budget": g["TOKEN_BUDGET"]}
+    out["remote_key_display"] = ("set (" + k[:5] + "\u2026" + k[-4:] + ")") if (masked and k and len(k) > 12) else ("set" if k else "")
+    out["remote_key_set"] = bool(k)
+    if masked:
+        out.pop("remote_key", None)
+    return out
+
 
 def apply_config(fields):
     """fields = dashboard form dict (subset). Reassigns globals live + persists to SHIM_ENV_FILE."""
@@ -288,7 +507,66 @@ def _est_tokens(body):
             for b in c:
                 if isinstance(b, dict):
                     chars += len(b.get("text", "") or "")
-    return int(chars / CHARS_PER_TOK)
+    if not EXACT_TOKENS:
+        return int(chars / CHARS_PER_TOK)
+    # A char count can only ever correspond to FEWER tokens than chars/MIN_CHARS_PER_TOK.
+    # If even that pessimistic bound is under every decision threshold, the exact number
+    # cannot change any routing decision, so skip the round-trip. This is an optimisation
+    # with a proof, not a heuristic about the answer.
+    if chars / MIN_CHARS_PER_TOK < _min_decision_threshold():
+        return int(chars / CHARS_PER_TOK)
+    exact = _tokenize_exact(_prompt_text(j))
+    return exact if exact is not None else int(chars / CHARS_PER_TOK)
+
+
+def _min_decision_threshold():
+    vals = [v for v in (TINY_TOKENS, BIG_TOKENS, BIG_PROMPT, MAX_LOCAL_TOKENS) if v and v > 0]
+    return min(vals) if vals else 1500
+
+
+def _prompt_text(j):
+    out = []
+    for m in (j.get("messages") or []):
+        c = m.get("content")
+        if isinstance(c, str):
+            out.append(c)
+        elif isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and b.get("text"):
+                    out.append(b["text"])
+    return "\n".join(out)
+
+
+_tok_fail_until = 0.0
+
+def _tokenize_exact(text):
+    """Ask the engine for the REAL token count instead of guessing chars/3.5.
+
+    The estimator was measured +9% to +19% off on real code and 1.77x off on repetitive
+    text, and every routing decision (tiny lane, big-prompt guard, local size cap) keys off
+    it. /tokenize costs 10ms on a small prompt and 400ms on a 1.2M-char one -- 0.2-0.8% of
+    those requests' own latency, i.e. cheapest exactly where precision matters most.
+
+    Falls back to the estimate (and stops trying for a minute) if the endpoint misbehaves,
+    so routing never depends on it being up."""
+    global _tok_fail_until
+    if time.time() < _tok_fail_until:
+        return None
+    try:
+        req = urllib.request.Request(
+            LOCAL.rstrip("/") + "/tokenize",
+            json.dumps({"model": _local_model_name(), "prompt": text}).encode(),
+            {"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=TOKENIZE_TIMEOUT) as r:
+            return int(json.load(r).get("count"))
+    except Exception as e:
+        _tok_fail_until = time.time() + 60
+        log.warning("tokenize failed (%s) -> falling back to estimate for 60s", str(e)[:80])
+        return None
+
+
+def _local_model_name():
+    return os.environ.get("SHIM_LOCAL_MODEL_NAME", "qwen-local")
 
 
 def estimate_units(body):
@@ -306,6 +584,31 @@ def first_token_timeout(body, concurrency=1):
     # remote/uncontended calls preserves the original tight deadline.
     factor = max(1, concurrency) if FT_CONCURRENCY_SCALE else 1
     return min(FIRST_TOKEN_MAX, FIRST_TOKEN_BASE + (_est_tokens(body) / PREFILL_TPS) * factor)
+
+
+def is_background(body, request):
+    """Background (cron/batch) request? Checked via X-Client header or prompt markers
+    (Hermes cron turns literally open with 'scheduled cron job'). Background yields
+    lanes to interactive traffic and fast-overflows instead of queueing."""
+    xc = (request.headers.get("X-Client") or "").lower()
+    if "cron" in xc or "batch" in xc:
+        return True
+    if not BG_MARKERS:
+        return False
+    try:
+        msgs = json.loads(body).get("messages") or []
+    except Exception:
+        return False
+    for m in (msgs[:2] + msgs[-1:]):
+        c = m.get("content")
+        if isinstance(c, str) and any(k in c[:500] for k in BG_MARKERS):
+            return True
+        if isinstance(c, list):
+            for b in c[:2]:
+                t = b.get("text", "") if isinstance(b, dict) else ""
+                if any(k in t[:500] for k in BG_MARKERS):
+                    return True
+    return False
 
 
 def is_tiny(body):
@@ -342,10 +645,125 @@ def over_local_cap(body):
     return (_est_tokens(body) + mt) > MAX_LOCAL_TOKENS
 
 
+def strip_thinking(body):
+    """Disable chain-of-thought for a LOCAL background request (cron/batch): status
+    reports don't need 2-3K reasoning tokens holding a lane for minutes."""
+    try:
+        j = json.loads(body)
+    except Exception:
+        return body
+    ctk = j.get("chat_template_kwargs") or {}
+    ctk["enable_thinking"] = False
+    j["chat_template_kwargs"] = ctk
+    return json.dumps(j).encode()
+
+
+def _is_empty_thinking_response(resp):
+    """True if a NON-STREAMING local response came back with finish_reason=length and no
+    content and no tool calls -- i.e. the model spent its entire budget thinking and
+    returned NOTHING. Returns False for anything we cannot parse, so this can only ever
+    trigger on a clearly-identified failure."""
+    try:
+        if not isinstance(getattr(resp, "body", None), (bytes, bytearray)):
+            return False
+        d = json.loads(resp.body)
+        ch = (d.get("choices") or [{}])[0]
+        if ch.get("finish_reason") != "length":
+            return False
+        m = ch.get("message") or {}
+        if m.get("tool_calls"):
+            return False
+        return not (m.get("content") or "").strip()
+    except Exception:
+        return False
+
+
+def repetition_guard(body):
+    """Stop degenerate output loops at the SAMPLER instead of waiting for a timeout.
+
+    vLLM's RepetitionDetectionParams watches for an N-gram pattern repeating and ends the
+    sequence when it does. Without it, a looping model holds a lane until max_tokens or the
+    client gives up -- the usual workaround is a client-side timeout, which wastes the whole
+    generation and the lane.
+
+    Deliberately CONSERVATIVE defaults: legitimate output repeats itself (code, tables,
+    lists, JSON arrays), so we require a fairly long pattern repeated several times rather
+    than trying to catch every loop. Better to miss a loop than truncate real work.
+    Disable with SHIM_REP_GUARD=0; tune via SHIM_REP_MIN/MAX_PATTERN and SHIM_REP_MIN_COUNT.
+    """
+    if not REP_GUARD:
+        return body
+    try:
+        j = json.loads(body)
+    except Exception:
+        return body
+    if j.get("repetition_detection") is not None:      # caller was explicit
+        return body
+    j["repetition_detection"] = {
+        "min_pattern_size": REP_MIN_PATTERN,
+        "max_pattern_size": REP_MAX_PATTERN,
+        "min_count": REP_MIN_COUNT,
+    }
+    return json.dumps(j).encode()
+
+
+def thinking_budget_guard(body):
+    """Bound chain-of-thought at the SAMPLER so a request cannot spend its whole budget
+    thinking and return nothing.
+
+    Uses vLLM's `thinking_token_budget` sampling param, which counts thinking tokens and
+    force-injects the reasoning end token when the budget is hit. That is a HARD bound in
+    the sampler -- unlike `reasoning_effort=low`, which is only a prompt suggestion and
+    demonstrably does not bound anything (measured 2026-08-14: max_tokens=4000 WITH
+    reasoning_effort=low returned empty, while max_tokens=8000 with full thinking completed
+    in 3519 tokens).
+
+    Measured effect at the source:
+        no budget                  -> 2341 tok, 6324ch thinking, 543ch answer, 25.5s
+        thinking_token_budget=200  ->  292 tok,  812ch thinking, 512ch answer,  3.6s
+    Same answer, 7x faster, 8x fewer tokens.
+
+    Policy: give thinking a fixed share of the caller's budget (THINK_BUDGET_FRAC), floored
+    and capped, so a small max_tokens always leaves room for an actual answer. Never
+    override a caller who set thinking behaviour explicitly. Disable with SHIM_THINK_GUARD=0.
+    """
+    if not THINK_GUARD:
+        return body
+    try:
+        j = json.loads(body)
+    except Exception:
+        return body
+    # Only a REAL bound counts as the caller having handled this. reasoning_effort is a
+    # prompt-level hint that demonstrably does NOT bound thinking (measured: max_tokens=4000
+    # with reasoning_effort=low still returned empty), so treating it as "caller knows best"
+    # silently disabled the budget for anyone who sets it. Both Hermes instances send
+    # reasoning_effort=medium on every request, so they were bypassing this entirely.
+    if (j.get("thinking_token_budget") is not None
+            or (j.get("chat_template_kwargs") or {}).get("enable_thinking") is not None):
+        return body
+    try:
+        mt = int(j.get("max_tokens") or 0)
+    except Exception:
+        return body
+    if mt <= 0:
+        return body
+    budget = int(mt * THINK_BUDGET_FRAC)
+    budget = max(THINK_BUDGET_MIN, min(budget, THINK_BUDGET_MAX))
+    if budget >= mt:                      # nothing left for an answer -> no thinking at all
+        ctk = j.get("chat_template_kwargs") or {}
+        ctk["enable_thinking"] = False
+        j["chat_template_kwargs"] = ctk
+    else:
+        j["thinking_token_budget"] = budget
+    return json.dumps(j).encode()
+
+
 def bound_local_output(body):
-    """Ensure a request routed to LOCAL has a bounded max_tokens. If it's absent or 0 (unbounded ->
-    could run away generating on the slow box), inject LOCAL_MAX_OUT. Explicit client values are kept.
-    Returns (possibly-rewritten) body bytes."""
+    """Ensure a request routed to LOCAL has a bounded max_tokens. Absent/0 (unbounded) OR an
+    oversized explicit ceiling (e.g. Hermes's 65536 — a ceiling, not real usage: typical turns
+    finish at EOS in a few K tokens) is CLAMPED to LOCAL_MAX_OUT so the request runs local-first
+    instead of being rerouted; only genuinely >LOCAL_MAX_OUT generations hit the cap
+    (finish_reason=length). Returns (possibly-rewritten) body bytes."""
     if LOCAL_MAX_OUT <= 0:
         return body
     try:
@@ -353,7 +771,7 @@ def bound_local_output(body):
     except Exception:
         return body
     mt = j.get("max_tokens")
-    if not mt or int(mt) <= 0:
+    if not mt or int(mt) <= 0 or int(mt) > LOCAL_MAX_OUT:
         j["max_tokens"] = LOCAL_MAX_OUT
         return json.dumps(j).encode()
     return body
@@ -559,15 +977,21 @@ async def handle_completions(request):
         maxtok = 0
     ev = dict(ptok=ptok, maxtok=maxtok, stream=streaming)
     tiny = is_tiny(body)
+    background = is_background(body, request)
 
     if LOG_REQUESTS:
         try:
             model_req = json.loads(body).get("model", "?")
         except Exception:
             model_req = "?"
-        log.info("REQ ip=%s ua=%r model=%s ptok=%d maxtok=%d stream=%s tiny=%s preview=%r",
+        log.info("REQ ip=%s ua=%r model=%s ptok=%d maxtok=%d stream=%s tiny=%s bg=%s preview=%r",
                  getattr(request, "remote", "?"), request.headers.get("User-Agent", "?")[:45],
-                 model_req, ptok, maxtok, streaming, tiny, _preview(body))
+                 model_req, ptok, maxtok, streaming, tiny, background, _preview(body))
+
+    # MASTER SWITCH: full-remote mode (maintenance/debug) — everything -> DeepSeek
+    if REMOTE_ENABLED and FORCE_REMOTE:
+        record_event("remote", "forced", request, units, 0, **ev)
+        return await _forward_remote(request, path, body, streaming)
 
     # size cap: too-big-for-this-box requests OOM local even at budget=1 -> send straight to remote
     if REMOTE_ENABLED and over_local_cap(body):
@@ -607,7 +1031,11 @@ async def handle_completions(request):
             log.info("route %s TINY units=%d inflight=%d/%d(+%d) -> local(tiny)",
                      path, units, _inflight, effective_budget(), TINY_EXTRA_LANES)
             try:
-                kind, payload = await _relay(request, LOCAL, path, bound_local_output(body), None, streaming, concurrency=1)
+                # tiny fast-lane needs the same thinking guard as the main path: these are
+                # exactly the small-max_tokens calls that get starved to an empty response.
+                kind, payload = await _relay(request, LOCAL, path,
+                                             repetition_guard(thinking_budget_guard(bound_local_output(body))),
+                                             None, streaming, concurrency=1)
                 if kind == "ok":
                     record_event("local", "tiny", request, units, 0, **ev)
                     return payload
@@ -628,15 +1056,24 @@ async def handle_completions(request):
         # no remote configured -> fall through to the normal local wait loop
 
     # local UP: claim a slot, WAITING up to LOCAL_WAIT for capacity instead of instant-overflow.
+    # PRIORITY LANES: background (cron/batch) may only fill lanes beyond FG_RESERVED — those
+    # stay free so an interactive turn NEVER queues behind robot busywork — and background
+    # waits only BG_WAIT before overflowing to the cheap remote.
     # The check-and-increment is done with no await in between, so it's race-free under asyncio.
-    deadline = time.time() + (LOCAL_WAIT if REMOTE_ENABLED else 1e9)
+    if background:
+        lane_limit = max(1, effective_budget() - FG_RESERVED)
+        _bgw = LOCAL_WAIT if is_peak() else BG_WAIT   # peak: bias bg toward local queueing
+        deadline = time.time() + (_bgw if REMOTE_ENABLED else 1e9)
+    else:
+        lane_limit = effective_budget()
+        deadline = time.time() + (LOCAL_WAIT if REMOTE_ENABLED else 1e9)
     admitted = False
     admitted_conc = 1        # local concurrency at admission -> scales the first-token deadline
     waited = 0.0
     queued = False
     try:
         while True:
-            if _health["ok"] and (_inflight + units) <= effective_budget() \
+            if _health["ok"] and (_inflight + units) <= lane_limit \
                     and (TOKEN_BUDGET <= 0 or _inflight_tokens + ptok <= TOKEN_BUDGET or _inflight == 0):
                 _inflight += units
                 _inflight_tokens += ptok
@@ -658,7 +1095,12 @@ async def handle_completions(request):
 
     if not admitted:
         # distinguish WHY we couldn't admit: lane-count vs total-context (size-aware) cap
-        reason = "tokens" if ((_inflight + units) <= effective_budget()) else "cap"
+        if (_inflight + units) <= lane_limit:
+            reason = "tokens"
+        elif background and (_inflight + units) <= effective_budget():
+            reason = "bg-yield"      # lanes exist but are reserved for interactive
+        else:
+            reason = "cap"
         where = f"remote({reason})" if REMOTE_ENABLED else "remote(none)"
         log.info("route %s units=%d inflight=%d/%d tok=%d/%d waited=%.1fs -> %s",
                  path, units, _inflight, effective_budget(), _inflight_tokens, TOKEN_BUDGET, waited, where)
@@ -669,9 +1111,41 @@ async def handle_completions(request):
 
     log.info("route %s units=%d inflight=%d/%d waited=%.1fs -> local",
              path, units, _inflight, effective_budget(), waited)
+    # FLIGHT RECORDER (RCA, 2026-08-13): persist big local-routed request bodies so the
+    # next Xid-31 crash leaves a deterministic repro payload. Ring of 40 files, 0600.
+    if ptok >= int(os.environ.get("SHIM_FLIGHTREC_MIN_TOK", "15000")):
+        try:
+            fr = "/home/kevin/.local/share/vllm-qwen27b/flightrec"
+            fn = f"{fr}/{int(time.time())}_{ptok}tok.json"
+            with open(fn, "wb") as f:
+                f.write(body)
+            os.chmod(fn, 0o600)
+            olds = sorted(os.listdir(fr))
+            for o in olds[:-40]:
+                os.unlink(os.path.join(fr, o))
+        except Exception as e:
+            log.warning("flightrec: %s", e)
     try:
-        kind, payload = await _relay(request, LOCAL, path, bound_local_output(body), None, streaming, concurrency=admitted_conc)
+        _lb = repetition_guard(thinking_budget_guard(bound_local_output(body)))
+        if (background and BG_NO_THINK) or (getattr(request, "remote", None) in NO_THINK_IPS):
+            _lb = strip_thinking(_lb)
+        kind, payload = await _relay(request, LOCAL, path, _lb, None, streaming, concurrency=admitted_conc)
         if kind == "ok":
+            # EMPTY-RESPONSE RETRY. Thinking length is prompt-dependent and unbounded, so no
+            # max_tokens threshold can guarantee an answer: measured 2026-08-14, the SAME
+            # budget that answered one prompt returned finish_reason=length with empty
+            # content on another, and reasoning_effort=low did NOT bound it (mt=4000 low ->
+            # empty, while mt=8000 full -> completed in 3519 tok). Predicting is hopeless;
+            # detecting is trivial. Retry once with thinking OFF, which reliably answers in
+            # ~100 tokens. Non-streaming only -- a streamed response is already committed.
+            if (EMPTY_RETRY and not streaming and _is_empty_thinking_response(payload)
+                    and b'"enable_thinking": false' not in _lb):
+                log.warning("local returned EMPTY (all budget spent thinking) -> retry no-think")
+                kind2, payload2 = await _relay(request, LOCAL, path, strip_thinking(_lb), None,
+                                               False, concurrency=admitted_conc)
+                if kind2 == "ok" and not _is_empty_thinking_response(payload2):
+                    record_event("local", "empty-retry", request, units, waited, **ev)
+                    return payload2
             record_event("local", "-", request, units, waited, **ev)
             return payload
         status, text, oom = payload
@@ -707,6 +1181,28 @@ async def h_models(request):
 
 
 async def h_health(request):
+    """Is the GATEWAY able to serve? Not "is local up".
+
+    These are different questions and conflating them causes false alarms: during an engine
+    restart (model swap, config test, crash recovery) local is down for ~40-90s while every
+    request is still answered via remote overflow. The old handler returned 503 there, so
+    Kevin's Hermes cron paged "DOWN HTTP 503" for a service that was working fine.
+
+    A monitor acts on "can it serve", so that is what /health answers now:
+      200 "OK"                 local is healthy
+      200 "DEGRADED: ..."      local down, remote available -> requests are still served
+      503                      nothing can serve -> a real outage
+    Anything that specifically needs local status has /health/local, which keeps the old
+    strict behaviour."""
+    if await local_healthy():
+        return web.Response(text="OK")
+    if REMOTE_ENABLED and REMOTE_BASE:
+        return web.Response(text="DEGRADED: local down, serving via remote")
+    return web.Response(status=503, text="local down, no remote configured")
+
+
+async def h_health_local(request):
+    """Strict local-only health, for callers that need to distinguish (503 when local down)."""
     return web.Response(text="OK") if await local_healthy() else web.Response(status=503, text="local down")
 
 
@@ -739,6 +1235,93 @@ async def gateway_stats(request):
         "gpu": _gpu_stats(),
         "events": list(_events)[:60],
     })
+
+MODELS_DIR = os.environ.get("SHIM_MODELS_DIR", "/home/kevin/Desktop/models")
+SWITCH_SH = os.environ.get("SHIM_SWITCH_SCRIPT", "/home/kevin/.local/share/vllm-qwen27b/switch-model.sh")
+SERVE_SH  = os.environ.get("SHIM_SERVE_SCRIPT", "/home/kevin/.local/share/vllm-qwen27b/serve-tqk8v4-fg.sh")
+
+
+def _detect_format(d):
+    """Model-agnostic: classify any HF checkpoint dir by servability on THIS box (SM75)."""
+    try:
+        c = json.load(open(os.path.join(d, "config.json")))
+    except Exception:
+        return None, "no config.json"
+    q = c.get("quantization_config") or {}
+    m = (q.get("quant_method") or q.get("method") or "").lower()
+    dt = str(c.get("torch_dtype") or c.get("dtype") or "").lower()
+    arch = (c.get("architectures") or ["?"])[0]
+    if "gptq" in m or "compressed" in m:
+        return "gptq_marlin", f"Int4/GPTQ · {arch}"
+    if "awq" in m:
+        return "awq_marlin", f"Int4/AWQ · {arch}"
+    if any(k in m for k in ("fp8", "modelopt", "nvfp4")):
+        return None, f"FP8/NVFP4 — BLOCKED on SM75 · {arch}"
+    if dt in ("bfloat16", "float16") or not q:
+        return None, f"{dt or 'bf16'} unquantized — quantize first · {arch}"
+    return None, f"unknown quant '{m}' · {arch}"
+
+
+def _scan_local_models():
+    out = []
+    try:
+        entries = sorted(os.listdir(MODELS_DIR))
+    except Exception:
+        return out
+    try:
+        live = open(SERVE_SH).read()
+    except Exception:
+        live = ""
+    for name in entries:
+        d = os.path.join(MODELS_DIR, name)
+        if not os.path.isdir(d) or not os.path.exists(os.path.join(d, "config.json")):
+            continue
+        quant, desc = _detect_format(d)
+        sz = 0
+        try:
+            for f in os.listdir(d):
+                if f.endswith((".safetensors", ".bin", ".gguf")):
+                    sz += os.path.getsize(os.path.join(d, f))
+        except Exception:
+            pass
+        out.append({"name": name, "path": d, "servable": quant is not None,
+                    "quant": quant, "desc": desc, "gb": round(sz / 1e9, 1),
+                    "live": d in live})
+    return out
+
+
+async def gateway_models_local(request):
+    if request.method == "GET":
+        return web.json_response({"models": _scan_local_models(), "models_dir": MODELS_DIR})
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid json"}, status=400)
+    target = (body or {}).get("path") or (body or {}).get("name")
+    if not target:
+        return web.json_response({"error": "path or name required"}, status=400)
+    if not os.path.isabs(target):
+        target = os.path.join(MODELS_DIR, target)
+    if not os.path.exists(os.path.join(target, "config.json")):
+        return web.json_response({"error": f"not a model dir: {target}"}, status=400)
+    quant, desc = _detect_format(target)
+    if quant is None:
+        return web.json_response({"error": f"not servable on this box: {desc}"}, status=400)
+    log.warning("MODEL SWITCH requested via dashboard -> %s (%s)", target, quant)
+
+    async def _run():
+        p = await asyncio.create_subprocess_exec(
+            "/usr/bin/env", "bash", SWITCH_SH, target,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        out, _ = await p.communicate()
+        log.warning("MODEL SWITCH finished rc=%s: %s", p.returncode,
+                    (out or b"").decode("utf-8", "replace")[-400:])
+
+    asyncio.create_task(_run())
+    return web.json_response({"switching_to": target, "quant": quant, "desc": desc,
+                              "note": "engine restarting; gateway serves via remote overflow "
+                                      "until :8001 is healthy (~40s warm, ~4-5 min cold)"})
+
 
 async def gateway_config(request):
     if request.method == "GET":
@@ -779,26 +1362,66 @@ td{padding:5px 8px;border-bottom:1px solid #21262d;white-space:nowrap}
 label{display:flex;flex-direction:column;gap:3px}input{background:#0d1117;border:1px solid var(--bd);color:var(--fg);border-radius:6px;padding:6px 8px;font:13px ui-monospace,monospace}
 button{background:var(--blu);color:#04101f;border:0;border-radius:6px;padding:7px 16px;font-weight:600;cursor:pointer;font-size:13px}button:hover{opacity:.9}
 </style></head><body><div class=wrap>
-<h1>vLLM Gateway <span id=live></span></h1>
+<h1>vLLM Gateway <span id=live></span> <span id=modebadge style='font-size:12px;padding:2px 10px;border-radius:10px;vertical-align:middle'></span> <button id=modebtn style='font-size:12px;padding:4px 12px;margin-left:6px'></button></h1>
 <div class=sub>:8000 capacity-routing gateway → local :8001 · overflow <span id=rm></span> · refresh 1.5s · <span id=err style="color:var(--red)"></span></div>
 <div class="grid g4" id=status></div>
 <h2>Routing (local vs overflow)</h2><div class=card><div class=bar id=lrbar></div><div id=lrtxt class=sub style=margin-top:8px></div><div id=reasons></div></div>
 <h2>GPU</h2><div class="grid g2" id=gpu></div>
 <h2>Recent requests</h2><div class=card style=overflow-x:auto><table><thead><tr><th>time</th><th>ep</th><th>client</th><th>route</th><th>reason</th><th>size (in→out)</th><th>waited</th></tr></thead><tbody id=ev></tbody></table></div>
-<h2>Settings — remote overflow endpoint &amp; tuning</h2>
+<h2>Local model — switch which checkpoint the engine serves</h2>
 <div class=card>
-<div class=sub>Applied live (no restart) and saved to shim.env. ⚠️ this page has no auth — anyone on the LAN can change these.</div>
-<div class="grid g2" style=gap:10px>
- <label class=k>Remote base URL<input id=f_base placeholder=https://api.deepseek.com></label>
- <label class=k>Remote model<input id=f_model placeholder=deepseek-v4-flash></label>
- <label class=k>Remote API key <span id=keystate class=rz></span><input id=f_key type=password placeholder="leave blank to keep current"></label>
- <label class=k>Local budget (lanes)<input id=f_budget type=number min=1 max=8></label>
- <label class=k>Queue wait secs<input id=f_wait type=number min=0 step=0.5></label>
- <label class=k>Total context cap (tok, size-aware)<input id=f_tokbud type=number min=0 step=50000></label>
- <label class=k>Max single-request tokens<input id=f_maxlocal type=number min=1000 step=10000></label>
- <label class=k>Big-request threshold (tok)<input id=f_big type=number min=1000 step=1000></label>
+<div class=sub>Scans <span id=mdir class=rz></span>. Any HF checkpoint works (not just Qwen). Switching restarts the engine (~40s warm / ~4-5 min cold); the gateway serves via remote overflow meanwhile. \u26a0\ufe0f no auth on this page.</div>
+<table><thead><tr><th></th><th>model</th><th>size</th><th>format</th><th></th></tr></thead><tbody id=lm></tbody></table>
+<div style=margin-top:8px><span id=lmmsg class=rz></span></div>
 </div>
-<div style=margin-top:10px><button id=save>Save settings</button> <span id=savemsg class=rz></span></div>
+<h2>Settings — remote overflow provider &amp; routing</h2>
+<div class=card>
+<div class=sub>Applied live (no restart) and saved to shim.env. \u26a0\ufe0f no auth \u2014 anyone on the LAN can change these.</div>
+<div class=k style=margin-bottom:6px>Provider preset <select id=f_preset style="background:#0d1117;border:1px solid var(--bd);color:var(--fg);border-radius:6px;padding:5px 8px">
+ <option value="">— pick to autofill base+model —</option>
+ <option value="https://api.deepseek.com|deepseek-v4-flash">DeepSeek v4-flash</option>
+ <option value="https://api.deepseek.com|deepseek-v4-pro">DeepSeek v4-pro</option>
+ <option value="https://api.minimax.io/v1|MiniMax-M3">MiniMax M3</option>
+ <option value="https://dashscope-intl.aliyuncs.com/compatible-mode/v1|qwen3-coder-next">Qwen3-Coder-Next (DashScope intl)</option>
+ <option value="https://dashscope-intl.aliyuncs.com/compatible-mode/v1|qwen3.7-flash">qwen3.7-flash (DashScope intl)</option>
+ <option value="https://openrouter.ai/api/v1|minimax/minimax-m3">OpenRouter \u2192 MiniMax M3</option>
+</select> <span class=rz>verify exact model id with your provider</span></div>
+<div class="grid g2" style=gap:10px>
+ <label class=k>Remote base URL<input id=f_remote_base placeholder=https://api.minimax.io/v1></label>
+ <label class=k>Remote model<input id=f_remote_model placeholder=MiniMax-M3></label>
+ <label class=k>Remote API key <span id=keystate class=rz></span><input id=f_remote_key type=password placeholder="leave blank to keep current"></label>
+ <label class=k>Force full-remote (0/1)<input id=f_force_remote type=number min=0 max=1></label>
+</div>
+<h2 style=margin-top:16px>Local capacity</h2>
+<div class="grid g2" style=gap:10px>
+ <label class=k>Local budget (lanes)<input id=f_local_budget type=number min=1 max=8></label>
+ <label class=k>Queue wait secs (interactive)<input id=f_local_wait_secs type=number min=0 step=1></label>
+ <label class=k>Total in-flight ctx cap (tok)<input id=f_token_budget type=number min=0 step=50000></label>
+ <label class=k>OOM backoff secs<input id=f_oom_backoff_secs type=number min=0 step=10></label>
+</div>
+<h2 style=margin-top:16px>Routing guards \u2014 what goes remote</h2>
+<div class="grid g2" style=gap:10px>
+ <label class=k>Big OUTPUT \u2265 tok \u2192 remote<input id=f_big_output type=number min=0 step=1000></label>
+ <label class=k>Big PROMPT \u2265 tok \u2192 remote (0=off, crash guard)<input id=f_big_prompt type=number min=0 step=1000></label>
+ <label class=k>Single-req size cap (tok)<input id=f_max_local_tokens type=number min=0 step=10000></label>
+ <label class=k>Local output clamp (tok)<input id=f_local_max_out type=number min=0 step=1024></label>
+ <label class=k>Serialize-solo threshold (big=full budget, tok)<input id=f_big_tokens type=number min=0 step=1000></label>
+ <label class=k>First-token deadline cap (s)<input id=f_first_token_max type=number min=5 step=5></label>
+ <label class=k>Prefill rate est (tok/s)<input id=f_prefill_tps type=number min=100 step=100></label>
+</div>
+<h2 style=margin-top:16px>Priority lanes &amp; behaviour</h2>
+<div class="grid g2" style=gap:10px>
+ <label class=k>Tiny fast-lane \u2264 tok<input id=f_tiny_tokens type=number min=0 step=100></label>
+ <label class=k>Tiny extra lanes (beyond budget)<input id=f_tiny_extra_lanes type=number min=0 max=4></label>
+ <label class=k>Lanes reserved for interactive<input id=f_fg_reserved type=number min=0 max=4></label>
+ <label class=k>Background queue wait (s)<input id=f_bg_wait_secs type=number min=0 step=1></label>
+ <label class=k>Background markers (|-sep)<input id=f_bg_markers placeholder="scheduled cron job"></label>
+ <label class=k>Peak hours UTC (e.g. 1-4,6-10)<input id=f_peak_hours_utc></label>
+ <label class=k>No-think for background (0/1)<input id=f_bg_no_think type=number min=0 max=1></label>
+ <label class=k>No-think client IPs (comma-sep)<input id=f_no_think_ips placeholder="10.0.1.10,10.0.1.250"></label>
+ <label class=k>Per-request logging (0/1)<input id=f_log_requests type=number min=0 max=1></label>
+</div>
+<div style=margin-top:12px><button id=save>Save settings</button> <span id=savemsg class=rz></span></div>
 </div>
 </div><script>
 const $=s=>document.querySelector(s);let model="?";
@@ -823,21 +1446,46 @@ async function tick(){
  $('#gpu').innerHTML=(s.gpu||[]).map((g,i)=>`<div class=card><div class=k>GPU ${i}</div><div class=v class=mono>${g.util}<small>% util</small></div><div class=bar><i class=bl style="width:${100*g.used/(g.used+g.free)}%;background:var(--blu)"></i></div><div class=k style=margin-top:4px>${(g.used/1024).toFixed(1)}G used · ${(g.free/1024).toFixed(1)}G free</div></div>`).join('')||'<div class=card><div class=k>no GPU data</div></div>';
  $('#ev').innerHTML=(s.events||[]).map(e=>`<tr><td class="rz mono">${fmtAgo(e.t)} ago</td><td>${e.ep}</td><td>${e.client}</td><td><span class="tag ${e.d=='local'?'tl':'tr'}">${e.d}</span></td><td class=rz>${e.r}</td><td class=mono>${(e.ptok||0)}→${(e.maxtok||0)}${e.stream?' ⚡':''}</td><td class=mono>${e.waited?e.waited+'s':''}</td></tr>`).join('');
 }
+let FR=0;
+function renderMode(){const b=document.getElementById('modebadge'),t=document.getElementById('modebtn');
+ if(FR){b.textContent='FULL REMOTE';b.style.background='rgba(210,153,34,.25)';b.style.color='var(--amb)';t.textContent='Switch to LOCAL';}
+ else{b.textContent='LOCAL-FIRST';b.style.background='rgba(63,185,80,.2)';b.style.color='var(--grn)';t.textContent='Switch to FULL REMOTE';}}
+async function toggleMode(){FR=FR?0:1;await fetch('/gateway/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({force_remote:FR})});renderMode();loadCfg();}
+document.getElementById('modebtn').addEventListener('click',toggleMode);
+document.getElementById('f_preset').addEventListener('change',e=>{const v=e.target.value;if(!v)return;const [b,m]=v.split('|');$('#f_remote_base').value=b;$('#f_remote_model').value=m;});
+async function loadLocalModels(){
+ try{const d=await(await fetch('/gateway/models/local')).json();
+  $('#mdir').textContent=d.models_dir||'';
+  $('#lm').innerHTML=(d.models||[]).map(m=>{
+    const badge=m.live?'<span class="tag tl">LIVE</span>':'';
+    const btn=m.servable&&!m.live?`<button class=lmsw data-p="${m.path}" style="font-size:11px;padding:3px 10px">Switch</button>`:
+              (m.servable?'<span class=rz>current</span>':'<span class=rz style=color:var(--amb)>not servable</span>');
+    return `<tr><td>${badge}</td><td class=mono>${m.name}</td><td class=mono>${m.gb} GB</td><td class=rz>${m.desc}</td><td>${btn}</td></tr>`;}).join('')
+    ||'<tr><td colspan=5 class=rz>no checkpoints found</td></tr>';
+  document.querySelectorAll('.lmsw').forEach(b=>b.addEventListener('click',()=>switchLocal(b.dataset.p)));
+ }catch(e){}}
+async function switchLocal(p){
+ if(!confirm('Switch the local engine to:\n\n'+p+'\n\nThe engine restarts. Traffic falls back to remote overflow until it is healthy.'))return;
+ $('#lmmsg').textContent='switching\u2026 engine restarting';
+ try{const r=await fetch('/gateway/models/local',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:p})});
+  const d=await r.json();
+  $('#lmmsg').textContent=d.error?('\u2717 '+d.error):('\u2713 switching to '+d.switching_to+' ('+d.quant+') \u2014 '+d.note);
+  setTimeout(loadLocalModels,15000);}catch(e){$('#lmmsg').textContent='\u2717 '+e;}}
+setInterval(loadLocalModels,20000);
 async function loadCfg(){try{const c=await(await fetch('/gateway/config')).json();
- $('#f_base').value=c.remote_base||'';$('#f_model').value=c.remote_model||'';
- $('#f_budget').value=c.budget;$('#f_wait').value=c.local_wait;$('#f_big').value=c.big_tokens;
- $('#f_tokbud').value=c.token_budget;$('#f_maxlocal').value=c.max_local_tokens;
- $('#keystate').textContent=c.remote_key_display?('· '+c.remote_key_display):'· not set';}catch(e){}}
-async function saveCfg(){const b={remote_base:$('#f_base').value.trim(),remote_model:$('#f_model').value.trim(),
- budget:$('#f_budget').value,local_wait:$('#f_wait').value,big_tokens:$('#f_big').value,
- token_budget:$('#f_tokbud').value,max_local_tokens:$('#f_maxlocal').value};
- const k=$('#f_key').value.trim();if(k)b.remote_key=k;
- $('#savemsg').textContent='saving…';
+ FR=c.force_remote?1:0;renderMode();
+ for(const [k,v] of Object.entries(c)){const el=document.getElementById('f_'+k);if(el&&el.type!=='password')el.value=v;}
+ $('#keystate').textContent=c.remote_key_display?('\u00b7 '+c.remote_key_display):'\u00b7 not set';}catch(e){}}
+async function saveCfg(){const b={};
+ document.querySelectorAll('input[id^=f_]').forEach(el=>{const k=el.id.slice(2);
+  if(el.type==='password'){if(el.value.trim())b[k]=el.value.trim();}
+  else if(el.value!=='')b[k]=el.value;});
+ $('#savemsg').textContent='saving\u2026';
  try{const r=await fetch('/gateway/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
-  const d=await r.json();$('#savemsg').textContent='✓ saved: '+(d.changed||[]).join(', ');$('#f_key').value='';loadCfg();}
- catch(e){$('#savemsg').textContent='✗ '+e;}}
+  const d=await r.json();$('#savemsg').textContent='\u2713 saved: '+(d.changed||[]).join(', ');$('#f_remote_key').value='';loadCfg();}
+ catch(e){$('#savemsg').textContent='\u2717 '+e;}}
 document.getElementById('save').addEventListener('click',saveCfg);
-models();loadCfg();tick();setInterval(tick,1500);setInterval(models,15000);
+models();loadCfg();loadLocalModels();tick();setInterval(tick,1500);setInterval(models,15000);
 </script></body></html>"""
 
 async def _on_startup(app):
@@ -855,10 +1503,13 @@ def make_app():
     app.on_startup.append(_on_startup)
     app.on_cleanup.append(_on_cleanup)
     app.router.add_get("/health", h_health)
+    app.router.add_get("/health/local", h_health_local)
     app.router.add_get("/v1/models", h_models)
     app.router.add_post("/v1/chat/completions", handle_completions)
     app.router.add_post("/v1/completions", handle_completions)
     app.router.add_get("/gateway/stats", gateway_stats)
+    app.router.add_get("/gateway/models/local", gateway_models_local)
+    app.router.add_post("/gateway/models/local", gateway_models_local)
     app.router.add_get("/gateway/config", gateway_config)
     app.router.add_post("/gateway/config", gateway_config)
     app.router.add_get("/gateway/dashboard", gateway_dashboard)

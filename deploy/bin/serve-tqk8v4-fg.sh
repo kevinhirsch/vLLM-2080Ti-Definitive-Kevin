@@ -7,6 +7,8 @@
 #   lines below and restart; the model's own chat_template.jinja takes over again.
 set -euo pipefail
 export VLLM_SUFFIX_OVERLAY=0
+export VLLM_MTP_DRAFT_CAP=3
+export VLLM_SUFFIX_COVER_MIN=4
 export VLLM_SUFFIX_OVERLAY_MIN=2
 
 # 2026-07-17 chaos-tested envelope (2x2080Ti, util 0.88, WORKSPACE_RESERVE 262144):
@@ -23,10 +25,12 @@ ARGS=(
   --port
   8001
   --model
-  /home/kevin/Desktop/models/Qwen3.6-27B-GPTQ-Int4
+  /home/kevin/Desktop/models/Qwen3.8-27B-GPTQ-Int4
   --served-model-name
-  qwen27b-int4-tqk8v4-two250K-mtp3-text-only-cu128
+  qwen-local
   qwen3.6:27b
+  qwen3.8-27b-gptq-int4
+  qwen27b-int4-tqk8v4-two250K-mtp3-text-only-cu128
   --dtype
   half
   --tensor-parallel-size
@@ -35,6 +39,10 @@ ARGS=(
   /home/kevin/.local/share/vllm-qwen27b/gencfg
   --gpu-memory-utilization
   0.82
+  --quantization
+  gptq_marlin
+  --compilation-config
+  '{"cudagraph_mode":"PIECEWISE"}'
   --max-model-len
   256000
   --enable-chunked-prefill
@@ -42,8 +50,6 @@ ARGS=(
   8
   --max-num-batched-tokens
   2560
-  --quantization
-  gptq_marlin
   --kv-cache-dtype
   turboquant_k8v4
   --mamba-cache-mode
@@ -52,9 +58,8 @@ ARGS=(
   --enable-prompt-tokens-details
   --language-model-only
   --skip-mm-profiling
-  --disable-log-stats
   --chat-template
-  /home/kevin/.local/share/vllm-qwen27b/chat_template-froggeric-v21.3.jinja
+  /home/kevin/.local/share/vllm-qwen27b/chat_template-froggeric-v22-official.jinja
   --reasoning-parser
   qwen3
   --tool-call-parser
@@ -62,8 +67,6 @@ ARGS=(
   --enable-auto-tool-choice
   --additional-config
   '{"gdn_prefill_backend":"flashqla_legacy"}'
-  --speculative-config
-  '{"method":"mtp","num_speculative_tokens":3}'
 )
 
 exec "${ARGS[@]}"

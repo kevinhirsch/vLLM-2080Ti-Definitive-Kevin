@@ -194,6 +194,11 @@ if [ "$DRY_RUN" = "1" ]; then
 fi
 
 log "DECISION wedge CONFIRMED (consecutive_failures=${new_failures}, models healthy, gen timed out ${new_failures}x consecutively) -> RESTARTING ${SERVICE}"
+# Clear any StartLimitBurst latch FIRST. systemd stops honouring `restart` once a unit has
+# failed too many times in the interval, and a latched unit silently ignores the command --
+# the watchdog then logs a successful restart that never happened. This is not hypothetical:
+# it stranded the engine on 2026-08-14 during the quantization window.
+sudo -n systemctl reset-failed "$SERVICE" >> "$ACTION_LOG" 2>&1 || true
 if sudo -n systemctl restart "$SERVICE" >> "$ACTION_LOG" 2>&1; then
   state_record_restart "$t"
   state_set_consecutive_failures 0
