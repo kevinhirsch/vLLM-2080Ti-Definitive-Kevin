@@ -283,6 +283,7 @@ if TYPE_CHECKING:
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool = False
+    VLLM_KEEP_DEFAULT_CAPTURE_SIZE: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -1879,6 +1880,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Flag to enable v2 model runner.
     "VLLM_USE_V2_MODEL_RUNNER": lambda: bool(
         int(os.getenv("VLLM_USE_V2_MODEL_RUNNER", "0"))
+    ),
+    # Escape hatch for the speculative-decoding cudagraph capture-size
+    # auto-cap. When speculative decoding is active and the user leaves
+    # max_cudagraph_capture_size at its default, vLLM auto-caps it to a
+    # rounded max_num_seqs*(1 + num_speculative_tokens) so the profiling
+    # minimal-KV allocation is not needlessly inflated by the legacy 512
+    # default. Set this to 1 to keep the legacy default instead.
+    "VLLM_KEEP_DEFAULT_CAPTURE_SIZE": lambda: bool(
+        int(os.getenv("VLLM_KEEP_DEFAULT_CAPTURE_SIZE", "0"))
     ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model

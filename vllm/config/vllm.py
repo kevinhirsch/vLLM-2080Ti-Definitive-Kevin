@@ -65,6 +65,83 @@ else:
 logger = init_logger(__name__)
 
 
+# Alignment stride (in batch-size units) used when auto-capping the default
+# cudagraph capture size for speculative decoding. The tight decode bound
+# max_num_seqs*(1 + K) is rounded up to a multiple of this so the resulting
+# size lands on the cudagraph capture grid (which steps by 8 below 256 and by
+# 16 above) with a small headroom, instead of the legacy flat 512 default.
+_SPEC_CUDAGRAPH_CAPTURE_ALIGN = 32
+
+# Absolute ceiling inherited from the legacy default. The auto-cap is only ever
+# allowed to *lower* the capture size relative to legacy behavior, never raise
+# it, so it is clamped to this.
+_SPEC_CUDAGRAPH_CAPTURE_CEILING = 512
+
+
+def default_spec_cudagraph_capture_size(
+    max_num_seqs: int,
+    num_speculative_tokens: int,
+    align: int = _SPEC_CUDAGRAPH_CAPTURE_ALIGN,
+    ceiling: int = _SPEC_CUDAGRAPH_CAPTURE_CEILING,
+) -> int:
+    """Tight default upper bound for cudagraph capture sizes under speculative
+    decoding.
+
+    With speculative decoding the largest *decode* batch is ``max_num_seqs``
+    sequences, each of query width ``1 + num_speculative_tokens`` (one verified
+    token plus K draft tokens). Capturing cudagraphs beyond
+    ``max_num_seqs * (1 + K)`` therefore only inflates the profiling
+    minimal-KV allocation without ever being exercised. This returns that bound
+    rounded up to ``align`` and clamped so it never exceeds the legacy default
+    (``min(2 * max_num_seqs * (1 + K), ceiling)``) -- i.e. the auto-cap can only
+    ever *lower* the capture size, never raise it (which matters in the tiny
+    regime where rounding up to ``align`` would otherwise overshoot the legacy
+    value). In the regime that matters -- large ``max_num_seqs * (1 + K)`` where
+    the legacy default is the flat ``ceiling`` -- the result lands on the
+    ``align`` capture grid, well below ``ceiling``.
+    """
+    decode_width = 1 + num_speculative_tokens
+    base = max_num_seqs * decode_width
+    aligned = ((base + align - 1) // align) * align
+    legacy_default = min(base * 2, ceiling)
+    return min(aligned, legacy_default)
+
+
+def mamba_align_block_size_error(
+    block_size: int,
+    max_num_batched_tokens: int,
+    num_speculative_tokens: int,
+) -> str:
+    """Actionable message for the Mamba-align ``block_size`` vs
+    ``max_num_batched_tokens`` constraint.
+
+    In Mamba cache align mode the KV block must hold one full decode step of
+    width ``1 + K`` (K = ``num_speculative_tokens``) plus chunk alignment, so
+    the resolved align ``block_size`` grows with K. The scheduler must be able
+    to place at least one whole block in a batch, which requires
+    ``max_num_batched_tokens >= block_size``. The bare assert only printed the
+    two numbers; this states the K it was derived with, the governing formula,
+    and the minimal valid ``max_num_batched_tokens`` (== ``block_size``).
+    """
+    decode_width = 1 + num_speculative_tokens
+    return (
+        "Invalid configuration for Mamba cache align mode: the resolved align "
+        f"block_size ({block_size}) exceeds max_num_batched_tokens "
+        f"({max_num_batched_tokens}).\n"
+        "  Why: an align-mode KV block must hold one full decode step of width "
+        f"(1 + num_speculative_tokens) = (1 + {num_speculative_tokens}) = "
+        f"{decode_width} tokens plus chunk alignment, so the align block_size "
+        "grows with the number of speculative tokens K.\n"
+        "  Constraint: the scheduler must be able to place at least one whole "
+        "Mamba block in a single batch, i.e. "
+        "max_num_batched_tokens >= block_size.\n"
+        f"  Minimal valid max_num_batched_tokens: {block_size}.\n"
+        f"  Remedy: set --max-num-batched-tokens to at least {block_size}, or "
+        f"lower --num-speculative-tokens (currently {num_speculative_tokens}) "
+        "to shrink the align block_size."
+    )
+
+
 class OptimizationLevel(IntEnum):
     """Optimization level enum."""
 
@@ -1543,9 +1620,39 @@ class VllmConfig:
                     and self.speculative_config.num_speculative_tokens
                 ):
                     decode_query_len += self.speculative_config.num_speculative_tokens
-                max_cudagraph_capture_size = min(
-                    self.scheduler_config.max_num_seqs * decode_query_len * 2, 512
-                )
+                if (
+                    self.speculative_config
+                    and self.speculative_config.num_speculative_tokens
+                    and not envs.VLLM_KEEP_DEFAULT_CAPTURE_SIZE
+                ):
+                    # Speculative decoding: the largest decode batch is
+                    # max_num_seqs sequences each of width (1 + K) tokens, so
+                    # capturing beyond max_num_seqs*(1 + K) only inflates the
+                    # profiling minimal-KV allocation without ever being used.
+                    # Auto-cap to that rounded bound instead of the flat 512
+                    # default. Escape hatch: VLLM_KEEP_DEFAULT_CAPTURE_SIZE=1.
+                    num_spec = self.speculative_config.num_speculative_tokens
+                    max_cudagraph_capture_size = default_spec_cudagraph_capture_size(
+                        self.scheduler_config.max_num_seqs, num_spec
+                    )
+                    logger.info(
+                        "Speculative decoding active "
+                        "(num_speculative_tokens=%d): auto-capping "
+                        "max_cudagraph_capture_size to %d "
+                        "(= round_up(max_num_seqs=%d * (1 + %d), %d), "
+                        "clamped to %d). Set VLLM_KEEP_DEFAULT_CAPTURE_SIZE=1 "
+                        "to keep the legacy default.",
+                        num_spec,
+                        max_cudagraph_capture_size,
+                        self.scheduler_config.max_num_seqs,
+                        num_spec,
+                        _SPEC_CUDAGRAPH_CAPTURE_ALIGN,
+                        _SPEC_CUDAGRAPH_CAPTURE_CEILING,
+                    )
+                else:
+                    max_cudagraph_capture_size = min(
+                        self.scheduler_config.max_num_seqs * decode_query_len * 2, 512
+                    )
             max_num_tokens = self.scheduler_config.max_num_batched_tokens
             max_cudagraph_capture_size = min(max_num_tokens, max_cudagraph_capture_size)
 
@@ -1983,12 +2090,14 @@ class VllmConfig:
 
         # Mamba cache align-mode constraints
         if self.cache_config.mamba_cache_mode == "align":
-            assert block_size <= self.scheduler_config.max_num_batched_tokens, (
-                "In Mamba cache align mode, block_size "
-                f"({block_size}) must be <= "
-                "max_num_batched_tokens "
-                f"({self.scheduler_config.max_num_batched_tokens})."
-            )
+            if block_size > self.scheduler_config.max_num_batched_tokens:
+                raise ValueError(
+                    mamba_align_block_size_error(
+                        block_size,
+                        self.scheduler_config.max_num_batched_tokens,
+                        self.num_speculative_tokens,
+                    )
+                )
             if self.scheduler_config.long_prefill_token_threshold > 0:
                 assert self.scheduler_config.long_prefill_token_threshold >= block_size
             assert not self.scheduler_config.disable_chunked_mm_input, (
