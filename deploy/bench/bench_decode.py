@@ -50,7 +50,8 @@ def main() -> int:
                     "for the intentionally slower MTP-off baseline)")
     args = ap.parse_args()
 
-    labels = set(args.only.split(",")) if args.only else None
+    labels = ({t.strip() for t in args.only.split(",") if t.strip()}
+              if args.only else None)
     if labels is not None:
         known = {m[0] for m in MATRIX}
         unknown = labels - known
@@ -73,8 +74,10 @@ def main() -> int:
                         for i in range(conc)]
                 results = [f.result() for f in futs]
         except Exception as exc:
+            r_err = nrestarts()
+            err_delta = (r_err - r0) if (r0 is not None and r_err is not None) else "?"
             print(f"| {label} | — | — | — | — | ERROR {type(exc).__name__} | "
-                  f"{(nrestarts() or 0) - (r0 or 0) if r0 is not None else '?'} |")
+                  f"{err_delta} |")
             rc = 1
             continue
         after, r1 = scrape_spec_metrics(args.base_url), nrestarts()

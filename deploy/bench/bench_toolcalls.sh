@@ -58,10 +58,15 @@ r = requests.post(f"{base}/chat/completions", timeout=180, json={
 r.raise_for_status()
 msg = r.json()["choices"][0]["message"]
 calls = msg.get("tool_calls") or []
-assert calls, f"no tool_calls in response: {json.dumps(msg)[:400]}"
-assert calls[0]["function"]["name"] == "read_file", calls[0]
+# explicit raises, not assert: python -O would silently skip asserts and let
+# this gate report PASS without validating anything
+if not calls:
+    raise SystemExit(f"FAIL: no tool_calls in response: {json.dumps(msg)[:400]}")
+if calls[0]["function"]["name"] != "read_file":
+    raise SystemExit(f"FAIL: wrong tool called: {calls[0]}")
 args = json.loads(calls[0]["function"]["arguments"])
-assert isinstance(args.get("path"), str) and args["path"], args
+if args.get("path") != "/etc/hostname":
+    raise SystemExit(f"FAIL: wrong path argument (expected /etc/hostname): {args}")
 print(f"named tool_choice OK: read_file({args['path']!r})")
 PY
 
@@ -103,7 +108,8 @@ for i in range(5):
     except (json.JSONDecodeError, KeyError, IndexError):
         pass
 print(f"code-args: {ok}/5 calls carried the exact snippet to the right path")
-assert ok >= 4, "code-heavy args are being mangled by the parser"
+if ok < 4:
+    raise SystemExit("FAIL: code-heavy args are being mangled by the parser")
 PY
 
 if [ "$FAIL" -ne 0 ]; then
