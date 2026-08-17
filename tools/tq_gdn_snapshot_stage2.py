@@ -276,6 +276,12 @@ def main() -> int:
         llm.unpin_kv_blocks(handle_id)
         return 1
     res_tokens, res_logprobs = _extract_continuation(res_out)
+    # THE restore-vs-recompute discriminator: a cache-hit restore skips prefill
+    # for the cached prefix; a recompute has num_cached_tokens ~ 0.
+    print(
+        f"  restore num_cached_tokens={getattr(res_out, 'num_cached_tokens', None)} "
+        f"(prompt len {len(prompt)}; cached>0 = rode the cache, 0 = recompute)"
+    )
 
     restore_attn: set[int] = set()
     restore_mamba: set[int] = set()
@@ -308,9 +314,17 @@ def main() -> int:
     reuse_checked = restore_blocks is not None and (
         len(restore_attn) > 0 or len(restore_mamba) > 0
     )
-    pin_load_bearing = attn_reused > 0 and (
-        mamba_reused > 0 or len(pinned_mamba) == 0
-    )
+    # Fable re-adjudication 2026-08-16: block-table intersection is the WRONG
+    # observable for load-bearing. (a) attn: only FULL blocks can cache-hit, so
+    # the partial decode block never intersects — attn_reused > 0 is already the
+    # maximum signal. (b) mamba: align-mode restore COPIES state out of the
+    # cached block into a FRESH running slot — the pinned source never appears
+    # in the new block table, by design. The decisive observable is
+    # num_cached_tokens: a cache-hit restore skips prefill for the cached
+    # prefix; a recompute has ~0.
+    cached_tokens = int(getattr(res_out, "num_cached_tokens", 0) or 0)
+    cached_frac = cached_tokens / max(1, len(prompt))
+    pin_load_bearing = cached_frac > 0.5 and attn_reused > 0
 
     llm.unpin_kv_blocks(handle_id)
 
@@ -324,8 +338,13 @@ def main() -> int:
         f"  reuse checked (caught restore block table mid-gen): {reuse_checked}"
     )
     print(
-        f"  pinned blocks reused by restore: attn {attn_reused}/{len(pinned_attn)}, "
-        f"mamba {mamba_reused}/{len(pinned_mamba)} -> load_bearing={pin_load_bearing}"
+        f"  pinned blocks in restore table: attn {attn_reused}/{len(pinned_attn)} "
+        f"(partial block can never hit), mamba {mamba_reused}/{len(pinned_mamba)} "
+        f"(copy-out by design, absence expected)"
+    )
+    print(
+        f"  cache-hit discriminator: num_cached_tokens={cached_tokens}/{len(prompt)} "
+        f"({cached_frac:.0%}) -> load_bearing={pin_load_bearing}"
     )
     if not tokens_equal:
         print(f"  ref[:16]={ref_tokens[:16]}")
@@ -338,13 +357,12 @@ def main() -> int:
     # NOT reuse the pinned blocks despite a byte-exact continuation -> the
     # continuation came from recompute, not restore. Flag for re-adjudication
     # rather than rubber-stamping (frontier rule).
-    if passed and reuse_checked and not pin_load_bearing:
+    if passed and not pin_load_bearing:
         print(
             "\nSTAGE-2 NEGATIVE — needs Fable re-adjudication: continuation is "
-            "byte-exact but the restore's block table did NOT intersect the "
-            "pinned blocks — the output came from recompute, not from the "
-            "pinned state. Inspect why find_longest_cache_hit missed the "
-            "pinned prefix (hash/eviction), or whether block-id spaces diverged."
+            "byte-exact but num_cached_tokens shows the restore RECOMPUTED the "
+            "prefix instead of riding the cache (cached_frac <= 0.5 or no full "
+            "attn block reused). Inspect find_longest_cache_hit (hash/eviction)."
         )
         return 1
 
