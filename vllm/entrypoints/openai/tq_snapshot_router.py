@@ -8,9 +8,11 @@ three HTTP routes on the OpenAI server:
 
     POST /tq/pin    {prompt|messages|prompt_token_ids, ...} -> {handle_id, ...}
     POST /tq/fork   {handle_id, children:[{temperature,max_tokens,...}]} -> {...}
+    POST /tq/fork2  {handle_id, children:[...]} -> {...}  (non-blocking, v2)
     POST /tq/unpin  {handle_id} -> {ok, num_freed_blocks}
 
-Design notes / honest limitations (full write-up: docs/exp038-http-routes.md):
+Design notes / honest limitations (full write-ups: docs/exp038-http-routes.md
+for pin/fork/unpin, docs/exp038-fork-v2.md for fork2):
 
 * The pin utility must catch a LIVE request (it ``touch``-pins the resident KV
   blocks of an in-flight request so they outlive its ``free()``). So /tq/pin
@@ -22,11 +24,19 @@ Design notes / honest limitations (full write-up: docs/exp038-http-routes.md):
   request at a time); req_id=None picks ``running[0]`` and would be unreliable
   under concurrent traffic -- which is exactly why this is throwaway-engine-only.
 
-* /tq/fork drives the children to completion INSIDE the EngineCore utility (the
-  single-threaded busy loop is BLOCKED for the whole fork). Cap
-  ``sum(child.max_tokens)`` (``max_total_tokens``, default 2048). The clean
-  follow-up is a non-blocking async fork that admits children as normal requests
-  and streams them back; that is deliberately out of scope for this staged step.
+* /tq/fork (v1) drives the children to completion INSIDE the EngineCore utility
+  (the single-threaded busy loop is BLOCKED for the whole fork), builds Request
+  objects from raw SamplingParams that bypass the model's eos/stop injection, and
+  returns one blob. Cap ``sum(child.max_tokens)`` (``max_total_tokens``, default
+  2048).
+
+* /tq/fork2 (v2, the production shape) is a thin SERVER-LAYER fan-out: it sources
+  the pinned prefix by handle_id (``get_pin_handle``) and admits each child as an
+  ORDINARY ``AsyncLLM.generate`` request. The busy loop is never blocked; the
+  pinned prefix is adopted via the normal prefix cache (~zero prefill); and the
+  model's eos / generation-config stop tokens are injected on the standard input
+  path, so children stop correctly instead of emitting special-token soup. Per-
+  child SSE streaming is a documented follow-up (this collects final outputs).
 
 Env-gated + default-inert: ``attach_router`` is a no-op unless
 VLLM_TQ_GDN_SNAPSHOT=1. NEVER attach against the production :8001 serve.
@@ -42,32 +52,15 @@ from fastapi.responses import JSONResponse
 import vllm.envs as envs
 from vllm import TokensPrompt
 from vllm.engine.protocol import EngineClient
+from vllm.entrypoints.openai.tq_fork_specs import (
+    parse_child_specs as _parse_child_specs,
+)
 from vllm.logger import init_logger
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 logger = init_logger(__name__)
 
 router = APIRouter()
-
-# Sampling kwargs a fork child may override. Everything else is rejected so a
-# malformed body can't smuggle unexpected SamplingParams kwargs into the engine.
-_CHILD_SAMPLING_KEYS = frozenset(
-    {
-        "temperature",
-        "top_p",
-        "top_k",
-        "min_p",
-        "seed",
-        "max_tokens",
-        "min_tokens",
-        "repetition_penalty",
-        "presence_penalty",
-        "frequency_penalty",
-        "stop",
-        "stop_token_ids",
-        "ignore_eos",
-    }
-)
 
 
 def engine_client(request: Request) -> EngineClient:
@@ -261,28 +254,11 @@ async def tq_fork(raw_request: Request) -> JSONResponse:
         max_total_tokens = int(body.get("max_total_tokens", 2048))
     except (TypeError, ValueError) as e:
         return _err(HTTPStatus.BAD_REQUEST, f"max_total_tokens must be an int: {e}")
-    child_specs: list[dict] = []
-    total_budget = 0
-    for i, child in enumerate(children):
-        if not isinstance(child, dict):
-            return _err(HTTPStatus.BAD_REQUEST, f"children[{i}] must be an object")
-        bad = set(child) - _CHILD_SAMPLING_KEYS
-        if bad:
-            return _err(
-                HTTPStatus.BAD_REQUEST,
-                f"children[{i}] has unsupported key(s): {sorted(bad)}; "
-                f"allowed: {sorted(_CHILD_SAMPLING_KEYS)}",
-            )
-        spec = dict(child)
-        try:
-            spec["max_tokens"] = int(spec.get("max_tokens", 64))
-        except (TypeError, ValueError) as e:
-            return _err(
-                HTTPStatus.BAD_REQUEST,
-                f"children[{i}].max_tokens must be an int: {e}",
-            )
-        total_budget += spec["max_tokens"]
-        child_specs.append(spec)
+    try:
+        child_specs = _parse_child_specs(children)
+    except ValueError as e:
+        return _err(HTTPStatus.BAD_REQUEST, str(e))
+    total_budget = sum(s["max_tokens"] for s in child_specs)
 
     if total_budget > max_total_tokens:
         return _err(
@@ -315,6 +291,203 @@ async def tq_fork(raw_request: Request) -> JSONResponse:
     return JSONResponse(content=result)
 
 
+@router.post("/tq/fork2")
+async def tq_fork2(raw_request: Request) -> JSONResponse:
+    """Non-blocking production fork (EXP-038 v2): fan a pinned handle out into N
+    children submitted as ORDINARY streamed requests.
+
+    Body: ``{handle_id, children:[{temperature?,max_tokens?,...}], cache_salt?,
+    verify_pin?, per_child_timeout_s?}``. Returns a /tq/fork-compatible payload:
+    ``{handle_id, n, prefix_len, children:[{req_id, text, token_ids,
+    num_output_tokens, num_cached_tokens, finish_reason, stop_reason, spec}],
+    pin_resident?}``.
+
+    Contrast with /tq/fork (v1): that builds child Requests inside the EngineCore
+    utility from raw ``SamplingParams`` (bypassing the model's eos/stop
+    injection) and drives them to completion with the busy loop BLOCKED. Here the
+    fork lives entirely in the server layer:
+
+      1. pin-check + source the prefix by handle_id: ``get_pin_handle`` reads the
+         pin registry /tq/pin populated (KeyError -> released/unknown -> 404) and
+         returns the cached ``prompt_token_ids`` + ``cache_salt``.
+      2. optional residency assertion (``verify_pin``, default on): confirm the
+         pinned blocks are still resident so children cache-hit, not recompute.
+      3. N parallel ``AsyncLLM.generate`` calls, each with the pinned prefix as
+         ordinary prompt token ids + its own ``SamplingParams``. The scheduler
+         admits them as first-class requests (busy loop never blocked), the
+         prefix cache adopts the pinned donor blocks (~zero prefill compute), and
+         the standard input path injects the model eos / generation-config stop
+         tokens -- so children STOP correctly (no special-token soup).
+
+    Per-child SSE streaming is a documented follow-up: this collects each child's
+    final cumulative output (``output_kind=FINAL_ONLY``). The pin is NOT released
+    here -- ownership stays with the caller's /tq/unpin.
+    """
+    engine = engine_client(raw_request)
+    try:
+        body = await raw_request.json()
+    except Exception:  # noqa: BLE001
+        return _err(HTTPStatus.BAD_REQUEST, "request body must be valid JSON")
+    if not isinstance(body, dict):
+        return _err(HTTPStatus.BAD_REQUEST, "request body must be a JSON object")
+
+    handle_id = body.get("handle_id")
+    if not handle_id:
+        return _err(HTTPStatus.BAD_REQUEST, "missing handle_id")
+    children = body.get("children")
+    if not isinstance(children, list) or not children:
+        return _err(HTTPStatus.BAD_REQUEST, "children must be a non-empty list")
+    try:
+        child_specs = _parse_child_specs(children)
+    except ValueError as e:
+        return _err(HTTPStatus.BAD_REQUEST, str(e))
+
+    per_child_timeout_s = body.get("per_child_timeout_s")
+    if per_child_timeout_s is not None:
+        try:
+            per_child_timeout_s = float(per_child_timeout_s)
+        except (TypeError, ValueError) as e:
+            return _err(
+                HTTPStatus.BAD_REQUEST,
+                f"per_child_timeout_s must be numeric: {e}",
+            )
+
+    # (1) pin-check + source the prefix by handle_id alone. Presence in the pin
+    # registry IS the pin-check: /tq/unpin pops the entry, so a released handle
+    # raises KeyError here (-> 404), exactly like /tq/fork.
+    try:
+        handle = await engine.get_pin_handle(handle_id)
+    except KeyError as e:
+        return _err(HTTPStatus.NOT_FOUND, f"unknown pin handle: {e}")
+    except Exception as e:  # noqa: BLE001
+        logger.exception("tq_fork2: get_pin_handle failed")
+        return _err(
+            HTTPStatus.INTERNAL_SERVER_ERROR, f"get_pin_handle failed: {e}"
+        )
+
+    prompt_token_ids = list(handle.get("prompt_token_ids") or [])
+    if not prompt_token_ids:
+        return _err(
+            HTTPStatus.BAD_REQUEST,
+            f"pin handle {handle_id!r} has no prompt_token_ids to fork from",
+        )
+    prefix_len = len(prompt_token_ids)
+    # Default the child cache_salt to the donor's (what the pinned blocks were
+    # hashed with) so children hash-match and cache-hit; allow explicit override.
+    cache_salt = body.get("cache_salt", handle.get("cache_salt"))
+
+    # (2) Optional residency assertion (diagnostic; non-fatal). If the pinned
+    # blocks were evicted, children still produce CORRECT output -- they just
+    # re-prefill -- so this only warns and reports, never fails the fork.
+    pin_resident: bool | None = None
+    if body.get("verify_pin", True):
+        try:
+            v = await engine.verify_pinned_blocks(handle_id)
+            pin_resident = bool(v.get("ok"))
+            if not pin_resident:
+                logger.warning(
+                    "tq_fork2: pinned blocks for %s not fully resident "
+                    "(min_ref_cnt=%s); children will re-prefill the prefix",
+                    handle_id,
+                    v.get("min_ref_cnt"),
+                )
+        except Exception:  # noqa: BLE001
+            logger.exception("tq_fork2: verify_pinned_blocks failed (continuing)")
+
+    # (3) Fan out: each child is an ordinary generate() request riding the pinned
+    # prefix. output_kind=FINAL_ONLY -> generate() yields only the final
+    # cumulative RequestOutput (no per-token deltas to accumulate).
+    async def _run_child(i: int, spec: dict) -> dict:
+        req_id = f"tqfork2-{uuid.uuid4().hex[:12]}-{i}"
+        sampling = SamplingParams(**spec)
+        sampling.output_kind = RequestOutputKind.FINAL_ONLY
+        prompt = TokensPrompt(prompt_token_ids=list(prompt_token_ids))
+        if cache_salt is not None:
+            # TokensPrompt is a TypedDict; cache_salt is a NotRequired field.
+            prompt["cache_salt"] = cache_salt
+        final = None
+        async for out in engine.generate(prompt, sampling, req_id):
+            final = out
+        if final is None or not final.outputs:
+            return {
+                "req_id": req_id,
+                "text": None,
+                "token_ids": [],
+                "num_output_tokens": 0,
+                "num_cached_tokens": 0,
+                "finish_reason": "empty",
+                "stop_reason": None,
+                "spec": spec,
+            }
+        co = final.outputs[0]
+        tok = list(co.token_ids or [])
+        return {
+            "req_id": req_id,
+            "text": co.text,
+            "token_ids": tok,
+            "num_output_tokens": len(tok),
+            "num_cached_tokens": int(final.num_cached_tokens or 0),
+            "finish_reason": co.finish_reason,
+            "stop_reason": co.stop_reason,
+            "spec": spec,
+        }
+
+    async def _guarded(i: int, spec: dict):
+        coro = _run_child(i, spec)
+        if per_child_timeout_s is not None:
+            coro = asyncio.wait_for(coro, per_child_timeout_s)
+        return await coro
+
+    results = await asyncio.gather(
+        *[_guarded(i, s) for i, s in enumerate(child_specs)],
+        return_exceptions=True,
+    )
+
+    children_out: list[dict] = []
+    for i, (spec, r) in enumerate(zip(child_specs, results)):
+        if isinstance(r, (asyncio.TimeoutError, TimeoutError)):
+            children_out.append(
+                {
+                    "req_id": None,
+                    "text": None,
+                    "token_ids": [],
+                    "num_output_tokens": 0,
+                    "num_cached_tokens": 0,
+                    "finish_reason": "timeout",
+                    "stop_reason": None,
+                    "spec": spec,
+                    "error": "per_child_timeout",
+                }
+            )
+        elif isinstance(r, BaseException):
+            logger.error("tq_fork2 child %d failed", i, exc_info=r)
+            children_out.append(
+                {
+                    "req_id": None,
+                    "text": None,
+                    "token_ids": [],
+                    "num_output_tokens": 0,
+                    "num_cached_tokens": 0,
+                    "finish_reason": "error",
+                    "stop_reason": None,
+                    "spec": spec,
+                    "error": f"{type(r).__name__}: {r}",
+                }
+            )
+        else:
+            children_out.append(r)
+
+    resp: dict = {
+        "handle_id": handle_id,
+        "n": len(children_out),
+        "prefix_len": prefix_len,
+        "children": children_out,
+    }
+    if pin_resident is not None:
+        resp["pin_resident"] = pin_resident
+    return JSONResponse(content=resp)
+
+
 @router.post("/tq/unpin")
 async def tq_unpin(raw_request: Request) -> JSONResponse:
     """Release a pin handle (frees its pinned blocks). Idempotent."""
@@ -344,6 +517,7 @@ def attach_router(app: FastAPI) -> None:
         return
     app.include_router(router)
     logger.warning(
-        "EXP-038 TQ snapshot routes ENABLED (/tq/pin, /tq/fork, /tq/unpin). "
-        "This is a throwaway-engine feature -- NEVER run it against :8001."
+        "EXP-038 TQ snapshot routes ENABLED (/tq/pin, /tq/fork, /tq/fork2, "
+        "/tq/unpin). This is a throwaway-engine feature -- NEVER run it "
+        "against :8001."
     )

@@ -1521,6 +1521,12 @@ class LLM:
         """
         return self.llm_engine.get_request_kv_block_ids(req_id, all_running)
 
+    def get_pin_handle(self, handle_id: str) -> dict[str, Any]:
+        """Read-only accessor for a pin handle's forkable metadata (EXP-038 v2:
+        ``prompt_token_ids`` + ``cache_salt`` + prefix/computed lengths). Raises
+        ``KeyError`` for a released/unknown handle."""
+        return self.llm_engine.get_pin_handle(handle_id)
+
     def unpin_kv_blocks(self, handle_id: str) -> dict[str, Any]:
         """Release a pin handle (frees the pinned blocks)."""
         return self.llm_engine.unpin_kv_blocks(handle_id)

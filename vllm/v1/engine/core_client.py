@@ -166,6 +166,9 @@ class EngineCoreClient(ABC):
     ) -> dict[str, Any]:
         raise NotImplementedError
 
+    def get_pin_handle(self, handle_id: str) -> dict[str, Any]:
+        raise NotImplementedError
+
     def unpin_kv_blocks(self, handle_id: str) -> dict[str, Any]:
         raise NotImplementedError
 
@@ -353,6 +356,9 @@ class InprocClient(EngineCoreClient):
         self, req_id: str | None = None, all_running: bool = False
     ) -> dict[str, Any]:
         return self.engine_core.get_request_kv_block_ids(req_id, all_running)
+
+    def get_pin_handle(self, handle_id: str) -> dict[str, Any]:
+        return self.engine_core.get_pin_handle(handle_id)
 
     def unpin_kv_blocks(self, handle_id: str) -> dict[str, Any]:
         return self.engine_core.unpin_kv_blocks(handle_id)
@@ -904,6 +910,9 @@ class SyncMPClient(MPClient):
             "get_request_kv_block_ids", req_id, all_running
         )
 
+    def get_pin_handle(self, handle_id: str) -> dict[str, Any]:
+        return self.call_utility("get_pin_handle", handle_id)
+
     def unpin_kv_blocks(self, handle_id: str) -> dict[str, Any]:
         return self.call_utility("unpin_kv_blocks", handle_id)
 
@@ -1228,6 +1237,9 @@ class AsyncMPClient(MPClient):
             "get_request_kv_block_ids", req_id, all_running
         )
 
+    async def get_pin_handle_async(self, handle_id: str) -> dict[str, Any]:
+        return await self.call_utility_async("get_pin_handle", handle_id)
+
     async def unpin_kv_blocks_async(self, handle_id: str) -> dict[str, Any]:
         return await self.call_utility_async("unpin_kv_blocks", handle_id)
 
@@ -1430,6 +1442,7 @@ _TQ_SNAPSHOT_SINGLE_ENGINE_UTILITIES = frozenset(
         "pin_request_kv_blocks",
         "verify_pinned_blocks",
         "get_request_kv_block_ids",
+        "get_pin_handle",
         "unpin_kv_blocks",
         "fork_from_handle",
     }

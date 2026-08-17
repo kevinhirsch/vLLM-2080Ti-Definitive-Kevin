@@ -279,6 +279,12 @@ class EngineClient(ABC):
         """Read-only per-group KV block ids of a live request."""
         raise NotImplementedError
 
+    async def get_pin_handle(self, handle_id: str) -> dict[str, Any]:
+        """Read-only accessor for a pin handle's forkable metadata (EXP-038 v2:
+        the cached ``prompt_token_ids`` + ``cache_salt`` the server-layer
+        ``/tq/fork2`` fan-out needs to re-derive the pinned prefix)."""
+        raise NotImplementedError
+
     async def unpin_kv_blocks(self, handle_id: str) -> dict[str, Any]:
         """Release a pin handle (frees the pinned blocks)."""
         raise NotImplementedError

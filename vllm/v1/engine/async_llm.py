@@ -956,6 +956,16 @@ class AsyncLLM(EngineClient):
             req_id, all_running
         )
 
+    async def get_pin_handle(self, handle_id: str) -> dict[str, Any]:
+        """Read-only accessor for a pin handle's forkable metadata (EXP-038 v2).
+
+        Returns ``{handle_id, req_id, prompt_token_ids, prefix_len,
+        num_computed_tokens, cache_salt}``. The server-layer ``/tq/fork2`` route
+        uses this to source the pinned prefix (token ids + salt) by handle_id and
+        fan the fork out as ordinary ``generate()`` calls. Raises ``KeyError``
+        for a released/unknown handle (that IS the pin-check)."""
+        return await self.engine_core.get_pin_handle_async(handle_id)
+
     async def unpin_kv_blocks(self, handle_id: str) -> dict[str, Any]:
         """Release a pin handle (frees the pinned blocks)."""
         return await self.engine_core.unpin_kv_blocks_async(handle_id)
