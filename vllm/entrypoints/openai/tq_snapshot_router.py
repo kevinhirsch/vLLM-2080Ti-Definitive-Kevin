@@ -82,8 +82,15 @@ async def _resolve_prompt_token_ids(engine: EngineClient, body: dict) -> list[in
     """Turn the request body into prompt token ids. Accepts (in priority order)
     an explicit ``prompt_token_ids`` list, a chat ``messages`` list (rendered via
     the tokenizer's chat template), or a raw ``prompt`` string."""
-    if body.get("prompt_token_ids"):
-        return [int(t) for t in body["prompt_token_ids"]]
+    ptids = body.get("prompt_token_ids")
+    if ptids:
+        if not isinstance(ptids, list):
+            raise ValueError(
+                "prompt_token_ids must be a list[int] (got "
+                f"{type(ptids).__name__}); a bare string would be silently "
+                "reinterpreted as per-character token ids"
+            )
+        return [int(t) for t in ptids]
     tokenizer = engine.get_tokenizer()
     messages = body.get("messages")
     if messages is not None:
@@ -127,9 +134,15 @@ async def tq_pin(raw_request: Request) -> JSONResponse:
     # Keepalive: enough decode headroom that the request does not finish in the
     # window between prefill-complete and our abort. ignore_eos guards against an
     # early EOS. The tokens themselves are thrown away.
-    keepalive_tokens = max(2, int(body.get("keepalive_tokens", 16)))
-    timeout_s = float(body.get("timeout_s", 60.0))
-    poll_s = float(body.get("poll_interval_s", 0.02))
+    try:
+        keepalive_tokens = max(2, int(body.get("keepalive_tokens", 16)))
+        timeout_s = float(body.get("timeout_s", 60.0))
+        poll_s = float(body.get("poll_interval_s", 0.02))
+    except (TypeError, ValueError) as e:
+        return _err(
+            HTTPStatus.BAD_REQUEST,
+            f"keepalive_tokens/timeout_s/poll_interval_s must be numeric: {e}",
+        )
 
     request_id = f"tqpin-src-{uuid.uuid4().hex[:12]}"
     sampling = SamplingParams(
@@ -240,7 +253,10 @@ async def tq_fork(raw_request: Request) -> JSONResponse:
     if not isinstance(children, list) or not children:
         return _err(HTTPStatus.BAD_REQUEST, "children must be a non-empty list")
 
-    max_total_tokens = int(body.get("max_total_tokens", 2048))
+    try:
+        max_total_tokens = int(body.get("max_total_tokens", 2048))
+    except (TypeError, ValueError) as e:
+        return _err(HTTPStatus.BAD_REQUEST, f"max_total_tokens must be an int: {e}")
     child_specs: list[dict] = []
     total_budget = 0
     for i, child in enumerate(children):
@@ -254,7 +270,13 @@ async def tq_fork(raw_request: Request) -> JSONResponse:
                 f"allowed: {sorted(_CHILD_SAMPLING_KEYS)}",
             )
         spec = dict(child)
-        spec["max_tokens"] = int(spec.get("max_tokens", 64))
+        try:
+            spec["max_tokens"] = int(spec.get("max_tokens", 64))
+        except (TypeError, ValueError) as e:
+            return _err(
+                HTTPStatus.BAD_REQUEST,
+                f"children[{i}].max_tokens must be an int: {e}",
+            )
         total_budget += spec["max_tokens"]
         child_specs.append(spec)
 

@@ -105,6 +105,7 @@ def main() -> int:
     # tokens to give the polling loop a comfortable window under enforce_eager.
     prompt = _build_block_aligned_prompt(args.block_aligned_tokens)
     gen_done = threading.Event()
+    gen_error: list[BaseException] = []
 
     def _generate() -> None:
         try:
@@ -112,6 +113,8 @@ def main() -> int:
                 {"prompt_token_ids": prompt},
                 SamplingParams(max_tokens=256, temperature=0.0),
             )
+        except BaseException as exc:  # noqa: BLE001 - surface to the main thread
+            gen_error.append(exc)
         finally:
             gen_done.set()
 
@@ -159,6 +162,16 @@ def main() -> int:
     gen_thread.join(timeout=180)
     if not gen_done.is_set():
         print("source generation did not finish in time", file=sys.stderr)
+        llm.unpin_kv_blocks(handle_id)
+        return 1
+    if gen_error:
+        print(
+            f"source generation raised ({gen_error[0]!r}); the pin's "
+            "survive-free claim was never exercised — failing rather than "
+            "reporting a false pass",
+            file=sys.stderr,
+        )
+        llm.unpin_kv_blocks(handle_id)
         return 1
     # Give the engine a beat to run the finish/free step for the request.
     time.sleep(1.0)

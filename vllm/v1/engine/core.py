@@ -666,6 +666,16 @@ class EngineCore:
                 "no running request to operate on; call while a request is "
                 "in flight (mid-generation polling pattern)"
             )
+        # The snapshot feature is throwaway-single-engine, one request at a
+        # time (design: req_id=None picks the sole in-flight request). Under
+        # concurrent traffic running[0] is ambiguous, so reject rather than
+        # silently pinning/forking the wrong request.
+        if len(running) != 1:
+            raise RuntimeError(
+                f"req_id must be provided when {len(running)} requests are "
+                "running; EXP-038 auto-pick requires exactly one in-flight "
+                "request (throwaway single-request feature)"
+            )
         return running[0].request_id
 
     def _tq_group_label(self, group_id: int) -> str:
@@ -728,6 +738,11 @@ class EngineCore:
             "req_id": req_id,
             "num_computed_tokens": int(req.num_computed_tokens),
             "prompt_token_ids": list(req.prompt_token_ids or []),
+            # Persist the donor's cache_salt: the prefix-cache block hash mixes
+            # it in (generate_block_hash_extra_keys), so a fork child built
+            # without it would hash differently and fail to adopt the pinned
+            # blocks. None for the unsalted default path.
+            "cache_salt": getattr(req, "cache_salt", None),
             "groups": groups_out,
         }
         return {
@@ -957,6 +972,10 @@ class EngineCore:
                 pooling_params=None,
                 arrival_time=time.time(),
                 block_hasher=self.request_block_hasher,
+                # Carry the donor's cache_salt so the child's prefix hashes
+                # match the pinned donor blocks (else the salted prefix cannot
+                # cache-hit). None for the unsalted default path.
+                cache_salt=entry.get("cache_salt"),
             )
             self.add_request(req)
             child_ids.append(req_id)
@@ -981,7 +1000,12 @@ class EngineCore:
         # batch-queue variant may return outputs=None mid-batch, handled below).
         step_fn = getattr(self, "step_fn", None) or self.step
         while pending and steps < max_steps:
-            outputs, _ = step_fn()
+            outputs, model_executed = step_fn()
+            # Mirror _process_engine_step: post_step updates spec-decode draft
+            # token state after each step. Bypassing it would leave the
+            # scheduler/worker sampling state inconsistent after the fork on
+            # spec-decode / CUDAGraph configs (no-op when spec decode is off).
+            self.post_step(model_executed)
             steps += 1
             for _client_idx, eco in (outputs.items() if outputs else ()):
                 for o in getattr(eco, "outputs", ()) or ():
@@ -1019,6 +1043,15 @@ class EngineCore:
         for rid in pending:
             if child_state[rid]["finish_reason"] is None:
                 child_state[rid]["finish_reason"] = "length_or_bound"
+
+        # Abort any child still scheduled at the bound BEFORE measuring free
+        # blocks. Otherwise the leftover Requests stay in scheduler.running and
+        # the outer _process_engine_step keeps decoding them after this utility
+        # returns — leaking outputs to the client socket for req_ids the driver
+        # never issued, and holding KV blocks that would break the
+        # post_free_blocks == pre_free_blocks leak invariant.
+        if pending:
+            self.abort_requests(list(pending))
 
         post_free_blocks = int(block_pool.get_num_free_blocks())
 

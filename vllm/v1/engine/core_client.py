@@ -1422,6 +1422,20 @@ class DPAsyncMPClient(AsyncMPClient):
         return self.core_engine
 
 
+# EXP-038 snapshot utilities that assume a single owning engine (one in-flight
+# request). Broadcasting these across load-balanced engines pins/forks the wrong
+# request and orphans handles, so DPLBAsyncMPClient rejects them.
+_TQ_SNAPSHOT_SINGLE_ENGINE_UTILITIES = frozenset(
+    {
+        "pin_request_kv_blocks",
+        "verify_pinned_blocks",
+        "get_request_kv_block_ids",
+        "unpin_kv_blocks",
+        "fork_from_handle",
+    }
+)
+
+
 class DPLBAsyncMPClient(DPAsyncMPClient):
     """Asyncio-compatible client for multi-proc, multi-engine (data parallel)
     EngineCore. Load-balances between multiple engine processes."""
@@ -1486,6 +1500,18 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         return chosen_engine
 
     async def call_utility_async(self, method: str, *args) -> Any:
+        # EXP-038 snapshot utilities are single-engine only: under internal DP
+        # load balancing this method broadcasts to EVERY engine, which would
+        # pin/fork on non-owning engines (their running[0] is a different or no
+        # request) and create orphaned handles the caller never receives to
+        # unpin. Reject them here rather than corrupting state; the feature is a
+        # throwaway single-engine serve (VLLM_TQ_GDN_SNAPSHOT), never DPLB.
+        if method in _TQ_SNAPSHOT_SINGLE_ENGINE_UTILITIES:
+            raise RuntimeError(
+                f"EXP-038 utility {method!r} is single-engine only and cannot "
+                "run under DP load balancing (this client broadcasts to every "
+                "engine). Use a throwaway single-engine serve, never DPLB."
+            )
         # Only the result from the first engine is returned.
         return (
             await asyncio.gather(

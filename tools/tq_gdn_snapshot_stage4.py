@@ -221,7 +221,11 @@ def main() -> int:
         f"[4/6] fork_from_handle(n=3): greedy(max={args.continuation_tokens}), "
         f"temp0.7(max={args.continuation_tokens}), temp1.0(max={child2_max}) ..."
     )
-    fork = llm.fork_from_handle(handle_id, child_specs)
+    try:
+        fork = llm.fork_from_handle(handle_id, child_specs)
+    except BaseException:  # noqa: BLE001 - fork raised/timed out; never leak the pin
+        llm.unpin_kv_blocks(handle_id)
+        raise
     children = fork.get("children", [])
     if len(children) != 3:
         print(
@@ -371,7 +375,10 @@ def main() -> int:
             "window to witness the shared attn block / distinct mamba slots."
         )
 
-    passed = cond_a and cond_b and cond_c and cond_d
+    # Cleanup must succeed too: a post-fork pin-integrity failure or a failed
+    # unpin means the run cannot be trusted as a PASS.
+    cleanup_ok = bool(post.get("ok")) and bool(released.get("ok"))
+    passed = cond_a and cond_b and cond_c and cond_d and cleanup_ok
 
     # Frontier rule — honest gaps flagged for re-adjudication regardless of PASS:
     print(
