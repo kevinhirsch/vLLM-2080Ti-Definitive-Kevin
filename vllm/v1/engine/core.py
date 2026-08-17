@@ -6,6 +6,7 @@ import queue
 import signal
 import threading
 import time
+import uuid
 from collections import defaultdict, deque
 from collections.abc import Callable, Generator
 from concurrent.futures import Future
@@ -609,6 +610,220 @@ class EngineCore:
         return self.scheduler.reset_prefix_cache(
             reset_running_requests, reset_connector
         )
+
+    # ------------------------------------------------------------------
+    # EXP-038 Stage-1 — attn KV block pin/unpin (scheduler / EngineCore side).
+    #
+    # SNAPSHOT's attn side is pure refcount pinning: ``block_pool.touch`` a
+    # finished prefix's KV blocks so they survive the producing request's
+    # ``free()`` (block_pool.py touch/free_blocks). The block pool and
+    # kv_cache_manager live in THIS (EngineCore) process, not the worker, so
+    # these are utility methods reachable from the ``LLM`` driver via
+    # ``call_utility`` -> ``getattr(self, name)`` (see core_client.py, exactly
+    # how reset_prefix_cache travels). The whole feature is env-gated
+    # (``VLLM_TQ_GDN_SNAPSHOT``, default off) and pins/allocates nothing until
+    # ``pin_request_kv_blocks`` is called. NEVER exercise against the
+    # production :8001 serve. Every returned value is a plain dict of
+    # str/int/list so it serializes across the ZMQ utility boundary.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _tq_snapshot_require_enabled() -> None:
+        import vllm.envs as envs
+
+        if not envs.VLLM_TQ_GDN_SNAPSHOT:
+            raise RuntimeError(
+                "EXP-038 pin/unpin requires VLLM_TQ_GDN_SNAPSHOT=1 "
+                "(the snapshot feature is inert by default)"
+            )
+
+    def _tq_pin_registry(self) -> dict[str, Any]:
+        reg = getattr(self, "_tq_pin_registry_store", None)
+        if reg is None:
+            reg = {}
+            self._tq_pin_registry_store = reg
+        return reg
+
+    def _tq_kv_cache_manager(self):
+        kvm = getattr(self.scheduler, "kv_cache_manager", None)
+        if kvm is None:
+            raise RuntimeError(
+                "scheduler has no kv_cache_manager (prefix caching disabled?)"
+            )
+        return kvm
+
+    def _tq_resolve_req_id(self, req_id: str | None) -> str:
+        sched = self.scheduler
+        if req_id is not None:
+            if req_id not in sched.requests:
+                raise KeyError(f"req {req_id!r} not known to the scheduler")
+            return req_id
+        # Auto-pick the single in-flight request (mirrors the Stage-0 worker
+        # self-test picking from mamba_state_idx). The throwaway PoC engine
+        # runs one request at a time under the driver's controlled flow.
+        running = list(getattr(sched, "running", []) or [])
+        if not running:
+            raise RuntimeError(
+                "no running request to operate on; call while a request is "
+                "in flight (mid-generation polling pattern)"
+            )
+        return running[0].request_id
+
+    def _tq_group_label(self, group_id: int) -> str:
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        spec = self.scheduler.kv_cache_config.kv_cache_groups[group_id].kv_cache_spec
+        return "mamba" if isinstance(spec, MambaSpec) else "attn"
+
+    def pin_request_kv_blocks(self, req_id: str | None = None) -> dict[str, Any]:
+        """Pin a request's resident KV blocks so they outlive its ``free()``.
+
+        Stage-1 primitive: ``block_pool.touch`` every non-null block of the
+        request's groups, bumping ``ref_cnt`` by one. When the producing
+        request later finishes, the scheduler's ``free_blocks`` decrements
+        ``ref_cnt`` once, leaving the pinned blocks resident (``ref_cnt >= 1``)
+        and out of the free queue -- available for a RESTORE. Records the pin
+        in an EngineCore-side registry keyed by an opaque handle id (auditable
+        pin/unpin ownership, per EXP-038 Risk #1).
+
+        The full-attn groups are the Stage-1 target. The mamba group is pinned
+        too, which keeps its by-hash-cached GDN *full* blocks (immutable, like
+        attn full blocks) resident so the zero-kernel Stage-2 restore's
+        find_longest_cache_hit still returns them (design lines 26-30). NOTE the
+        mamba running-state block is mutable and is NOT a stable snapshot when
+        pinned in place — Stage-0's dedicated park pool (batch_copy_slots) is
+        the mechanism for freezing the running state; this pin only guarantees
+        the cached prefix blocks survive eviction. Each group is labelled
+        ("attn"/"mamba") in the return so a driver can assert against whichever
+        it needs.
+
+        Returns a plain-dict handle: ``{handle_id, req_id, num_computed_tokens,
+        groups: {gid: {spec, block_ids}}, num_pinned_blocks}``.
+        """
+        self._tq_snapshot_require_enabled()
+        sched = self.scheduler
+        block_pool = self._tq_kv_cache_manager().block_pool
+        coordinator = self._tq_kv_cache_manager().coordinator
+        req_id = self._tq_resolve_req_id(req_id)
+        req = sched.requests[req_id]
+
+        blocks_per_group = coordinator.get_blocks(req_id)
+        groups_out: dict[str, Any] = {}
+        num_pinned = 0
+        for group_id, blocks in enumerate(blocks_per_group):
+            # Disjoint block-id spaces across groups (one shared pool, one
+            # physical block belongs to at most one (request, group)), so each
+            # block is touched exactly once. Skip null/sentinel blocks
+            # (remove_skipped_blocks replaces evicted mamba blocks with the
+            # null block; touching it is meaningless).
+            live = [b for b in blocks if not b.is_null]
+            block_pool.touch(live)
+            num_pinned += len(live)
+            groups_out[str(group_id)] = {
+                "spec": self._tq_group_label(group_id),
+                "block_ids": [b.block_id for b in live],
+            }
+
+        handle_id = f"tqpin-{req_id}-{uuid.uuid4().hex[:12]}"
+        self._tq_pin_registry()[handle_id] = {
+            "req_id": req_id,
+            "num_computed_tokens": int(req.num_computed_tokens),
+            "prompt_token_ids": list(req.prompt_token_ids or []),
+            "groups": groups_out,
+        }
+        return {
+            "handle_id": handle_id,
+            "req_id": req_id,
+            "num_computed_tokens": int(req.num_computed_tokens),
+            "groups": groups_out,
+            "num_pinned_blocks": num_pinned,
+        }
+
+    def verify_pinned_blocks(self, handle_id: str) -> dict[str, Any]:
+        """Read-only residency check for a pinned handle (Stage-1 assertion).
+
+        Asserts every pinned block is still resident: ``ref_cnt >= 1`` and not
+        a null block (ref_cnt==0 <=> the block is back in the free queue and
+        evictable, so ref_cnt>=1 == "resident"). Meant to be called AFTER the
+        producing request has finished, to prove the pin -- not luck -- kept
+        the blocks alive. Returns per-block ref_cnts plus the pool's free-block
+        count so the driver can see the pinned blocks are not in the free pool.
+        """
+        self._tq_snapshot_require_enabled()
+        reg = self._tq_pin_registry()
+        entry = reg.get(handle_id)
+        if entry is None:
+            raise KeyError(f"unknown pin handle {handle_id!r}")
+        block_pool = self._tq_kv_cache_manager().block_pool
+        per_group: dict[str, Any] = {}
+        min_ref: int | None = None
+        all_resident = True
+        for group_id, group in entry["groups"].items():
+            rows = []
+            for bid in group["block_ids"]:
+                block = block_pool.blocks[bid]
+                rc = int(block.ref_cnt)
+                resident = rc >= 1 and not block.is_null
+                all_resident = all_resident and resident
+                min_ref = rc if min_ref is None else min(min_ref, rc)
+                rows.append(
+                    {"block_id": bid, "ref_cnt": rc, "resident": resident}
+                )
+            per_group[group_id] = {"spec": group["spec"], "blocks": rows}
+        return {
+            "handle_id": handle_id,
+            "ok": bool(all_resident),
+            "min_ref_cnt": int(min_ref) if min_ref is not None else 0,
+            "num_free_blocks": int(block_pool.get_num_free_blocks()),
+            "groups": per_group,
+        }
+
+    def get_request_kv_block_ids(self, req_id: str | None = None) -> dict[str, Any]:
+        """Read-only snapshot of a live request's per-group KV block ids.
+
+        Used by the Stage-2 restore proof to assert that a resubmitted
+        request's prefix block ids equal the pinned handle's block ids -- i.e.
+        the restore provably reused the same physical (pinned) blocks rather
+        than re-allocating fresh ones.
+        """
+        self._tq_snapshot_require_enabled()
+        req_id = self._tq_resolve_req_id(req_id)
+        coordinator = self._tq_kv_cache_manager().coordinator
+        blocks_per_group = coordinator.get_blocks(req_id)
+        out: dict[str, Any] = {}
+        for group_id, blocks in enumerate(blocks_per_group):
+            out[str(group_id)] = {
+                "spec": self._tq_group_label(group_id),
+                "block_ids": [b.block_id for b in blocks if not b.is_null],
+            }
+        return {"req_id": req_id, "groups": out}
+
+    def unpin_kv_blocks(self, handle_id: str) -> dict[str, Any]:
+        """Release a pin handle: ``free_blocks`` its blocks, drop the registry
+        entry. Exactly undoes ``pin_request_kv_blocks``' ``touch`` (one release
+        per pin, per EXP-038 Risk #1). Idempotent: releasing an unknown or
+        already-released handle is a no-op that reports ``ok: False``.
+        """
+        self._tq_snapshot_require_enabled()
+        reg = self._tq_pin_registry()
+        entry = reg.pop(handle_id, None)
+        if entry is None:
+            return {
+                "handle_id": handle_id,
+                "ok": False,
+                "detail": "unknown or already-released handle",
+                "num_freed_blocks": 0,
+            }
+        block_pool = self._tq_kv_cache_manager().block_pool
+        num_freed = 0
+        for group in entry["groups"].values():
+            blocks = [block_pool.blocks[bid] for bid in group["block_ids"]]
+            block_pool.free_blocks(blocks)
+            num_freed += len(blocks)
+        return {
+            "handle_id": handle_id,
+            "ok": True,
+            "num_freed_blocks": num_freed,
+        }
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
