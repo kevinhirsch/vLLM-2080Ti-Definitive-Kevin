@@ -172,3 +172,50 @@ def spec_verify_reserve_bytes(
         dtype_bytes=dtype_bytes,
         profiled_baseline_width=profiled_baseline_width,
     ).reserve_bytes
+
+
+def spec_verify_reserve_decision(
+    *,
+    speculative_present: bool,
+    enabled: bool,
+    num_speculative_tokens: int,
+    max_num_seqs: int,
+    vocab_size: int,
+    overshoot_mult: int,
+) -> tuple[int, str]:
+    """Return ``(reserve_bytes, human_reason)`` for the spec-verify reserve.
+
+    Pure (scalars in, tuple out) so the *always-on* boot diagnostic and the
+    actual subtraction agree by construction and can be unit-tested without an
+    engine. ``reason`` is safe to log verbatim; it says either ``applied ...`` or
+    ``skipped: <why>`` so a boot is attributable even when a *different* phase
+    (e.g. cudagraph-memory profiling) OOMs before the reserve is used.
+    """
+    if not speculative_present:
+        return 0, "skipped: no speculative_config"
+    if not enabled:
+        return 0, "skipped: VLLM_SPEC_RESERVE_VERIFY_WORKSPACE=0"
+    if int(num_speculative_tokens) <= 1:
+        return 0, (
+            f"skipped: num_speculative_tokens={num_speculative_tokens} <= 1 "
+            "(nothing beyond the profiled K=1 baseline)"
+        )
+    if int(overshoot_mult) <= 0:
+        return 0, "skipped: VLLM_SPEC_VERIFY_OVERSHOOT_MULT=0"
+    if int(max_num_seqs) <= 0 or int(vocab_size) <= 0:
+        return 0, (
+            f"skipped: degenerate (max_num_seqs={max_num_seqs}, "
+            f"vocab_size={vocab_size})"
+        )
+    b = spec_verify_reserve_bytes(
+        num_speculative_tokens,
+        max_num_seqs,
+        vocab_size,
+        overshoot_mult=overshoot_mult,
+    )
+    reason = (
+        f"applied: K={num_speculative_tokens} max_num_seqs={max_num_seqs} "
+        f"vocab={vocab_size} mult={overshoot_mult} "
+        f"({b / (1 << 30):.3f} GiB)"
+    )
+    return b, reason

@@ -18,7 +18,7 @@ from vllm.logger import init_logger
 from vllm.utils.hashing import sha256_cbor, xxhash_cbor
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
-from vllm.v1.core.spec_decode_workspace import spec_verify_reserve_bytes
+from vllm.v1.core.spec_decode_workspace import spec_verify_reserve_decision
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
@@ -1920,45 +1920,35 @@ def _project_kv_cache_groups_to_worker(
     return projected_groups
 
 
-def _spec_decode_verify_workspace_reserve_bytes(vllm_config: VllmConfig) -> int:
-    """Per-rank VRAM (bytes) the speculative-decode *verify* working set needs
-    that KV-cache memory profiling under-counts at large
+def spec_decode_verify_reserve_decision(vllm_config: VllmConfig) -> tuple[int, str]:
+    """``(reserve_bytes, human_reason)`` for the speculative-decode verify
+    working set that KV-cache memory profiling under-counts at large
     ``num_speculative_tokens``.
 
     Subtracted from the KV budget *before* ``num_gpu_blocks`` is derived (same
     contract as ``_turboquant_prefill_workspace_reserve_bytes``). See
     ``vllm/v1/core/spec_decode_workspace.py`` for the root cause and formula.
-
-    Returns 0 when it does not apply: feature disabled, no speculative config,
-    ``num_speculative_tokens <= 1`` (nothing beyond the profiled K=1 baseline),
-    or the multiplier is 0.
+    Returns bytes=0 (with a reason) when it does not apply.
 
     Unlike the turboquant continuation workspace, these are plain transient torch
     allocations that profiling never triggers at full width, so there is nothing
     to add back in ``determine_available_memory`` — the reserve applies once.
+    Exposed (not private) so ``gpu_worker.determine_available_memory`` can emit
+    the same decision as an always-on boot diagnostic.
     """
-    if not envs.VLLM_SPEC_RESERVE_VERIFY_WORKSPACE:
-        return 0
-    if getattr(vllm_config, "speculative_config", None) is None:
-        return 0
-
-    num_spec_tokens = int(vllm_config.num_speculative_tokens)
-    if num_spec_tokens <= 1:
-        return 0
-
+    speculative_present = getattr(vllm_config, "speculative_config", None) is not None
     scheduler_config = getattr(vllm_config, "scheduler_config", None)
     max_num_seqs = int(getattr(scheduler_config, "max_num_seqs", 0) or 0)
-    if max_num_seqs <= 0:
-        return 0
-
-    vocab_size = int(vllm_config.model_config.get_vocab_size())
-    if vocab_size <= 0:
-        return 0
-
-    return spec_verify_reserve_bytes(
-        num_spec_tokens,
-        max_num_seqs,
-        vocab_size,
+    try:
+        vocab_size = int(vllm_config.model_config.get_vocab_size())
+    except Exception:
+        vocab_size = 0
+    return spec_verify_reserve_decision(
+        speculative_present=speculative_present,
+        enabled=bool(envs.VLLM_SPEC_RESERVE_VERIFY_WORKSPACE),
+        num_speculative_tokens=int(vllm_config.num_speculative_tokens),
+        max_num_seqs=max_num_seqs,
+        vocab_size=vocab_size,
         overshoot_mult=int(envs.VLLM_SPEC_VERIFY_OVERSHOOT_MULT),
     )
 
@@ -2038,7 +2028,16 @@ def get_kv_cache_configs(
     # a no-op then). No add-back is needed in determine_available_memory: unlike
     # the turboquant continuation workspace, these buffers are never allocated
     # during profiling, so there is no double-count.
-    spec_verify_reserve = _spec_decode_verify_workspace_reserve_bytes(vllm_config)
+    spec_verify_reserve, spec_verify_reason = spec_decode_verify_reserve_decision(
+        vllm_config
+    )
+    if getattr(vllm_config, "speculative_config", None) is not None:
+        # Always-on so a boot is attributable (mirrors the diagnostic in
+        # determine_available_memory, which prints even when an earlier phase
+        # OOMs before this point).
+        logger.info(
+            "KV sizing: speculative-decode verify workspace reserve %s", spec_verify_reason
+        )
     if spec_verify_reserve > 0:
         available_memory = [
             avail_mem
@@ -2047,14 +2046,10 @@ def get_kv_cache_configs(
             for groups, avail_mem in zip(projected_groups_per_worker, available_memory)
         ]
         logger.info(
-            "Reserving %s GiB per rank for the speculative-decode verify working "
-            "set before sizing the KV cache (num_speculative_tokens=%d, "
-            "max_num_seqs=%d, VLLM_SPEC_VERIFY_OVERSHOOT_MULT=%d); set "
+            "Reserved %s GiB per rank for the speculative-decode verify working "
+            "set before sizing the KV cache; set "
             "VLLM_SPEC_RESERVE_VERIFY_WORKSPACE=0 to restore the legacy sizing.",
             format_gib(spec_verify_reserve),
-            vllm_config.num_speculative_tokens,
-            vllm_config.scheduler_config.max_num_seqs,
-            envs.VLLM_SPEC_VERIFY_OVERSHOOT_MULT,
         )
 
     # If `num_gpu_blocks_override` is set, the cache size that will actually

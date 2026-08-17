@@ -235,6 +235,27 @@ Validated by `tests/v1/core/test_spec_decode_workspace.py` (pure-python, no engi
 at K16/seqs16, **1.33 GiB** at K16/seqs4 (=÷4), **0.36 GiB** at K2/seqs16 — matching all three measured
 boot facts.
 
+**Hardware verification (2026-08-17) — the reserve is necessary but NOT sufficient; the
+binding OOM is upstream.** Booting `feat-s4-scoped-drafter` at K16/seqs16/util0.82 still OOM'd,
+with **zero** reserve log lines. The traceback pins it: `determine_available_memory` ->
+`profile_cudagraph_memory` -> `_init_minimal_kv_cache_for_profiling` -> `torch.zeros(868 MiB)` — the
+**minimal KV cache for cudagraph-memory profiling** (`min_blocks = max_cudagraph_capture_size = 512`).
+That is *inside* `determine_available_memory`, **upstream of `get_kv_cache_configs`**, so the KV-sizing
+reserve (and its log) never execute. The env wiring is correct; the reserve is simply unreachable in
+this failure mode. Crucially, `gpu_memory_utilization` does **not** cap the profiling-phase peak
+(it only sizes the eventual KV budget) — so 0.82 vs 0.75 is not the lever; **`max_num_seqs`** is (it
+shrinks the profile peak, the cudagraph decode batch, and the minimal KV), which is why seqs=4 booted.
+Fixes staged this round: (1) an **always-on diagnostic** of the reserve decision in
+`determine_available_memory` (prints before the OOM-prone step, so every boot is attributable);
+(2) `gc.collect(); torch.accelerator.empty_cache()` before `_init_minimal_kv_cache_for_profiling`, which
+returns profile_run's fragmented reserved-but-unallocated cache (~0.8 GiB here) to the driver so the
+minimal-KV alloc has contiguous room. **Residual (gap):** the model + compiled graphs leave ~19.7 GiB
+*live* per rank, so the empty_cache margin is thin and capture may still OOM at seqs=16. The guaranteed
+boot path is to cut the profiling peak: cap `cudagraph_capture_sizes` / `max_cudagraph_capture_size` to
+the max useful decode batch (`max_num_seqs*(1+K) = 272` -> ~288, vs the current 512 which captures token
+counts never reached at decode and inflates the minimal KV to 868 MiB), or lower `max_num_seqs`. That is
+a launch-config lever, verified via boot — not a KV-sizing change.
+
 **Honest caveat (per [[Challenge Impossible Claims]]).** The *mechanistically* attributable verify
 buffers are only ~1.3 GiB (`OVERSHOOT_MULT≈6`); the arithmetic ceiling of the verify logits is ~2 GiB at
 this vocab/batch, so the observed ~5 GiB is **not** all spec-verify logits. The default `OVERSHOOT_MULT=24`
