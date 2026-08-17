@@ -184,7 +184,6 @@ def _post_stream(base_url: str, model: str, messages, max_tokens: int, timeout: 
     )
     t0 = time.monotonic()
     t_first = None
-    n_chunks = 0
     usage_completion = None
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         for raw in resp:
@@ -207,13 +206,12 @@ def _post_stream(base_url: str, model: str, messages, max_tokens: int, timeout: 
                 if delta.get("content"):
                     if t_first is None:
                         t_first = time.monotonic()
-                    n_chunks += 1
     t_end = time.monotonic()
     decode_s = t_end - (t_first if t_first is not None else t0)
     if usage_completion is None:
         # Fail fast: an SSE content chunk is NOT one token (a chunk can carry
-        # several, especially under speculative decode), so falling back to
-        # n_chunks would silently mismeasure tok/s. The request sets
+        # several, especially under speculative decode), so falling back to a
+        # chunk count would silently mismeasure tok/s. The request sets
         # stream_options.include_usage=True; if the server omits usage, error out
         # rather than report a wrong throughput number.
         raise RuntimeError(
@@ -326,7 +324,11 @@ def run_bench(args):
             toks_per_s.append(tps)
             # Record on every successful rep so a failure on the LAST rep does not
             # blank out metrics captured by earlier reps (keeps the last good one).
-            metrics_delta = _delta_metrics(m_before, m_after)
+            # Only overwrite when the scrape succeeded: a failed /metrics scrape
+            # yields None and must not wipe an earlier rep's good snapshot.
+            delta = _delta_metrics(m_before, m_after)
+            if delta is not None:
+                metrics_delta = delta
             print(
                 f"[{args.label}] {name:11s} rep{r}: {tps:7.2f} tok/s "
                 f"({n_tokens} toks / {decode_s:.3f}s)"
