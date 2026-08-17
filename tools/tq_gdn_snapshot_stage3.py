@@ -302,7 +302,20 @@ def main() -> int:
             llm, [prompt, prompt], greedy, _probe
         )
     except BaseException:  # noqa: BLE001 - child gen raised/timed out; never leak the pin
-        llm.unpin_kv_blocks(handle_id)
+        # Report (but never let) a cleanup failure replace the original error:
+        # unpin can return ok=False or itself raise; surface both, then re-raise.
+        try:
+            released = llm.unpin_kv_blocks(handle_id)
+            if not released.get("ok"):
+                print(
+                    f"warning: unpin failed during exception cleanup: {released}",
+                    file=sys.stderr,
+                )
+        except Exception as cleanup_err:  # noqa: BLE001 - preserve original failure
+            print(
+                f"warning: unpin raised during exception cleanup: {cleanup_err}",
+                file=sys.stderr,
+            )
         raise
     if not child_outs or len(child_outs) != 2:
         print(
