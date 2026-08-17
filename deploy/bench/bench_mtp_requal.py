@@ -72,17 +72,31 @@ def run_stage(base: str, model: str, ctx_tokens: int, *, temperature: float,
         "needle_recalled": needle in text,
         "garble": g,
         "acceptance": None if acc is None else round(acc, 3),
+        # raw deltas kept so foreign traffic during a stage is visible in the
+        # results JSON (drafts >> this probe's expected count = contaminated
+        # sample; re-run the stage with the engine isolated)
+        "draft_tokens_delta": None if (before is None or after is None)
+        else after["draft_tokens"] - before["draft_tokens"],
         "nrestarts_delta": None if (r0 is None or r1 is None) else r1 - r0,
     }
+    # FAIL CLOSED: missing telemetry is missing evidence, not health.
+    #  - nrestarts None: cannot prove the engine stayed up
+    #  - acceptance None: MTP is not drafting or /metrics is down — either way
+    #    a re-qualification of MTP cannot be scored
     hard_fail = (
         not stage["needle_recalled"]
         or g["garbled"]
-        or (stage["nrestarts_delta"] not in (0, None))
+        or stage["nrestarts_delta"] != 0
+        or acc is None
         or result["finish_reason"] not in ("stop", "length")
     )
     soft_fail = acc is not None and acc < ACCEPTANCE_FLOOR
     stage["verdict"] = ("FAIL" if hard_fail else
                        "SOFT-FAIL(acceptance)" if soft_fail else "PASS")
+    if hard_fail and stage["nrestarts_delta"] is None:
+        stage["fail_reason"] = "NRestarts unavailable (fail-closed)"
+    elif hard_fail and acc is None:
+        stage["fail_reason"] = "no acceptance telemetry (fail-closed)"
     return stage
 
 
@@ -102,6 +116,11 @@ def main() -> int:
     args = ap.parse_args()
 
     stages = [int(s) for s in args.stages.split(",") if s.strip()]
+    if not stages:
+        ap.error("--stages must name at least one context size")
+    if args.repeat < 2:
+        ap.error("--repeat must be >= 2 (garble is intermittent; "
+                 "a single probe per stage proves nothing)")
     results, failed = [], False
     for ctx in stages:
         # generous ceiling: prefill at worst ~850 tok/s + decode + slack
@@ -138,10 +157,15 @@ def main() -> int:
         return 1
     soft = [r for r in results if r["verdict"].startswith("SOFT")]
     if soft:
-        print(f"NOTE: {len(soft)} stage(s) below acceptance floor "
-              f"{ACCEPTANCE_FLOOR} — clean output, but weigh the speed win "
-              "against MTP-off before shipping.")
-    print("ladder complete: no garble, no crash. MTP is re-qualifiable.")
+        # exit 2 (distinct from hard-fail 1): output was clean but acceptance
+        # sat below the floor — the ladder does NOT approve MTP on this run.
+        # Ship only after a deliberate decision recorded in RESULTS-TEMPLATE.md.
+        print(f"SOFT FAIL: {len(soft)} stage(s) below acceptance floor "
+              f"{ACCEPTANCE_FLOOR} — clean output, but speculation is not "
+              "paying for itself. NOT auto-approving; exit 2.")
+        return 2
+    print("ladder complete: no garble, no crash, acceptance above floor. "
+          "MTP is re-qualifiable.")
     return 0
 
 

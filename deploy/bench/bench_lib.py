@@ -48,6 +48,8 @@ def chat(base_url: str, model: str, messages: list[dict[str, Any]], *,
     if stream:
         payload["stream_options"] = {"include_usage": True}
     if extra:
+        if "stream" in extra:
+            raise ValueError("'stream' is reserved — pass stream= to chat()")
         payload.update(extra)
 
     start = time.perf_counter()
@@ -66,7 +68,9 @@ def chat(base_url: str, model: str, messages: list[dict[str, Any]], *,
             "finish_reason": ch.get("finish_reason"),
             "ttft_s": None,
             "total_s": total,
-            "decode_tps": (ct / total) if total > 0 else 0.0,
+            # decode-only rate is unmeasurable without streaming (total time
+            # includes prefill) — report None rather than an understated number
+            "decode_tps": None,
             "completion_tokens": ct,
             "prompt_tokens": usage.get("prompt_tokens") or 0,
         }
@@ -116,17 +120,22 @@ def chat(base_url: str, model: str, messages: list[dict[str, Any]], *,
     }
 
 
-def scrape_spec_metrics(base_url: str) -> dict[str, float]:
+def scrape_spec_metrics(base_url: str) -> dict[str, float] | None:
     """Cumulative spec-decode counters from /metrics. Take a delta around a probe
-    to get per-probe acceptance: accepted_delta / draft_delta."""
+    to get per-probe acceptance: accepted_delta / draft_delta.
+
+    Returns None when /metrics is unreachable or errors — callers must treat
+    that as MISSING EVIDENCE (fail the gate), never as zero activity."""
     root = base_url.rstrip("/")
     if root.endswith("/v1"):
         root = root[:-3]
     out = {"drafts": 0.0, "draft_tokens": 0.0, "accepted_tokens": 0.0}
     try:
-        text = requests.get(f"{root}/metrics", timeout=10).text
+        resp = requests.get(f"{root}/metrics", timeout=10)
+        resp.raise_for_status()
+        text = resp.text
     except requests.RequestException:
-        return out
+        return None
     for line in text.splitlines():
         if line.startswith("#"):
             continue
@@ -143,7 +152,12 @@ def scrape_spec_metrics(base_url: str) -> dict[str, float]:
     return out
 
 
-def acceptance_rate(before: dict[str, float], after: dict[str, float]) -> float | None:
+def acceptance_rate(before: dict[str, float] | None,
+                    after: dict[str, float] | None) -> float | None:
+    """None means NO EVIDENCE (scrape failed or nothing drafted) — gate-callers
+    must fail on None, not skip the check."""
+    if before is None or after is None:
+        return None
     drafted = after["draft_tokens"] - before["draft_tokens"]
     if drafted <= 0:
         return None

@@ -48,10 +48,15 @@ across successive un-rebooted crash cycles. Therefore:
 - Reboot the box before the ladder, and re-reboot after any crash before
   re-testing — otherwise a descending Xid31 floor masquerades as an MTP
   regression at ever-lower context.
-- Export `VLLM_TURBOQUANT_CONTINUATION_BOUNDS_CHECK=1` for the duration of
+- Enable `VLLM_TURBOQUANT_CONTINUATION_BOUNDS_CHECK=1` for the duration of
   qualification (env-gated reader guard from `fix-xid31-guard`; requires that
-  branch's guard commits if not yet merged — skip the env if the running build
-  predates them).
+  branch's guard commits if not yet merged — skip if the running build
+  predates them). NOTE: the engine runs under systemd, which does NOT inherit
+  a shell `export`. The requal serve variant sets the env itself; for the
+  step-1 MTP-off reference recording, either accept that it runs unguarded
+  (it exercises the same TQ path at 60K) or add
+  `Environment=VLLM_TURBOQUANT_CONTINUATION_BOUNDS_CHECK=1` to a
+  `vllm-qwen27b.service.d` drop-in before recording.
 - On any crash, check `dmesg -T | grep -i xid` FIRST. Paired Xid 31 on both
   GPUs = the pre-existing fault hunt, NOT automatically an MTP verdict; file it
   against the Xid31 investigation and re-run the stage after a reboot. Only a

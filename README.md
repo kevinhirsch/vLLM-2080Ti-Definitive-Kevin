@@ -198,7 +198,7 @@ Profiles declare compatible modes, not a recommended launch mode. Set
 you want a specific mode; the launcher validates that choice against the
 profile.
 
-3. Update an existing checkout:
+Update an existing checkout:
 
 ```bash
 ./update.sh
