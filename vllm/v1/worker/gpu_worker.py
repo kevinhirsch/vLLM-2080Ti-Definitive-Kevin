@@ -446,6 +446,27 @@ class Worker(WorkerBase):
             - cudagraph_memory_estimate_applied
         )
 
+        # [FORK] With VLLM_TQ_RESERVE_PREFILL_WORKSPACE the turboquant
+        # continuation workspace is explicitly subtracted at KV-sizing time
+        # (get_kv_cache_configs). Whether the arena was ALSO captured in the
+        # profiled torch peak depends on allocation timing (load-time vs lazy
+        # first-touch), which made available memory vary boot-to-boot and
+        # intermittently double-counted the reserve. Add back whatever arena
+        # exists at measurement time so the explicit reserve applies exactly
+        # once, deterministically.
+        if envs.VLLM_TQ_RESERVE_PREFILL_WORKSPACE:
+            from vllm.v1.worker.workspace import workspace_manager_total_bytes
+
+            _tq_arena_bytes = workspace_manager_total_bytes()
+            if _tq_arena_bytes > 0:
+                self.available_kv_cache_memory_bytes += _tq_arena_bytes
+                logger.info(
+                    "Excluding %s GiB turboquant workspace arena from the "
+                    "profiled non-KV footprint (explicit reserve is applied "
+                    "once at KV sizing).",
+                    format_gib(_tq_arena_bytes),
+                )
+
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
         logger.debug(
             "Initial free memory: %s GiB; Requested memory: %f (util), %s GiB",
