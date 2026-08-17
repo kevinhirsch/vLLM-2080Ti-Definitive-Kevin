@@ -837,17 +837,18 @@ class VllmConfig:
                         "Async scheduling is not compatible with "
                         "disable_padded_drafter_batch=True."
                     )
-                if os.environ.get("VLLM_SUFFIX_OVERLAY", "0") == "1":
-                    # Suffix overlay (2080Ti fork) merges CPU-list drafts, which the
-                    # async on-device draft scatter cannot consume (same reason
-                    # method=suffix is rejected above). The auto path (async=None)
-                    # silently disables async for this; an EXPLICIT --async-scheduling
-                    # must hard-fail at config time rather than crash at runtime in the
-                    # scatter (asserts _draft_token_ids is a tensor).
+                if (
+                    self.speculative_config.use_eagle()
+                    and os.environ.get("VLLM_S4_SCOPED_DRAFTER", "0") == "1"
+                ):
+                    # EXP-039 (S4): the scoped drafter emits CPU-list drafts, which
+                    # the async on-device draft scatter cannot consume. Auto mode
+                    # disables async for this below; when async is set explicitly,
+                    # fail fast like the other async incompatibilities above.
                     raise ValueError(
-                        "Async scheduling is not compatible with the suffix overlay "
-                        "(VLLM_SUFFIX_OVERLAY=1), which produces CPU-list drafts. "
-                        "Unset VLLM_SUFFIX_OVERLAY or drop --async-scheduling."
+                        "Async scheduling is not compatible with the S4 scoped "
+                        "drafter (VLLM_S4_SCOPED_DRAFTER=1), which emits CPU-list "
+                        "drafts. Unset it or disable async scheduling."
                     )
             if not executor_supports_async_sched:
                 raise ValueError(
@@ -888,10 +889,14 @@ class VllmConfig:
                 self.scheduler_config.async_scheduling = False
             elif (
                 self.speculative_config is not None
+                and self.speculative_config.use_eagle()
                 and os.environ.get("VLLM_S4_SCOPED_DRAFTER", "0") == "1"
             ):
                 # EXP-039 (S4): the scoped drafter emits CPU-list drafts (variable
                 # length per request), same async incompatibility as the overlay.
+                # Only the EAGLE/MTP path constructs the scoped drafter (see
+                # gpu_model_runner), so scope the disable to use_eagle(): other
+                # methods (e.g. ngram_gpu) never build it and keep async scheduling.
                 # See docs/exp039-scoped-drafter-design.md S7 (known headwind).
                 logger.warning_once(
                     "Async scheduling disabled: S4 scoped drafter produces CPU drafts."

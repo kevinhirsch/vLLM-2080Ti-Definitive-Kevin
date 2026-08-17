@@ -208,9 +208,12 @@ if __name__ == "__main__":
         try:
             t()
             print(f"PASS {t.__name__}")
-        except AssertionError as e:
+        except Exception as e:
+            # Catch Exception (not just AssertionError) so a non-assertion failure
+            # (AttributeError/TypeError/...) is counted and reported like the rest
+            # instead of aborting the script and skipping the summary/exit code.
             failed += 1
-            print(f"FAIL {t.__name__}: {e}")
+            print(f"FAIL {t.__name__}: {type(e).__name__}: {e}")
     print()
     _print_table()
     print()

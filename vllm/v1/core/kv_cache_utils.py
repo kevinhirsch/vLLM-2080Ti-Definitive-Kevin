@@ -1941,7 +1941,11 @@ def spec_decode_verify_reserve_decision(vllm_config: VllmConfig) -> tuple[int, s
     max_num_seqs = int(getattr(scheduler_config, "max_num_seqs", 0) or 0)
     try:
         vocab_size = int(vllm_config.model_config.get_vocab_size())
-    except Exception:
+    except (AttributeError, TypeError, ValueError):
+        # Only the expected "no/invalid vocab" shapes (missing model_config attr,
+        # non-int return) map to 0. An unexpected failure must NOT silently set
+        # vocab_size=0, which would disable the spec-verify OOM reserve; let it
+        # propagate so the guard is never bypassed unnoticed.
         vocab_size = 0
     return spec_verify_reserve_decision(
         speculative_present=speculative_present,
