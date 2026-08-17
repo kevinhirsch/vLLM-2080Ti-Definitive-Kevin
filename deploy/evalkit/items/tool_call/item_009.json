@@ -1,0 +1,91 @@
+{
+  "id": "tool_call_009",
+  "category": "tool_call",
+  "description": "parallel calls: schedule + notify in one turn",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Schedule a meeting titled 'Budget Review' at 3pm tomorrow, and email alice@example.com to let her know about it. Do both actions in this turn."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "create_calendar_event",
+          "description": "Create a calendar event.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "time": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "title",
+              "time"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "send_email",
+          "description": "Send an email.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "to": {
+                "type": "string"
+              },
+              "subject": {
+                "type": "string"
+              },
+              "body": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "to",
+              "subject",
+              "body"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "max_tokens": 400
+  },
+  "check": {
+    "type": "tool_call",
+    "expected_calls": [
+      {
+        "name": "create_calendar_event",
+        "args": [
+          {
+            "path": "title",
+            "match": "contains",
+            "value": "Budget Review"
+          }
+        ]
+      },
+      {
+        "name": "send_email",
+        "args": [
+          {
+            "path": "to",
+            "match": "exact",
+            "value": "alice@example.com"
+          }
+        ]
+      }
+    ],
+    "mode": "any_order"
+  }
+}

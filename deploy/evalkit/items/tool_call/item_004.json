@@ -1,0 +1,126 @@
+{
+  "id": "tool_call_004",
+  "category": "tool_call",
+  "description": "tool choice among 4 distractors",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Translate the word 'Bonjour' into English."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "send_email",
+          "description": "Send an email.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "to": {
+                "type": "string"
+              },
+              "subject": {
+                "type": "string"
+              },
+              "body": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "to",
+              "subject",
+              "body"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "create_calendar_event",
+          "description": "Create a calendar event.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "time": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "title",
+              "time"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "search_web",
+          "description": "Search the web for a query.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "query"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "translate_text",
+          "description": "Translate text into a target language.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "target_language": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "text",
+              "target_language"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "max_tokens": 400
+  },
+  "check": {
+    "type": "tool_call",
+    "expected_calls": [
+      {
+        "name": "translate_text",
+        "args": [
+          {
+            "path": "text",
+            "match": "exact",
+            "value": "Bonjour"
+          },
+          {
+            "path": "target_language",
+            "match": "regex",
+            "pattern": "(?i)\\benglish\\b|\\ben\\b"
+          }
+        ]
+      }
+    ],
+    "mode": "in_order"
+  }
+}

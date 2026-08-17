@@ -1,0 +1,20 @@
+{
+  "id": "code_exec_023",
+  "category": "code_exec",
+  "description": "chunk_list",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Write a Python function `chunk_list(lst, n)` that splits lst into consecutive chunks of size n (a list of lists); the final chunk may be shorter than n. Return an empty list if lst is empty.\n\nReply with a single Python code block containing only your function definition(s) (imports allowed if needed). Do not include any example usage, test calls, or print statements of your own -- a separate test harness will be run against your function afterward. Do not print anything else outside the code block."
+      }
+    ],
+    "max_tokens": 900
+  },
+  "check": {
+    "type": "code_exec",
+    "expected_stdout": "[]\n[[1, 2], [3, 4], [5]]\n[[1, 2, 3]]\n[[0, 1, 2], [3, 4, 5], [6, 7, 8]]\n",
+    "timeout_sec": 10,
+    "harness": "print(chunk_list([], 3))\nprint(chunk_list([1,2,3,4,5], 2))\nprint(chunk_list([1,2,3], 5))\nprint(chunk_list(list(range(9)), 3))"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "id": "instruction_009",
+  "category": "instruction",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Is 2 + 2 equal to 4? Reply with exactly one word, either 'YES' or 'NO' in uppercase, and absolutely nothing else."
+      }
+    ],
+    "max_tokens": 300
+  },
+  "check": {
+    "type": "regex_fullmatch",
+    "pattern": "YES"
+  }
+}

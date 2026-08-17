@@ -1,0 +1,73 @@
+{
+  "id": "tool_call_018",
+  "category": "tool_call",
+  "description": "optional-param handling: optional field correctly left absent",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Open a support ticket titled 'Printer not working' with description 'The 3rd floor printer is jammed.' I don't have a priority preference, so leave that out."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "create_ticket",
+          "description": "Open a support ticket.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              },
+              "priority": {
+                "type": "string",
+                "enum": [
+                  "low",
+                  "medium",
+                  "high"
+                ],
+                "description": "Optional priority"
+              }
+            },
+            "required": [
+              "title",
+              "description"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "max_tokens": 400
+  },
+  "check": {
+    "type": "tool_call",
+    "expected_calls": [
+      {
+        "name": "create_ticket",
+        "args": [
+          {
+            "path": "title",
+            "match": "contains",
+            "value": "Printer not working"
+          },
+          {
+            "path": "description",
+            "match": "contains",
+            "value": "jammed"
+          },
+          {
+            "path": "priority",
+            "match": "absent"
+          }
+        ]
+      }
+    ],
+    "mode": "in_order"
+  }
+}
