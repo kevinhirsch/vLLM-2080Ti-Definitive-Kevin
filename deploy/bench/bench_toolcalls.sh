@@ -14,8 +14,12 @@
 #   ./bench_toolcalls.sh [BASE_URL] [MODEL] [N_AUTO]
 set -uo pipefail
 BASE="${1:-http://127.0.0.1:8001/v1}"
+BASE="${BASE%/}"
 MODEL="${2:-qwen-local}"
 N="${3:-20}"
+if ! [ "$N" -gt 0 ] 2>/dev/null; then
+  echo "N_AUTO must be a positive integer (got: $N)" >&2; exit 2
+fi
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SMOKE="$HERE/../../tools/tool_call_smoke.py"
 FAIL=0
@@ -29,8 +33,9 @@ for i in $(seq 1 "$N"); do
   fi
 done
 echo "auto tool choice: $AUTO_OK/$N clean"
-# bar: >=19/20 (matches the runbook acceptance table)
-[ "$AUTO_OK" -ge $((N * 19 / 20)) ] || FAIL=1
+# bar: >=95% with ceiling division (19/20 at the default N=20; never a
+# zero-success pass at small N)
+[ "$AUTO_OK" -ge $(((N * 19 + 19) / 20)) ] || FAIL=1
 
 echo "== 2/3 NAMED tool_choice (v0.1.15 fix) =="
 python3 - "$BASE" "$MODEL" <<'PY' || FAIL=1
@@ -71,9 +76,9 @@ tools = [{"type": "function", "function": {
                    "properties": {"path": {"type": "string"},
                                   "content": {"type": "string"}},
                    "required": ["path", "content"]}}}]
+SNIPPET = 'if (a < b && b > c) { printf("<ok>\\n"); }'
 prompt = ("Use write_file to save this exact C snippet to /tmp/cmp.c:\n"
-          "if (a < b && b > c) { printf(\"<ok>\\n\"); }\n"
-          "Preserve it byte-for-byte.")
+          + SNIPPET + "\nPreserve it byte-for-byte.")
 ok = 0
 for i in range(5):
     r = requests.post(f"{base}/chat/completions", timeout=180, json={
@@ -86,13 +91,18 @@ for i in range(5):
     msg = r.json()["choices"][0]["message"]
     calls = msg.get("tool_calls") or []
     try:
-        args = json.loads(calls[0]["function"]["arguments"]) if calls else {}
-        if "<" in args.get("content", "") and "&&" in args.get("content", ""):
+        # strict: right tool, right path, and the snippet byte-for-byte in the
+        # decoded arguments — a substring check on '<' would pass mangled args
+        call = calls[0]["function"]
+        args = json.loads(call["arguments"]) if calls else {}
+        if (call["name"] == "write_file"
+                and args.get("path") == "/tmp/cmp.c"
+                and SNIPPET in args.get("content", "")):
             ok += 1
     except (json.JSONDecodeError, KeyError, IndexError):
         pass
-print(f"code-args: {ok}/5 calls carried <, > and && intact")
-assert ok >= 4, "angle-bracket/ampersand args are being mangled by the parser"
+print(f"code-args: {ok}/5 calls carried the exact snippet to the right path")
+assert ok >= 4, "code-heavy args are being mangled by the parser"
 PY
 
 if [ "$FAIL" -ne 0 ]; then

@@ -364,6 +364,14 @@ class OffloadingConnectorScheduler:
                 max_hit_size_tokens = min(
                     max_hit_size_tokens, len(offload_keys) * offloaded_block_size
                 )
+                if self._mamba_align_size is not None:
+                    # Re-align after the per-group constraint: a group whose
+                    # offloaded_block_size is not a multiple of the Mamba
+                    # alignment would otherwise undo the initial round_down and
+                    # let the hit include a Mamba state beyond the boundary.
+                    max_hit_size_tokens = round_down(
+                        max_hit_size_tokens, self._mamba_align_size
+                    )
                 if max_hit_size_tokens - num_computed_tokens < offloaded_block_size:
                     # we can only load less than a block, better skip
                     return 0
@@ -400,6 +408,12 @@ class OffloadingConnectorScheduler:
                         max_hit_size_tokens,
                         offloaded_block_size * (start_block_idx + num_hit_blocks),
                     )
+                    if self._mamba_align_size is not None:
+                        # same re-alignment as above for the backend-confirmed
+                        # hit boundary
+                        max_hit_size_tokens = round_down(
+                            max_hit_size_tokens, self._mamba_align_size
+                        )
 
                 new_num_hit_tokens = max_hit_size_tokens - num_computed_tokens
                 if new_num_hit_tokens < offloaded_block_size:

@@ -189,7 +189,7 @@ Profile 只声明兼容模式，不再提供推荐启动模式。需要指定模
 `MODE=safe`、`MODE=normal`、`MODE=fast` 或 `MODE=aggressive`；launcher
 会根据 profile 做二次校验。
 
-3. 更新已有 checkout：
+更新已有 checkout：
 
 ```bash
 ./update.sh

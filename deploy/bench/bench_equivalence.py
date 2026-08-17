@@ -15,8 +15,9 @@ recall (the old garble band), and a tool-flavored prompt. Greedy (temperature
 0) is deliberate: Qwen discourages it for QUALITY, but for equivalence it is
 the correct instrument — sampling would mask real divergence. Tiny numeric
 drift can legitimately flip a late token (fp nondeterminism, cudagraph vs
-eager kernels), so the bar is a >=PREFIX_MIN-token identical prefix, not
-byte equality to the end.
+eager kernels), so the bar is a >=PREFIX_MIN-character identical prefix
+(whitespace-normalized; see the constant's comment), not byte equality to
+the end.
 """
 import argparse
 import json
@@ -24,7 +25,10 @@ import sys
 
 from bench_lib import DEFAULT_BASE, DEFAULT_MODEL, build_context_prompt, chat
 
-PREFIX_MIN = 200  # identical leading tokens required (whitespace-normalized chars used as proxy)
+# Identity bar measured in whitespace-normalized CHARACTERS (not tokens):
+# 800 chars ≈ 200 tokens at ~4 chars/token, i.e. half of each 400-token probe
+# must match before fp-drift divergence is tolerated.
+PREFIX_MIN = 800
 
 PROBES = [
     ("prose", "Explain in one paragraph why a watchdog must clear a systemd "

@@ -70,7 +70,7 @@ blocks.
 
 ## Validated Profiles
 
-### Qwen3.x 27B
+### Qwen3.x 27B FP8
 
 Tested checkpoints: official [Qwen/Qwen3.8-27B-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8),
 [Qwen/Qwen3.6-27B-FP8](https://huggingface.co/Qwen/Qwen3.6-27B-FP8), and
@@ -96,7 +96,7 @@ Tested checkpoint target: Qwen/Qwen3.6-35B-A3B-FP8, about 36G.
 | `qwen35b/aggressive/fp8/fp16kv-136K-nomtp-text-image.env` | aggressive | 136K | FP16 | 0 | text+image | 1 | 5422.83 / 124.11 |
 | `qwen35b/fast/fp8/fp16kv-178K-mtp3-text-only.env` | fast | 178K | FP16 | 3 | text-only | 1 | 5889.20 / 195.95 |
 
-### Qwen3.x 27B
+### Qwen3.x 27B AWQ/GPTQ-INT4
 
 Tested checkpoints: QuantTrio/Qwen3.6-27B-AWQ, mconcat/Qwopus3.6-27B-v2-AWQ-4bit,
 and llmfan46/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-GPTQ-Int4,

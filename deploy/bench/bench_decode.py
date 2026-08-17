@@ -27,9 +27,12 @@ MATRIX = [  # (label, ctx_tokens, concurrency, max_tokens)
 ]
 
 
-def one(base, model, ctx, max_tokens, timeout):
+def one(base, model, ctx, max_tokens, timeout, salt):
+    # unique salt FIRST so concurrent requests share no prefix — otherwise
+    # prefix caching turns "2x30K" into one prefill + one cache hit and the
+    # row stops matching the documented reference workload
     msgs = [{"role": "user", "content":
-             build_context_prompt(ctx, f"DM-{ctx}") +
+             f"[run {salt}] " + build_context_prompt(ctx, f"DM-{ctx}-{salt}") +
              "\n\nSummarize the operational policy in detail."}]
     return chat(base, model, msgs, max_tokens=max_tokens, temperature=0.7,
                 timeout=timeout,
@@ -41,9 +44,19 @@ def main() -> int:
     ap.add_argument("--base-url", default=DEFAULT_BASE)
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--only", help="comma list of labels to run (default all)")
+    ap.add_argument("--min-single-tps", type=float, default=None,
+                    help="fail if the 1x7.5K per-stream decode rate is below "
+                    "this (G4 ship bar: 70 for the MTP-on run; leave unset "
+                    "for the intentionally slower MTP-off baseline)")
     args = ap.parse_args()
 
     labels = set(args.only.split(",")) if args.only else None
+    if labels is not None:
+        known = {m[0] for m in MATRIX}
+        unknown = labels - known
+        if unknown or not labels:
+            ap.error(f"unknown --only label(s): {sorted(unknown)}; "
+                     f"choose from {sorted(known)}")
     print(f"| point | TTFT s | decode tok/s (per stream) | aggregate tok/s | "
           f"acceptance | garble | NRestarts Δ |")
     print("|---|---|---|---|---|---|---|")
@@ -56,7 +69,8 @@ def main() -> int:
         try:
             with cf.ThreadPoolExecutor(max_workers=conc) as ex:
                 futs = [ex.submit(one, args.base_url, args.model, ctx, mt,
-                                  timeout) for _ in range(conc)]
+                                  timeout, f"{label}-{i}")
+                        for i in range(conc)]
                 results = [f.result() for f in futs]
         except Exception as exc:
             print(f"| {label} | — | — | — | — | ERROR {type(exc).__name__} | "
@@ -76,7 +90,14 @@ def main() -> int:
               f"{agg_tokens / wall:.1f} | "
               f"{'—' if acc is None else f'{acc:.2f}'} | "
               f"{'YES' if garbled else 'no'} | {delta} |", flush=True)
-        if garbled or (delta not in (0, None)):
+        # fail closed: an unavailable NRestarts delta cannot prove the engine
+        # stayed up, so it fails the row just like a real restart would
+        if garbled or delta != 0:
+            rc = 1
+        if (args.min_single_tps is not None and label == "1x7.5K"
+                and max(per) < args.min_single_tps):
+            print(f"SHIP BAR MISSED: 1x7.5K {max(per):.1f} tok/s "
+                  f"< {args.min_single_tps}", flush=True)
             rc = 1
     return rc
 
