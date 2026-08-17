@@ -113,17 +113,29 @@ def run_stage(base: str, model: str, ctx_tokens: int, *, temperature: float,
     soft_fail = acc is not None and acc < ACCEPTANCE_FLOOR
     stage["verdict"] = ("FAIL" if hard_fail else
                        "SOFT-FAIL(acceptance)" if soft_fail else "PASS")
-    if hard_fail and stage["nrestarts_delta"] is None:
-        stage["fail_reason"] = "NRestarts unavailable (fail-closed)"
-    elif hard_fail and acc is None:
-        stage["fail_reason"] = "no acceptance telemetry (fail-closed)"
-    elif hard_fail and contaminated:
-        stage["fail_reason"] = (
-            "spec counters contaminated by concurrent traffic "
-            f"(drafts_delta={drafts_delta} exceeds completion_tokens="
-            f"{result['completion_tokens']} by {excess} > margin "
-            f"{CONTAMINATION_MARGIN}) — isolate the engine and re-run"
-        )
+    if hard_fail:
+        # every FAIL row records why — the results JSON is the incident record
+        reasons = []
+        if not stage["needle_recalled"]:
+            reasons.append("needle not recalled")
+        if g["garbled"]:
+            flags = [k for k, v in g["flags"].items() if v]
+            reasons.append(f"garble signature ({', '.join(flags)})")
+        if result["finish_reason"] not in ("stop", "length"):
+            reasons.append(f"unexpected finish_reason {result['finish_reason']!r}")
+        if stage["nrestarts_delta"] is None:
+            reasons.append("NRestarts unavailable (fail-closed)")
+        elif stage["nrestarts_delta"] != 0:
+            reasons.append(f"engine restarted (NRestarts +{stage['nrestarts_delta']})")
+        if acc is None:
+            reasons.append("no acceptance telemetry (fail-closed)")
+        if contaminated:
+            reasons.append(
+                "spec counters contaminated by concurrent traffic "
+                f"(drafts_delta={drafts_delta} exceeds completion_tokens="
+                f"{result['completion_tokens']} by {excess} > margin "
+                f"{CONTAMINATION_MARGIN}) — isolate the engine and re-run")
+        stage["fail_reason"] = "; ".join(reasons)
     return stage
 
 
@@ -142,12 +154,22 @@ def main() -> int:
     ap.add_argument("--out", default="mtp-requal-results.json")
     args = ap.parse_args()
 
-    stages = [int(s) for s in args.stages.split(",") if s.strip()]
+    try:
+        stages = [int(s) for s in args.stages.split(",") if s.strip()]
+    except ValueError as exc:
+        ap.error(f"--stages must be comma-separated integers: {exc}")
     if not stages:
         ap.error("--stages must name at least one context size")
     if args.repeat < 2:
         ap.error("--repeat must be >= 2 (garble is intermittent; "
                  "a single probe per stage proves nothing)")
+    # The NRestarts gate reads LOCAL systemd; against a remote engine it would
+    # score the wrong machine's state. This ladder must run on the engine host.
+    from urllib.parse import urlparse
+    host = urlparse(args.base_url).hostname or ""
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        ap.error(f"--base-url host {host!r} is not local — run this ladder on "
+                 "the engine host (the NRestarts gate reads local systemd)")
     results, failed = [], False
     for ctx in stages:
         # generous ceiling: prefill at worst ~850 tok/s + decode + slack

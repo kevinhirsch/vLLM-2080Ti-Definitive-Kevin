@@ -51,11 +51,13 @@ def main() -> int:
     args = ap.parse_args()
 
     labels = ({t.strip() for t in args.only.split(",") if t.strip()}
-              if args.only else None)
+              if args.only is not None else None)
     if labels is not None:
         known = {m[0] for m in MATRIX}
+        if not labels:
+            ap.error(f"--only selected nothing; choose from {sorted(known)}")
         unknown = labels - known
-        if unknown or not labels:
+        if unknown:
             ap.error(f"unknown --only label(s): {sorted(unknown)}; "
                      f"choose from {sorted(known)}")
     print(f"| point | TTFT s | decode tok/s (per stream) | aggregate tok/s | "
@@ -94,8 +96,10 @@ def main() -> int:
               f"{'—' if acc is None else f'{acc:.2f}'} | "
               f"{'YES' if garbled else 'no'} | {delta} |", flush=True)
         # fail closed: an unavailable NRestarts delta cannot prove the engine
-        # stayed up, so it fails the row just like a real restart would
-        if garbled or delta != 0:
+        # stayed up, and on a ship-bar (MTP-on) run missing acceptance
+        # telemetry cannot prove MTP is actually drafting
+        if garbled or delta != 0 or (args.min_single_tps is not None
+                                     and acc is None):
             rc = 1
         if (args.min_single_tps is not None and label == "1x7.5K"
                 and max(per) < args.min_single_tps):

@@ -77,15 +77,21 @@ def main() -> int:
     ap.add_argument("--ref", default="ref-mtp-off.json")
     args = ap.parse_args()
 
+    ref = None
+    if args.mode == "check":
+        # validate the reference BEFORE burning GPU time on the probe suite
+        try:
+            with open(args.ref) as f:
+                ref = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            ap.error(f"cannot load --ref {args.ref!r}: {exc}")
+
     outputs = run_probes(args.base_url, args.model)
     if args.mode == "record":
         with open(args.out, "w") as f:
             json.dump(outputs, f, indent=2)
         print(f"reference recorded -> {args.out}")
         return 0
-
-    with open(args.ref) as f:
-        ref = json.load(f)
     failures = []
     for name, text in outputs.items():
         a, b = norm(ref.get(name, "")), norm(text)
