@@ -93,6 +93,14 @@ class KVCacheSpec:
     block_size: int
 
     @property
+    def supports_eagle_cache_peek(self) -> bool:
+        """Whether EAGLE/MTP may peek one extra block and then drop it.
+
+        Recurrent state caches cannot be rewound like token KV caches.
+        """
+        return False
+
+    @property
     def page_size_bytes(self) -> int:
         """
         The size of a page with `block_size` tokens in bytes.
@@ -215,6 +223,10 @@ class FullAttentionSpec(AttentionSpec):
     def __post_init__(self):
         if self.head_size_v is None:
             object.__setattr__(self, "head_size_v", self.head_size)
+
+    @property
+    def supports_eagle_cache_peek(self) -> bool:
+        return True
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_model_len = vllm_config.model_config.max_model_len
@@ -360,6 +372,10 @@ class MLAAttentionSpec(FullAttentionSpec):
         return self.block_size // self.compress_ratio
 
     @property
+    def supports_eagle_cache_peek(self) -> bool:
+        return False
+
+    @property
     def real_page_size_bytes(self) -> int:
         if self.cache_dtype_str == "fp8_ds_mla":
             if self.model_version == "deepseek_v4":
@@ -443,6 +459,10 @@ class SlidingWindowSpec(AttentionSpec):
             object.__setattr__(self, "head_size_v", self.head_size)
 
     @property
+    def supports_eagle_cache_peek(self) -> bool:
+        return True
+
+    @property
     def real_page_size_bytes(self) -> int:
         # Mirror ``FullAttentionSpec.real_page_size_bytes`` for NVFP4 KV cache.
         if self.kv_quant_mode.is_nvfp4:
@@ -512,6 +532,10 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     @property
     def storage_block_size(self) -> int:
         return self.block_size // self.compress_ratio
+    @property
+    def supports_eagle_cache_peek(self) -> bool:
+        return False
+
 
     @property
     def real_page_size_bytes(self) -> int:

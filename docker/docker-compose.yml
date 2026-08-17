@@ -40,7 +40,7 @@ services:
         CUTLASS_REVISION: ${CUTLASS_REVISION:-da5e086dab31d63815acafdac9a9c5893b1c69e2}
         TRITON_REPO: ${TRITON_REPO:-https://github.com/triton-lang/triton.git}
         TRITON_TAG: ${TRITON_TAG:-7c56a5e40f7fd928dfd5c72902d5def0097db73a}
-    image: ${VLLM_IMAGE:-local/vllm-2080ti-definitive:v0.1.14}
+    image: ${VLLM_IMAGE:-local/vllm-2080ti-definitive:v0.1.15}
     container_name: ${VLLM_CONTAINER_NAME:-vllm-2080ti}
     restart: unless-stopped
     ipc: host

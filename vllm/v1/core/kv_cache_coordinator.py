@@ -543,12 +543,13 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     )
                     continue
 
-                use_eagle = (
+                drop_eagle_block = (
                     idx in self.eagle_attn_group_indices and idx not in eagle_verified
+                    and spec.supports_eagle_cache_peek
                 )
 
                 _max_length = curr_hit_length
-                if use_eagle:
+                if drop_eagle_block:
                     # Eagle needs to match one more block and then pop the last.
                     _max_length = min(
                         curr_hit_length + spec.block_size, max_cache_hit_length
@@ -559,16 +560,16 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     kv_cache_group_ids=group_ids,
                     block_pool=self.block_pool,
                     kv_cache_spec=spec,
-                    use_eagle=use_eagle,
+                    use_eagle=drop_eagle_block,
                     alignment_tokens=self.lcm_block_size,
                 )
                 _new_hit_length = len(hit_blocks[0]) * spec.block_size
-                if use_eagle:
+                if drop_eagle_block:
                     eagle_verified.add(idx)
                 elif _new_hit_length < curr_hit_length:
                     # length shrunk; invalidate previous eagle verifications
                     eagle_verified.clear()
-                curr_hit_length = _new_hit_length
+                curr_hit_length = min(curr_hit_length, _new_hit_length)
                 for group_id, blocks in zip(group_ids, hit_blocks):
                     hit_blocks_by_group[group_id] = blocks
 

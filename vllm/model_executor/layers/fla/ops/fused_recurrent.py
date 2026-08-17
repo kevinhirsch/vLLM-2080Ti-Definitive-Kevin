@@ -11,6 +11,7 @@
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from .op import exp
 
@@ -270,6 +271,7 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     stride_init_state_token: tl.constexpr,
     stride_final_state_token: tl.constexpr,
     stride_indices_seq: tl.constexpr,
+    null_block_id: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -292,8 +294,7 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq).to(tl.int64)
     p_o = o + (i_n * HV + i_hv) * V + o_v
 
-    # Skip if state index is invalid (NULL_BLOCK_ID=0)
-    if state_idx <= 0:
+    if state_idx < 0 or state_idx == null_block_id:
         zero = tl.zeros([BV], dtype=tl.float32).to(p_o.dtype.element_ty)
         tl.store(p_o, zero, mask=mask_v)
         return
@@ -347,6 +348,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     out: torch.Tensor,
     ssm_state_indices: torch.Tensor,
     use_qk_l2norm_in_kernel: bool = False,
+    null_block_id: int = NULL_BLOCK_ID,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if mixed_qkv.ndim != 2:
         raise ValueError(
@@ -464,6 +466,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         stride_init_state_token=stride_init_state_token,
         stride_final_state_token=stride_final_state_token,
         stride_indices_seq=stride_indices_seq,
+        null_block_id=null_block_id,
         H=H,
         HV=HV,
         K=K,
