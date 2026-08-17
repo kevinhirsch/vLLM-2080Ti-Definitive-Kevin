@@ -871,7 +871,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # EXP-045b: arm Xid31 instrumentation (buffer registry + int32/2GiB offset
     # projection + CUDA memory-history snapshot on fault). Default OFF; negligible
     # overhead in the hot path when unset. See vllm/v1/worker/xid31_trace.py.
-    "VLLM_TQ_XID31_TRACE": lambda: bool(int(os.getenv("VLLM_TQ_XID31_TRACE", "0"))),
+    "VLLM_TQ_XID31_TRACE": lambda: os.getenv("VLLM_TQ_XID31_TRACE", "0")
+    .strip()
+    .lower()
+    in ("1", "true", "yes", "on"),
     "VLLM_TQ_XID31_TRACE_MIN_MB": lambda: int(
         os.getenv("VLLM_TQ_XID31_TRACE_MIN_MB", "64")
     ),
@@ -2145,6 +2148,13 @@ def compile_factors() -> dict[str, object]:
         "VLLM_ENABLE_CUDA_COMPATIBILITY",
         "VLLM_CUDA_COMPATIBILITY_PATH",
         "VLLM_SKIP_MODEL_NAME_VALIDATION",
+        # EXP-045b: Xid31 diagnostics — pure instrumentation (trace on/off,
+        # cadence, size threshold, snapshot path). None affect the compiled
+        # graph, so keep them out of the compile-cache key.
+        "VLLM_TQ_XID31_TRACE",
+        "VLLM_TQ_XID31_TRACE_MIN_MB",
+        "VLLM_TQ_XID31_TRACE_EVERY_N",
+        "VLLM_TQ_XID31_TRACE_SNAPSHOT",
         "LOCAL_RANK",
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",

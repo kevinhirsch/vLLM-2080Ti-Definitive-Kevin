@@ -4202,14 +4202,16 @@ class GPUModelRunner(
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        # EXP-045b: cheap periodic Xid31 suspect projection (no-op unless armed).
-        xid31_trace.periodic(self, num_scheduled_tokens)
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
             # Update persistent batch states.
             deferred_state_corrections_fn = self._update_states(scheduler_output)
+            # EXP-045b: cheap periodic Xid31 suspect projection (no-op unless
+            # armed). Runs after _update_states so the high-water projection
+            # reflects the batch about to execute, not the previous step.
+            xid31_trace.periodic(self)
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
