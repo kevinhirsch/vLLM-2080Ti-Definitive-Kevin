@@ -205,6 +205,7 @@ from vllm.v1.worker.ubatch_utils import (
     maybe_create_ubatch_slices,
     split_attn_metadata,
 )
+from vllm.v1.worker import xid31_trace
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.workspace import lock_workspace
 
@@ -4201,6 +4202,8 @@ class GPUModelRunner(
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        # EXP-045b: cheap periodic Xid31 suspect projection (no-op unless armed).
+        xid31_trace.periodic(self, num_scheduled_tokens)
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
@@ -6700,6 +6703,12 @@ class GPUModelRunner(
         # Lock workspace to prevent resizing during execution.
         # Max workspace sizes should have been captured during warmup/profiling.
         lock_workspace()
+
+        # EXP-045b: arm Xid31 (max_model_len-gated MMU FAULT_PDE) instrumentation
+        # and register the now-allocated persistent buffers. No-op unless
+        # VLLM_TQ_XID31_TRACE is set; see vllm/v1/worker/xid31_trace.py.
+        xid31_trace.install()
+        xid31_trace.scan_runner(self)
 
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time
