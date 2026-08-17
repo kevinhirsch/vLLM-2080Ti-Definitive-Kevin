@@ -888,6 +888,17 @@ class VllmConfig:
                 self.scheduler_config.async_scheduling = False
             elif (
                 self.speculative_config is not None
+                and os.environ.get("VLLM_S4_SCOPED_DRAFTER", "0") == "1"
+            ):
+                # EXP-039 (S4): the scoped drafter emits CPU-list drafts (variable
+                # length per request), same async incompatibility as the overlay.
+                # See docs/exp039-scoped-drafter-design.md S7 (known headwind).
+                logger.warning_once(
+                    "Async scheduling disabled: S4 scoped drafter produces CPU drafts."
+                )
+                self.scheduler_config.async_scheduling = False
+            elif (
+                self.speculative_config is not None
                 and self.speculative_config.disable_padded_drafter_batch
             ):
                 logger.warning_once(
