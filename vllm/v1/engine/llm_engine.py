@@ -350,9 +350,9 @@ class LLMEngine:
         return self.engine_core.verify_pinned_blocks(handle_id)
 
     def get_request_kv_block_ids(
-        self, req_id: str | None = None
+        self, req_id: str | None = None, all_running: bool = False
     ) -> dict[str, Any]:
-        return self.engine_core.get_request_kv_block_ids(req_id)
+        return self.engine_core.get_request_kv_block_ids(req_id, all_running)
 
     def unpin_kv_blocks(self, handle_id: str) -> dict[str, Any]:
         return self.engine_core.unpin_kv_blocks(handle_id)

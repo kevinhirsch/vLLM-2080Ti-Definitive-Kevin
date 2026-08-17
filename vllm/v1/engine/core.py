@@ -777,25 +777,52 @@ class EngineCore:
             "groups": per_group,
         }
 
-    def get_request_kv_block_ids(self, req_id: str | None = None) -> dict[str, Any]:
+    def get_request_kv_block_ids(
+        self, req_id: str | None = None, all_running: bool = False
+    ) -> dict[str, Any]:
         """Read-only snapshot of a live request's per-group KV block ids.
 
         Used by the Stage-2 restore proof to assert that a resubmitted
         request's prefix block ids equal the pinned handle's block ids -- i.e.
         the restore provably reused the same physical (pinned) blocks rather
         than re-allocating fresh ones.
+
+        ``all_running=True`` (EXP-038 Stage-3 fork corroboration) returns EVERY
+        in-flight request's block table keyed by req_id in one read, because
+        ``req_id=None`` resolves only the FIRST running request
+        (``_tq_resolve_req_id``) and so cannot observe two co-scheduled fork
+        children at once. The per-request payload shape is identical to the
+        single-request case (``{"spec", "block_ids"}`` per group); the multi
+        shape is ``{"req_ids": [...], "requests": {req_id: {"groups": {...}}}}``.
+        Read-only: no touch/free/alloc, so it never perturbs the very sharing
+        it is meant to witness.
         """
         self._tq_snapshot_require_enabled()
-        req_id = self._tq_resolve_req_id(req_id)
         coordinator = self._tq_kv_cache_manager().coordinator
-        blocks_per_group = coordinator.get_blocks(req_id)
-        out: dict[str, Any] = {}
-        for group_id, blocks in enumerate(blocks_per_group):
-            out[str(group_id)] = {
-                "spec": self._tq_group_label(group_id),
-                "block_ids": [b.block_id for b in blocks if not b.is_null],
+
+        def _blocks_for(rid: str) -> dict[str, Any]:
+            blocks_per_group = coordinator.get_blocks(rid)
+            out: dict[str, Any] = {}
+            for group_id, blocks in enumerate(blocks_per_group):
+                out[str(group_id)] = {
+                    "spec": self._tq_group_label(group_id),
+                    "block_ids": [b.block_id for b in blocks if not b.is_null],
+                }
+            return out
+
+        if all_running:
+            running = list(getattr(self.scheduler, "running", []) or [])
+            requests_out = {
+                r.request_id: {"groups": _blocks_for(r.request_id)}
+                for r in running
             }
-        return {"req_id": req_id, "groups": out}
+            return {
+                "req_ids": [r.request_id for r in running],
+                "requests": requests_out,
+            }
+
+        req_id = self._tq_resolve_req_id(req_id)
+        return {"req_id": req_id, "groups": _blocks_for(req_id)}
 
     def unpin_kv_blocks(self, handle_id: str) -> dict[str, Any]:
         """Release a pin handle: ``free_blocks`` its blocks, drop the registry
