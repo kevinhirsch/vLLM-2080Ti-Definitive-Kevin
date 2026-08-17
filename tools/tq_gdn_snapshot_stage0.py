@@ -17,6 +17,7 @@ verifies its own shard.
 Example (throwaway engine, same flags as the deploy):
 
     VLLM_TQ_GDN_SNAPSHOT=1 \
+    VLLM_TQ_GDN_SNAPSHOT_CONFIRM_THROWAWAY=1 \
     python tools/tq_gdn_snapshot_stage0.py \
         --model /path/to/Qwen3.8-27B-hybrid \
         --tensor-parallel-size 2 \
@@ -76,6 +77,17 @@ def main() -> int:
         print(
             "REFUSING TO RUN: set VLLM_TQ_GDN_SNAPSHOT_CONFIRM_THROWAWAY=1 to "
             "confirm this is a THROWAWAY engine, not the :8001 serve.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # A non-positive prompt length yields an empty prompt and never exercises the
+    # snapshot path; reject it up front.
+    if args.block_aligned_tokens <= 0:
+        print(
+            "REFUSING TO RUN: --block-aligned-tokens must be > 0 (got "
+            f"{args.block_aligned_tokens}); a non-positive value yields an "
+            "empty prompt.",
             file=sys.stderr,
         )
         return 2

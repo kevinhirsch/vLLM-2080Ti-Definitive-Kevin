@@ -895,6 +895,7 @@ class GPUModelRunner(
         # first dim uniformly across every GDN layer (like a shared block id).
         self._mamba_park_pool: dict[str, list[torch.Tensor]] | None = None
         self._mamba_park_free: list[int] = []
+        self._mamba_park_num_slots: int = 0
         self.layerwise_nvtx_hooks_registered = False
 
     def update_max_model_len(self, max_model_len: int) -> None:
@@ -1043,6 +1044,7 @@ class GPUModelRunner(
                 ]
         self._mamba_park_pool = pool
         self._mamba_park_free = list(range(num_park))
+        self._mamba_park_num_slots = num_park
 
     @torch.inference_mode()
     def snapshot_mamba_state(self, req_id: str) -> dict[str, Any]:
@@ -1099,16 +1101,10 @@ class GPUModelRunner(
         # Park must be complete before the handle is usable across steps.
         torch.cuda.current_stream().synchronize()
 
-        token_ids = list(req_state.prompt_token_ids or []) + list(
-            req_state.output_token_ids
-        )
         return {
             "park_slot": park_slot,
             "mamba_group_ids": list(mamba_group_ids),
             "num_computed_tokens": int(req_state.num_computed_tokens),
-            "token_ids": token_ids,
-            "src_req_id": req_id,
-            "num_state_tensors": len(src_slots),
         }
 
     @torch.inference_mode()
@@ -1156,11 +1152,16 @@ class GPUModelRunner(
     def release_mamba_snapshot(self, handle: dict[str, Any]) -> None:
         """Return a snapshot handle's park slot to the free list."""
         park_slot = handle.get("park_slot")
-        if (
-            park_slot is not None
-            and self._mamba_park_pool is not None
-            and park_slot not in self._mamba_park_free
+        if park_slot is None or self._mamba_park_pool is None:
+            return
+        # Validate before appending: a malformed handle crossing the RPC
+        # boundary must not poison _mamba_park_free (a bad index would later
+        # corrupt snapshot/restore copies into the wrong pool row).
+        if not isinstance(park_slot, int) or not (
+            0 <= park_slot < self._mamba_park_num_slots
         ):
+            raise ValueError(f"invalid park_slot {park_slot!r}")
+        if park_slot not in self._mamba_park_free:
             self._mamba_park_free.append(park_slot)
 
     @torch.inference_mode()
@@ -1189,6 +1190,7 @@ class GPUModelRunner(
             "num_state_tensors_checked": 0,
             "detail": "",
         }
+        handle: dict[str, Any] | None = None
         try:
             if not envs.VLLM_TQ_GDN_SNAPSHOT:
                 raise RuntimeError("set VLLM_TQ_GDN_SNAPSHOT=1")
@@ -1222,7 +1224,6 @@ class GPUModelRunner(
                     )
                 checked += 1
 
-            self.release_mamba_snapshot(handle)
             result["ok"] = True
             result["num_state_tensors_checked"] = checked
             result["detail"] = (
@@ -1231,6 +1232,12 @@ class GPUModelRunner(
             )
         except Exception as e:  # noqa: BLE001 - report failure to the driver
             result["detail"] = f"{type(e).__name__}: {e}"
+        finally:
+            # Always return the reserved park slot to the free list, even when
+            # the byte-equal assertion (or anything after the snapshot) raised —
+            # otherwise a failed self-test leaks the slot.
+            if handle is not None:
+                self.release_mamba_snapshot(handle)
         return result
 
     def _init_model_kwargs(self):

@@ -324,7 +324,13 @@ def main() -> int:
     # prefix; a recompute has ~0.
     cached_tokens = int(getattr(res_out, "num_cached_tokens", 0) or 0)
     cached_frac = cached_tokens / max(1, len(prompt))
-    pin_load_bearing = cached_frac > 0.5 and attn_reused > 0
+    # num_cached_tokens is the decisive load-bearing observable; attn_reused>0 is
+    # secondary corroboration and only meaningful when we actually caught the
+    # restore block table (reuse_checked). When the poll MISSED it, attn_reused
+    # is 0 for lack of a sample, NOT because the pin was bypassed — so don't let
+    # a missed catch flip a genuine cache-hit into a false NEGATIVE (that case is
+    # the INCONCLUSIVE note below).
+    pin_load_bearing = cached_frac > 0.5 and (attn_reused > 0 or not reuse_checked)
 
     llm.unpin_kv_blocks(handle_id)
 

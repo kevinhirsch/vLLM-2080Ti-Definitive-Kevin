@@ -145,8 +145,10 @@ is the wrong risk trade. We take the achievable increment (b) and document the r
    (all children running). This runs on the busy-loop thread inside the utility handler;
    it is **not** re-entrant with `_process_engine_step` (single-threaded busy loop:
    `_process_input_queue` -> utility -> return, *then* `_process_engine_step`). By the
-   time the utility returns, the children are finished and freed, so the outer step is a
-   no-op and no stray outputs reach the client output socket.
+   time the utility returns, every child is terminal: children that ran to completion are
+   finished and freed, and any still pending at the `max_steps` bound are **aborted (and
+   freed)** before return (`abort_requests`). So no child is left in `scheduler.running`,
+   the outer step is a no-op, and no stray outputs reach the client output socket.
 4. Return plain dicts (children outputs + mid-gen block tables + free-block accounting).
 
 On the first schedule step of each child, `get_computed_blocks` cache-hits the pinned
@@ -236,7 +238,7 @@ auditable pin/unpin).
 | no prefix caching | `request_block_hasher is None` | explicit `RuntimeError` (fork needs the prefix cache to adopt donor blocks). |
 | child never cache-hits | pin evicted / hash mismatch | `num_cached_tokens ~ 0`; driver flags per-child (byte-exactness may still hold via recompute -> FAIL-inconclusive, not a NEGATIVE). |
 | shared mamba running slot | align-mode slot aliasing bug | driver hard-NEGATIVE (Stage-3 rule). |
-| decode loop runs away | stop never reached | `max_steps` bound -> `finish_reason="length_or_bound"`; reported. |
+| decode loop runs away | stop never reached | `max_steps` bound -> `finish_reason="length_or_bound"`; the still-pending children are `abort_requests`-ed (freed) before return so they neither keep running on the outer step nor break the leak invariant; reported. |
 | block leak | children left residue | `post_free_blocks != pre_free_blocks` -> driver FAIL. |
 
 ## 7. Residual gap vs the ideal (precise, for re-adjudication)

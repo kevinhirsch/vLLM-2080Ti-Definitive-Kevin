@@ -297,9 +297,13 @@ def main() -> int:
                 catch["verify"] = None
         return catch
 
-    child_outs, probe = _run_children_and_probe(
-        llm, [prompt, prompt], greedy, _probe
-    )
+    try:
+        child_outs, probe = _run_children_and_probe(
+            llm, [prompt, prompt], greedy, _probe
+        )
+    except BaseException:  # noqa: BLE001 - child gen raised/timed out; never leak the pin
+        llm.unpin_kv_blocks(handle_id)
+        raise
     if not child_outs or len(child_outs) != 2:
         print(
             f"fork run did not return 2 child outputs (got "
@@ -346,9 +350,16 @@ def main() -> int:
     def _logprob_max_delta(ref: list[float], got: list[float]) -> float:
         if not ref or not got or len(ref) != len(got):
             return float("inf")
-        deltas = [abs(x - y) for x, y in zip(ref, got)
-                  if x == x and y == y]  # skip NaN pairs
-        return max(deltas) if deltas else 0.0
+        worst = 0.0
+        for x, y in zip(ref, got):
+            x_nan = x != x
+            y_nan = y != y
+            if x_nan and y_nan:
+                continue  # both missing -> treat as equal
+            if x_nan or y_nan:
+                return float("inf")  # one-sided NaN -> real mismatch, never 0
+            worst = max(worst, abs(x - y))
+        return worst
 
     def _logprobs_equal(ref: list[float], got: list[float]) -> bool:
         return _logprob_max_delta(ref, got) <= LOGPROB_TOL
@@ -457,7 +468,10 @@ def main() -> int:
         print(f"    c0 [:16]={c0_tokens[:16]}")
         print(f"    c1 [:16]={c1_tokens[:16]}")
 
-    passed = cond_a and cond_b and cond_c
+    # Cleanup must succeed too: a post-children pin-integrity failure or a failed
+    # unpin means the run cannot be trusted as a PASS.
+    cleanup_ok = bool(post.get("ok")) and bool(released.get("ok"))
+    passed = cond_a and cond_b and cond_c and cleanup_ok
 
     # Real NEGATIVE (the ONE hard corroboration signal): we caught both children
     # AND they share a mamba running block -> two sequences writing one recurrent

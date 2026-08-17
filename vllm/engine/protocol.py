@@ -255,3 +255,39 @@ class EngineClient(ABC):
     async def finish_weight_update(self) -> None:
         """Finish the current weight update."""
         raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # EXP-038 (VLLM_TQ_GDN_SNAPSHOT) pin / fork / unpin surface. Declared here
+    # so typed call sites (the /tq/* router, which holds an EngineClient) stay
+    # valid; only AsyncLLM implements them and only when the feature is enabled.
+    # Default-raising, like collective_rpc / scale_elastic_ep above — never
+    # forced on other EngineClient subclasses. NEVER use against :8001.
+    # ------------------------------------------------------------------
+    async def pin_request_kv_blocks(
+        self, req_id: str | None = None
+    ) -> dict[str, Any]:
+        """Pin a live request's KV blocks; returns an opaque handle dict."""
+        raise NotImplementedError
+
+    async def verify_pinned_blocks(self, handle_id: str) -> dict[str, Any]:
+        """Read-only residency check (ref_cnt >= 1) for a pin handle."""
+        raise NotImplementedError
+
+    async def get_request_kv_block_ids(
+        self, req_id: str | None = None, all_running: bool = False
+    ) -> dict[str, Any]:
+        """Read-only per-group KV block ids of a live request."""
+        raise NotImplementedError
+
+    async def unpin_kv_blocks(self, handle_id: str) -> dict[str, Any]:
+        """Release a pin handle (frees the pinned blocks)."""
+        raise NotImplementedError
+
+    async def fork_from_handle(
+        self,
+        handle_id: str,
+        child_specs: list[dict[str, Any]],
+        max_steps: int | None = None,
+    ) -> dict[str, Any]:
+        """Fork a pinned handle into ``len(child_specs)`` children (EXP-038)."""
+        raise NotImplementedError
