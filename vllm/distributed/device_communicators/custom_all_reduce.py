@@ -29,6 +29,10 @@ except Exception:
 
 logger = init_logger(__name__)
 
+# [FORK] custom AR disable flag during profiling (128K IPC leak debug).
+# Defined after all imports to satisfy Ruff E402 (review #108 round 7 P3).
+_PROFILING_CAR_DISABLED = False
+
 
 def _can_p2p(rank: int, world_size: int) -> bool:
     for i in range(world_size):
