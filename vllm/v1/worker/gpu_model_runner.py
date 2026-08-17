@@ -183,6 +183,7 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
     update_ngram_gpu_tensors_incremental,
     update_scheduler_for_invalid_drafts,
 )
+from vllm.v1.spec_decode.scoped_reemission import ScopedReemissionDrafter
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
@@ -590,6 +591,19 @@ class GPUModelRunner(
                     except Exception as e:
                         self.suffix_overlay = None
                         logger.warning("Suffix overlay unavailable: %s", e)
+                # EXP-039 (S4): FSM-gated scoped drafter for verbatim re-emission.
+                # Layers on MTP: only overrides a request's draft when the last G
+                # generated tokens uniquely match a prompt span (verbatim copy);
+                # otherwise MTP-K2 is left untouched. Unlike the always-on suffix
+                # overlay above, this is gated -> no drag on generation-shaped work.
+                # Requires VLLM_MTP_DRAFT_CAP to keep MTP's GPU chain short while
+                # the pipeline is sized for K_scoped. See docs/exp039-*.md.
+                if os.environ.get("VLLM_S4_SCOPED_DRAFTER", "0") == "1":
+                    try:
+                        self.scoped_drafter = ScopedReemissionDrafter(self.vllm_config)
+                    except Exception as e:
+                        self.scoped_drafter = None
+                        logger.warning("S4 scoped drafter unavailable: %s", e)
                 if self.speculative_config.method == "eagle3":
                     self.use_aux_hidden_state_outputs = (
                         self.drafter.eagle3_use_aux_hidden_state
@@ -4912,7 +4926,39 @@ class GPUModelRunner(
                     draft_token_ids, _suffix_drafts
                 )
 
+            # EXP-039 (S4): gate MTP against the prompt-scoped drafter. Per
+            # request, override the MTP draft with a verbatim continuation ONLY
+            # when the FSM gate is open; otherwise MTP passes through untouched.
+            if getattr(self, "scoped_drafter", None) is not None:
+                draft_token_ids = self._scoped_gate_merge(
+                    draft_token_ids, sampled_token_ids
+                )
+
         return draft_token_ids
+
+    def _scoped_gate_merge(
+        self,
+        draft_token_ids: list[list[int]] | torch.Tensor,
+        sampled_token_ids: torch.Tensor | list[list[int]],
+    ) -> list[list[int]]:
+        """EXP-039 (S4): merge MTP drafts with the FSM-gated scoped drafter.
+
+        Fail-safe: on any error, return the MTP drafts unchanged (as a list) so
+        the spec pipeline is never broken by the scoped path."""
+        try:
+            return self.scoped_drafter.merge(
+                draft_token_ids, self.input_batch, sampled_token_ids
+            )
+        except Exception as e:
+            if self._suffix_overlay_log_countdown > 0:
+                self._suffix_overlay_log_countdown -= 1
+                logger.warning("S4 scoped drafter skipped: %s", e)
+            base = (
+                draft_token_ids.tolist()
+                if isinstance(draft_token_ids, torch.Tensor)
+                else draft_token_ids
+            )
+            return [[t for t in row if t != -1] for row in base]
 
     def _suffix_early(
         self,
