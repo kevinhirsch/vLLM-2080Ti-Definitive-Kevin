@@ -795,10 +795,17 @@ class OpenAIServingChat(OpenAIServing):
                     # streaming and id generation, and their legitimate content
                     # deltas (leading text, control-token renders) must not be
                     # re-wrapped into a synthesized call.
+                    # named_tool_name_sent[i] marks the wrap itself as active
+                    # (its continuation chunks must keep flowing through the
+                    # helper); tools_streamed[i] without it means the PARSER
+                    # already emitted a real tool call for this choice — a
+                    # later content delta must then not be re-wrapped into a
+                    # duplicate synthesized call.
                     if (
                         tool_choice_function_name
                         and not self.use_harmony
                         and not is_mistral_grammar_path
+                        and (named_tool_name_sent[i] or not tools_streamed[i])
                         and delta_message is not None
                         and not delta_message.tool_calls
                         and delta_message.content

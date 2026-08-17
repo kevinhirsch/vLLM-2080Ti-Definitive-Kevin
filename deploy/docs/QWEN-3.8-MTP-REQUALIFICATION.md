@@ -96,7 +96,7 @@ sudo systemctl daemon-reload && sudo systemctl restart vllm-qwen27b
 | # | Gate | Command | Pass bar |
 |---|---|---|---|
 | G1 | Losslessness | `python3 bench_equivalence.py check --ref ref-mtp-off.json` | all probes ≥800 normalized chars (≈200 tokens) identical prefix |
-| G2 | Failure-band ladder | `python3 bench_mtp_requal.py` | every stage PASS: needle recalled, no garble flags, NRestarts Δ=0 |
+| G2 | Failure-band ladder | `python3 bench_mtp_requal.py` | exit 0 only: every stage PASS (needle recalled, no garble flags, NRestarts Δ=0, acceptance present and ≥0.45, clean counters). Exit 2 (acceptance below floor) or 1 (garble/crash/missing telemetry/contamination) = NOT approved |
 | G3 | Tool calls | `./bench_toolcalls.sh` | ≥19/20 auto; named OK; ≥4/5 code-args intact |
 | G4 | Reference matrix | `python3 bench_decode.py --min-single-tps 70` | 1x7.5K ≥ **70 tok/s** (else MTP isn't paying for its risk); no garble; NRestarts Δ=0 |
 | G5 | Soak | leave running overnight with the watchdog; re-run G2 next morning | NRestarts Δ=0 over the soak; morning ladder still green |
@@ -111,9 +111,9 @@ try the sweep once at T0.4 to see how much headroom sampling costs.
 - **Adopt:** keep the drop-in; record the numbers in `RESULTS-TEMPLATE.md`;
   append the outcome to vLLM-Benchmarks.md; update the Obsidian "Qwen3.8 Live
   Config" note. Clients need no changes (`qwen-local` alias unchanged).
-- **Roll back:** `sudo rm /etc/systemd/system/vllm-qwen27b.service.d/mtp-requal.conf && sudo systemctl daemon-reload
-  && sudo systemctl restart vllm-qwen27b` → MTP-off config J serves again.
-  File the failing stage JSON + engine journal in the incident notes.
+- **Roll back:** `sudo rm /etc/systemd/system/vllm-qwen27b.service.d/mtp-requal.conf && sudo systemctl daemon-reload && sudo systemctl restart vllm-qwen27b`
+  → MTP-off config J serves again. File the failing stage JSON + engine
+  journal in the incident notes.
 
 ## Interactions to keep in mind
 
