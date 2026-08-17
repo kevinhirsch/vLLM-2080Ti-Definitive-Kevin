@@ -93,7 +93,6 @@ class _ReqState:
         "run_len",         # consecutive COPYING steps (accounting only)
         "last_draft",      # draft emitted last step (for acceptance reconcile)
         "last_source",     # "scoped" | "mtp"
-        "last_num_tokens", # seq length when last_draft was emitted
     )
 
     def __init__(self, index: _PromptIndex):
@@ -102,7 +101,6 @@ class _ReqState:
         self.run_len = 0
         self.last_draft: list[int] | None = None
         self.last_source = ""
-        self.last_num_tokens = -1
 
 
 class _SourceStats:
@@ -197,38 +195,64 @@ class ScopedReemissionDrafter:
 
     # -- gate --------------------------------------------------------------
 
-    def _needle_hash(self, seq: np.ndarray, n: int) -> np.uint64:
-        # hash of seq[n-g : n] with the same polynomial as _PromptIndex. uint64
-        # overflow == the intended mod-2**64 wraparound.
+    def _hash_tail(self, tail: np.ndarray) -> np.uint64:
+        # hash of a length-g token window with the same polynomial as
+        # _PromptIndex. uint64 overflow == the intended mod-2**64 wraparound.
         base = _HASH_BASE
-        start = n - self.g
         with np.errstate(over="ignore"):
             h = np.uint64(0)
             for t in range(self.g):
-                h = h * base + np.uint64(int(seq[start + t]))
+                h = h * base + np.uint64(int(tail[t]))
         return h
 
-    def _scoped_draft(self, st: _ReqState, seq: np.ndarray, n: int) -> list[int] | None:
+    def _effective_tail(
+        self, seq: np.ndarray, n: int, sampled_ids: list[int]
+    ) -> np.ndarray:
+        """Last G tokens of the sequence INCLUDING this step's sampled tokens.
+
+        CRITICAL (root cause of EXP-039's acceptance collapse): ``merge`` runs in
+        ``gpu_model_runner.propose_draft_token_ids``, which for the MTP/EAGLE path
+        executes BEFORE ``_bookkeeping_sync`` writes this step's freshly-sampled
+        tokens into ``token_ids_cpu`` and advances ``num_tokens_no_spec``. So the
+        committed tail ``seq[:n]`` lags by ``len(sampled_ids)`` tokens. Splicing
+        the just-sampled tokens on realigns the needle -- and therefore the
+        continuation index -- with what MTP proposes from (it is seeded from these
+        same tokens via ``next_token_ids``). Without this, the drafted position 0
+        is the token JUST sampled (already emitted -> always rejected)."""
+        g = self.g
+        s = len(sampled_ids)
+        if s >= g:
+            return np.asarray(sampled_ids[s - g :], dtype=np.int64)
+        head = np.asarray(seq[n - (g - s) : n], dtype=np.int64)
+        tail = np.asarray(sampled_ids, dtype=np.int64)
+        return np.concatenate([head, tail])
+
+    def _scoped_draft(
+        self, st: _ReqState, seq: np.ndarray, n: int, sampled_ids: list[int]
+    ) -> list[int] | None:
         """Return the scoped continuation if the gate is OPEN, else None.
 
-        Memoryless two-state FSM: COPYING iff the last G tokens uniquely (<=
-        min_uniq) match a prompt G-gram; then draft the next K prompt tokens.
+        Memoryless two-state FSM: COPYING iff the last G tokens (the committed
+        tail spliced with THIS step's sampled tokens -- see ``_effective_tail``)
+        uniquely (<= min_uniq) match a prompt G-gram; then draft the next K prompt
+        tokens, i.e. the continuation that FOLLOWS this step's sampled tokens.
         """
         idx = st.index
-        if idx.n < self.g or n < self.g:
+        n_eff = n + len(sampled_ids)  # true length once this step is committed
+        if idx.n < self.g or n_eff < self.g:
             st.cursor = -1
             return None
-        if n >= self.max_model_len:
+        if n_eff >= self.max_model_len:
             st.cursor = -1
             return None
 
-        needle_hash = self._needle_hash(seq, n)
+        needle = self._effective_tail(seq, n, sampled_ids)
+        needle_hash = self._hash_tail(needle)
         cands = idx.candidates(needle_hash)  # candidate end positions in prompt
         if cands.shape[0] == 0:
             st.cursor = -1
             return None
 
-        needle = seq[n - self.g : n]
         prompt = idx.prompt
         # Verify exact match (guards hash collisions); collect valid end-positions
         # that also have at least one continuation token left.
@@ -278,26 +302,25 @@ class ScopedReemissionDrafter:
 
     # -- accounting --------------------------------------------------------
 
-    def _reconcile(self, st: _ReqState, seq: np.ndarray, num_tokens: int) -> None:
+    def _reconcile(self, st: _ReqState, sampled_ids: list[int]) -> None:
         """Score the draft emitted last step against what was actually accepted.
 
-        Sequence grew by 1 (bonus) + n_accepted_draft; confirm by comparing the
-        draft prefix to the newly-appended real tokens. Tagged by draft source so
+        The draft emitted at step T-1 is verified by the target model at step T;
+        its accepted prefix arrives as THIS step's ``sampled_ids`` (the rejection
+        sampler emits [accepted drafts..., bonus], so accepted == the matching
+        prefix). This runs before the draft is overwritten. Tagged by source so
         scoped and MTP acceptance are measured separately (design doc S6).
+
+        Note: this internal per-source accounting is a diagnostic (surfaced only
+        in the periodic log); the AUTHORITATIVE per-position acceptance is vLLM's
+        own rejection-sampler Prometheus metric, which the A/B bench scrapes.
         """
         draft = st.last_draft
-        if draft is None or st.last_num_tokens < 0:
+        if draft is None:
             return
-        grew = num_tokens - st.last_num_tokens
-        # grew includes the bonus token; accepted drafts = grew - 1, clamped.
-        n_acc = max(0, min(grew - 1, len(draft)))
-        # Confirm against the real appended tokens (defensive; handles any
-        # off-by-one from partial prefills or discards).
-        base = st.last_num_tokens
         confirmed = 0
-        for i in range(n_acc):
-            pos = base + i
-            if pos < num_tokens and int(seq[pos]) == draft[i]:
+        for i in range(min(len(draft), len(sampled_ids))):
+            if int(sampled_ids[i]) == draft[i]:
                 confirmed += 1
             else:
                 break
@@ -342,14 +365,20 @@ class ScopedReemissionDrafter:
         else:
             base = mtp_drafts
 
-        # Normalise sampled_token_ids to a per-row "has a real sampled token"
-        # signal (partial prefills produce empty rows -> no draft).
+        # Normalise sampled_token_ids to per-row lists of the tokens sampled THIS
+        # step (bonus + accepted drafts), padding (-1) stripped. Partial prefills
+        # produce empty rows -> no draft. These rows are (a) the seed the scoped
+        # draft must continue FROM (they are not yet in token_ids_cpu, see
+        # _effective_tail) and (b) the verification result used to reconcile the
+        # previous step's draft.
         if hasattr(sampled_token_ids, "tolist"):
             sampled_rows = [
                 [t for t in row if t != -1] for row in sampled_token_ids.tolist()
             ]
         else:
-            sampled_rows = sampled_token_ids
+            sampled_rows = [
+                [t for t in row if t != -1] for row in sampled_token_ids
+            ]
 
         req_ids = input_batch.req_ids
         num_reqs = len(req_ids)
@@ -360,7 +389,8 @@ class ScopedReemissionDrafter:
             # Filter MTP padding (-1) that the padded tensor path leaves in rows.
             mtp_i = [t for t in mtp_i if t != -1]
 
-            has_sampled = (i < len(sampled_rows)) and bool(sampled_rows[i])
+            sampled_ids = sampled_rows[i] if i < len(sampled_rows) else []
+            has_sampled = bool(sampled_ids)
             req_id = req_ids[i]
             index_row = input_batch.req_id_to_index[req_id]
             num_tokens = int(input_batch.num_tokens_no_spec[i])
@@ -368,13 +398,14 @@ class ScopedReemissionDrafter:
             st = self._get_state(req_id, input_batch, index_row)
             seq = input_batch.token_ids_cpu[index_row]
 
-            # Reconcile the previous step's draft for acceptance accounting.
-            self._reconcile(st, seq, num_tokens)
+            # Reconcile the previous step's draft against this step's accepted
+            # tokens (which arrive in sampled_ids) for acceptance accounting.
+            self._reconcile(st, sampled_ids)
 
             scoped = None
             if has_sampled:
                 prev_cursor = st.cursor
-                scoped = self._scoped_draft(st, seq, num_tokens)
+                scoped = self._scoped_draft(st, seq, num_tokens, sampled_ids)
                 if scoped is not None:
                     self._gate_fires += 1
                     if prev_cursor < 0:
@@ -395,7 +426,6 @@ class ScopedReemissionDrafter:
             # Stash for next-step reconciliation.
             st.last_draft = list(chosen) if chosen else None
             st.last_source = source
-            st.last_num_tokens = num_tokens
 
             merged.append(chosen)
 
