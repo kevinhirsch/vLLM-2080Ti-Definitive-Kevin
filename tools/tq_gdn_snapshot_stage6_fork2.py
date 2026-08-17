@@ -145,7 +145,7 @@ def main() -> int:
             not_ = ch.get("num_output_tokens")
             head = (ch.get("text") or "").replace("\n", " ")[:80]
             stop_ok = fr == "stop"
-            cache_ok = isinstance(nct, int) and nct >= cache_floor
+            cache_ok = isinstance(nct, int) and nct >= max(0, prefix_len - 2112)  # all FULL blocks; the final partial block can never cache (align block=2112)
             print(f"  child[{i}] temp={temps[i]} finish={fr} "
                   f"out={not_}tok cached={nct} "
                   f"stop_ok={stop_ok} cache_ok={cache_ok} :: {head!r}")
