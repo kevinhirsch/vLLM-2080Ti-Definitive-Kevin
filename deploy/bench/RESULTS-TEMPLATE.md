@@ -3,7 +3,7 @@
 Run date: ____  Engine: fork v0.1.15 merge @ ____  Model: Qwen3.8-27B-GPTQ-Int4
 Variant: serve-qwen38-mtp-requal-fg.sh  MTP_K=__  Template: froggeric v22-official
 
-## G1 losslessness (bench_equivalence.py) — PASS requires ≥800 whitespace-normalized common-prefix chars per probe
+## G1 losslessness (bench_equivalence.py) — PASS requires the reference prefix (up to 800 whitespace-normalized chars) to match identically per probe
 
 | probe | common prefix (chars) | verdict |
 |---|---|---|

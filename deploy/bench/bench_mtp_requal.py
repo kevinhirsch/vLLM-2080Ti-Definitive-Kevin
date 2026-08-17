@@ -139,6 +139,28 @@ def run_stage(base: str, model: str, ctx_tokens: int, *, temperature: float,
     return stage
 
 
+def _host_is_local(host: str) -> bool:
+    """True when `host` names THIS machine — a loopback literal, or a name/IP
+    that resolves to one of this host's own addresses. The NRestarts gate reads
+    local systemd, so the engine must be on this box; that legitimately includes
+    the box's LAN hostname/IP, which a loopback-only check would wrongly reject.
+    """
+    import socket
+    if host in ("", "127.0.0.1", "localhost", "::1"):
+        return True
+    try:
+        target = {ai[4][0] for ai in socket.getaddrinfo(host, None)}
+    except OSError:
+        return False
+    local = {"127.0.0.1", "::1"}
+    for name in (socket.gethostname(), socket.getfqdn(), "localhost"):
+        try:
+            local.update(ai[4][0] for ai in socket.getaddrinfo(name, None))
+        except OSError:
+            pass
+    return bool(target & local)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--base-url", default=DEFAULT_BASE)
@@ -164,12 +186,17 @@ def main() -> int:
         ap.error("--repeat must be >= 2 (garble is intermittent; "
                  "a single probe per stage proves nothing)")
     # The NRestarts gate reads LOCAL systemd; against a remote engine it would
-    # score the wrong machine's state. This ladder must run on the engine host.
+    # score the wrong machine's state. This ladder must run on the engine host —
+    # but "the engine host" includes the box's own LAN name/IP, not just
+    # loopback, so gate on actual locality (loopback OR an address that resolves
+    # to one of this machine's own addresses) rather than a loopback literal.
     from urllib.parse import urlparse
     host = urlparse(args.base_url).hostname or ""
-    if host not in ("127.0.0.1", "localhost", "::1"):
-        ap.error(f"--base-url host {host!r} is not local — run this ladder on "
-                 "the engine host (the NRestarts gate reads local systemd)")
+    if not _host_is_local(host):
+        ap.error(f"--base-url host {host!r} is not this machine — run this "
+                 "ladder on the engine host (the NRestarts gate reads local "
+                 "systemd). If this IS the engine box, use 127.0.0.1 or a name "
+                 "that resolves to one of its own addresses.")
     results, failed = [], False
     for ctx in stages:
         # generous ceiling: prefill at worst ~850 tok/s + decode + slack

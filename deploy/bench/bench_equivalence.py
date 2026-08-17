@@ -85,6 +85,11 @@ def main() -> int:
                 ref = json.load(f)
         except (OSError, json.JSONDecodeError) as exc:
             ap.error(f"cannot load --ref {args.ref!r}: {exc}")
+        # a valid-JSON non-object (list/str/number) would survive the load and
+        # only blow up at ref.get(...) AFTER the probe suite burned GPU time
+        if not isinstance(ref, dict):
+            ap.error(f"--ref {args.ref!r} must be a JSON object mapping probe "
+                     "names to reference text")
 
     outputs = run_probes(args.base_url, args.model)
     if args.mode == "record":
