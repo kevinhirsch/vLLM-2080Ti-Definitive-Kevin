@@ -9,8 +9,15 @@ from typing import Any
 import requests
 
 
-REPEATED_CHARS = re.compile(r"(.)\1{24,}", re.DOTALL)
-REPEATED_TOOL_TAGS = re.compile(r"(<tool_call>\s*){3,}", re.DOTALL)
+# Garble signatures are single-sourced in deploy/bench/bench_lib.py (review:
+# the two copies had already begun to diverge — bench_lib gained
+# REPEATED_PHRASE). Path-safe import since both files run as standalone
+# scripts from different cwds.
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "deploy" / "bench"))
+from bench_lib import REPEATED_CHARS, REPEATED_TOOL_TAGS  # noqa: E402
 
 
 def request_chat(
