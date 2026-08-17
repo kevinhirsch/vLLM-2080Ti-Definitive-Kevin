@@ -1208,6 +1208,39 @@ class AsyncMPClient(MPClient):
             "collective_rpc", method, timeout, args, kwargs
         )
 
+    # EXP-038 Stage-1/4 async utility surface (mirrors the SyncMPClient methods
+    # above). Env-gated on the EngineCore side by VLLM_TQ_GDN_SNAPSHOT; these
+    # just carry the call over the async utility RPC like reset_prefix_cache_async.
+    # They exist so the OpenAI api_server path (AsyncLLM, not the sync LLM) can
+    # drive pin / fork / unpin. NEVER exercise against the production :8001 serve.
+    async def pin_request_kv_blocks_async(
+        self, req_id: str | None = None
+    ) -> dict[str, Any]:
+        return await self.call_utility_async("pin_request_kv_blocks", req_id)
+
+    async def verify_pinned_blocks_async(self, handle_id: str) -> dict[str, Any]:
+        return await self.call_utility_async("verify_pinned_blocks", handle_id)
+
+    async def get_request_kv_block_ids_async(
+        self, req_id: str | None = None, all_running: bool = False
+    ) -> dict[str, Any]:
+        return await self.call_utility_async(
+            "get_request_kv_block_ids", req_id, all_running
+        )
+
+    async def unpin_kv_blocks_async(self, handle_id: str) -> dict[str, Any]:
+        return await self.call_utility_async("unpin_kv_blocks", handle_id)
+
+    async def fork_from_handle_async(
+        self,
+        handle_id: str,
+        child_specs: list[dict[str, Any]],
+        max_steps: int | None = None,
+    ) -> dict[str, Any]:
+        return await self.call_utility_async(
+            "fork_from_handle", handle_id, child_specs, max_steps
+        )
+
 
 class DPAsyncMPClient(AsyncMPClient):
     """Asyncio-compatible client for multi-proc, multi-engine (data parallel)
