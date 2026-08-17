@@ -169,6 +169,16 @@ class EngineCoreClient(ABC):
     def unpin_kv_blocks(self, handle_id: str) -> dict[str, Any]:
         raise NotImplementedError
 
+    # EXP-038 Stage-4 fork API: fork a pinned handle into N children (each with
+    # its own sampling params) WITHOUT resubmit; env-gated on the EngineCore side.
+    def fork_from_handle(
+        self,
+        handle_id: str,
+        child_specs: list[dict[str, Any]],
+        max_steps: int | None = None,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
     def reset_encoder_cache(self) -> None:
         raise NotImplementedError
 
@@ -346,6 +356,14 @@ class InprocClient(EngineCoreClient):
 
     def unpin_kv_blocks(self, handle_id: str) -> dict[str, Any]:
         return self.engine_core.unpin_kv_blocks(handle_id)
+
+    def fork_from_handle(
+        self,
+        handle_id: str,
+        child_specs: list[dict[str, Any]],
+        max_steps: int | None = None,
+    ) -> dict[str, Any]:
+        return self.engine_core.fork_from_handle(handle_id, child_specs, max_steps)
 
     def reset_encoder_cache(self) -> None:
         self.engine_core.reset_encoder_cache()
@@ -888,6 +906,16 @@ class SyncMPClient(MPClient):
 
     def unpin_kv_blocks(self, handle_id: str) -> dict[str, Any]:
         return self.call_utility("unpin_kv_blocks", handle_id)
+
+    def fork_from_handle(
+        self,
+        handle_id: str,
+        child_specs: list[dict[str, Any]],
+        max_steps: int | None = None,
+    ) -> dict[str, Any]:
+        return self.call_utility(
+            "fork_from_handle", handle_id, child_specs, max_steps
+        )
 
     def reset_encoder_cache(self) -> None:
         self.call_utility("reset_encoder_cache")
