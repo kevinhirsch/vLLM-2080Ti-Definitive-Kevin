@@ -371,14 +371,14 @@ def _log_config(runner: Any) -> None:
             block_size,
             wbc,
             num_spec,
-            int32_overflow_maxlen(507904) if False else 2**31 / 507904,
+            2**31 / 507904,
             2**31 / 460800,
         )
     except Exception:  # pragma: no cover - defensive
         logger.exception("[XID31] _log_config failed")
 
 
-def periodic(runner: Any, num_scheduled_tokens: int = 0) -> None:
+def periodic(runner: Any) -> None:
     """Cheap per-step check: project the high-water position onto each suspect
     and log-assert it stays under the buffer extent and 2**31. No-op if off."""
     if not _ENABLED:
@@ -437,7 +437,9 @@ def _current_high_water(runner: Any) -> int:
         ib = getattr(runner, "input_batch", None)
         if ib is None:
             return 0
-        nt = getattr(ib, "num_tokens", None)
+        # InputBatch tracks per-request depth as ``num_tokens_no_spec`` (a numpy
+        # array indexed by request slot); there is no plain ``num_tokens``.
+        nt = getattr(ib, "num_tokens_no_spec", None)
         if nt is not None:
             try:
                 return int(max(nt[: ib.num_reqs])) if ib.num_reqs else 0
