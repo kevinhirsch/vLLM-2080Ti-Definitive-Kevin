@@ -1,0 +1,17 @@
+{
+  "id": "instruction_010",
+  "category": "instruction",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "List exactly 5 programming languages, one per line, each line formatted as '- <name>' (a hyphen, one space, then the language name). Output exactly 5 lines and nothing else -- no numbering, no blank lines, no extra commentary."
+      }
+    ],
+    "max_tokens": 300
+  },
+  "check": {
+    "type": "regex_fullmatch",
+    "pattern": "-\\s+\\S.*(?:\\n-\\s+\\S.*){4}"
+  }
+}

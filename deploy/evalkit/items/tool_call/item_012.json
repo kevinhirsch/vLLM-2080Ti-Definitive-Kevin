@@ -1,0 +1,56 @@
+{
+  "id": "tool_call_012",
+  "category": "tool_call",
+  "description": "nested/multiline argument with nested JSON braces",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Please pretty-print this JSON payload using the tool: {\"a\": {\"b\": [1, 2, 3], \"c\": null}, \"d\": \"x\"}"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "format_json",
+          "description": "Pretty-print a JSON payload string.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "payload": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "payload"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "max_tokens": 400
+  },
+  "check": {
+    "type": "tool_call",
+    "expected_calls": [
+      {
+        "name": "format_json",
+        "args": [
+          {
+            "path": "payload",
+            "match": "regex",
+            "pattern": "\"a\"\\s*:\\s*\\{"
+          },
+          {
+            "path": "payload",
+            "match": "contains",
+            "value": "[1, 2, 3]"
+          }
+        ]
+      }
+    ],
+    "mode": "in_order"
+  }
+}

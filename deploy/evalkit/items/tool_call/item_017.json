@@ -1,0 +1,64 @@
+{
+  "id": "tool_call_017",
+  "category": "tool_call",
+  "description": "optional-param handling: optional enum inferred from phrasing",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Remind me every day at 8am to drink water."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "set_reminder",
+          "description": "Set a reminder.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "time": {
+                "type": "string"
+              },
+              "repeat": {
+                "type": "string",
+                "enum": [
+                  "daily",
+                  "weekly",
+                  "none"
+                ],
+                "description": "Optional recurrence, defaults to none"
+              }
+            },
+            "required": [
+              "text",
+              "time"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "max_tokens": 400
+  },
+  "check": {
+    "type": "tool_call",
+    "expected_calls": [
+      {
+        "name": "set_reminder",
+        "args": [
+          {
+            "path": "repeat",
+            "match": "exact",
+            "value": "daily"
+          }
+        ]
+      }
+    ],
+    "mode": "in_order"
+  }
+}

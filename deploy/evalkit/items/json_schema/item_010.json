@@ -1,0 +1,53 @@
+{
+  "id": "json_schema_010",
+  "category": "json_schema",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Return a JSON object describing a task list with exactly these fields: title (non-empty string), tasks (array of at least 1 object, each with fields name (string) and done (boolean)). Respond with ONLY the JSON object, no other text."
+      }
+    ],
+    "response_format": {
+      "type": "json_object"
+    },
+    "max_tokens": 400
+  },
+  "check": {
+    "type": "json_schema",
+    "schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "title",
+        "tasks"
+      ],
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tasks": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "done"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "done": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

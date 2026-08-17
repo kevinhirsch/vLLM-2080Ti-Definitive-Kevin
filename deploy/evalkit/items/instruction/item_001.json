@@ -1,0 +1,17 @@
+{
+  "id": "instruction_001",
+  "category": "instruction",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Write a short 3-line note about the ocean, one short sentence per line. Output exactly 3 lines and nothing else (no title, no blank lines)."
+      }
+    ],
+    "max_tokens": 300
+  },
+  "check": {
+    "type": "line_count",
+    "value": 3
+  }
+}

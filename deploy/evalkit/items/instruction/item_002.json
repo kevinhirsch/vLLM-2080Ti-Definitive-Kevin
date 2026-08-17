@@ -1,0 +1,16 @@
+{
+  "id": "instruction_002",
+  "category": "instruction",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Respond with a short phrase of 5 to 15 characters that contains NO vowels at all (a, e, i, o, u -- uppercase or lowercase forms all count). Output only the phrase, nothing else."
+      }
+    ],
+    "max_tokens": 300
+  },
+  "check": {
+    "type": "no_vowels"
+  }
+}

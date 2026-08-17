@@ -1,0 +1,20 @@
+{
+  "id": "code_exec_007",
+  "category": "code_exec",
+  "description": "gcd",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Write a Python function `gcd(a, b)` returning the greatest common divisor of non-negative integers a and b (gcd(0, n) = n).\n\nReply with a single Python code block containing only your function definition(s) (imports allowed if needed). Do not include any example usage, test calls, or print statements of your own -- a separate test harness will be run against your function afterward. Do not print anything else outside the code block."
+      }
+    ],
+    "max_tokens": 900
+  },
+  "check": {
+    "type": "code_exec",
+    "expected_stdout": "5\n5\n6\n1\n25\n0\n",
+    "timeout_sec": 10,
+    "harness": "for a, b in [(0, 5), (5, 0), (12, 18), (17, 13), (100, 75), (0, 0)]:\n    print(gcd(a, b))"
+  }
+}

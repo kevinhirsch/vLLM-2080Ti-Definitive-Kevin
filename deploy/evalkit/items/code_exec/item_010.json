@@ -1,0 +1,20 @@
+{
+  "id": "code_exec_010",
+  "category": "code_exec",
+  "description": "set_ops",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Write a Python function `set_ops(a, b)` where a and b are lists; return a tuple of three sorted lists: (intersection, union, difference) where difference is elements in a but not in b.\n\nReply with a single Python code block containing only your function definition(s) (imports allowed if needed). Do not include any example usage, test calls, or print statements of your own -- a separate test harness will be run against your function afterward. Do not print anything else outside the code block."
+      }
+    ],
+    "max_tokens": 900
+  },
+  "check": {
+    "type": "code_exec",
+    "expected_stdout": "([2, 3], [1, 2, 3, 4], [1])\n([], [1, 2], [])\n([2], [1, 2, 3], [1])\n([], [], [])\n",
+    "timeout_sec": 10,
+    "harness": "for a, b in [([1,2,3], [2,3,4]), ([], [1,2]), ([1,1,2], [2,2,3]), ([], [])]:\n    print(set_ops(a, b))"
+  }
+}

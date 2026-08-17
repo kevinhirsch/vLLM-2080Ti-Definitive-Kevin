@@ -1,0 +1,88 @@
+{
+  "id": "tool_call_003",
+  "category": "tool_call",
+  "description": "tool choice among 3 distractors",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "What's the current stock price of AAPL?"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get the current weather for a city.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string",
+                "description": "City name"
+              }
+            },
+            "required": [
+              "city"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "get_stock_price",
+          "description": "Get the current stock price for a ticker symbol.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "symbol": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "symbol"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "get_time",
+          "description": "Get the current time in a timezone.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "timezone": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "timezone"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "max_tokens": 400
+  },
+  "check": {
+    "type": "tool_call",
+    "expected_calls": [
+      {
+        "name": "get_stock_price",
+        "args": [
+          {
+            "path": "symbol",
+            "match": "exact",
+            "value": "AAPL"
+          }
+        ]
+      }
+    ],
+    "mode": "in_order"
+  }
+}

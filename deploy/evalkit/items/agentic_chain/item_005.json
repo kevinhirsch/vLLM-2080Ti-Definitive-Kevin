@@ -1,0 +1,86 @@
+{
+  "id": "agentic_chain_005",
+  "category": "agentic_chain",
+  "description": "authenticate then fetch balance with returned token",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "authenticate_user",
+        "description": "Authenticate a user and return a session token.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "username": {
+              "type": "string"
+            },
+            "password": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "username",
+            "password"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_account_balance",
+        "description": "Get the account balance for an authenticated session.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "token": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "token"
+          ]
+        }
+      }
+    }
+  ],
+  "user": "Log me in as username 'jsmith' password 'hunter2' and tell me my account balance.",
+  "steps": [
+    {
+      "expect_tool": "authenticate_user",
+      "arg_checks": [
+        {
+          "path": "username",
+          "match": "exact",
+          "value": "jsmith"
+        }
+      ],
+      "inject_result": {
+        "token": "tok_abc123"
+      },
+      "max_tokens": 300
+    },
+    {
+      "expect_tool": "get_account_balance",
+      "arg_checks": [
+        {
+          "path": "token",
+          "match": "exact",
+          "value_from_previous_result": "token"
+        }
+      ],
+      "inject_result": {
+        "balance": 532.1
+      },
+      "max_tokens": 300
+    },
+    {
+      "final": true,
+      "answer_check": {
+        "pattern": "532\\.1\\b|532\\.10",
+        "must_not_pattern": "\\b(not|n't|unable|fail(ed|s)?|couldn't|cannot|can't|never|didn't|wasn't|isn't|error|sorry|unfortunately)\\b"
+      },
+      "max_tokens": 150
+    }
+  ]
+}

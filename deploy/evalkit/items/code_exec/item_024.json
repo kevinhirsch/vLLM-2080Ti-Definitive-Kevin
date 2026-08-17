@@ -1,0 +1,20 @@
+{
+  "id": "code_exec_024",
+  "category": "code_exec",
+  "description": "matrix_transpose",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Write a Python function `matrix_transpose(matrix)` where matrix is a list of equal-length row lists; return its transpose as a list of lists. Return an empty list for an empty matrix.\n\nReply with a single Python code block containing only your function definition(s) (imports allowed if needed). Do not include any example usage, test calls, or print statements of your own -- a separate test harness will be run against your function afterward. Do not print anything else outside the code block."
+      }
+    ],
+    "max_tokens": 900
+  },
+  "check": {
+    "type": "code_exec",
+    "expected_stdout": "[]\n[[1], [2], [3]]\n[[1, 3, 5], [2, 4, 6]]\n[[1]]\n",
+    "timeout_sec": 10,
+    "harness": "print(matrix_transpose([]))\nprint(matrix_transpose([[1,2,3]]))\nprint(matrix_transpose([[1,2],[3,4],[5,6]]))\nprint(matrix_transpose([[1]]))"
+  }
+}
