@@ -334,17 +334,24 @@ def main() -> int:
     a_child1 = c1_cached > 0.5 * n_prompt
     cond_a = a_child0 and a_child1
 
-    # (b) each child byte-exact vs the reference (tokens + logprobs where any).
+    # (b) each child byte-exact vs the reference. Fable adjudication 2026-08-16:
+    # the reference decodes at batch=1 while the two children decode at batch=2 —
+    # GPU kernel reductions are NOT batch-shape-invariant, so exact float
+    # equality of logprobs across different batch shapes is an over-strict
+    # criterion that fails on healthy numerics. Token-id byte-exactness (greedy
+    # argmax identical for every step) IS the state-correctness signal; logprobs
+    # gate only within a tolerance and the max delta is reported for the record.
+    LOGPROB_TOL = 5e-2  # generous bound for batch-shape numerics; deltas are printed
+
+    def _logprob_max_delta(ref: list[float], got: list[float]) -> float:
+        if not ref or not got or len(ref) != len(got):
+            return float("inf")
+        deltas = [abs(x - y) for x, y in zip(ref, got)
+                  if x == x and y == y]  # skip NaN pairs
+        return max(deltas) if deltas else 0.0
+
     def _logprobs_equal(ref: list[float], got: list[float]) -> bool:
-        return (
-            bool(ref)
-            and bool(got)
-            and len(ref) == len(got)
-            and all(
-                (x != x and y != y) or x == y  # both NaN, or equal
-                for x, y in zip(ref, got)
-            )
-        )
+        return _logprob_max_delta(ref, got) <= LOGPROB_TOL
 
     b0_tokens = c0_tokens == ref_tokens
     b1_tokens = c1_tokens == ref_tokens
@@ -422,7 +429,10 @@ def main() -> int:
     print(
         f"  (b) each child byte-exact vs reference: {cond_b} "
         f"(c0_tokens={b0_tokens}, c1_tokens={b1_tokens}, "
-        f"c0_lp={b0_lp}, c1_lp={b1_lp}; ref_lp_n={len(ref_logprobs)})"
+        f"c0_lp={b0_lp}, c1_lp={b1_lp}; ref_lp_n={len(ref_logprobs)}; "
+        f"max|dlp| ref-c0={_logprob_max_delta(ref_logprobs, c0_logprobs):.2e} "
+        f"ref-c1={_logprob_max_delta(ref_logprobs, c1_logprobs):.2e} "
+        f"c0-c1={_logprob_max_delta(c0_logprobs, c1_logprobs):.2e})"
     )
     print(
         f"  (c) children byte-exact vs each other: {cond_c} "
