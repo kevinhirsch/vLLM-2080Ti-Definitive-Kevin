@@ -1489,6 +1489,37 @@ class LLM:
             reset_running_requests, reset_connector
         )
 
+    # ------------------------------------------------------------------
+    # EXP-038 Stage-1 attn KV block pin/unpin (snapshot/park/fork PoC).
+    #
+    # SNAPSHOT's attn side = refcount pinning of a finished prefix's KV blocks
+    # so they survive the producing request's free(). The block pool lives in
+    # the EngineCore process, so these route through the utility RPC surface
+    # (same path as reset_prefix_cache). Env-gated on the EngineCore side by
+    # VLLM_TQ_GDN_SNAPSHOT; default-inert. NEVER use against :8001.
+    # ------------------------------------------------------------------
+    def pin_request_kv_blocks(self, req_id: str | None = None) -> dict[str, Any]:
+        """Pin an in-flight request's KV blocks; returns an opaque handle dict.
+
+        Call ``req_id=None`` to auto-pick the single in-flight request. Release
+        with :meth:`unpin_kv_blocks`.
+        """
+        return self.llm_engine.pin_request_kv_blocks(req_id)
+
+    def verify_pinned_blocks(self, handle_id: str) -> dict[str, Any]:
+        """Read-only residency check (ref_cnt >= 1) for a pin handle."""
+        return self.llm_engine.verify_pinned_blocks(handle_id)
+
+    def get_request_kv_block_ids(
+        self, req_id: str | None = None
+    ) -> dict[str, Any]:
+        """Read-only per-group KV block ids of a live request."""
+        return self.llm_engine.get_request_kv_block_ids(req_id)
+
+    def unpin_kv_blocks(self, handle_id: str) -> dict[str, Any]:
+        """Release a pin handle (frees the pinned blocks)."""
+        return self.llm_engine.unpin_kv_blocks(handle_id)
+
     def sleep(self, level: int = 1, mode: PauseMode = "abort"):
         """
         Put the engine to sleep. The engine should not process any requests.

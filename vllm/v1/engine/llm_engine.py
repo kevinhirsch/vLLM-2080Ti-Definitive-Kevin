@@ -341,6 +341,22 @@ class LLMEngine:
             reset_running_requests, reset_connector
         )
 
+    # EXP-038 Stage-1 attn KV pin/unpin (env-gated on the EngineCore side by
+    # VLLM_TQ_GDN_SNAPSHOT). See vllm/v1/engine/core.py for semantics.
+    def pin_request_kv_blocks(self, req_id: str | None = None) -> dict[str, Any]:
+        return self.engine_core.pin_request_kv_blocks(req_id)
+
+    def verify_pinned_blocks(self, handle_id: str) -> dict[str, Any]:
+        return self.engine_core.verify_pinned_blocks(handle_id)
+
+    def get_request_kv_block_ids(
+        self, req_id: str | None = None
+    ) -> dict[str, Any]:
+        return self.engine_core.get_request_kv_block_ids(req_id)
+
+    def unpin_kv_blocks(self, handle_id: str) -> dict[str, Any]:
+        return self.engine_core.unpin_kv_blocks(handle_id)
+
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
 

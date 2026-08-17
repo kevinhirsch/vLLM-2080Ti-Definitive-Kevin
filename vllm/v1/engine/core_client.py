@@ -152,6 +152,23 @@ class EngineCoreClient(ABC):
     ) -> bool:
         raise NotImplementedError
 
+    # EXP-038 Stage-1 attn KV pin/unpin utility surface (env-gated on the
+    # EngineCore side by VLLM_TQ_GDN_SNAPSHOT; see core.py). Mirrors how
+    # reset_prefix_cache travels from the driver to the scheduler process.
+    def pin_request_kv_blocks(self, req_id: str | None = None) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def verify_pinned_blocks(self, handle_id: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def get_request_kv_block_ids(
+        self, req_id: str | None = None
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def unpin_kv_blocks(self, handle_id: str) -> dict[str, Any]:
+        raise NotImplementedError
+
     def reset_encoder_cache(self) -> None:
         raise NotImplementedError
 
@@ -315,6 +332,20 @@ class InprocClient(EngineCoreClient):
         return self.engine_core.reset_prefix_cache(
             reset_running_requests, reset_connector
         )
+
+    def pin_request_kv_blocks(self, req_id: str | None = None) -> dict[str, Any]:
+        return self.engine_core.pin_request_kv_blocks(req_id)
+
+    def verify_pinned_blocks(self, handle_id: str) -> dict[str, Any]:
+        return self.engine_core.verify_pinned_blocks(handle_id)
+
+    def get_request_kv_block_ids(
+        self, req_id: str | None = None
+    ) -> dict[str, Any]:
+        return self.engine_core.get_request_kv_block_ids(req_id)
+
+    def unpin_kv_blocks(self, handle_id: str) -> dict[str, Any]:
+        return self.engine_core.unpin_kv_blocks(handle_id)
 
     def reset_encoder_cache(self) -> None:
         self.engine_core.reset_encoder_cache()
@@ -841,6 +872,20 @@ class SyncMPClient(MPClient):
         return self.call_utility(
             "reset_prefix_cache", reset_running_requests, reset_connector
         )
+
+    def pin_request_kv_blocks(self, req_id: str | None = None) -> dict[str, Any]:
+        return self.call_utility("pin_request_kv_blocks", req_id)
+
+    def verify_pinned_blocks(self, handle_id: str) -> dict[str, Any]:
+        return self.call_utility("verify_pinned_blocks", handle_id)
+
+    def get_request_kv_block_ids(
+        self, req_id: str | None = None
+    ) -> dict[str, Any]:
+        return self.call_utility("get_request_kv_block_ids", req_id)
+
+    def unpin_kv_blocks(self, handle_id: str) -> dict[str, Any]:
+        return self.call_utility("unpin_kv_blocks", handle_id)
 
     def reset_encoder_cache(self) -> None:
         self.call_utility("reset_encoder_cache")
