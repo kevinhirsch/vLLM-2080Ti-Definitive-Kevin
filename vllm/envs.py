@@ -69,6 +69,7 @@ if TYPE_CHECKING:
     VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE: Literal["off", "on", "auto"] = "auto"
     VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE_MIN_TOKENS: int = 20480
     VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS: int = 0
+    VLLM_TQ_RESERVE_PREFILL_WORKSPACE: bool = True
     VLLM_TURBOQUANT_CONTINUATION_SDPA_Q_CHUNK: int = 0
     VLLM_TURBOQUANT_CONTINUATION_SDPA_MAX_QK_CELLS: int = 0
     VLLM_TURBOQUANT_FORCE_DECODE_SDPA: bool = False
@@ -840,6 +841,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS": lambda: int(
         os.getenv("VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS", "0")
+    ),
+    # When serving a turboquant_* KV cache, reserve VRAM for the runtime
+    # continuation-prefill dequant workspace *before* the KV cache budget is
+    # sized, so max_model_len auto-caps to a value where KV + workspace fit.
+    # Default ON: it only makes sizing safer (never allocates more, only caps).
+    # Set to 0 to restore the legacy behaviour (KV cache sized ignoring the
+    # workspace, which can crash with an illegal memory access at deep prefill).
+    "VLLM_TQ_RESERVE_PREFILL_WORKSPACE": lambda: bool(
+        int(os.getenv("VLLM_TQ_RESERVE_PREFILL_WORKSPACE", "1"))
     ),
     "VLLM_TURBOQUANT_CONTINUATION_SDPA_Q_CHUNK": lambda: int(
         os.getenv("VLLM_TURBOQUANT_CONTINUATION_SDPA_Q_CHUNK", "0")
