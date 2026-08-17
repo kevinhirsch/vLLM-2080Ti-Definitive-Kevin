@@ -1,0 +1,50 @@
+{
+  "id": "json_schema_008",
+  "category": "json_schema",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Return a JSON object describing a recipe with exactly these fields: name (non-empty string), servings (integer >= 1), ingredients (array of at least 2 strings), minutes (integer >= 1). Respond with ONLY the JSON object, no other text."
+      }
+    ],
+    "response_format": {
+      "type": "json_object"
+    },
+    "max_tokens": 400
+  },
+  "check": {
+    "type": "json_schema",
+    "schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "servings",
+        "ingredients",
+        "minutes"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "servings": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "ingredients": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "string"
+          }
+        },
+        "minutes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    }
+  }
+}

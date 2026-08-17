@@ -1,0 +1,104 @@
+{
+  "id": "agentic_chain_010",
+  "category": "agentic_chain",
+  "description": "3-step: search flights -> book flight, answer states confirmation code",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "search_flights",
+        "description": "Search for flights.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "origin": {
+              "type": "string"
+            },
+            "destination": {
+              "type": "string"
+            },
+            "date": {
+              "type": "string"
+            },
+            "nonstop": {
+              "type": "boolean",
+              "description": "Optional: restrict to nonstop flights"
+            }
+          },
+          "required": [
+            "origin",
+            "destination",
+            "date"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "book_flight",
+        "description": "Book a flight.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "origin": {
+              "type": "string"
+            },
+            "destination": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "origin",
+            "destination"
+          ]
+        }
+      }
+    }
+  ],
+  "user": "Find a flight from SFO to ORD on 2026-09-10 and book it.",
+  "steps": [
+    {
+      "expect_tool": "search_flights",
+      "arg_checks": [
+        {
+          "path": "origin",
+          "match": "exact",
+          "value": "SFO"
+        },
+        {
+          "path": "destination",
+          "match": "exact",
+          "value": "ORD"
+        }
+      ],
+      "inject_result": {
+        "flight_id": "FL2200",
+        "price": 312.5
+      },
+      "max_tokens": 300
+    },
+    {
+      "expect_tool": "book_flight",
+      "arg_checks": [
+        {
+          "path": "origin",
+          "match": "exact",
+          "value": "SFO"
+        }
+      ],
+      "inject_result": {
+        "confirmation": "CNF-9981"
+      },
+      "max_tokens": 300
+    },
+    {
+      "final": true,
+      "answer_check": {
+        "pattern": "CNF-9981",
+        "must_not_pattern": "\\b(not|n't|unable|fail(ed|s)?|couldn't|cannot|can't|never|didn't|wasn't|isn't|error|sorry|unfortunately)\\b"
+      },
+      "max_tokens": 150
+    }
+  ]
+}

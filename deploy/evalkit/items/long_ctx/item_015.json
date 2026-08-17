@@ -1,0 +1,14 @@
+{
+  "id": "long_ctx_015",
+  "category": "long_ctx",
+  "description": "purpose summarization, ~128000 target tokens",
+  "corpus_tokens": 128000,
+  "request": {
+    "question": "In exactly one sentence, state the overall purpose of this codebase.",
+    "max_tokens": 100
+  },
+  "check": {
+    "type": "purpose",
+    "pattern": "vllm|inference|LLM|serving"
+  }
+}

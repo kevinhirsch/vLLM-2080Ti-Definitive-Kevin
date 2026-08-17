@@ -1,0 +1,54 @@
+{
+  "id": "json_schema_005",
+  "category": "json_schema",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Return a JSON object describing a server config with exactly these fields: hostname (non-empty string), port (integer between 1 and 65535), tags (array of strings), env (one of exactly: 'dev', 'staging', 'prod'). Respond with ONLY the JSON object, no other text."
+      }
+    ],
+    "response_format": {
+      "type": "json_object"
+    },
+    "max_tokens": 400
+  },
+  "check": {
+    "type": "json_schema",
+    "schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "hostname",
+        "port",
+        "tags",
+        "env"
+      ],
+      "properties": {
+        "hostname": {
+          "type": "string",
+          "minLength": 1
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "env": {
+          "type": "string",
+          "enum": [
+            "dev",
+            "staging",
+            "prod"
+          ]
+        }
+      }
+    }
+  }
+}

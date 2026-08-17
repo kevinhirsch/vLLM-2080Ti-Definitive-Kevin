@@ -1,0 +1,21 @@
+{
+  "target_tokens": 8000,
+  "char_len": 26544,
+  "approx_tokens": 8044,
+  "chars_per_token": 3.3,
+  "sentinels": {
+    "80": {
+      "id": "SENTINEL-8000-80",
+      "number": 238174
+    },
+    "50": {
+      "id": "SENTINEL-8000-50",
+      "number": 512655
+    },
+    "20": {
+      "id": "SENTINEL-8000-20",
+      "number": 443952
+    }
+  },
+  "source_dir": "/home/kevin/Desktop/vLLM-2080Ti-Definitive/vllm"
+}

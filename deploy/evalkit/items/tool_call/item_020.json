@@ -1,0 +1,65 @@
+{
+  "id": "tool_call_020",
+  "category": "tool_call",
+  "description": "numeric + enum argument typing",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Set the thermostat to 21.5 degrees Celsius."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "set_thermostat",
+          "description": "Set the thermostat target temperature.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "temperature": {
+                "type": "number"
+              },
+              "unit": {
+                "type": "string",
+                "enum": [
+                  "C",
+                  "F"
+                ]
+              }
+            },
+            "required": [
+              "temperature",
+              "unit"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "max_tokens": 400
+  },
+  "check": {
+    "type": "tool_call",
+    "expected_calls": [
+      {
+        "name": "set_thermostat",
+        "args": [
+          {
+            "path": "temperature",
+            "match": "numeric",
+            "value": 21.5,
+            "tol": 0.05
+          },
+          {
+            "path": "unit",
+            "match": "exact",
+            "value": "C"
+          }
+        ]
+      }
+    ],
+    "mode": "in_order"
+  }
+}

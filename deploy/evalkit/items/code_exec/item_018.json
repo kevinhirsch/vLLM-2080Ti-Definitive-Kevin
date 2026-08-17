@@ -1,0 +1,20 @@
+{
+  "id": "code_exec_018",
+  "category": "code_exec",
+  "description": "caesar_cipher",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Write a Python function `caesar_cipher(s, shift)` that shifts each letter in s by `shift` positions (wrapping within its case, a-z / A-Z), leaving non-letters unchanged.\n\nReply with a single Python code block containing only your function definition(s) (imports allowed if needed). Do not include any example usage, test calls, or print statements of your own -- a separate test harness will be run against your function afterward. Do not print anything else outside the code block."
+      }
+    ],
+    "max_tokens": 900
+  },
+  "check": {
+    "type": "code_exec",
+    "expected_stdout": "bcd\nabc\nMjqqt, Btwqi!\nabc\nabc\nZAB\n",
+    "timeout_sec": 10,
+    "harness": "for s, shift in [('abc', 1), ('xyz', 3), ('Hello, World!', 5), ('abc', 0), ('abc', 26), ('ABC', -1)]:\n    print(caesar_cipher(s, shift))"
+  }
+}

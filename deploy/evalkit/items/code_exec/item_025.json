@@ -1,0 +1,20 @@
+{
+  "id": "code_exec_025",
+  "category": "code_exec",
+  "description": "valid_ip",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Write a Python function `valid_ip(s)` using the `re` module that returns True if s is a syntactically valid IPv4 address (four dot-separated decimal octets, each 0-255, no leading zeros other than the single digit '0'), else False.\n\nReply with a single Python code block containing only your function definition(s) (imports allowed if needed). Do not include any example usage, test calls, or print statements of your own -- a separate test harness will be run against your function afterward. Do not print anything else outside the code block."
+      }
+    ],
+    "max_tokens": 900
+  },
+  "check": {
+    "type": "code_exec",
+    "expected_stdout": "True\nTrue\nTrue\nFalse\nFalse\nFalse\nFalse\nFalse\n",
+    "timeout_sec": 10,
+    "harness": "for s in ['255.255.255.255', '0.0.0.0', '192.168.1.1', '256.1.1.1', '1.2.3', '01.1.1.1', '1.2.3.4.5', '']:\n    print(valid_ip(s))"
+  }
+}

@@ -1,0 +1,99 @@
+{
+  "id": "agentic_chain_008",
+  "category": "agentic_chain",
+  "description": "exchange rate lookup then currency conversion using retrieved rate",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_exchange_rate",
+        "description": "Get the exchange rate between two currencies.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "base": {
+              "type": "string"
+            },
+            "quote": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "base",
+            "quote"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "convert_currency",
+        "description": "Convert an amount from one currency to another.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "amount": {
+              "type": "number"
+            },
+            "from_currency": {
+              "type": "string"
+            },
+            "to_currency": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "amount",
+            "from_currency",
+            "to_currency"
+          ]
+        }
+      }
+    }
+  ],
+  "user": "What is 500 USD worth in GBP right now?",
+  "steps": [
+    {
+      "expect_tool": "get_exchange_rate",
+      "arg_checks": [
+        {
+          "path": "base",
+          "match": "regex",
+          "pattern": "(?i)usd"
+        },
+        {
+          "path": "quote",
+          "match": "regex",
+          "pattern": "(?i)gbp"
+        }
+      ],
+      "inject_result": {
+        "rate": 0.79
+      },
+      "max_tokens": 300
+    },
+    {
+      "expect_tool": "convert_currency",
+      "arg_checks": [
+        {
+          "path": "amount",
+          "match": "numeric",
+          "value": 500
+        }
+      ],
+      "inject_result": {
+        "converted": 395.0
+      },
+      "max_tokens": 300
+    },
+    {
+      "final": true,
+      "answer_check": {
+        "pattern": "395(\\.0)?",
+        "must_not_pattern": "\\b(not|n't|unable|fail(ed|s)?|couldn't|cannot|can't|never|didn't|wasn't|isn't|error|sorry|unfortunately)\\b"
+      },
+      "max_tokens": 150
+    }
+  ]
+}
