@@ -455,16 +455,28 @@ class Worker(WorkerBase):
         # exists at measurement time so the explicit reserve applies exactly
         # once, deterministically.
         if envs.VLLM_TQ_RESERVE_PREFILL_WORKSPACE:
+            from vllm.v1.core.kv_cache_utils import (
+                _turboquant_prefill_workspace_reserve_bytes,
+            )
             from vllm.v1.worker.workspace import workspace_manager_total_bytes
 
-            _tq_arena_bytes = workspace_manager_total_bytes()
-            if _tq_arena_bytes > 0:
-                self.available_kv_cache_memory_bytes += _tq_arena_bytes
+            # Add back ONLY the portion of the arena the KV-sizing reserve will
+            # re-subtract (review #111: the arena is shared with the decode /
+            # DCP / fused-moe workspaces, and the reserve is 0 for
+            # non-turboquant caches — adding back the whole arena would inflate
+            # the KV budget with no matching reserve).
+            _tq_reserve_bytes = _turboquant_prefill_workspace_reserve_bytes(
+                self.vllm_config
+            )
+            _tq_add_back = min(workspace_manager_total_bytes(), _tq_reserve_bytes)
+            if _tq_add_back > 0:
+                self.available_kv_cache_memory_bytes += _tq_add_back
                 logger.info(
-                    "Excluding %s GiB turboquant workspace arena from the "
-                    "profiled non-KV footprint (explicit reserve is applied "
-                    "once at KV sizing).",
-                    format_gib(_tq_arena_bytes),
+                    "Excluding %s GiB of the workspace arena (the turboquant "
+                    "continuation reserve portion) from the profiled non-KV "
+                    "footprint; the explicit reserve is applied once at KV "
+                    "sizing.",
+                    format_gib(_tq_add_back),
                 )
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
