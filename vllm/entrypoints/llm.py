@@ -1511,10 +1511,15 @@ class LLM:
         return self.llm_engine.verify_pinned_blocks(handle_id)
 
     def get_request_kv_block_ids(
-        self, req_id: str | None = None
+        self, req_id: str | None = None, all_running: bool = False
     ) -> dict[str, Any]:
-        """Read-only per-group KV block ids of a live request."""
-        return self.llm_engine.get_request_kv_block_ids(req_id)
+        """Read-only per-group KV block ids of a live request.
+
+        ``all_running=True`` returns every in-flight request's block table
+        keyed by req_id (EXP-038 Stage-3 fork: observe two co-scheduled
+        children in one read; ``req_id=None`` sees only the first).
+        """
+        return self.llm_engine.get_request_kv_block_ids(req_id, all_running)
 
     def unpin_kv_blocks(self, handle_id: str) -> dict[str, Any]:
         """Release a pin handle (frees the pinned blocks)."""
