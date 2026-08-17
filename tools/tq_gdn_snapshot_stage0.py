@@ -95,19 +95,50 @@ def main() -> int:
         additional_config={"gdn_prefill_backend": "flashqla_legacy"},
     )
 
-    # Drive a block-aligned prefill so a running-state slot exists, then decode
-    # a few tokens to make the sequence in-flight when we snapshot.
+    # Drive a block-aligned prefill, then snapshot MID-GENERATION: the runner
+    # drops ``self.requests[req_id]`` the moment a request finishes (while
+    # ``mamba_state_idx`` lingers one step longer), so the self-test must catch
+    # the sequence while it is genuinely in flight. Decode enough tokens to
+    # give the polling loop a comfortable window under enforce_eager.
+    import threading
+    import time
+
     prompt = _build_block_aligned_prompt(args.block_aligned_tokens)
-    llm.generate(
-        {"prompt_token_ids": prompt},
-        SamplingParams(max_tokens=4, temperature=0.0),
-    )
+    gen_done = threading.Event()
+
+    def _generate() -> None:
+        try:
+            llm.generate(
+                {"prompt_token_ids": prompt},
+                SamplingParams(max_tokens=256, temperature=0.0),
+            )
+        finally:
+            gen_done.set()
+
+    gen_thread = threading.Thread(target=_generate, daemon=True)
+    gen_thread.start()
 
     # The self-test runs per rank on the worker's model_runner. The callable
-    # form of collective_rpc receives the worker as ``self``.
-    results = llm.collective_rpc(
-        lambda worker: worker.model_runner.snapshot_mamba_self_test()
-    )
+    # form of collective_rpc receives the worker as ``self``. Poll until the
+    # sequence is live on both ranks (utility RPCs interleave between engine
+    # steps); keep the last attempt's results as the verdict.
+    results: list[dict] = []
+    while not gen_done.is_set():
+        time.sleep(0.5)
+        try:
+            attempt = llm.collective_rpc(
+                lambda worker: worker.model_runner.snapshot_mamba_self_test()
+            )
+        except Exception as exc:  # noqa: BLE001 - transient mid-gen RPC issues
+            print(f"self-test RPC attempt failed transiently: {exc!r}")
+            continue
+        results = attempt
+        if all(r.get("ok") for r in attempt):
+            break
+    gen_thread.join(timeout=120)
+    if not results:
+        print("never caught the sequence in flight", file=sys.stderr)
+        return 1
 
     ok = all(r.get("ok") for r in results)
     for r in results:
