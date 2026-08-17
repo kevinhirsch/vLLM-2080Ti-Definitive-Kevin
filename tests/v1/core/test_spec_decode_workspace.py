@@ -42,6 +42,7 @@ def _load_module():
 M = _load_module()
 reserve_bytes = M.spec_verify_reserve_bytes
 reserve = M.spec_verify_reserve
+decision = M.spec_verify_reserve_decision
 
 
 def _gib(b):
@@ -125,6 +126,60 @@ def test_exact_bytes_k16_seqs16():
     expected = 24 * (16 - 1) * 16 * VOCAB * 4
     assert reserve_bytes(16, 16, VOCAB) == expected
     assert expected == 5_721_292_800  # 5.328 GiB
+
+
+# --- gating decision (drives the always-on boot diagnostic) ----------------
+
+def _dec(**kw):
+    base = dict(
+        speculative_present=True,
+        enabled=True,
+        num_speculative_tokens=16,
+        max_num_seqs=16,
+        vocab_size=VOCAB,
+        overshoot_mult=24,
+    )
+    base.update(kw)
+    return decision(**base)
+
+
+def test_decision_applies_when_spec_present_and_enabled():
+    b, reason = _dec()
+    assert b == reserve_bytes(16, 16, VOCAB)
+    assert reason.startswith("applied:")
+    assert "K=16" in reason and "5.328 GiB" in reason
+
+
+def test_decision_skips_reasons_are_explicit():
+    # These are exactly the branches the coordinator asked to be diagnosable.
+    assert _dec(speculative_present=False) == (0, "skipped: no speculative_config")
+    b, r = _dec(enabled=False)
+    assert b == 0 and "VLLM_SPEC_RESERVE_VERIFY_WORKSPACE=0" in r
+    b, r = _dec(num_speculative_tokens=1)
+    assert b == 0 and "num_speculative_tokens=1 <= 1" in r
+    b, r = _dec(num_speculative_tokens=2, overshoot_mult=0)
+    assert b == 0 and "VLLM_SPEC_VERIFY_OVERSHOOT_MULT=0" in r
+    b, r = _dec(max_num_seqs=0)
+    assert b == 0 and "degenerate" in r
+
+
+def test_decision_default_on_when_spec_present():
+    """Env default (enabled=True) must reach the gate and produce a reserve.
+
+    Mirrors the boot config: spec present, K=16, default mult -> non-zero.
+    """
+    b, reason = _dec()  # enabled defaults True here as it does via envs
+    assert b > 5 * GIB, reason
+
+
+def test_decision_bytes_match_reserve_bytes_everywhere():
+    for k in (1, 2, 8, 16, 32):
+        for s in (0, 1, 4, 16):
+            b, _ = _dec(num_speculative_tokens=k, max_num_seqs=s)
+            if k <= 1 or s <= 0:
+                assert b == 0
+            else:
+                assert b == reserve_bytes(k, s, VOCAB)
 
 
 # ---------------------------------------------------------------------------
