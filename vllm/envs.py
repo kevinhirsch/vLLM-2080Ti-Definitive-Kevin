@@ -81,6 +81,13 @@ if TYPE_CHECKING:
     VLLM_TURBOQUANT_K8V4_FP8_FORMAT: str = "auto"
     VLLM_TURBOQUANT_CUDAGRAPH_SPEC_DECODE_SAFE: bool = False
     VLLM_TURBOQUANT_SKIP_PREFILL_STORE: bool = False
+    # EXP-038 GDN snapshot/park/fork PoC. Default OFF: the whole feature is
+    # inert (no park pool allocated, snapshot/restore raise) until explicitly
+    # enabled on a throwaway engine. Never enable on the production :8001 serve.
+    VLLM_TQ_GDN_SNAPSHOT: bool = False
+    # Number of park slots reserved per mamba group when the snapshot feature is
+    # enabled (one snapshot handle consumes one slot across all GDN layers).
+    VLLM_TQ_GDN_SNAPSHOT_PARK_BLOCKS: int = 4
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
@@ -887,6 +894,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_TURBOQUANT_SKIP_PREFILL_STORE": lambda: bool(
         int(os.getenv("VLLM_TURBOQUANT_SKIP_PREFILL_STORE", "0"))
+    ),
+    # EXP-038 GDN snapshot/park/fork PoC. OFF by default; only enable on a
+    # throwaway engine, never on the production :8001 serve.
+    "VLLM_TQ_GDN_SNAPSHOT": lambda: bool(
+        int(os.getenv("VLLM_TQ_GDN_SNAPSHOT", "0"))
+    ),
+    "VLLM_TQ_GDN_SNAPSHOT_PARK_BLOCKS": lambda: int(
+        os.getenv("VLLM_TQ_GDN_SNAPSHOT_PARK_BLOCKS", "4")
     ),
     # Allow hybrid Mamba/GDN speculative decode to keep full decode CUDA
     # graphs. This is unsafe for production because accepted speculative
