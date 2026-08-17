@@ -1919,6 +1919,79 @@ def _project_kv_cache_groups_to_worker(
     return projected_groups
 
 
+# Mirror of turboquant_attn._CONTINUATION_DECODE_THRESHOLD: continuation
+# prefill only enters the large-dequant workspace path when the batched-token
+# budget exceeds this value. Kept local to avoid importing the CUDA/triton
+# attention backend into the (CPU-side) KV cache planner.
+_TQ_CONTINUATION_DECODE_THRESHOLD = 128
+
+
+def _turboquant_prefill_workspace_reserve_bytes(vllm_config: VllmConfig) -> int:
+    """Per-rank VRAM (bytes) that the runtime turboquant continuation-prefill
+    dequant workspace will occupy at deep prefill.
+
+    This is subtracted from the KV cache budget *before* ``num_gpu_blocks`` is
+    derived. Without it, the KV cache is sized to consume nearly all VRAM and
+    the continuation workspace (allocated after warmup, then locked) reads out
+    of bounds -> illegal memory access, instead of a clean startup cap.
+
+    The formula mirrors ``TurboQuantAttentionImpl._reserve_continuation_workspace``
+    exactly: two fp16 buffers of shape
+    ``(1, num_kv_heads_per_rank, reserve_cached_len, head_size)`` (k and v),
+    each 256-byte aligned (``WorkspaceManager.get_simultaneous`` alignment),
+    replicated across every workspace ubatch slot.
+
+    Returns 0 when the reservation does not apply: feature disabled, the cache
+    is not a ``turboquant_*`` cache, or the continuation path never triggers.
+    """
+    if not envs.VLLM_TQ_RESERVE_PREFILL_WORKSPACE:
+        return 0
+
+    cache_config = getattr(vllm_config, "cache_config", None)
+    cache_dtype = getattr(cache_config, "cache_dtype", None)
+    if not (isinstance(cache_dtype, str) and cache_dtype.startswith("turboquant_")):
+        return 0
+
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    max_batched_tokens = int(
+        getattr(scheduler_config, "max_num_batched_tokens", 0)
+        if scheduler_config is not None
+        else 0
+    )
+    if max_batched_tokens <= _TQ_CONTINUATION_DECODE_THRESHOLD:
+        return 0
+
+    block_size = int(getattr(cache_config, "block_size", 0) or 0)
+    if block_size <= 0:
+        block_size = max_batched_tokens
+    if block_size <= 0:
+        return 0
+
+    reserve_tokens = max(
+        max_batched_tokens,
+        int(envs.VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS),
+    )
+    reserve_cached_len = math.ceil(reserve_tokens / block_size) * block_size
+    if reserve_cached_len <= 0:
+        return 0
+
+    model_config = vllm_config.model_config
+    parallel_config = vllm_config.parallel_config
+    num_kv_heads = model_config.get_num_kv_heads(parallel_config)
+    head_size = model_config.get_head_size()
+
+    # One fp16 (2 bytes) buffer of shape (1, num_kv_heads, reserve_cached_len,
+    # head_size), 256-byte aligned to match get_simultaneous.
+    buf_bytes = round_up(num_kv_heads * reserve_cached_len * head_size * 2, 256)
+    # k + v are requested simultaneously (aligned bytes summed) ...
+    per_ubatch_bytes = 2 * buf_bytes
+    # ... and reserve_simultaneous_for_all_ubatches replicates the reservation
+    # across every workspace ubatch slot (2 under DBO, else 1; see
+    # gpu_worker.init_workspace_manager).
+    num_ubatches = 2 if getattr(parallel_config, "enable_dbo", False) else 1
+    return per_ubatch_bytes * num_ubatches
+
+
 def get_kv_cache_configs(
     vllm_config: VllmConfig,
     kv_cache_specs: list[dict[str, KVCacheSpec]],
@@ -1980,6 +2053,32 @@ def get_kv_cache_configs(
         _project_kv_cache_groups_to_worker(global_kv_cache_groups, worker_spec)
         for worker_spec in kv_cache_specs
     ]
+
+    # Reserve VRAM for the runtime turboquant continuation-prefill dequant
+    # workspace *before* deriving the KV cache budget. Otherwise the KV cache
+    # is sized to consume nearly all VRAM and the workspace (allocated after
+    # warmup, then locked) reads out of bounds -> illegal memory access at deep
+    # prefill. Subtracting here makes auto-fit, the admission check, and the
+    # per-worker config builder all plan against a budget that leaves room for
+    # the workspace, so an over-large max_model_len becomes a clean startup cap
+    # (the "estimated maximum model length" ValueError) instead of a crash.
+    # Applied before the num_gpu_blocks_override adjustment below so an explicit
+    # operator override still pins num_blocks exactly (reserve is a no-op then).
+    workspace_reserve = _turboquant_prefill_workspace_reserve_bytes(vllm_config)
+    if workspace_reserve > 0:
+        available_memory = [
+            avail_mem
+            if not groups
+            else max(0, avail_mem - workspace_reserve)
+            for groups, avail_mem in zip(projected_groups_per_worker, available_memory)
+        ]
+        logger.info(
+            "Reserving %s GiB per rank for the turboquant continuation-prefill "
+            "workspace before sizing the KV cache "
+            "(VLLM_TQ_RESERVE_PREFILL_WORKSPACE=1); set it to 0 to restore the "
+            "legacy sizing.",
+            format_gib(workspace_reserve),
+        )
 
     # If `num_gpu_blocks_override` is set, the cache size that will actually
     # be allocated is decoupled from the profiled `available_memory`:
