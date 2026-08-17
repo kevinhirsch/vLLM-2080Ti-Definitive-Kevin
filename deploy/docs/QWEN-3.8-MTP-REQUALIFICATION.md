@@ -95,7 +95,7 @@ sudo systemctl daemon-reload && sudo systemctl restart vllm-qwen27b
 
 | # | Gate | Command | Pass bar |
 |---|---|---|---|
-| G1 | Losslessness | `bench_equivalence.py check --ref ref-mtp-off.json` | all probes ≥200-char identical prefix |
+| G1 | Losslessness | `bench_equivalence.py check --ref ref-mtp-off.json` | all probes ≥800 normalized chars (≈200 tokens) identical prefix |
 | G2 | Failure-band ladder | `bench_mtp_requal.py` | every stage PASS: needle recalled, no garble flags, NRestarts Δ=0 |
 | G3 | Tool calls | `bench_toolcalls.sh` | ≥19/20 auto; named OK; ≥4/5 code-args intact |
 | G4 | Reference matrix | `bench_decode.py` | 1x7.5K ≥ **70 tok/s** (else MTP isn't paying for its risk); no garble; NRestarts Δ=0 |

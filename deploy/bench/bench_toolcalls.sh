@@ -91,13 +91,14 @@ for i in range(5):
     msg = r.json()["choices"][0]["message"]
     calls = msg.get("tool_calls") or []
     try:
-        # strict: right tool, right path, and the snippet byte-for-byte in the
-        # decoded arguments — a substring check on '<' would pass mangled args
-        call = calls[0]["function"]
-        args = json.loads(call["arguments"]) if calls else {}
+        # strict: right tool, right path, and the snippet byte-for-byte as the
+        # decoded content (modulo leading/trailing whitespace — a trailing
+        # newline is not a mangling failure; wrapped/mutated text is)
+        call = calls[0]["function"]  # empty calls -> IndexError -> not ok
+        args = json.loads(call["arguments"])
         if (call["name"] == "write_file"
                 and args.get("path") == "/tmp/cmp.c"
-                and SNIPPET in args.get("content", "")):
+                and args.get("content", "").strip() == SNIPPET):
             ok += 1
     except (json.JSONDecodeError, KeyError, IndexError):
         pass
