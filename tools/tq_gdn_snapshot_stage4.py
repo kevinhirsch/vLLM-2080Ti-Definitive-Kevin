@@ -228,9 +228,11 @@ def main() -> int:
         # primary fork error (which is what the caller needs to see).
         try:
             llm.unpin_kv_blocks(handle_id)
-        except Exception as cleanup_err:  # noqa: BLE001 - preserve the fork error
+        except BaseException as cleanup_err:  # noqa: BLE001 - even SystemExit/
+            # KeyboardInterrupt raised mid-cleanup must not replace the primary
+            # fork error; log and let the original propagate via the outer raise.
             print(
-                f"warning: unpin failed during fork-error cleanup: {cleanup_err}",
+                f"warning: unpin failed during fork-error cleanup: {cleanup_err!r}",
                 file=sys.stderr,
             )
         raise
