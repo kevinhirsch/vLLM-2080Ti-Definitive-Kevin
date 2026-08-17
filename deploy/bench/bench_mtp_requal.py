@@ -83,18 +83,23 @@ def run_stage(base: str, model: str, ctx_tokens: int, *, temperature: float,
     #  - nrestarts None: cannot prove the engine stayed up
     #  - acceptance None: MTP is not drafting or /metrics is down — either way
     #    a re-qualification of MTP cannot be scored
-    # CONTAMINATION: /metrics counters are engine-global. A single probe can be
-    # drafted at most once per emitted token, so a drafts delta exceeding this
-    # probe's completion tokens proves concurrent traffic reached the engine
-    # during the stage — the acceptance figure then scores a mixture, not this
-    # probe, and cannot qualify MTP.
+    # CONTAMINATION: /metrics counters are engine-global. A single probe is
+    # drafted at most ~once per emitted token, but the engine's own final
+    # speculative step (drafting past EOS / max_tokens) legitimately lands
+    # 1-2 groups above completion_tokens on a clean isolated run — so allow a
+    # small margin before declaring the sample contaminated by concurrent
+    # traffic. Excess within the margin is recorded, not failed.
+    CONTAMINATION_MARGIN = 2
     drafts_delta = (None if (before is None or after is None)
                     else after["drafts"] - before["drafts"])
     stage["drafts_delta"] = drafts_delta
+    excess = (None if drafts_delta is None
+              else drafts_delta - result["completion_tokens"])
+    stage["drafts_excess"] = excess
     contaminated = (
-        drafts_delta is not None
+        excess is not None
         and result["completion_tokens"] > 0
-        and drafts_delta > result["completion_tokens"]
+        and excess > CONTAMINATION_MARGIN
     )
     stage["contaminated"] = contaminated
     hard_fail = (
@@ -115,8 +120,9 @@ def run_stage(base: str, model: str, ctx_tokens: int, *, temperature: float,
     elif hard_fail and contaminated:
         stage["fail_reason"] = (
             "spec counters contaminated by concurrent traffic "
-            f"(drafts_delta={drafts_delta} > completion_tokens="
-            f"{result['completion_tokens']}) — isolate the engine and re-run"
+            f"(drafts_delta={drafts_delta} exceeds completion_tokens="
+            f"{result['completion_tokens']} by {excess} > margin "
+            f"{CONTAMINATION_MARGIN}) — isolate the engine and re-run"
         )
     return stage
 

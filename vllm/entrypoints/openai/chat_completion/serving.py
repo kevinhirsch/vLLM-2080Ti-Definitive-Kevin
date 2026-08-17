@@ -791,8 +791,15 @@ class OpenAIServingChat(OpenAIServing):
                     # stay identical to the model-parser path
                     # (vllm.parser.abstract_parser); the reasoning field, which
                     # the helper does not carry, is preserved separately.
+                    # Scoped to the plain/parser fallback paths only: harmony
+                    # and the mistral grammar path manage their own tool-call
+                    # streaming and id generation, and their legitimate content
+                    # deltas (leading text, control-token renders) must not be
+                    # re-wrapped into a synthesized call.
                     if (
                         tool_choice_function_name
+                        and not self.use_harmony
+                        and not is_mistral_grammar_path
                         and delta_message is not None
                         and not delta_message.tool_calls
                         and delta_message.content

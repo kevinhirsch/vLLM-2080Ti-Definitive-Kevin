@@ -94,7 +94,10 @@ def main() -> int:
             if ca != cb:
                 break
             common += 1
-        ok = common >= min(PREFIX_MIN, len(a), len(b)) and bool(a) and bool(b)
+        # bar is anchored to the REFERENCE length only — a truncated check
+        # output must fail, not shrink the requirement to its own size
+        needed = min(PREFIX_MIN, len(a))
+        ok = bool(a) and len(b) >= needed and common >= needed
         print(f"[{name}] common prefix {common} chars "
               f"(ref {len(a)}, now {len(b)}) -> {'OK' if ok else 'DIVERGED'}")
         if not ok:

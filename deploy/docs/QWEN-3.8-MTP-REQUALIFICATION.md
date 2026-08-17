@@ -95,10 +95,10 @@ sudo systemctl daemon-reload && sudo systemctl restart vllm-qwen27b
 
 | # | Gate | Command | Pass bar |
 |---|---|---|---|
-| G1 | Losslessness | `bench_equivalence.py check --ref ref-mtp-off.json` | all probes ≥800 normalized chars (≈200 tokens) identical prefix |
-| G2 | Failure-band ladder | `bench_mtp_requal.py` | every stage PASS: needle recalled, no garble flags, NRestarts Δ=0 |
-| G3 | Tool calls | `bench_toolcalls.sh` | ≥19/20 auto; named OK; ≥4/5 code-args intact |
-| G4 | Reference matrix | `bench_decode.py` | 1x7.5K ≥ **70 tok/s** (else MTP isn't paying for its risk); no garble; NRestarts Δ=0 |
+| G1 | Losslessness | `python3 bench_equivalence.py check --ref ref-mtp-off.json` | all probes ≥800 normalized chars (≈200 tokens) identical prefix |
+| G2 | Failure-band ladder | `python3 bench_mtp_requal.py` | every stage PASS: needle recalled, no garble flags, NRestarts Δ=0 |
+| G3 | Tool calls | `./bench_toolcalls.sh` | ≥19/20 auto; named OK; ≥4/5 code-args intact |
+| G4 | Reference matrix | `python3 bench_decode.py --min-single-tps 70` | 1x7.5K ≥ **70 tok/s** (else MTP isn't paying for its risk); no garble; NRestarts Δ=0 |
 | G5 | Soak | leave running overnight with the watchdog; re-run G2 next morning | NRestarts Δ=0 over the soak; morning ladder still green |
 
 **4. Optional sweep once green:** `MTP_K=2` via the drop-in (`Environment=MTP_K=2`)
@@ -111,7 +111,7 @@ try the sweep once at T0.4 to see how much headroom sampling costs.
 - **Adopt:** keep the drop-in; record the numbers in `RESULTS-TEMPLATE.md`;
   append the outcome to vLLM-Benchmarks.md; update the Obsidian "Qwen3.8 Live
   Config" note. Clients need no changes (`qwen-local` alias unchanged).
-- **Roll back:** `sudo rm .../mtp-requal.conf && sudo systemctl daemon-reload
+- **Roll back:** `sudo rm /etc/systemd/system/vllm-qwen27b.service.d/mtp-requal.conf && sudo systemctl daemon-reload
   && sudo systemctl restart vllm-qwen27b` → MTP-off config J serves again.
   File the failing stage JSON + engine journal in the incident notes.
 

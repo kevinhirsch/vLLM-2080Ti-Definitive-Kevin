@@ -37,9 +37,11 @@ Variant: serve-qwen38-mtp-requal-fg.sh  MTP_K=__  Template: froggeric v22-offici
 _Transcription note: this comparison table is assembled by hand from TWO runs
 of `bench_decode.py` (one on the MTP-off engine, one on the requal variant —
 each prints `point | TTFT | decode tok/s | aggregate | acceptance | garble |
-NRestarts Δ` rows); copy each run's decode column into its column below. Run
-the MTP-on pass with `--min-single-tps 70` so the ship bar is enforced by
-exit code, not just by eyeball._
+NRestarts Δ` rows); copy each run's decode column into its column below. The
+`acceptance`, `garble`, and `NRestarts Δ` columns are taken from the **MTP-on
+run** (the MTP-off baseline has no acceptance and contributes only its decode
+column). Run the MTP-on pass with `--min-single-tps 70` so the ship bar is
+enforced by exit code, not just by eyeball._
 
 | point | MTP-off tok/s | MTP-on tok/s | Δ | acceptance | garble | NRestarts Δ |
 |---|---|---|---|---|---|---|
