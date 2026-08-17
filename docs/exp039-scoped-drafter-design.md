@@ -198,14 +198,52 @@ So the K=2→K=16 jump inflates the required mnbt from ~3488 to ~3856; **3968** 
 ON server start. (The two calibration points above are empirical for this model/box; the operative rule
 is `mnbt ≥ align_block(K)` with `align_block` scaling ~linearly in `1+K`.)
 
-#### K-sizing finding #2 — ~5 GiB profiling underestimate at K=16 (documented, fix out of scope)
+#### K-sizing finding #2 — ~5 GiB profiling underestimate at K=16 (root-caused + fixed 2026-08-17)
 
-At `num_speculative_tokens=16` the KV-cache profiling pass **under-counts peak memory by ≈ 5 GiB**
-(the `(1+K)`-wide decode activations + the widened draft/lookahead buffers are not fully reflected in
-the profiling forward), so a nominal `gpu-memory-utilization` that profiles fine will then OOM under
-load. The ON server was brought up with **`--gpu-memory-utilization 0.75`** (down from prod's higher
-util) to absorb the gap. **The profiling fix itself is out of scope for EXP-039** — recorded here so the
-re-A/B (and any future K>2 run) starts from a util that already accounts for the underestimate.
+At `num_speculative_tokens=16` the KV-cache profiling pass **under-counts peak memory by ≈ 5 GiB**, so a
+nominal `gpu-memory-utilization` that profiles fine then OOMs post-profiling. The ON server had to be
+brought up with **`--gpu-memory-utilization 0.75`** + `--max-num-seqs 4` (down from 16) to absorb it.
+
+**Root cause (proven by reading allocation sites, not guessed).** `GPUModelRunner.profile_run` runs a
+prefill-shaped `_dummy_run` then `_dummy_sampler_run`. The spec branch of `_dummy_sampler_run`
+(`gpu_model_runner.py:5984-6006`) exercises the rejection sampler with `draft_token_ids = [[0]]*num_reqs`
+— **one** draft token per request (`logits = randn(2·num_reqs, vocab)`), and the prefill dummy computes
+logits at only `num_reqs` positions. A *real* decode step with `K=16` instead verifies `(1+K)·num_reqs`
+positions: `compute_logits` produces a `((1+K)·num_reqs, vocab)` fp32 tensor
+(`gpu_model_runner.py:4221-4222`, `logits_indices` from `_calc_spec_decode_metadata`), and the rejection
+sampler (`vllm/v1/sample/rejection_sampler.py`) holds several concurrent full-vocab **fp32** buffers over
+the `K·num_reqs` target positions (`raw_target_logits`, its `.clone()`, the top-k/top-p sort scratch, the
+`target_probs` softmax). None of that full-width verify peak is materialised during profiling, so it
+lands lazily on the first real decode step — after the KV cache has already claimed the rest of VRAM — and
+OOMs. The gap scales with `(K−1)·num_reqs` (verify width beyond the profiled K=1 baseline), which is
+exactly why it is invisible at K=2, ≈5 GiB at K=16/seqs=16, and ~4× smaller at seqs=4. Ruled out by the
+same audit: `_reserve_decode_workspace` (turboquant decode; `B·Hq·S·(D+1)`, no `(1+K)` factor, reserved
+eagerly at weight-load), the mamba spec buffers (`state_indices_tensor_d (B,1+K)` / `decode_num_accepted`
+— tiny int32, eager), and the drafter (`VLLM_MTP_DRAFT_CAP=2` keeps its chain at K2; buffers are
+`max_num_batched_tokens`-sized and eager; `dummy_run` allocates no vocab logits).
+
+**Fix (at source, staged 2026-08-17).** An analytical reserve subtracted from the KV budget *before*
+`num_gpu_blocks` is derived — mirroring `_turboquant_prefill_workspace_reserve_bytes`:
+`vllm/v1/core/spec_decode_workspace.py` (pure, torch-free formula) +
+`kv_cache_utils._spec_decode_verify_workspace_reserve_bytes` (config wrapper) +
+the subtract in `get_kv_cache_configs`. Formula:
+`reserve = OVERSHOOT_MULT · (K−1)·max_num_seqs · vocab · 4`. No add-back in
+`determine_available_memory` is needed (unlike the turboquant arena): the verify buffers are never
+allocated during profiling, so there is no double-count. Env-gated (`VLLM_SPEC_RESERVE_VERIFY_WORKSPACE`,
+default on when `speculative_config` present and `K>1`; `VLLM_SPEC_VERIFY_OVERSHOOT_MULT`, default 24).
+Validated by `tests/v1/core/test_spec_decode_workspace.py` (pure-python, no engine): predicts **5.33 GiB**
+at K16/seqs16, **1.33 GiB** at K16/seqs4 (=÷4), **0.36 GiB** at K2/seqs16 — matching all three measured
+boot facts.
+
+**Honest caveat (per [[Challenge Impossible Claims]]).** The *mechanistically* attributable verify
+buffers are only ~1.3 GiB (`OVERSHOOT_MULT≈6`); the arithmetic ceiling of the verify logits is ~2 GiB at
+this vocab/batch, so the observed ~5 GiB is **not** all spec-verify logits. The default `OVERSHOOT_MULT=24`
+reserves the full observed envelope; the excess over the ~6 mechanistic floor covers the un-instrumented
+residual that also scales with the `(1+K)`-wide decode batch — the **GDN/Mamba align-mode decode scan
+workspace** and PyTorch caching-allocator **fragmentation**. Attributing that residual precisely needs an
+instrumented boot (`torch.cuda.memory._record_memory_history` around the first decode step); once done,
+`OVERSHOOT_MULT` can drop toward 6 and the residual be handled at its own source. Until then the default
+lets a K=16 run boot at the prod util instead of crashing.
 
 ---
 
