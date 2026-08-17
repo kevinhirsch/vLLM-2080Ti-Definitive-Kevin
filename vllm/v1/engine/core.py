@@ -852,6 +852,207 @@ class EngineCore:
             "num_freed_blocks": num_freed,
         }
 
+    # ------------------------------------------------------------------
+    # EXP-038 Stage-4 — scheduler-level FORK API (fork WITHOUT resubmit).
+    #
+    # ``fork_from_handle`` constructs N child Requests INSIDE EngineCore from a
+    # pinned handle's cached prefix (each with its OWN sampling params) and drives
+    # them to completion, letting the EXISTING local prefix-cache adoption
+    # (``find_longest_cache_hit`` ref-count touch for attn + align-mode GDN
+    # copy-out for mamba, i.e. the proven Stage-2/3 path) adopt the pinned donor
+    # blocks at admission. This is the least-invasive insertion point: NO
+    # scheduler / kv_cache_manager / connector / worker changes — a pure
+    # scheduler-side utility like the Stage-1 pin set. See
+    # docs/exp038-stage4-fork-api.md for the full insertion-point analysis, the
+    # honest "win" definition (per-child sampling divergence is NOT unique to fork
+    # — block hashes exclude sampling params), and the residual gap (the single
+    # internal cache-hit prefill schedule per child is not eliminated — that would
+    # need a direct running-seed, too invasive for staged work). Env-gated
+    # (``VLLM_TQ_GDN_SNAPSHOT``), default-inert. NEVER run against :8001.
+    # ------------------------------------------------------------------
+    def _tq_block_tables_for(self, req_ids: list[str]) -> dict[str, Any]:
+        """Read-only per-group block table for each of ``req_ids`` (fork mid-gen
+        witness). Same payload shape as ``get_request_kv_block_ids``. Skips
+        req_ids not currently resident in the coordinator."""
+        coordinator = self._tq_kv_cache_manager().coordinator
+        out: dict[str, Any] = {}
+        for rid in req_ids:
+            try:
+                blocks_per_group = coordinator.get_blocks(rid)
+            except Exception:  # noqa: BLE001 - not resident (finished/never sched)
+                continue
+            groups: dict[str, Any] = {}
+            for group_id, blocks in enumerate(blocks_per_group):
+                groups[str(group_id)] = {
+                    "spec": self._tq_group_label(group_id),
+                    "block_ids": [b.block_id for b in blocks if not b.is_null],
+                }
+            out[rid] = {"groups": groups}
+        return out
+
+    def fork_from_handle(
+        self,
+        handle_id: str,
+        child_specs: list[dict[str, Any]],
+        max_steps: int | None = None,
+    ) -> dict[str, Any]:
+        """Fork a pinned handle into ``len(child_specs)`` children WITHOUT resubmit.
+
+        Each child is a fresh ``Request`` built engine-side from the pinned
+        handle's cached ``prompt_token_ids`` with its OWN sampling params
+        (``child_specs[i]`` is a dict of ``SamplingParams`` kwargs, e.g.
+        ``{"temperature": 0.0, "max_tokens": 64, "logprobs": 1}``). Children are
+        admitted through the normal scheduler path and adopt the pinned donor
+        blocks via the local prefix cache (attn full blocks touched -> ``ref_cnt``
+        bumped; mamba GDN full block copied out to a fresh running slot by align
+        mode). The children are then driven to completion on the busy-loop thread
+        (single-threaded: this runs inside the utility handler, before the outer
+        ``_process_engine_step``, so it is not re-entrant and no child outputs leak
+        to the client output socket).
+
+        The pin is NOT released here — ownership stays with the caller's
+        ``unpin_kv_blocks(handle_id)`` (EXP-038 Risk #1). Returns plain dicts:
+        per-child token_ids + ``num_cached_tokens`` (the ~zero-prefill-compute
+        proxy) + finish_reason, a widest-catch mid-gen block-table snapshot, and
+        the pre/post free-block counts for the leak invariant.
+        """
+        self._tq_snapshot_require_enabled()
+        from vllm.sampling_params import SamplingParams
+
+        if not child_specs:
+            raise ValueError("fork_from_handle requires at least one child spec")
+        if self.request_block_hasher is None:
+            raise RuntimeError(
+                "fork_from_handle requires prefix caching (request_block_hasher "
+                "is None); enable_prefix_caching must be on so children can adopt "
+                "the pinned donor blocks via the local prefix cache"
+            )
+        reg = self._tq_pin_registry()
+        entry = reg.get(handle_id)
+        if entry is None:
+            raise KeyError(f"unknown pin handle {handle_id!r}")
+        prompt_token_ids = list(entry["prompt_token_ids"])
+        if not prompt_token_ids:
+            raise RuntimeError(
+                f"pin handle {handle_id!r} has no prompt_token_ids to fork from"
+            )
+
+        sched = self.scheduler
+        block_pool = self._tq_kv_cache_manager().block_pool
+        pre_free_blocks = int(block_pool.get_num_free_blocks())
+
+        # Build + admit the children. n is implied by len(child_specs) so each
+        # child's sampling params are first-class / independently divergent.
+        child_ids: list[str] = []
+        child_state: dict[str, dict[str, Any]] = {}
+        for i, spec in enumerate(child_specs):
+            spec = dict(spec)
+            spec.setdefault("max_tokens", 16)
+            sampling_params = SamplingParams(**spec)
+            req_id = f"tqfork-{handle_id}-{i}-{uuid.uuid4().hex[:8]}"
+            req = Request(
+                request_id=req_id,
+                prompt_token_ids=list(prompt_token_ids),
+                sampling_params=sampling_params,
+                pooling_params=None,
+                arrival_time=time.time(),
+                block_hasher=self.request_block_hasher,
+            )
+            self.add_request(req)
+            child_ids.append(req_id)
+            child_state[req_id] = {
+                "req_id": req_id,
+                "token_ids": [],
+                "num_cached_tokens": None,
+                "finish_reason": None,
+                "spec": spec,
+            }
+
+        # Bounded decode loop. Cap = sum(max_tokens) + one prefill step per child
+        # + slack, so a stuck request can never spin the busy loop forever.
+        if max_steps is None:
+            total_max = sum(int(s.get("max_tokens", 16)) for s in child_specs)
+            max_steps = total_max + 2 * len(child_specs) + 8
+        pending = set(child_ids)
+        midgen: dict[str, Any] = {}
+        midgen_best_n = -1
+        steps = 0
+        # Use the engine's own stepping path (self.step for the PoC engine; the
+        # batch-queue variant may return outputs=None mid-batch, handled below).
+        step_fn = getattr(self, "step_fn", None) or self.step
+        while pending and steps < max_steps:
+            outputs, _ = step_fn()
+            steps += 1
+            for _client_idx, eco in (outputs.items() if outputs else ()):
+                for o in getattr(eco, "outputs", ()) or ():
+                    st = child_state.get(o.request_id)
+                    if st is None:
+                        continue
+                    if o.new_token_ids:
+                        st["token_ids"].extend(int(t) for t in o.new_token_ids)
+                    if (
+                        o.prefill_stats is not None
+                        and st["num_cached_tokens"] is None
+                    ):
+                        st["num_cached_tokens"] = int(
+                            o.prefill_stats.num_cached_tokens
+                        )
+                    if o.finish_reason is not None:
+                        st["finish_reason"] = str(o.finish_reason)
+                        pending.discard(o.request_id)
+            # Widest mid-gen catch: keep the block tables from the step where the
+            # most children were co-running (the window that shows the shared attn
+            # block + distinct mamba running slots).
+            running_child_ids = [
+                r.request_id
+                for r in getattr(sched, "running", []) or []
+                if r.request_id in child_state
+            ]
+            if len(running_child_ids) > midgen_best_n:
+                snap = self._tq_block_tables_for(running_child_ids)
+                if snap:
+                    midgen = snap
+                    midgen_best_n = len(running_child_ids)
+
+        # Any still-pending child hit the safety bound; mark it so the driver sees
+        # it rather than silently trusting a truncated result.
+        for rid in pending:
+            if child_state[rid]["finish_reason"] is None:
+                child_state[rid]["finish_reason"] = "length_or_bound"
+
+        post_free_blocks = int(block_pool.get_num_free_blocks())
+
+        children_out = []
+        for rid in child_ids:
+            st = child_state[rid]
+            children_out.append(
+                {
+                    "req_id": rid,
+                    "token_ids": st["token_ids"],
+                    "num_cached_tokens": (
+                        st["num_cached_tokens"]
+                        if st["num_cached_tokens"] is not None
+                        else 0
+                    ),
+                    "num_output_tokens": len(st["token_ids"]),
+                    "finish_reason": st["finish_reason"],
+                    "spec": st["spec"],
+                }
+            )
+        return {
+            "handle_id": handle_id,
+            "n": len(child_ids),
+            "prefix_len": len(prompt_token_ids),
+            "children": children_out,
+            "midgen_block_tables": {
+                "n_running": midgen_best_n if midgen_best_n > 0 else 0,
+                "requests": midgen,
+            },
+            "pre_free_blocks": pre_free_blocks,
+            "post_free_blocks": post_free_blocks,
+            "steps": steps,
+        }
+
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
 

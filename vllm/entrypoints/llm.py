@@ -1525,6 +1525,28 @@ class LLM:
         """Release a pin handle (frees the pinned blocks)."""
         return self.llm_engine.unpin_kv_blocks(handle_id)
 
+    def fork_from_handle(
+        self,
+        handle_id: str,
+        child_specs: list[dict[str, Any]],
+        max_steps: int | None = None,
+    ) -> dict[str, Any]:
+        """EXP-038 Stage-4: fork a pinned handle into ``len(child_specs)``
+        children WITHOUT resubmit.
+
+        Each ``child_specs[i]`` is a dict of ``SamplingParams`` kwargs (e.g.
+        ``{"temperature": 0.0, "max_tokens": 64, "logprobs": 1}``) so children may
+        diverge in sampling / max_tokens. Children are built engine-side from the
+        pinned handle's cached prefix and adopt the pinned donor blocks via the
+        local prefix cache (attn ref-count touch + align-mode GDN copy-out), then
+        are driven to completion inside EngineCore. The pin is NOT released — call
+        :meth:`unpin_kv_blocks` when done. Returns per-child token_ids +
+        ``num_cached_tokens`` (~zero-prefill-compute proxy), a mid-gen block-table
+        snapshot, and pre/post free-block counts (leak invariant). Env-gated by
+        ``VLLM_TQ_GDN_SNAPSHOT``; NEVER use against :8001.
+        """
+        return self.llm_engine.fork_from_handle(handle_id, child_specs, max_steps)
+
     def sleep(self, level: int = 1, mode: PauseMode = "abort"):
         """
         Put the engine to sleep. The engine should not process any requests.
