@@ -1,7 +1,10 @@
 # EXP-039 (S4): Suffix-scoped drafter for verbatim re-emission
 
 **Branch:** `feat-s4-scoped-drafter` (worktree `~/Desktop/.ftree-s4drafter`, base `frontier-pastnative-20260816`)
-**Status:** first staged implementation — code-complete, env-gated default-off, **no engine runs yet**.
+**Status:** first A/B ran on hardware (2026-08-16 eve) → **NEGATIVE, root-caused, fixed** (2026-08-17).
+The gate-open drafts were misaligned by one step (proposing the token *just* sampled), collapsing
+copy-span acceptance to ~0. Fixed in `scoped_reemission.py`; unit-test proven. **Re-A/B pending.**
+See **§11** for the A/B numbers, the proven root cause, the fix, and the corrected re-test protocol.
 **Env switch:** `VLLM_S4_SCOPED_DRAFTER=1` (default `0` = strict no-op).
 
 ---
@@ -170,15 +173,53 @@ The list-path draft (variable length per request) then flows through
 buffer is only used on the padded tensor path), and the scheduler trims each request's drafts only to
 what the token budget allows (`scheduler.py:492`), not to `num_spec_tokens`.
 
+#### K-sizing finding #1 — `max-num-batched-tokens` must clear the inflated mamba align block
+
+Qwen3.8 runs the mamba/GDN layers in **`mamba_cache_mode="align"`**, where each in-flight decode
+sequence occupies a query window of `1 + num_speculative_tokens` tokens (`mamba_attn.py:98-99,173`:
+`max_query_len == 1 + self.num_spec_tokens`, decode-only), and the align-mode batch is padded to the
+mamba `chunk_size` boundary. The scheduler's `max_num_batched_tokens` (**mnbt**) must be ≥ that padded
+align block or the engine refuses to boot (`config/vllm.py:1996-2002` asserts `block_size ≤ mnbt`, and
+the align path further requires the full `(1+K)`-wide decode batch to fit).
+
+Because the block grows with `1 + K`, **raising K raises the minimum mnbt**:
+
+```
+align_block(K)  ≈  chunk_pad( max_num_seqs · (1 + K) + prefill_reserve )
+required_mnbt(K) ≥ align_block(K)
+
+measured (max_num_seqs=4, this box):
+  K=2  (MTP baseline) : align_block ≈ 3488
+  K=16 (S4 pipeline)  : align_block ≈ 3856     ← the boot-blocker at K=16
+  → ON server booted with mnbt = 3968 (first headroom step above 3856)
+```
+
+So the K=2→K=16 jump inflates the required mnbt from ~3488 to ~3856; **3968** is the value that let the
+ON server start. (The two calibration points above are empirical for this model/box; the operative rule
+is `mnbt ≥ align_block(K)` with `align_block` scaling ~linearly in `1+K`.)
+
+#### K-sizing finding #2 — ~5 GiB profiling underestimate at K=16 (documented, fix out of scope)
+
+At `num_speculative_tokens=16` the KV-cache profiling pass **under-counts peak memory by ≈ 5 GiB**
+(the `(1+K)`-wide decode activations + the widened draft/lookahead buffers are not fully reflected in
+the profiling forward), so a nominal `gpu-memory-utilization` that profiles fine will then OOM under
+load. The ON server was brought up with **`--gpu-memory-utilization 0.75`** (down from prod's higher
+util) to absorb the gap. **The profiling fix itself is out of scope for EXP-039** — recorded here so the
+re-A/B (and any future K>2 run) starts from a util that already accounts for the underestimate.
+
 ---
 
 ## 6. Per-position acceptance accounting (scoped vs MTP, measured separately)
 
-The drafter records, per request, the last draft it emitted **tagged by source** (`scoped`|`mtp`) and
-the sequence length at emit time. On the following step it reconciles: the sequence grew by
-`1 (bonus) + n_accepted_draft`, so `n_accepted_draft = new_len − old_len − 1`, clamped to
-`[0, len(draft)]` and confirmed by comparing the draft prefix to the newly-appended real tokens. Each
-observation lands in per-source, per-position histograms:
+The drafter records, per request, the last draft it emitted **tagged by source** (`scoped`|`mtp`). On
+the following step it reconciles against **that step's `sampled_token_ids`**: the draft emitted at step
+T−1 is verified by the target model at step T, and its accepted prefix arrives as step T's sampled
+tokens (the rejection sampler emits `[accepted drafts…, bonus]`), so `n_accepted = ` the longest prefix
+where `draft[i] == sampled_ids[i]`. Scoring against `sampled_token_ids` (not against a `new_len − old_len`
+delta over `token_ids_cpu`) is deliberate — at draft-merge time `token_ids_cpu`/`num_tokens_no_spec`
+have **not yet** been advanced by `_bookkeeping_sync`, so a length-delta reconcile reads a stale, step-
+mismatched sequence (this is the same staleness that caused the §11 root-cause bug). Each observation
+lands in per-source, per-position histograms:
 
 ```
 S4 scoped-drafter: gate_fires=..., copy_spans=..., mean_span_len=...
@@ -277,3 +318,112 @@ Required companions when enabling: `num_speculative_tokens = VLLM_S4_K_SCOPED`, 
    `uniform_decode_query_len` to 17 and needs a matching `cudagraph_capture_sizes` review before a soak
    (staged-code caveat — verify at first engine bring-up).
 ```
+
+---
+
+## 11. A/B result, root cause & fix (2026-08-17)
+
+### 11.1 The measured failure (first A/B, on hardware, PIECEWISE both sides)
+
+`num_speculative_tokens=16`, `VLLM_S4_G=12`, `VLLM_S4_K_SCOPED=16`, `VLLM_S4_MIN_UNIQ=1`.
+Per-position numbers are vLLM's **own** `vllm:spec_decode_num_accepted_tokens_per_pos` (Prometheus),
+scraped by the bench — i.e. the authoritative rejection-sampler acceptance, not the drafter's internal
+accounting.
+
+| workload | OFF tok/s | OFF per_pos[0,1] | ON tok/s | ON per_pos |
+|---|---|---|---|---|
+| quote | 364.7 | 0.906, 0.818 | **91.0 (−75%)** | **0.165, 0.128, 0, 0, …** |
+| mixed | 72.3 | 0.804, 0.656 | 31.3 | 0.220, 0.166, 0, … |
+| generation (control) | 69.1 | 0.749, 0.529 | 65.9 (≈passthrough; −5% = async-off headwind) | 0.732, 0.498, 0, … |
+
+The tell: gate-open proposals accepted **~0 even at position 0** (0.165 vs MTP's 0.906 on the *same*
+copy workload), and positions **2–15 accepted exactly zero**. That is not a "weak draft" — the drafted
+tokens were the **wrong** tokens.
+
+### 11.2 Proven root cause — **Suspect (3): stale token stream** (manifesting as Suspect (1)'s off-by-one)
+
+`ScopedReemissionDrafter.merge` runs inside `gpu_model_runner.propose_draft_token_ids`, which on the
+**MTP/EAGLE path executes BEFORE `_bookkeeping_sync`** (call order in `execute_model`:
+`propose_draft_token_ids` at ~L4381 → `_bookkeeping_sync` at ~L4440; `_bookkeeping_sync` is what writes
+`token_ids_cpu[req, start:end] = sampled_ids` and advances `num_tokens_no_spec`, at ~L3598-3600).
+So at merge time the committed sequence `token_ids_cpu[:num_tokens_no_spec]` is **missing the token(s)
+sampled this step** — those arrive only via the `sampled_token_ids` argument (exactly what MTP is seeded
+from, via `next_token_ids`).
+
+The old gate hashed the **committed** last-G window (`seq[n−g:n]`, `n = num_tokens_no_spec`), so in a
+verbatim copy span its needle ended one token *before* this step's sample. It matched the prompt G-gram
+ending at `e = (that position)` and drafted `prompt[e : e+K]` — whose **position 0 is the token just
+sampled this step** (already emitted). The rejection sampler rejects it immediately, and since rejection
+cascades, positions 1–15 never get a chance → the observed `[low, low, 0, 0, …]` shape (the residual
+0.165/0.128 at 0–1 is the *gate-closed* steps where MTP-K2 still flows through; the gate-open steps
+contribute pure zeros, dragging MTP's 0.906 down to 0.165).
+
+Not Suspect (2) (tensor-layout/slot): a slot/order corruption would zero position 0 uniformly; the
+surviving nonzero at 0–1 (= MTP passthrough on gate-closed steps) rules it out. **Proven, not assumed**,
+by the unit test in §11.4.
+
+### 11.3 The fix (in `vllm/v1/spec_decode/scoped_reemission.py`)
+
+Splice this step's sampled tokens onto the committed tail **before** hashing the needle and computing the
+continuation, so the scoped draft continues from the same point MTP does:
+
+- New `_effective_tail(seq, n, sampled_ids)` returns the true last-G window = `(committed tail) ⧺
+  (this step's sampled tokens)`, handling `len(sampled_ids) ≥ g` (needle wholly from sampled tokens).
+- `_scoped_draft(st, seq, n, sampled_ids)` now uses `n_eff = n + len(sampled_ids)` for the length/
+  `max_model_len` guards and hashes `_effective_tail`; the matched G-gram's continuation `prompt[e:e+K]`
+  is therefore the token **after** this step's sample — aligned with MTP. Handles multi-token accept
+  steps (`grew > 1`), so it is **not** a hard-coded `+1`.
+- `_reconcile` rewritten to score the previous draft against **this step's `sampled_token_ids`** (the
+  verification result), replacing the stale `new_len − old_len − 1` delta over `token_ids_cpu`.
+- `merge` now normalises `sampled_token_ids` (strips `-1`) on both the tensor and list paths and passes
+  the per-request sampled tokens into both reconcile and the gate. Dropped the now-unused
+  `last_num_tokens` state.
+
+Fail-safe path (`_scoped_gate_merge` in `gpu_model_runner`) is unchanged: any error → MTP drafts pass
+through. The gate remains **lossless** (draft-only; the rejection sampler verifies).
+
+### 11.4 Unit-test evidence — `tests/v1/spec_decode/test_scoped_reemission.py`
+
+Pure-python (numpy only; stubs `vllm.config`/`vllm.logger`, loads the module by path — no torch/CUDA).
+It reproduces the exact merge-time timing contract (committed sequence lags by this step's samples).
+
+- `test_verbatim_copy_single_token_step` — **reproduced the bug first**: against the old code the draft
+  was `prompt[m−1 : …]` with `got[0] == prompt[m−1]` (the just-sampled token); after the fix it equals
+  the true continuation `prompt[m : m+K]`.
+- `test_verbatim_copy_multi_token_step` — 3 tokens accepted this step; proves the fix advances by *all*
+  sampled tokens (a `+1`-only fix fails this).
+- `test_needle_longer_than_g` — `len(sampled) ≥ g`, needle wholly from sampled tokens.
+- `test_gate_closed_passes_mtp_through` / `test_no_sampled_token_returns_mtp` — gate stays shut off a
+  non-copy tail and on empty (partial-prefill) rows.
+
+Result: **5/5 pass** post-fix; the first two **fail** on the pre-fix code (bug reproduced, then fixed).
+Run: `python3 tests/v1/spec_decode/test_scoped_reemission.py`.
+
+### 11.5 Corrected re-A/B protocol
+
+Boot the ON server with the sizing adjustments that let it start (see §5 findings #1/#2): **util 0.75,
+max-num-seqs 4, mnbt 3968, max-len 65536**, plus the required spec shape:
+
+```
+--speculative-config '{"method":"mtp","num_speculative_tokens":16}'
+--gpu-memory-utilization 0.75 --max-num-seqs 4
+--max-num-batched-tokens 3968 --max-model-len 65536
+# env: VLLM_MTP_DRAFT_CAP=2 VLLM_S4_SCOPED_DRAFTER=1 (ON) / 0 (OFF)
+#      VLLM_S4_K_SCOPED=16 VLLM_S4_G=12 VLLM_S4_MIN_UNIQ=1
+```
+
+Same bench commands as the first A/B (endpoint `:8001`, model `qwen-local`), OFF then ON, then compare:
+
+```
+python tools/s4_replay_bench.py --base-url http://127.0.0.1:8001 --model qwen-local \
+    --label off --reps 3 --warmup 1 --out /tmp/s4_off.json      # VLLM_S4_SCOPED_DRAFTER=0
+python tools/s4_replay_bench.py --base-url http://127.0.0.1:8001 --model qwen-local \
+    --label on  --reps 3 --warmup 1 --out /tmp/s4_on.json       # VLLM_S4_SCOPED_DRAFTER=1
+python tools/s4_replay_bench.py --compare /tmp/s4_off.json /tmp/s4_on.json
+```
+
+**Expected post-fix:** `quote`/`rewrite` per_pos[0] should recover to ≫0.16 (target ≈ MTP's ~0.9,
+extending into positions 2–15 as the copy span is drafted K-deep); `generation` unchanged (~−5% async-
+off headwind only). If `quote` per_pos[0] is still ~0.16, the gate is still misaligned — do not re-run
+until the unit test above is green. Pass/leak criteria unchanged from §8.
+
