@@ -144,6 +144,71 @@ def do_mamba_copy_block(copy_bufs: MambaCopyBuffers):
     )
 
 
+def iter_mamba_state_tensors(
+    kv_cache_config: KVCacheConfig,
+    mamba_group_ids: list[int],
+    forward_context: dict[str, Any],
+):
+    """Yield ``(group_id, layer_name, state_index, state_tensor)`` for every
+    mamba state tensor (e.g. conv + temporal for GDN) across all mamba groups.
+
+    The iteration order is deterministic and matches the group/layer/state
+    order used by :func:`collect_mamba_copy_meta`, so snapshot and restore
+    build their src/dst slot lists in the same order and pair up correctly.
+    Used by the EXP-038 snapshot/park/fork PoC (worker-side).
+    """
+    for group_id in mamba_group_ids:
+        layer_names = kv_cache_config.kv_cache_groups[group_id].layer_names
+        for layer_name in layer_names:
+            attention = forward_context[layer_name]
+            kv_caches: list[torch.Tensor] = attention.kv_cache
+            for state_index, state in enumerate(kv_caches):
+                yield group_id, layer_name, state_index, state
+
+
+def batch_copy_slots(
+    copy_bufs: MambaCopyBuffers,
+    src_slots: list[torch.Tensor],
+    dst_slots: list[torch.Tensor],
+) -> None:
+    """Byte-exact device-to-device copy of a list of per-block state slots via
+    the same fused ``batch_memcpy`` kernel that align mode runs every decode
+    step (:func:`do_mamba_copy_block`).
+
+    ``src_slots[i]`` / ``dst_slots[i]`` are per-block state slices — e.g.
+    ``state[block_id]`` for a live KV block, or ``park_pool[layer][s][idx]``
+    for a park slot. They must be equal in ``numel`` and element size and each
+    contiguous over that ``numel`` (true for a full running-state slot). A
+    full-slot copy is byte-identical to the align-mode per-step copy for
+    ``num_accepted_tokens == 1`` (``accept_token_bias == 0``), which is exactly
+    the snapshot/restore case. This is a thin generalization of
+    :func:`collect_mamba_copy_meta` that accepts explicit src/dst tensors
+    (so the destination can live outside ``req_state.block_ids``, i.e. a park
+    slot) instead of indexing a single request's block table.
+    """
+    assert len(src_slots) == len(dst_slots)
+    n = len(src_slots)
+    if n == 0:
+        return
+    capacity = copy_bufs.src_ptrs.np.shape[0]
+    assert n <= capacity, (
+        f"mamba copy buffer too small for snapshot/restore batch: {n} > {capacity}"
+    )
+    src_ptrs_np = copy_bufs.src_ptrs.np
+    dst_ptrs_np = copy_bufs.dst_ptrs.np
+    sizes_np = copy_bufs.sizes.np
+    for i, (src, dst) in enumerate(zip(src_slots, dst_slots)):
+        assert src.numel() == dst.numel(), "snapshot/restore slot numel mismatch"
+        assert src.element_size() == dst.element_size(), (
+            "snapshot/restore slot dtype size mismatch"
+        )
+        src_ptrs_np[i] = src.data_ptr()
+        dst_ptrs_np[i] = dst.data_ptr()
+        sizes_np[i] = src.numel() * src.element_size()
+    copy_bufs.offset = n
+    do_mamba_copy_block(copy_bufs)
+
+
 def preprocess_mamba(
     scheduler_output: SchedulerOutput,
     kv_cache_config: KVCacheConfig,
