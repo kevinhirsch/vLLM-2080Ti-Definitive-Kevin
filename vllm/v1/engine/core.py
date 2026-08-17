@@ -868,6 +868,40 @@ class EngineCore:
             "num_freed_blocks": num_freed,
         }
 
+    def get_pin_handle(self, handle_id: str) -> dict[str, Any]:
+        """Read-only accessor for a pin handle's forkable metadata (EXP-038 v2).
+
+        Returns the serializable fields the SERVER-LAYER fork (``/tq/fork2``)
+        needs to fan out children by handle_id alone: the donor's cached
+        ``prompt_token_ids`` and ``cache_salt`` (the two inputs a child prompt
+        must reproduce to hash-match and adopt the pinned blocks), plus the
+        prefix length and computed-token count. Purely reads the pin registry
+        the Stage-1 ``pin_request_kv_blocks`` already populated — NO touch, free,
+        alloc, or step, so it can never perturb the pinned blocks it describes.
+
+        This is the read side of the pin registry (a sibling of the read-only
+        ``verify_pinned_blocks`` / ``get_request_kv_block_ids`` accessors), NOT
+        new fork machinery: the v2 non-blocking fork path deliberately keeps all
+        fan-out / streaming / stop-token semantics in the server layer's normal
+        ``generate()`` path (see docs/exp038-fork-v2.md). Presence in the
+        registry IS the pin-check — ``unpin_kv_blocks`` pops the entry, so a
+        released handle raises ``KeyError`` here just as it would for a fork.
+        """
+        self._tq_snapshot_require_enabled()
+        reg = self._tq_pin_registry()
+        entry = reg.get(handle_id)
+        if entry is None:
+            raise KeyError(f"unknown pin handle {handle_id!r}")
+        prompt_token_ids = list(entry.get("prompt_token_ids") or [])
+        return {
+            "handle_id": handle_id,
+            "req_id": entry.get("req_id"),
+            "prompt_token_ids": prompt_token_ids,
+            "prefix_len": len(prompt_token_ids),
+            "num_computed_tokens": int(entry.get("num_computed_tokens", 0)),
+            "cache_salt": entry.get("cache_salt"),
+        }
+
     # ------------------------------------------------------------------
     # EXP-038 Stage-4 — scheduler-level FORK API (fork WITHOUT resubmit).
     #

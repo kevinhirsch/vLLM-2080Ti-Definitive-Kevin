@@ -354,6 +354,9 @@ class LLMEngine:
     ) -> dict[str, Any]:
         return self.engine_core.get_request_kv_block_ids(req_id, all_running)
 
+    def get_pin_handle(self, handle_id: str) -> dict[str, Any]:
+        return self.engine_core.get_pin_handle(handle_id)
+
     def unpin_kv_blocks(self, handle_id: str) -> dict[str, Any]:
         return self.engine_core.unpin_kv_blocks(handle_id)
 
