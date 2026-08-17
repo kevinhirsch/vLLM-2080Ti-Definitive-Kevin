@@ -89,6 +89,10 @@ def main() -> int:
         gpu_memory_utilization=args.gpu_memory_utilization,
         enable_prefix_caching=True,
         enforce_eager=True,
+        # throwaway-test envelope: tiny window boots fast; pin the SM75 GDN
+        # prefill backend the production serve validates (fork default may differ)
+        max_model_len=8192,
+        additional_config={"gdn_prefill_backend": "flashqla_legacy"},
     )
 
     # Drive a block-aligned prefill so a running-state slot exists, then decode
