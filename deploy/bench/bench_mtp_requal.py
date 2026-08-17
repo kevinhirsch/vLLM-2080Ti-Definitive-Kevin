@@ -83,11 +83,26 @@ def run_stage(base: str, model: str, ctx_tokens: int, *, temperature: float,
     #  - nrestarts None: cannot prove the engine stayed up
     #  - acceptance None: MTP is not drafting or /metrics is down — either way
     #    a re-qualification of MTP cannot be scored
+    # CONTAMINATION: /metrics counters are engine-global. A single probe can be
+    # drafted at most once per emitted token, so a drafts delta exceeding this
+    # probe's completion tokens proves concurrent traffic reached the engine
+    # during the stage — the acceptance figure then scores a mixture, not this
+    # probe, and cannot qualify MTP.
+    drafts_delta = (None if (before is None or after is None)
+                    else after["drafts"] - before["drafts"])
+    stage["drafts_delta"] = drafts_delta
+    contaminated = (
+        drafts_delta is not None
+        and result["completion_tokens"] > 0
+        and drafts_delta > result["completion_tokens"]
+    )
+    stage["contaminated"] = contaminated
     hard_fail = (
         not stage["needle_recalled"]
         or g["garbled"]
         or stage["nrestarts_delta"] != 0
         or acc is None
+        or contaminated
         or result["finish_reason"] not in ("stop", "length")
     )
     soft_fail = acc is not None and acc < ACCEPTANCE_FLOOR
@@ -97,6 +112,12 @@ def run_stage(base: str, model: str, ctx_tokens: int, *, temperature: float,
         stage["fail_reason"] = "NRestarts unavailable (fail-closed)"
     elif hard_fail and acc is None:
         stage["fail_reason"] = "no acceptance telemetry (fail-closed)"
+    elif hard_fail and contaminated:
+        stage["fail_reason"] = (
+            "spec counters contaminated by concurrent traffic "
+            f"(drafts_delta={drafts_delta} > completion_tokens="
+            f"{result['completion_tokens']}) — isolate the engine and re-run"
+        )
     return stage
 
 
