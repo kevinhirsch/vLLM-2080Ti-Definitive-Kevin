@@ -599,11 +599,28 @@ class GPUModelRunner(
                 # Requires VLLM_MTP_DRAFT_CAP to keep MTP's GPU chain short while
                 # the pipeline is sized for K_scoped. See docs/exp039-*.md.
                 if os.environ.get("VLLM_S4_SCOPED_DRAFTER", "0") == "1":
-                    try:
-                        self.scoped_drafter = ScopedReemissionDrafter(self.vllm_config)
-                    except Exception as e:
+                    if self.speculative_config.disable_padded_drafter_batch:
+                        # EXP-039 (S4): the scoped merge's effective-tail splice
+                        # assumes it runs PRE-bookkeeping (padded path), where
+                        # token_ids_cpu / num_tokens_no_spec do NOT yet include this
+                        # step's sampled tokens. With disable_padded_drafter_batch
+                        # the drafter runs AFTER _bookkeeping_sync (execute_model's
+                        # propose_drafts_after_bookkeeping path), so those tokens
+                        # are already committed and the splice would double-count and
+                        # misalign the gate. Refuse rather than draft misaligned.
                         self.scoped_drafter = None
-                        logger.warning("S4 scoped drafter unavailable: %s", e)
+                        logger.warning(
+                            "S4 scoped drafter disabled: incompatible with "
+                            "disable_padded_drafter_batch=True (runs post-bookkeeping)."
+                        )
+                    else:
+                        try:
+                            self.scoped_drafter = ScopedReemissionDrafter(
+                                self.vllm_config
+                            )
+                        except Exception as e:
+                            self.scoped_drafter = None
+                            logger.warning("S4 scoped drafter unavailable: %s", e)
                 if self.speculative_config.method == "eagle3":
                     self.use_aux_hidden_state_outputs = (
                         self.drafter.eagle3_use_aux_hidden_state
@@ -4929,7 +4946,14 @@ class GPUModelRunner(
             # EXP-039 (S4): gate MTP against the prompt-scoped drafter. Per
             # request, override the MTP draft with a verbatim continuation ONLY
             # when the FSM gate is open; otherwise MTP passes through untouched.
-            if getattr(self, "scoped_drafter", None) is not None:
+            # Skip under async spec decode: merge returns a CPU list, but the
+            # async path needs draft_token_ids to stay a padded tensor for the
+            # on-device scatter in _prepare_input_ids. Config already forbids
+            # async+S4 (see vllm/config/vllm.py), so this is belt-and-suspenders
+            # keeping S4 a strict no-op if the two ever coexist.
+            if getattr(self, "scoped_drafter", None) is not None and not (
+                self.use_async_spec_decode and isinstance(draft_token_ids, torch.Tensor)
+            ):
                 draft_token_ids = self._scoped_gate_merge(
                     draft_token_ids, sampled_token_ids
                 )

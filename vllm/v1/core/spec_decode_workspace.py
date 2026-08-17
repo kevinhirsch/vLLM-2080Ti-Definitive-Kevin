@@ -154,7 +154,16 @@ def spec_verify_reserve_bytes(
     that profiling under-counts, scaled by ``(K - 1) * max_num_seqs`` — the
     per-request verify width beyond the profiled K=1 baseline, times the batch.
     """
-    if num_speculative_tokens is None or max_num_seqs is None or vocab_size is None:
+    if (
+        num_speculative_tokens is None
+        or max_num_seqs is None
+        or vocab_size is None
+        or overshoot_mult is None
+        or dtype_bytes is None
+        or profiled_baseline_width is None
+    ):
+        # Any None kwarg is a degenerate input; return 0 before int() so the
+        # documented "0 for degenerate input" contract holds instead of TypeError.
         return 0
     if (
         int(num_speculative_tokens) <= 1

@@ -32,7 +32,14 @@ _MODULE_PATH = os.path.join(
 
 
 def _load_drafter_module():
-    """(Re)load scoped_reemission.py with stubbed vllm deps."""
+    """(Re)load scoped_reemission.py with stubbed vllm deps.
+
+    The stubs are installed into ``sys.modules`` only for the duration of the
+    module exec (the drafter binds ``VllmConfig`` / ``init_logger`` at import
+    time), then the ORIGINAL entries are restored. Otherwise pytest collection of
+    this file leaves a pathless ``vllm`` stub in ``sys.modules`` for the whole
+    process, breaking ``import vllm.*`` in every other test module that shares it.
+    """
     vllm_pkg = types.ModuleType("vllm")
     cfg_mod = types.ModuleType("vllm.config")
     cfg_mod.VllmConfig = object  # only used as a type hint
@@ -46,15 +53,24 @@ def _load_drafter_module():
             pass
 
     log_mod.init_logger = lambda *_a, **_k: _NullLogger()
-    sys.modules["vllm"] = vllm_pkg
-    sys.modules["vllm.config"] = cfg_mod
-    sys.modules["vllm.logger"] = log_mod
 
-    spec = importlib.util.spec_from_file_location(
-        "scoped_reemission_under_test", _MODULE_PATH
-    )
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    _keys = ("vllm", "vllm.config", "vllm.logger")
+    _saved = {k: sys.modules.get(k) for k in _keys}
+    try:
+        sys.modules["vllm"] = vllm_pkg
+        sys.modules["vllm.config"] = cfg_mod
+        sys.modules["vllm.logger"] = log_mod
+        spec = importlib.util.spec_from_file_location(
+            "scoped_reemission_under_test", _MODULE_PATH
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    finally:
+        for k in _keys:
+            if _saved[k] is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = _saved[k]
     return mod
 
 

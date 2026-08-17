@@ -1,10 +1,13 @@
 # EXP-039 (S4): Suffix-scoped drafter for verbatim re-emission
 
 **Branch:** `feat-s4-scoped-drafter` (worktree `~/Desktop/.ftree-s4drafter`, base `frontier-pastnative-20260816`)
-**Status:** first A/B ran on hardware (2026-08-16 eve) → **NEGATIVE, root-caused, fixed** (2026-08-17).
-The gate-open drafts were misaligned by one step (proposing the token *just* sampled), collapsing
-copy-span acceptance to ~0. Fixed in `scoped_reemission.py`; unit-test proven. **Re-A/B pending.**
-See **§11** for the A/B numbers, the proven root cause, the fix, and the corrected re-test protocol.
+**Status:** first A/B ran on hardware (2026-08-16 eve) → **NEGATIVE, root-caused, fixed, re-A/B'd**
+(2026-08-17). The gate-open drafts were misaligned by one step (proposing the token *just* sampled),
+collapsing copy-span acceptance to ~0. Fixed in `scoped_reemission.py`; unit-test proven, then
+**re-A/B'd on hardware (seqs-4 / max-len 65536): quote 365→811.5 tok/s (mean 7.44 accepted/step),
+mixed no-harm, generation unchanged** — the fix is confirmed. **Prod-shape re-proof (full
+concurrency/context envelope) still pending.** See **§11** for the measured numbers, the proven root
+cause, the fix, and the re-test protocol.
 **Env switch:** `VLLM_S4_SCOPED_DRAFTER=1` (default `0` = strict no-op).
 
 ---
@@ -376,7 +379,6 @@ Required companions when enabling: `num_speculative_tokens = VLLM_S4_K_SCOPED`, 
 5. **cudagraph capture size.** Prod captures size `[4]`; running `num_speculative_tokens=16` changes
    `uniform_decode_query_len` to 17 and needs a matching `cudagraph_capture_sizes` review before a soak
    (staged-code caveat — verify at first engine bring-up).
-```
 
 ---
 
@@ -481,8 +483,24 @@ python tools/s4_replay_bench.py --base-url http://127.0.0.1:8001 --model qwen-lo
 python tools/s4_replay_bench.py --compare /tmp/s4_off.json /tmp/s4_on.json
 ```
 
-**Expected post-fix:** `quote`/`rewrite` per_pos[0] should recover to ≫0.16 (target ≈ MTP's ~0.9,
-extending into positions 2–15 as the copy span is drafted K-deep); `generation` unchanged (~−5% async-
-off headwind only). If `quote` per_pos[0] is still ~0.16, the gate is still misaligned — do not re-run
-until the unit test above is green. Pass/leak criteria unchanged from §8.
+Pass/leak criteria unchanged from §8. (Pre-flight gate: the §11.4 unit test must be green before a
+re-run — if `quote` per_pos[0] is still ~0.16 the gate is still misaligned.)
+
+### 11.6 Re-A/B result — measured on hardware (2026-08-17)
+
+Re-ran the protocol above at the boot-feasible shape (**max_num_seqs=4 / max-len 65536**, PIECEWISE both
+sides). The fix is confirmed:
+
+| workload | result |
+|---|---|
+| quote | OFF 365 → ON **811.5 tok/s (+122%)**, mean **7.44** accepted/step; gate-open per_pos[0] recovered from the collapsed 0.165 back toward MTP's ~0.9, extending into positions 2–15 as the copy span is drafted K-deep |
+| mixed | ON **101.5 tok/s — no-harm** (copy spans fire; prose stays on MTP) |
+| generation (control) | **unchanged** (≈passthrough; ~−5% async-off headwind only) |
+
+This is exactly the recovery §11.3's fix predicted: gate-open acceptance climbs from ~0 back to MTP-grade
+at position 0 and extends K-deep on the copy span, confirming the effective-tail splice (`bbc09d3`).
+
+**Still open — prod-shape re-proof.** The numbers above are at `max_num_seqs=4`; a re-proof at the full
+production concurrency/context envelope is still pending, as is the GPU-side merge increment (§10.1) that
+removes the async-off headwind on `mixed`.
 

@@ -210,8 +210,17 @@ def _post_stream(base_url: str, model: str, messages, max_tokens: int, timeout: 
                     n_chunks += 1
     t_end = time.monotonic()
     decode_s = t_end - (t_first if t_first is not None else t0)
-    n_tokens = usage_completion if usage_completion is not None else n_chunks
-    return n_tokens, max(decode_s, 1e-9)
+    if usage_completion is None:
+        # Fail fast: an SSE content chunk is NOT one token (a chunk can carry
+        # several, especially under speculative decode), so falling back to
+        # n_chunks would silently mismeasure tok/s. The request sets
+        # stream_options.include_usage=True; if the server omits usage, error out
+        # rather than report a wrong throughput number.
+        raise RuntimeError(
+            "stream omitted usage.completion_tokens (include_usage not honored); "
+            "refusing to use SSE chunk count as a token proxy"
+        )
+    return usage_completion, max(decode_s, 1e-9)
 
 
 def _scrape_spec_metrics(base_url: str):
@@ -315,8 +324,9 @@ def run_bench(args):
             m_after = _scrape_spec_metrics(args.base_url)
             tps = n_tokens / decode_s
             toks_per_s.append(tps)
-            if r == args.reps - 1:
-                metrics_delta = _delta_metrics(m_before, m_after)
+            # Record on every successful rep so a failure on the LAST rep does not
+            # blank out metrics captured by earlier reps (keeps the last good one).
+            metrics_delta = _delta_metrics(m_before, m_after)
             print(
                 f"[{args.label}] {name:11s} rep{r}: {tps:7.2f} tok/s "
                 f"({n_tokens} toks / {decode_s:.3f}s)"

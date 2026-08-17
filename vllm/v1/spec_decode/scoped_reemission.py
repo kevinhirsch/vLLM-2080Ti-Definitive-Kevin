@@ -183,7 +183,22 @@ class ScopedReemissionDrafter:
         st = self._states.get(req_id)
         if st is None:
             num_prompt = int(input_batch.num_prompt_tokens[index_row])
-            prompt = input_batch.token_ids_cpu[index_row, :num_prompt]
+            # Prompt-embeds / mixed prompts: positions flagged is_token_ids=False
+            # were never written into token_ids_cpu, so indexing them would build
+            # the scoped haystack over stale values and could open the gate on
+            # unrelated tokens. Only build the index when every prompt position is
+            # a real token id; otherwise use an empty index so the gate stays shut
+            # (MTP passthrough). getattr keeps the pure-python unit tests (whose
+            # fake input_batch has no is_token_ids) on the normal path.
+            is_token_ids = getattr(input_batch, "is_token_ids", None)
+            if (
+                num_prompt > 0
+                and is_token_ids is not None
+                and not bool(is_token_ids[index_row, :num_prompt].all())
+            ):
+                prompt = np.empty(0, dtype=np.int64)
+            else:
+                prompt = input_batch.token_ids_cpu[index_row, :num_prompt]
             st = _ReqState(_PromptIndex(prompt, self.g))
             self._states[req_id] = st
         return st
