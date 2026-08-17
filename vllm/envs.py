@@ -70,6 +70,11 @@ if TYPE_CHECKING:
     VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE_MIN_TOKENS: int = 20480
     VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS: int = 0
     VLLM_TQ_RESERVE_PREFILL_WORKSPACE: bool = True
+    # EXP-045b: Xid31 (max_model_len-gated MMU FAULT_PDE) instrumentation.
+    VLLM_TQ_XID31_TRACE: bool = False
+    VLLM_TQ_XID31_TRACE_MIN_MB: int = 64
+    VLLM_TQ_XID31_TRACE_EVERY_N: int = 64
+    VLLM_TQ_XID31_TRACE_SNAPSHOT: str = "/tmp/xid31_mem_snapshot.pickle"
     VLLM_TURBOQUANT_CONTINUATION_SDPA_Q_CHUNK: int = 0
     VLLM_TURBOQUANT_CONTINUATION_SDPA_MAX_QK_CELLS: int = 0
     VLLM_TURBOQUANT_FORCE_DECODE_SDPA: bool = False
@@ -850,6 +855,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # workspace, which can crash with an illegal memory access at deep prefill).
     "VLLM_TQ_RESERVE_PREFILL_WORKSPACE": lambda: bool(
         int(os.getenv("VLLM_TQ_RESERVE_PREFILL_WORKSPACE", "1"))
+    ),
+    # EXP-045b: arm Xid31 instrumentation (buffer registry + int32/2GiB offset
+    # projection + CUDA memory-history snapshot on fault). Default OFF; negligible
+    # overhead in the hot path when unset. See vllm/v1/worker/xid31_trace.py.
+    "VLLM_TQ_XID31_TRACE": lambda: bool(int(os.getenv("VLLM_TQ_XID31_TRACE", "0"))),
+    "VLLM_TQ_XID31_TRACE_MIN_MB": lambda: int(
+        os.getenv("VLLM_TQ_XID31_TRACE_MIN_MB", "64")
+    ),
+    "VLLM_TQ_XID31_TRACE_EVERY_N": lambda: int(
+        os.getenv("VLLM_TQ_XID31_TRACE_EVERY_N", "64")
+    ),
+    "VLLM_TQ_XID31_TRACE_SNAPSHOT": lambda: os.getenv(
+        "VLLM_TQ_XID31_TRACE_SNAPSHOT", "/tmp/xid31_mem_snapshot.pickle"
     ),
     "VLLM_TURBOQUANT_CONTINUATION_SDPA_Q_CHUNK": lambda: int(
         os.getenv("VLLM_TURBOQUANT_CONTINUATION_SDPA_Q_CHUNK", "0")
