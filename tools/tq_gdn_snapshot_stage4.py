@@ -224,7 +224,15 @@ def main() -> int:
     try:
         fork = llm.fork_from_handle(handle_id, child_specs)
     except BaseException:  # noqa: BLE001 - fork raised/timed out; never leak the pin
-        llm.unpin_kv_blocks(handle_id)
+        # Best-effort unpin, isolated so a cleanup failure never masks the
+        # primary fork error (which is what the caller needs to see).
+        try:
+            llm.unpin_kv_blocks(handle_id)
+        except Exception as cleanup_err:  # noqa: BLE001 - preserve the fork error
+            print(
+                f"warning: unpin failed during fork-error cleanup: {cleanup_err}",
+                file=sys.stderr,
+            )
         raise
     children = fork.get("children", [])
     if len(children) != 3:

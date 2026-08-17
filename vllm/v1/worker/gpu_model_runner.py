@@ -1082,24 +1082,34 @@ class GPUModelRunner(
             )
         park_slot = self._mamba_park_free.pop()
 
-        mamba_group_ids, _ = mamba_utils.get_mamba_groups(self.kv_cache_config)
-        forward_context = self.compilation_config.static_forward_context
-        src_slots: list[torch.Tensor] = []
-        dst_slots: list[torch.Tensor] = []
-        for group_id, layer_name, state_index, state in (
-            mamba_utils.iter_mamba_state_tensors(
-                self.kv_cache_config, mamba_group_ids, forward_context
-            )
-        ):
-            live_block_id = req_state.block_ids[group_id][src_block_idx]
-            src_slots.append(state[live_block_id])
-            dst_slots.append(self._mamba_park_pool[layer_name][state_index][park_slot])
+        # The slot is reserved (popped) BEFORE the copy below. If anything after
+        # the pop raises, this method never returns a handle, so the caller has
+        # nothing to release -- reclaim the slot here or it leaks permanently.
+        try:
+            mamba_group_ids, _ = mamba_utils.get_mamba_groups(self.kv_cache_config)
+            forward_context = self.compilation_config.static_forward_context
+            src_slots: list[torch.Tensor] = []
+            dst_slots: list[torch.Tensor] = []
+            for group_id, layer_name, state_index, state in (
+                mamba_utils.iter_mamba_state_tensors(
+                    self.kv_cache_config, mamba_group_ids, forward_context
+                )
+            ):
+                live_block_id = req_state.block_ids[group_id][src_block_idx]
+                src_slots.append(state[live_block_id])
+                dst_slots.append(
+                    self._mamba_park_pool[layer_name][state_index][park_slot]
+                )
 
-        mamba_utils.batch_copy_slots(
-            self._get_mamba_copy_bufs(), src_slots, dst_slots
-        )
-        # Park must be complete before the handle is usable across steps.
-        torch.cuda.current_stream().synchronize()
+            mamba_utils.batch_copy_slots(
+                self._get_mamba_copy_bufs(), src_slots, dst_slots
+            )
+            # Park must be complete before the handle is usable across steps.
+            torch.cuda.current_stream().synchronize()
+        except BaseException:
+            if park_slot not in self._mamba_park_free:
+                self._mamba_park_free.append(park_slot)
+            raise
 
         return {
             "park_slot": park_slot,
@@ -1156,8 +1166,10 @@ class GPUModelRunner(
             return
         # Validate before appending: a malformed handle crossing the RPC
         # boundary must not poison _mamba_park_free (a bad index would later
-        # corrupt snapshot/restore copies into the wrong pool row).
-        if not isinstance(park_slot, int) or not (
+        # corrupt snapshot/restore copies into the wrong pool row). Use an exact
+        # type check, not isinstance: bool is an int subclass, so True/False
+        # would otherwise pass as slot 1/0.
+        if type(park_slot) is not int or not (
             0 <= park_slot < self._mamba_park_num_slots
         ):
             raise ValueError(f"invalid park_slot {park_slot!r}")

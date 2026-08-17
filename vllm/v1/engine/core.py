@@ -804,9 +804,10 @@ class EngineCore:
 
         ``all_running=True`` (EXP-038 Stage-3 fork corroboration) returns EVERY
         in-flight request's block table keyed by req_id in one read, because
-        ``req_id=None`` resolves only the FIRST running request
-        (``_tq_resolve_req_id``) and so cannot observe two co-scheduled fork
-        children at once. The per-request payload shape is identical to the
+        ``req_id=None`` auto-picks only when EXACTLY ONE request is in flight
+        (``_tq_resolve_req_id`` raises otherwise) and so cannot observe two
+        co-scheduled fork children at once. The per-request payload shape is
+        identical to the
         single-request case (``{"spec", "block_ids"}`` per group); the multi
         shape is ``{"req_ids": [...], "requests": {req_id: {"groups": {...}}}}``.
         Read-only: no touch/free/alloc, so it never perturbs the very sharing

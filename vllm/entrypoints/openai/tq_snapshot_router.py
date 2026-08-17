@@ -82,11 +82,15 @@ async def _resolve_prompt_token_ids(engine: EngineClient, body: dict) -> list[in
     """Turn the request body into prompt token ids. Accepts (in priority order)
     an explicit ``prompt_token_ids`` list, a chat ``messages`` list (rendered via
     the tokenizer's chat template), or a raw ``prompt`` string."""
-    ptids = body.get("prompt_token_ids")
-    if ptids:
-        if not isinstance(ptids, list):
+    if "prompt_token_ids" in body:
+        # Presence, not truthiness: an explicitly-provided prompt_token_ids keeps
+        # highest priority and an invalid/empty value is rejected consistently,
+        # rather than silently falling through to messages/prompt when the key is
+        # present but falsy (e.g. [] or null).
+        ptids = body["prompt_token_ids"]
+        if not isinstance(ptids, list) or not ptids:
             raise ValueError(
-                "prompt_token_ids must be a list[int] (got "
+                "prompt_token_ids must be a non-empty list[int] (got "
                 f"{type(ptids).__name__}); a bare string would be silently "
                 "reinterpreted as per-character token ids"
             )
