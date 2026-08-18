@@ -21,6 +21,10 @@ rm -f "$OUT"/s4_*.json "$OUT"/engine_*.log
 # because the caller's cwd held a different vllm checkout).
 cd "$WT"
 
+# torch cpp_extension JIT (sampler/GDN warmup in the default-PIECEWISE boot)
+# shells out to `ninja`, which lives only in the venv bin — put it on PATH.
+export PATH="/home/kevin/Desktop/vLLM-2080Ti-Definitive/.venv/bin:$PATH"
+
 ENGINE_PID=""
 restore_prod() {
   echo "[window] restoring prod ..."
