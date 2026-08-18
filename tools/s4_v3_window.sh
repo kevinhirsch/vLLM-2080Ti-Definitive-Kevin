@@ -46,10 +46,10 @@ sudo systemctl stop vllm-qwen27b-watchdog.timer
 sudo systemctl stop vllm-qwen27b.service
 sleep 5
 
-launch_arm() {  # $1=arm-name  $2=VLLM_S4_GPU_MERGE  $3=extra-flag ("" or --no-async-scheduling)
-  local arm=$1 gpumerge=$2 extra=${3:-}
-  echo "[arm $arm] launching (gpu_merge=$gpumerge extra='$extra')"
-  env VLLM_S4_SCOPED_DRAFTER=1 VLLM_S4_GPU_MERGE=$gpumerge \
+launch_arm() {  # $1=arm-name  $2=VLLM_S4_GPU_MERGE  $3=extra-flag  $4=scoped (default 1)
+  local arm=$1 gpumerge=$2 extra=${3:-} scoped=${4:-1}
+  echo "[arm $arm] launching (scoped=$scoped gpu_merge=$gpumerge extra='$extra')"
+  env VLLM_S4_SCOPED_DRAFTER=$scoped VLLM_S4_GPU_MERGE=$gpumerge \
       VLLM_MTP_DRAFT_CAP=2 VLLM_S4_K_SCOPED=16 VLLM_S4_G=12 VLLM_S4_MIN_UNIQ=1 \
       VLLM_QWOPUS_MTP_BF16_DRAFT=1 VLLM_SUFFIX_OVERLAY=0 VLLM_S4_LOG_EVERY=200 \
       PYTHONPATH=$WT \
@@ -81,7 +81,14 @@ kill_arm() {
   kill "$ENGINE_PID" 2>/dev/null || true
   for i in $(seq 1 30); do kill -0 "$ENGINE_PID" 2>/dev/null || break; sleep 2; done
   kill -9 "$ENGINE_PID" 2>/dev/null || true
-  sleep 8
+  # wait for the VRAM to actually come back before the next arm boots
+  # (window r4: arm A's corpse held ~11 GiB and starved arms B/C at startup)
+  for i in $(seq 1 30); do
+    free_mib=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | sort -n | head -1)
+    [ "${free_mib:-0}" -ge 19000 ] && break
+    sleep 5
+  done
+  echo "[window] GPU free after kill: ${free_mib:-?} MiB"
 }
 
 check_async() {  # $1=arm  $2=expected substring in engine log
@@ -98,13 +105,18 @@ run_bench() {  # $1=arm  $2=label
       --label "$2" --reps 3 --warmup 1 --out "$OUT/s4_$1.json" 2>&1 | tail -12
 }
 
-declare -A ARM_MERGE=( [A]=0 [B]=1 [C]=1 )
-declare -A ARM_EXTRA=( [A]="" [B]="" [C]="--no-async-scheduling" )
-declare -A ARM_LABEL=( [A]=A_v2_asyncoff [B]=B_v3_asyncon [C]=C_v3_asyncoff )
-declare -A ARM_EXPECT=( [A]="Async scheduling disabled" [B]="Asynchronous scheduling is enabled" [C]="Async" )
+declare -A ARM_MERGE=( [Z]=0 [A]=0 [B]=1 [C]=1 )
+declare -A ARM_SCOPED=( [Z]=0 [A]=1 [B]=1 [C]=1 )
+declare -A ARM_EXTRA=( [Z]="" [A]="" [B]="" [C]="--no-async-scheduling" )
+declare -A ARM_LABEL=( [Z]=Z_s4off_baseline [A]=A_v2_asyncoff [B]=B_v3_asyncon [C]=C_v3_asyncoff )
+declare -A ARM_EXPECT=( [Z]="Async" [A]="Async scheduling disabled" [B]="Asynchronous scheduling is enabled" [C]="Async" )
 
-for arm in A B C; do
-  if launch_arm "$arm" "${ARM_MERGE[$arm]}" "${ARM_EXTRA[$arm]}"; then
+# Arm Z first: S4 fully OFF on the same minimal boot — discriminates "the
+# minimal boot + spec16 crashes at HEAD regardless of S4" from "the v2 S4
+# path itself is the crasher" (window r4: arm A died on
+# 'assert num_required_blocks > len(req_blocks)' at first spec-decode traffic).
+for arm in Z A B C; do
+  if launch_arm "$arm" "${ARM_MERGE[$arm]}" "${ARM_EXTRA[$arm]}" "${ARM_SCOPED[$arm]}"; then
     check_async "$arm" "${ARM_EXPECT[$arm]}"
     grep -i "scoped-reemission drafter ENABLED" "$OUT/engine_$arm.log" | head -1
     run_bench "$arm" "${ARM_LABEL[$arm]}"
