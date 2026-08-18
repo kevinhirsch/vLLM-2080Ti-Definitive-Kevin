@@ -394,6 +394,21 @@ async def tq_fork2(raw_request: Request) -> JSONResponse:
         except Exception:  # noqa: BLE001
             logger.exception("tq_fork2: verify_pinned_blocks failed (continuing)")
 
+    # Per-child SSE mode: after the shared validation/pin-check above, the
+    # streaming fan-out lives in tq_fork2_sse (validation errors stay JSON).
+    if body.get("stream"):
+        from vllm.entrypoints.openai.tq_fork2_sse import fork2_sse_response
+        return fork2_sse_response(
+            engine=engine,
+            handle_id=handle_id,
+            child_specs=child_specs,
+            prompt_token_ids=prompt_token_ids,
+            cache_salt=cache_salt,
+            prefix_len=prefix_len,
+            pin_resident=pin_resident,
+            per_child_timeout_s=per_child_timeout_s,
+        )
+
     # (3) Fan out: each child is an ordinary generate() request riding the pinned
     # prefix. output_kind=FINAL_ONLY -> generate() yields only the final
     # cumulative RequestOutput (no per-token deltas to accumulate).
