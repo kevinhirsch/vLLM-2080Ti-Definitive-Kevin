@@ -840,15 +840,20 @@ class VllmConfig:
                 if (
                     self.speculative_config.use_eagle()
                     and os.environ.get("VLLM_S4_SCOPED_DRAFTER", "0") == "1"
+                    and os.environ.get("VLLM_S4_GPU_MERGE", "0") != "1"
                 ):
-                    # EXP-039 (S4): the scoped drafter emits CPU-list drafts, which
-                    # the async on-device draft scatter cannot consume. Auto mode
-                    # disables async for this below; when async is set explicitly,
-                    # fail fast like the other async incompatibilities above.
+                    # EXP-039 (S4): the v2 scoped drafter emits CPU-list drafts,
+                    # which the async on-device draft scatter cannot consume. Auto
+                    # mode disables async for this below; when async is set
+                    # explicitly, fail fast like the other async incompatibilities.
+                    # EXP-039 v3 (VLLM_S4_GPU_MERGE=1) merges GPU-side and returns a
+                    # padded tensor, so it IS async-compatible -- do not fail then.
                     raise ValueError(
-                        "Async scheduling is not compatible with the S4 scoped "
-                        "drafter (VLLM_S4_SCOPED_DRAFTER=1), which emits CPU-list "
-                        "drafts. Unset it or disable async scheduling."
+                        "Async scheduling is not compatible with the v2 S4 scoped "
+                        "drafter (VLLM_S4_SCOPED_DRAFTER=1 without "
+                        "VLLM_S4_GPU_MERGE=1), which emits CPU-list drafts. Set "
+                        "VLLM_S4_GPU_MERGE=1 (GPU-side merge, async-safe), unset "
+                        "the drafter, or disable async scheduling."
                     )
             if not executor_supports_async_sched:
                 raise ValueError(
@@ -891,15 +896,19 @@ class VllmConfig:
                 self.speculative_config is not None
                 and self.speculative_config.use_eagle()
                 and os.environ.get("VLLM_S4_SCOPED_DRAFTER", "0") == "1"
+                and os.environ.get("VLLM_S4_GPU_MERGE", "0") != "1"
             ):
-                # EXP-039 (S4): the scoped drafter emits CPU-list drafts (variable
-                # length per request), same async incompatibility as the overlay.
-                # Only the EAGLE/MTP path constructs the scoped drafter (see
-                # gpu_model_runner), so scope the disable to use_eagle(): other
-                # methods (e.g. ngram_gpu) never build it and keep async scheduling.
-                # See docs/exp039-scoped-drafter-design.md S7 (known headwind).
+                # EXP-039 (S4): the v2 scoped drafter emits CPU-list drafts
+                # (variable length per request), same async incompatibility as the
+                # overlay. Only the EAGLE/MTP path constructs the scoped drafter
+                # (see gpu_model_runner), so scope the disable to use_eagle():
+                # other methods (e.g. ngram_gpu) never build it and keep async.
+                # EXP-039 v3 (VLLM_S4_GPU_MERGE=1) merges GPU-side into a padded
+                # tensor -- async-compatible -- so this branch is skipped then and
+                # async stays enabled. See docs/exp039-v3-gpu-merge.md.
                 logger.warning_once(
-                    "Async scheduling disabled: S4 scoped drafter produces CPU drafts."
+                    "Async scheduling disabled: v2 S4 scoped drafter produces CPU "
+                    "drafts (set VLLM_S4_GPU_MERGE=1 for the async-safe GPU merge)."
                 )
                 self.scheduler_config.async_scheduling = False
             elif (
