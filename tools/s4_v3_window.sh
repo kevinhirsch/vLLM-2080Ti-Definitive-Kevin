@@ -13,10 +13,20 @@ MODEL=/home/kevin/Desktop/models/Qwen3.8-27B-GPTQ-Int4
 SHARE=/home/kevin/.local/share/vllm-qwen27b
 OUT=/tmp/s4v3-window
 mkdir -p "$OUT"
+# fresh window: stale arm results from a previous run must never reach compare
+rm -f "$OUT"/s4_*.json "$OUT"/engine_*.log
+# CRITICAL: python -m puts CWD at sys.path[0], AHEAD of PYTHONPATH. Run from
+# the worktree so the arm engines load THIS branch's vllm no matter where the
+# caller's shell happens to sit (window r2 silently ran another worktree's code
+# because the caller's cwd held a different vllm checkout).
+cd "$WT"
 
+ENGINE_PID=""
 restore_prod() {
   echo "[window] restoring prod ..."
-  pkill -f "vllm.entrypoints.openai.api_server" 2>/dev/null || true
+  # kill only OUR arm engine (a global pkill here would murder prod itself
+  # when the trap fires after a partial restore or an outside restart)
+  [ -n "$ENGINE_PID" ] && kill "$ENGINE_PID" 2>/dev/null
   sleep 8
   sudo systemctl start vllm-qwen27b.service
   for i in $(seq 1 90); do
