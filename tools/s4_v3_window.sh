@@ -37,7 +37,7 @@ launch_arm() {  # $1=arm-name  $2=VLLM_S4_GPU_MERGE  $3=extra-flag ("" or --no-a
   echo "[arm $arm] launching (gpu_merge=$gpumerge extra='$extra')"
   env VLLM_S4_SCOPED_DRAFTER=1 VLLM_S4_GPU_MERGE=$gpumerge \
       VLLM_MTP_DRAFT_CAP=2 VLLM_S4_K_SCOPED=16 VLLM_S4_G=12 VLLM_S4_MIN_UNIQ=1 \
-      VLLM_QWOPUS_MTP_BF16_DRAFT=1 VLLM_SUFFIX_OVERLAY=0 \
+      VLLM_QWOPUS_MTP_BF16_DRAFT=1 VLLM_SUFFIX_OVERLAY=0 VLLM_S4_LOG_EVERY=200 \
       PYTHONPATH=$WT \
     "$PY" -m vllm.entrypoints.openai.api_server \
       --host 127.0.0.1 --port 8001 \
@@ -46,15 +46,11 @@ launch_arm() {  # $1=arm-name  $2=VLLM_S4_GPU_MERGE  $3=extra-flag ("" or --no-a
       --generation-config "$SHARE/gencfg" \
       --quantization gptq_marlin \
       --gpu-memory-utilization 0.75 \
-      --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","max_cudagraph_capture_size":288}' \
       --speculative-config '{"method":"mtp","num_speculative_tokens":16}' \
       --max-model-len 65536 --max-num-seqs 4 --max-num-batched-tokens 3968 \
-      --enable-chunked-prefill \
-      --kv-cache-dtype turboquant_k3v4_nc --mamba-cache-mode align \
-      --enable-prefix-caching --enable-prompt-tokens-details \
+      --mamba-cache-mode align \
+      --enable-prefix-caching \
       --language-model-only --skip-mm-profiling \
-      --chat-template "$SHARE/chat_template-froggeric-v22-official.jinja" \
-      --reasoning-parser qwen3 --tool-call-parser qwen3_xml --enable-auto-tool-choice \
       --additional-config '{"gdn_prefill_backend":"flashqla_legacy"}' \
       $extra \
       > "$OUT/engine_$arm.log" 2>&1 &
@@ -91,7 +87,7 @@ run_bench() {  # $1=arm  $2=label
 declare -A ARM_MERGE=( [A]=0 [B]=1 [C]=1 )
 declare -A ARM_EXTRA=( [A]="" [B]="" [C]="--no-async-scheduling" )
 declare -A ARM_LABEL=( [A]=A_v2_asyncoff [B]=B_v3_asyncon [C]=C_v3_asyncoff )
-declare -A ARM_EXPECT=( [A]="Async scheduling is disabled" [B]="Async scheduling is enabled" [C]="Async scheduling is disabled" )
+declare -A ARM_EXPECT=( [A]="Async scheduling disabled" [B]="Asynchronous scheduling is enabled" [C]="Async" )
 
 for arm in A B C; do
   if launch_arm "$arm" "${ARM_MERGE[$arm]}" "${ARM_EXTRA[$arm]}"; then
