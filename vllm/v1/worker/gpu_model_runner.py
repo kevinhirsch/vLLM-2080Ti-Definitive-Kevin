@@ -4946,14 +4946,12 @@ class GPUModelRunner(
             # EXP-039 (S4): gate MTP against the prompt-scoped drafter. Per
             # request, override the MTP draft with a verbatim continuation ONLY
             # when the FSM gate is open; otherwise MTP passes through untouched.
-            # Skip under async spec decode: merge returns a CPU list, but the
-            # async path needs draft_token_ids to stay a padded tensor for the
-            # on-device scatter in _prepare_input_ids. Config already forbids
-            # async+S4 (see vllm/config/vllm.py), so this is belt-and-suspenders
-            # keeping S4 a strict no-op if the two ever coexist.
-            if getattr(self, "scoped_drafter", None) is not None and not (
-                self.use_async_spec_decode and isinstance(draft_token_ids, torch.Tensor)
-            ):
+            # v2 (CPU list) returns a list -> incompatible with the async
+            # on-device scatter, so config disables async for it. v3
+            # (VLLM_S4_GPU_MERGE=1) returns a padded tensor and is async-safe.
+            # _scoped_gate_merge dispatches and is a strict no-op for the one
+            # combination that would break the pipeline (v2 list under async).
+            if getattr(self, "scoped_drafter", None) is not None:
                 draft_token_ids = self._scoped_gate_merge(
                     draft_token_ids, sampled_token_ids
                 )
@@ -4964,12 +4962,29 @@ class GPUModelRunner(
         self,
         draft_token_ids: list[list[int]] | torch.Tensor,
         sampled_token_ids: torch.Tensor | list[list[int]],
-    ) -> list[list[int]]:
+    ) -> list[list[int]] | torch.Tensor:
         """EXP-039 (S4): merge MTP drafts with the FSM-gated scoped drafter.
 
-        Fail-safe: on any error, return the MTP drafts unchanged (as a list) so
-        the spec pipeline is never broken by the scoped path."""
+        Dispatch:
+          * GPU merge on + tensor drafts -> ``merge_gpu`` (returns a padded tensor;
+            keeps async scheduling's on-device draft scatter intact).
+          * async spec decode + tensor drafts + GPU merge OFF -> strict no-op
+            (the v2 list draft would break the async scatter; config normally
+            forbids this combo, this is belt-and-suspenders).
+          * otherwise -> v2 CPU-list ``merge``.
+
+        Fail-safe: on any error return the MTP drafts unchanged -- as a tensor if
+        drafts came in as a tensor (async-safe), else the cleaned list -- so the
+        spec pipeline is never broken by the scoped path."""
+        drafts_are_tensor = isinstance(draft_token_ids, torch.Tensor)
         try:
+            if self.scoped_drafter.gpu_merge and drafts_are_tensor:
+                return self.scoped_drafter.merge_gpu(
+                    draft_token_ids, self.input_batch, sampled_token_ids
+                )
+            if self.use_async_spec_decode and drafts_are_tensor:
+                # v2 list path under async would break the on-device scatter.
+                return draft_token_ids
             return self.scoped_drafter.merge(
                 draft_token_ids, self.input_batch, sampled_token_ids
             )
@@ -4977,12 +4992,10 @@ class GPUModelRunner(
             if self._suffix_overlay_log_countdown > 0:
                 self._suffix_overlay_log_countdown -= 1
                 logger.warning("S4 scoped drafter skipped: %s", e)
-            base = (
-                draft_token_ids.tolist()
-                if isinstance(draft_token_ids, torch.Tensor)
-                else draft_token_ids
-            )
-            return [[t for t in row if t != -1] for row in base]
+            if drafts_are_tensor:
+                # Preserve the tensor so async scheduling is not broken on error.
+                return draft_token_ids
+            return [[t for t in row if t != -1] for row in draft_token_ids]
 
     def _suffix_early(
         self,
