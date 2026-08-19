@@ -30,7 +30,7 @@ restore_prod() {
   echo "[window] restoring prod ..."
   # kill only OUR arm engine (a global pkill here would murder prod itself
   # when the trap fires after a partial restore or an outside restart)
-  [ -n "$ENGINE_PID" ] && kill "$ENGINE_PID" 2>/dev/null
+  [ -n "$ENGINE_PID" ] && { kill -KILL -- "-$ENGINE_PID" 2>/dev/null || kill -9 "$ENGINE_PID" 2>/dev/null; }
   sleep 8
   sudo systemctl start vllm-qwen27b.service
   for i in $(seq 1 90); do
@@ -49,7 +49,16 @@ sleep 5
 launch_arm() {  # $1=arm-name  $2=VLLM_S4_GPU_MERGE  $3=extra-flag  $4=scoped (default 1)
   local arm=$1 gpumerge=$2 extra=${3:-} scoped=${4:-1}
   echo "[arm $arm] launching (scoped=$scoped gpu_merge=$gpumerge extra='$extra')"
-  env VLLM_S4_SCOPED_DRAFTER=$scoped VLLM_S4_GPU_MERGE=$gpumerge \
+  # pre-flight: never boot into a starved GPU (a prior arm's leak would make
+  # this arm boot-fail for the wrong reason). Require both cards >= 19 GiB free.
+  local minfree
+  minfree=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | sort -n | head -1)
+  if [ "${minfree:-0}" -lt 19000 ]; then
+    echo "[arm $arm] ABORT: only ${minfree} MiB free (need >=19000) — prior leak?"; return 1
+  fi
+  # setsid -> the engine leads its own process group so kill_arm can reap the
+  # WHOLE tree (TP workers included); a bare kill of the parent leaks them.
+  setsid env VLLM_S4_SCOPED_DRAFTER=$scoped VLLM_S4_GPU_MERGE=$gpumerge \
       VLLM_MTP_DRAFT_CAP=2 VLLM_S4_K_SCOPED=16 VLLM_S4_G=12 VLLM_S4_MIN_UNIQ=1 \
       VLLM_QWOPUS_MTP_BF16_DRAFT=1 VLLM_SUFFIX_OVERLAY=0 VLLM_S4_LOG_EVERY=200 \
       PYTHONPATH=$WT \
@@ -78,9 +87,11 @@ launch_arm() {  # $1=arm-name  $2=VLLM_S4_GPU_MERGE  $3=extra-flag  $4=scoped (d
 }
 
 kill_arm() {
-  kill "$ENGINE_PID" 2>/dev/null || true
+  # reap the whole process group (setsid made ENGINE_PID the group leader), so
+  # the TP worker children that actually hold CUDA memory die too.
+  kill -TERM -- "-$ENGINE_PID" 2>/dev/null || kill "$ENGINE_PID" 2>/dev/null || true
   for i in $(seq 1 30); do kill -0 "$ENGINE_PID" 2>/dev/null || break; sleep 2; done
-  kill -9 "$ENGINE_PID" 2>/dev/null || true
+  kill -KILL -- "-$ENGINE_PID" 2>/dev/null || kill -9 "$ENGINE_PID" 2>/dev/null || true
   # wait for the VRAM to actually come back before the next arm boots
   # (window r4: arm A's corpse held ~11 GiB and starved arms B/C at startup)
   for i in $(seq 1 30); do
