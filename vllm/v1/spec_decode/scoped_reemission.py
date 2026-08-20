@@ -247,11 +247,19 @@ class ScopedReemissionDrafter:
     def _hash_tail(self, tail: np.ndarray) -> np.uint64:
         # hash of a length-g token window with the same polynomial as
         # _PromptIndex. uint64 overflow == the intended mod-2**64 wraparound.
+        # NB: numpy>=2.0 makes np.uint64(negative) RAISE ("Python integer -1 out
+        # of bounds for uint64") instead of wrapping. The async spec-decode path
+        # feeds -1-padded sampled tokens into the tail, which crashed merge/merge_gpu
+        # (EXP-039 v3 window 2026-08-19: "S4 scoped drafter skipped: ... out of
+        # bounds for uint64" -> fail-safe returned the raw narrow draft -> width
+        # mismatch @ gpu_model_runner). Mask to 64 bits to restore the documented
+        # mod-2**64 fold; this is identity for real token ids and matches the
+        # prompt-index build's astype(uint64) for every value.
         base = _HASH_BASE
         with np.errstate(over="ignore"):
             h = np.uint64(0)
             for t in range(self.g):
-                h = h * base + np.uint64(int(tail[t]))
+                h = h * base + np.uint64(int(tail[t]) & 0xFFFFFFFFFFFFFFFF)
         return h
 
     def _effective_tail(
