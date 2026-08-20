@@ -837,6 +837,18 @@ class VllmConfig:
                         "Async scheduling is not compatible with "
                         "disable_padded_drafter_batch=True."
                     )
+                if os.environ.get("VLLM_SUFFIX_OVERLAY", "0") == "1":
+                    # Suffix overlay (2080Ti fork) merges CPU-list drafts, which the
+                    # async on-device draft scatter cannot consume (same reason
+                    # method=suffix is rejected above). The auto path (async=None)
+                    # silently disables async for this; an EXPLICIT --async-scheduling
+                    # must hard-fail at config time rather than crash at runtime in the
+                    # scatter (asserts _draft_token_ids is a tensor).
+                    raise ValueError(
+                        "Async scheduling is not compatible with the suffix overlay "
+                        "(VLLM_SUFFIX_OVERLAY=1), which produces CPU-list drafts. "
+                        "Unset VLLM_SUFFIX_OVERLAY or drop --async-scheduling."
+                    )
             if not executor_supports_async_sched:
                 raise ValueError(
                     f"`{executor_backend}` does not support async scheduling yet."
