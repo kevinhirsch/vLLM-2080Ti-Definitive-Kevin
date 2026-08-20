@@ -330,3 +330,41 @@ unstable (Z/A). C proves the merge math is sound async-OFF, but that's the confi
 already had. **Not shippable. Next: fix the width reconciliation at gpu_model_runner.py:4618
 (gap-1), and separately stabilize MTP K=16 at the minimal shape, then re-run the window.**
 Each re-run costs a ~30-min engine window (prod → DeepSeek), so batch the two fixes first.
+
+---
+
+## 11. Window r2 RESULT — 2026-08-19 ~21:40 (crash FIXED, verdict DECISIVE NEGATIVE)
+
+After the `_hash_tail` numpy-2.x fix (commit ce6727a), arm B (v3 GPU-merge, async-ON)
+**no longer crashes** and produces full bench data. Clean C-vs-B isolation (same merge
+code, async toggle only), 3-rep + warmup at the §8 shape:
+
+| workload | C v3 async-OFF | B v3 async-ON | delta |
+|---|---|---|---|
+| rewrite | 122.5 | 67.6 | **−44.9%** |
+| quote | 150.1 | 63.3 | **−57.8%** |
+| mixed | 106.3 | 60.9 | **−42.7%** |
+| generation | 52.8 | 53.3 | +0.9% (no-op) |
+
+**Smoking gun — per-position acceptance:**
+- C (async-off): `[0.896, 0.757, 0.208, 0.208, 0.202, …]`, mean_accept 5.2–6.4 — S4 scoped
+  positions 2..15 ARE accepted (the copy speedup is real).
+- B (async-on): `[0.955, 0.917, 0.000, 0.000, …]`, mean_accept 2.6–2.9 — positions 2..15 get
+  **ZERO acceptance**. Only the 2 capped-MTP tokens land; the S4 scoped continuation never
+  reaches/passes verify under async scheduling.
+
+**Verdict: NEGATIVE, decisive.** Turning async ON does not recover the −40% tax — it makes
+copy work 42–58% *worse*, because the on-device async draft path drops the scoped positions
+(they verify as stale/empty). merge_gpu's math is correct (arm C proves it); the failure is
+purely the async scatter/verify timing = the §9 gap-1 (scoped H2D must be event-gated to land
+before the next step's `prev_index * num_spec_tokens` scatter, and the inline sampled-token D2H
+must overlap MTP's forward). Shipping v3-async-on would REGRESS copy 42–58%.
+
+**What shipped anyway (real wins):** the crash was a genuine bug — numpy≥2.0 `np.uint64(-1)`
+raising broke the rolling hash on any -1-padded async sampled token, taking down *both* merge
+paths. Fixed at source + 2 regression tests (ce6727a). The 811 copy-burst path stays **v2
+async-OFF** (already banked, `serve-PROFILE-copyburst.sh`) — unaffected.
+
+**Next increment (hard, not a tweak):** implement §9 gap-1 (event-gated scoped-H2D-before-scatter
++ overlap the sampled-token D2H). Only then re-window. Arms A (v2 cpu-list) and Z (S4-off+cap under
+async) still crash on separate/unsupported paths — out of scope for the C-vs-B verdict.
