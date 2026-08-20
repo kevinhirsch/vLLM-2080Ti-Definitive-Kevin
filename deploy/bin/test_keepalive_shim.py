@@ -58,6 +58,18 @@ class EstTokens(unittest.TestCase):
     def test_garbage_body_is_zero_not_crash(self):
         self.assertEqual(shim._est_tokens(b"not json"), 0)
 
+    def test_tool_definitions_counted(self):
+        # Regression 2026-08-19: tool schemas are part of the prompt the engine
+        # prefills, but were omitted from the estimate. A 34-tool Hermes request
+        # undercounted by ~20K tokens, so the first-token timeout (scaled off the
+        # estimate) fired before prefill finished -> false failover to DeepSeek.
+        no_tools = shim._est_tokens(_body([{"role": "user", "content": "hi"}]))
+        big_tool = {"type": "function", "function": {
+            "name": "bash", "description": "d" * 3500, "parameters": {}}}
+        with_tools = shim._est_tokens(
+            _body([{"role": "user", "content": "hi"}], tools=[big_tool]))
+        self.assertGreater(with_tools, no_tools + 500)
+
 
 class OverLocalCap(unittest.TestCase):
     def test_small_request_is_under_cap(self):
@@ -129,6 +141,35 @@ class RemapForRemote(unittest.TestCase):
         self.assertEqual(shim.remap_for_remote(b"not json"), b"not json")
 
 
+class RemapForRemoteThinking(unittest.TestCase):
+    """Regression 2026-08-19: DeepSeek V4 thinking mode 400s ANY conversation
+    ending on a tool result whose assistant tool_call lacks reasoning_content
+    ('The reasoning_content in the thinking mode must be passed back to the
+    API'). Hermes/pi histories are Qwen-generated and never carry it, so EVERY
+    failover to DeepSeek died as 'model provider failed'. remap_for_remote now
+    forces non-thinking on DeepSeek. Verified against the live API."""
+
+    def _remap(self, base, no_think):
+        orig_base, orig_nt = shim.REMOTE_BASE, shim.REMOTE_NO_THINK
+        shim.REMOTE_BASE, shim.REMOTE_NO_THINK = base, no_think
+        try:
+            return json.loads(shim.remap_for_remote(_body()))
+        finally:
+            shim.REMOTE_BASE, shim.REMOTE_NO_THINK = orig_base, orig_nt
+
+    def test_deepseek_gets_thinking_disabled(self):
+        out = self._remap("https://api.deepseek.com", True)
+        self.assertEqual(out.get("thinking"), {"type": "disabled"})
+
+    def test_non_deepseek_remote_untouched(self):
+        out = self._remap("https://api.openai.com/v1", True)
+        self.assertNotIn("thinking", out)
+
+    def test_env_flag_can_disable(self):
+        out = self._remap("https://api.deepseek.com", False)
+        self.assertNotIn("thinking", out)
+
+
 class ThinkingBudgetGuard(unittest.TestCase):
     def test_injects_thinking_budget_when_enabled(self):
         if not getattr(shim, "THINK_GUARD", True):
@@ -177,6 +218,38 @@ class EmptyThinkingResponse(unittest.TestCase):
         r = self._Resp({"choices": [{"finish_reason": "length", "message": {
             "content": "", "tool_calls": [{"id": "1"}]}}]})
         self.assertFalse(shim._is_empty_thinking_response(r))
+
+
+class LooksMeaningful(unittest.TestCase):
+    """The streaming first-token gate holds the response until real generated
+    output appears, then commits to the client. Regression 2026-08-19: a
+    tool-call-only response streams its progress in tool_calls (not content),
+    was invisible to the gate, hit the first-token timeout, and false-failed-
+    over to DeepSeek -> 'model provider failed'. Tool calls now count."""
+
+    def test_content_token_is_meaningful(self):
+        self.assertTrue(shim._looks_meaningful('{"delta":{"content":"Hi"}}'))
+
+    def test_empty_content_not_meaningful(self):
+        self.assertFalse(shim._looks_meaningful('{"delta":{"content":""}}'))
+
+    def test_reasoning_token_is_meaningful(self):
+        self.assertTrue(shim._looks_meaningful(
+            '{"delta":{"reasoning_content":"Let"}}'))
+
+    def test_tool_call_is_meaningful(self):
+        self.assertTrue(shim._looks_meaningful(
+            '{"delta":{"tool_calls":[{"function":{"name":"bash"}}]}}'))
+
+    def test_function_call_is_meaningful(self):
+        self.assertTrue(shim._looks_meaningful(
+            '{"delta":{"function_call":{"name":"bash"}}}'))
+
+    def test_finish_reason_is_meaningful(self):
+        self.assertTrue(shim._looks_meaningful('{"finish_reason":"stop"}'))
+
+    def test_prelude_noise_not_meaningful(self):
+        self.assertFalse(shim._looks_meaningful('{"choices":[{"index":0}]}'))
 
 
 if __name__ == "__main__":
