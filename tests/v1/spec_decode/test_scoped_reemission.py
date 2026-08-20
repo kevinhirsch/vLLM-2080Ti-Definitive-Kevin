@@ -236,6 +236,41 @@ def test_no_sampled_token_returns_mtp():
     print("PASS test_no_sampled_token_returns_mtp")
 
 
+def test_hash_tail_tolerates_negative_pad_tokens():
+    """Regression (EXP-039 v3 window 2026-08-19): the async spec-decode path feeds
+    -1-padded sampled tokens into the rolling hash. numpy>=2.0 makes
+    ``np.uint64(-1)`` RAISE instead of wrapping, so ``_hash_tail`` threw ->
+    merge_gpu failed -> the fail-safe returned the raw narrow MTP draft ->
+    width mismatch crash at gpu_model_runner. _hash_tail must fold -1 to the
+    mod-2**64 value instead of crashing."""
+    drafter = _fresh_drafter(g=12)
+    tail = np.array([100, 101, -1, -1, 102, 103, -1, 104, 105, 106, -1, 107],
+                    dtype=np.int64)
+    h = drafter._hash_tail(tail)  # must not raise
+    assert h.dtype == np.uint64
+    # deterministic + order-sensitive (a real hash, not a constant)
+    assert drafter._hash_tail(tail) == h
+    shuffled = np.array([101, 100, -1, -1, 102, 103, -1, 104, 105, 106, -1, 107],
+                        dtype=np.int64)
+    assert drafter._hash_tail(shuffled) != h
+
+
+def test_hash_tail_matches_prompt_index_for_real_tokens():
+    """The fix must not change hashing for real (non-negative) token ids: the
+    needle hash (``_hash_tail``) must still equal the ``_PromptIndex`` g-gram hash
+    so gate matching keeps working. Prove it end-to-end via candidates()."""
+    g = 12
+    prompt = np.array(list(range(200, 260)), dtype=np.int64)  # distinct g-grams
+    idx = SR._PromptIndex(prompt, g)
+    drafter = _fresh_drafter(g=g)
+    e = 40  # a g-gram ending at position e
+    needle = prompt[e - g:e]
+    h = drafter._hash_tail(needle)
+    ends = idx.candidates(h)
+    assert e in ends.tolist(), (
+        f"needle hash didn't match its own prompt g-gram: end {e} not in {ends}")
+
+
 def _run_all():
     tests = [
         test_verbatim_copy_single_token_step,
@@ -243,6 +278,8 @@ def _run_all():
         test_needle_longer_than_g,
         test_gate_closed_passes_mtp_through,
         test_no_sampled_token_returns_mtp,
+        test_hash_tail_tolerates_negative_pad_tokens,
+        test_hash_tail_matches_prompt_index_for_real_tokens,
     ]
     failures = 0
     for t in tests:
