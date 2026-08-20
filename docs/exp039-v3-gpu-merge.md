@@ -300,3 +300,33 @@ per-step D2H/H2D (§7) is eating the async gain, and gap 1 (event-gated overlap)
 All v2 knobs (`VLLM_S4_SCOPED_DRAFTER`, `_G`, `_K_SCOPED`, `_MIN_UNIQ`, `_LOG_EVERY`, `VLLM_MTP_DRAFT_CAP`)
 are unchanged (design doc §9). `VLLM_S4_GPU_MERGE=1` requires the padded drafter batch (it needs the MTP
 tensor input); with `disable_padded_drafter_batch=True` the drafter is not constructed (unchanged guard).
+
+---
+
+## 10. Window RESULT — 2026-08-19 ~20:54 (NEGATIVE, bug located)
+
+Ran arms Z/A/B/C via `tools/s4_v3_window.sh` at the §8 shape (65536/seqs4/util.75,
+num_spec_tokens=16, MTP_DRAFT_CAP=2). **No valid A/B comparison produced** — three of
+four arms crashed on first spec-decode traffic:
+
+| arm | config | outcome |
+|---|---|---|
+| Z | S4 off, plain MTP K=16 | **HTTP 500** on all traffic — the K=16 minimal shape is fragile at HEAD *independent of S4* (confirms backlog #19 "K=16 boot fragility") |
+| A | v2 CPU-list, async off | HTTP 500 then engine died — same K=16 fragility |
+| B | **v3 GPU-merge, async ON** (the target) | **crash**: `RuntimeError: tensor a (16) must match tensor b (2) at dim 1` |
+| C | v3 GPU-merge, async OFF | **clean** — rewrite 123.5 / quote 150.8 / mixed 106.5 / generation 52.75 tok/s (small shape, 3-rep) |
+
+**Root cause of the arm-B crash (async-on path):** `_copy_draft_token_ids_to_cpu`
+(`gpu_model_runner.py:4618`) copies the merged draft into `draft_token_ids_cpu`, which
+is allocated at width `num_spec_tokens` (=16, L897). The v3 GPU-merge emits a draft of
+width `MTP_DRAFT_CAP` (=2), so the copy shape-mismatches (16≠2). The async-off path (C)
+never takes this copy, which is why C alone survived. This is precisely the §9 gap-1
+width-reconciliation increment: the async path must expand the capped-MTP draft to the
+full K=16 pipeline width (pad + valid-count) before the on-device scatter/CPU copy.
+
+**Verdict: NEGATIVE for prod-eligibility.** v3's whole purpose — async ON to recover the
+−40% tax — crashes at the merge→async-copy width seam; and the K=16 test shape is itself
+unstable (Z/A). C proves the merge math is sound async-OFF, but that's the config v2
+already had. **Not shippable. Next: fix the width reconciliation at gpu_model_runner.py:4618
+(gap-1), and separately stabilize MTP K=16 at the minimal shape, then re-run the window.**
+Each re-run costs a ~30-min engine window (prod → DeepSeek), so batch the two fixes first.
