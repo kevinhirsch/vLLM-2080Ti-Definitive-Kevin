@@ -107,11 +107,11 @@ def _serving(parser_cls=None):
     return instance
 
 
-async def _full(text: str, parser=None, tokenizer=object()):
+async def _full(text: str, parser=None, tokenizer=object(), finish_reason="stop"):
     request = _request(False)
     return await _serving().chat_completion_full_generator(
         request,
-        _results([(text, "stop")]),
+        _results([(text, finish_reason)]),
         "named-full",
         "test-model",
         request.messages,
@@ -204,3 +204,36 @@ def test_named_tool_choice_mistral_stream_uses_mistral_id():
     )
 
     assert MistralToolCall.is_valid_id(tool_delta["id"])
+
+
+def test_named_tool_choice_stream_truncated_preserves_length():
+    # Truncated by max_tokens mid-arguments -> finish_reason "length". A
+    # streamed named tool call must not flip the final finish_reason to
+    # "tool_calls", or clients would execute a truncated argument blob.
+    choices = asyncio.run(_stream([("{", None), ('"city": "Shang', "length")]))
+    tool_deltas = [
+        choice["delta"]["tool_calls"][0]
+        for choice in choices
+        if choice["delta"].get("tool_calls")
+    ]
+
+    assert tool_deltas[0]["function"] == {
+        "name": "get_weather",
+        "arguments": "{",
+    }
+    # continuation chunk streams arguments only; id/type/name are omitted
+    assert "id" not in tool_deltas[1]
+    assert "type" not in tool_deltas[1]
+    assert "name" not in tool_deltas[1]["function"]
+    assert tool_deltas[1]["function"]["arguments"] == '"city": "Shang'
+    assert choices[-1]["finish_reason"] == "length"
+
+
+def test_named_tool_choice_full_truncated_preserves_length():
+    response = asyncio.run(
+        _full('{"city": "Shang', _PlainContentParser(), finish_reason="length")
+    )
+    choice = response.choices[0]
+
+    # A truncated named tool call keeps its real finish_reason.
+    assert choice.finish_reason == "length"

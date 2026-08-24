@@ -61,3 +61,14 @@ for m in d:
   fi
   sleep "$INTERVAL"
 done
+
+# ---------------------------------------------------------------------------
+# RETIRED 2026-08-16: purpose fulfilled — Qwen3.8-27B weights landed 2026-08-14
+# and the box has been serving Qwen3.8-27B-GPTQ-Int4 since the 2026-08-15
+# campaign (commit 746d8b1).
+# Postmortem note kept for the record: the header's claim that FP8 "won't run
+# on 2080 Ti" was WRONG for this fork — the FP8-weight route runs on SM75 and
+# upstream v0.1.15 validates Qwen/Qwen3.8-27B-FP8 on dual 2080 Ti TP=2. An
+# FP8-only release window would have been silently missed. If a detector like
+# this is ever revived, include official *-FP8 repos in the trigger set.
+# ---------------------------------------------------------------------------

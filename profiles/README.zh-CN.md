@@ -64,7 +64,7 @@ block 对齐后的 prefix-cache 路径已验证设置。
 
 ## 已验证 Profile
 
-### Qwen3.x 27B
+### Qwen3.x 27B FP8
 
 测试权重：官方 [Qwen/Qwen3.8-27B-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8)、
 [Qwen/Qwen3.6-27B-FP8](https://huggingface.co/Qwen/Qwen3.6-27B-FP8)，以及
@@ -90,7 +90,7 @@ Jackrong/Qwopus3.6-27B-v2-FP8（后者约 29G）。
 | `qwen35b/aggressive/fp8/fp16kv-136K-nomtp-text-image.env` | aggressive | 136K | FP16 | 0 | text+image | 1 | 5422.83 / 124.11 |
 | `qwen35b/fast/fp8/fp16kv-178K-mtp3-text-only.env` | fast | 178K | FP16 | 3 | text-only | 1 | 5889.20 / 195.95 |
 
-### Qwen3.x 27B
+### Qwen3.x 27B AWQ/GPTQ-INT4
 
 测试权重：QuantTrio/Qwen3.6-27B-AWQ、mconcat/Qwopus3.6-27B-v2-AWQ-4bit，以及
 llmfan46/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-GPTQ-Int4，

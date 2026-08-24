@@ -318,6 +318,16 @@ class OffloadingConnectorScheduler:
                     req_status.req_context,
                 )
 
+    def _align_hit_boundary(self, num_tokens: int) -> int:
+        """Round a hit boundary down to the Mamba alignment (no-op when Mamba
+        align mode is off). Every tightening of max_hit_size_tokens must pass
+        through this, or a group whose offloaded_block_size is not a multiple
+        of the alignment can report an unaligned hit that includes a Mamba
+        state beyond the boundary."""
+        if self._mamba_align_size is None:
+            return num_tokens
+        return round_down(num_tokens, self._mamba_align_size)
+
     def _lookup(self, req_status: RequestOffloadState) -> int | None:
         """
         Find how many tokens beyond num_locally_computed_tokens can be loaded.
@@ -334,12 +344,9 @@ class OffloadingConnectorScheduler:
             # for sliding window attention, we must reduce by 1 to make sure
             # we still have a hit after reduction
             max_hit_size_tokens -= 1
-        if self._mamba_align_size is not None:
-            # Mamba align stores a single recurrent state at block boundaries.
-            # Never load a partial boundary or a state beyond the valid hit.
-            max_hit_size_tokens = round_down(
-                max_hit_size_tokens, self._mamba_align_size
-            )
+        # Mamba align stores a single recurrent state at block boundaries.
+        # Never load a partial boundary or a state beyond the valid hit.
+        max_hit_size_tokens = self._align_hit_boundary(max_hit_size_tokens)
         num_hit_tokens: int = 0
         defer_lookup = False
         lookup_groups = self._lookup_groups
@@ -360,9 +367,15 @@ class OffloadingConnectorScheduler:
                     >= req_status.req.num_tokens // offloaded_block_size
                 )
 
-                # Constrain to block-aligned boundary for this group
-                max_hit_size_tokens = min(
-                    max_hit_size_tokens, len(offload_keys) * offloaded_block_size
+                # Constrain to block-aligned boundary for this group, then
+                # re-align to the Mamba boundary (the per-group min can undo
+                # the initial round_down when offloaded_block_size is not a
+                # multiple of the alignment)
+                max_hit_size_tokens = self._align_hit_boundary(
+                    min(
+                        max_hit_size_tokens,
+                        len(offload_keys) * offloaded_block_size,
+                    )
                 )
                 if max_hit_size_tokens - num_computed_tokens < offloaded_block_size:
                     # we can only load less than a block, better skip
@@ -396,9 +409,14 @@ class OffloadingConnectorScheduler:
                 if num_hit_blocks is None:
                     defer_lookup = True
                 else:
-                    max_hit_size_tokens = min(
-                        max_hit_size_tokens,
-                        offloaded_block_size * (start_block_idx + num_hit_blocks),
+                    # same re-alignment as above for the backend-confirmed
+                    # hit boundary
+                    max_hit_size_tokens = self._align_hit_boundary(
+                        min(
+                            max_hit_size_tokens,
+                            offloaded_block_size
+                            * (start_block_idx + num_hit_blocks),
+                        )
                     )
 
                 new_num_hit_tokens = max_hit_size_tokens - num_computed_tokens

@@ -42,7 +42,12 @@ q=c.get("quantization_config") or {}
 m=(q.get("quant_method") or q.get("method") or "").lower()
 d=str(c.get("torch_dtype") or c.get("dtype") or "").lower()
 if any(k in m for k in ("awq","gptq","compressed")): print("Int4 (SERVABLE)")
-elif "fp8" in m or "modelopt" in m or "nvfp4" in m: print("FP8/NVFP4 (BLOCKED on SM75)")
+# FP8 WEIGHTS run on SM75 via the fork's FP8-weight route — upstream v0.1.15
+# validates Qwen3.8-27B-FP8 on this exact dual-2080Ti TP=2 rig. Only NVFP4
+# stays Blackwell-only. (The old blanket "BLOCKED on SM75" label was wrong and
+# also hid the FP8 lane in the release detector.)
+elif "nvfp4" in m: print("NVFP4 (BLOCKED on SM75)")
+elif "fp8" in m or "modelopt" in m: print("FP8-weight (SERVABLE, v0.1.15 route)")
 else: print(f"{d or 'bf16'} (needs quantizing)")
 PY
 )

@@ -5,6 +5,12 @@ Edition. It is separate from the upstream vLLM package version.
 
 ## v0.1.15 - 2026-08-15
 
+> Deployment status on this fork: MTP speculative decoding remains **OFF** in
+> the live serve config (2026-08-15 campaign decision after the 57-64K
+> incident). The MTP correctness fixes below make re-enabling *plausible*, not
+> automatic — it stays off until every gate in
+> `deploy/docs/QWEN-3.8-MTP-REQUALIFICATION.md` (G1-G5) is green.
+
 - Validates the official
   [Qwen/Qwen3.8-27B-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8) checkpoint
   end to end on the dual RTX 2080 Ti TP=2 runtime. The Qwen3.x 27B FP8 route
