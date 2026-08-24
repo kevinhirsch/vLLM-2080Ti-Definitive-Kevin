@@ -8,7 +8,7 @@
 这是一个硬件定向的 vLLM fork，用来保存已经跑通的 2080 Ti vLLM
 栈：补丁源码、启动 profile、运行时说明和稳定环境记录。
 
-Fork 发布版本：`v0.1.15`
+Fork 发布版本：`v0.1.16`
 基础 vLLM：`0.21.0`
 
 核心实测：双 2080 Ti TP=2 runtime 下，Qwen3.x 27B FP8 路线已在官方
@@ -130,7 +130,7 @@ FP16/default KV 空间。
   size 2
 - 已验证主机系统：Ubuntu 22.04/24.04 LTS 或 Debian 12，Linux kernel 6.x
 - CUDA/PyTorch：CUDA 12.8，`torch 2.11.0+cu128`
-- Fork 发布版本：`v0.1.15`
+- Fork 发布版本：`v0.1.16`
 - 基础 vLLM：`0.21.0`
 - 仓库身份：`vllm-2080ti-definitive`
 - 运行时身份：`vllm-sm75-tp2-cu128`

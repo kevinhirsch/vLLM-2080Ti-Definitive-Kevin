@@ -3,6 +3,15 @@
 This changelog tracks the fork release version for vLLM 2080 Ti Definitive
 Edition. It is separate from the upstream vLLM package version.
 
+## v0.1.16 - 2026-08-20
+
+- Merges [PR #101](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/101), bounding Qwen reasoning blocks without dropping split markers.
+- Merges [PR #108](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/108), disabling custom all-reduce during CUDA Graph profiling to avoid the SM75 128K IPC leak path.
+- Merges [PR #111](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/111), reserving TurboQuant continuation-prefill workspace before KV-cache sizing to avoid high-context Xid 31 crashes.
+- Merges [PR #116](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/116), preventing `None` function names in Qwen3 XML streaming tool-call chunks.
+- Merges [PR #120](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/120), adding interactive and non-interactive TP/PP layout selection to the 0.1.x launcher with GPU-factorization validation.
+- Release credit: @YuYue1208, @superniker, @kevinhirsch, @hotwa, and @weicj.
+
 ## v0.1.15 - 2026-08-15
 
 > Deployment status on this fork: MTP speculative decoding remains **OFF** in

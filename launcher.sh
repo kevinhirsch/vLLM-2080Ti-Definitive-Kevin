@@ -327,6 +327,7 @@ NON_INTERACTIVE_CONFIG_KEYS=(
   SERVICE_SCOPE
   GPU_DEVICES
   TP_SIZE
+  PP_SIZE
   CHAT_TEMPLATE_FILE
   CHAT_TEMPLATE_PRESET
   TEMPLATE_DIR
@@ -454,6 +455,12 @@ unset_config_override() {
 
 config_key_from_flag() {
   local flag=$1
+  case "$flag" in
+    --pp-size|--pipeline-parallel-size)
+      printf 'PP_SIZE\n'
+      return 0
+      ;;
+  esac
   local key=${CONFIG_FLAG_TO_KEY[$flag]:-}
   [[ -n "$key" ]] || return 1
   printf '%s\n' "$key"
@@ -579,7 +586,7 @@ reset_route_profile_fields() {
 
 profile_key_is_global() {
   case "$1" in
-MODEL_DIR|PROFILE_DIR|PROFILE|MODE|PORT|SERVICE_SCOPE|GPU_DEVICES|TP_SIZE|\
+MODEL_DIR|PROFILE_DIR|PROFILE|MODE|PORT|SERVICE_SCOPE|GPU_DEVICES|TP_SIZE|PP_SIZE|\
 CHAT_TEMPLATE_FILE|CHAT_TEMPLATE_PRESET|TEMPLATE_DIR|REASONING_PARSER|\
 DEFAULT_CHAT_TEMPLATE_KWARGS|REASONING_MODE|REASONING_BUDGET|\
 ENABLE_AUTO_TOOL_CHOICE|TOOL_CALL_PARSER|TOOL_PARSER_PLUGIN|\
@@ -710,6 +717,7 @@ save_manager_state() {
     printf 'SPECULATIVE_CONFIG=%q\n' "${SPECULATIVE_CONFIG:-}"
     printf 'COMPILATION_CONFIG_JSON=%q\n' "${COMPILATION_CONFIG_JSON:-}"
     printf 'TP_SIZE=%q\n' "${TP_SIZE:-}"
+    printf 'PP_SIZE=%q\n' "${PP_SIZE:-1}"
     printf 'CHAT_TEMPLATE_FILE=%q\n' "${CHAT_TEMPLATE_FILE:-}"
     printf 'CHAT_TEMPLATE_PRESET=%q\n' "${CHAT_TEMPLATE_PRESET:-}"
     printf 'ATTENTION_BACKEND=%q\n' "${ATTENTION_BACKEND:-}"
@@ -1092,6 +1100,59 @@ gpu_device_count() {
     [[ -n "$part" ]] && count=$((count + 1))
   done
   echo "$count"
+}
+
+parallelism_options() {
+  local gpu_count=$1
+  local pp tp
+
+  [[ "$gpu_count" =~ ^[1-9][0-9]*$ ]] || return 0
+  for ((pp = 1; pp <= gpu_count; pp++)); do
+    (( gpu_count % pp == 0 )) || continue
+    tp=$((gpu_count / pp))
+    printf 'TP%s / PP%s\n' "$tp" "$pp"
+  done
+}
+
+select_parallelism_menu() {
+  local gpu_count=$1
+  local options=() default selected
+
+  mapfile -t options < <(parallelism_options "$gpu_count")
+  ((${#options[@]} > 0)) || return 1
+
+  default="TP${TP_SIZE:-$gpu_count} / PP${PP_SIZE:-1}"
+  if ! printf '%s\n' "${options[@]}" | grep -Fxq "$default"; then
+    default="TP${gpu_count} / PP1"
+  fi
+  selected=$(menu_select "Tensor / pipeline parallelism ($gpu_count GPU(s))" \
+    "$default" "${options[@]}") || return 1
+  [[ "$selected" =~ ^TP([0-9]+)[[:space:]]*/[[:space:]]*PP([0-9]+)$ ]] || return 1
+  TP_SIZE=${BASH_REMATCH[1]}
+  PP_SIZE=${BASH_REMATCH[2]}
+}
+
+validate_parallelism() {
+  local gpu_count expected
+
+  gpu_count=$(gpu_device_count "${GPU_DEVICES:-}")
+  if [[ ! "${TP_SIZE:-}" =~ ^[1-9][0-9]*$ ]] || [[ ! "${PP_SIZE:-}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: TP_SIZE and PP_SIZE must be positive integers." >&2
+    return 1
+  fi
+  expected=$((TP_SIZE * PP_SIZE))
+  if (( gpu_count != expected )); then
+    echo "ERROR: selected GPU count ($gpu_count) must equal TP_SIZE ($TP_SIZE) * PP_SIZE ($PP_SIZE) = $expected." >&2
+    echo "       For four GPUs, use TP4/PP1, TP2/PP2, or TP1/PP4." >&2
+    return 1
+  fi
+  if (( PP_SIZE > 1 )) && {
+    (( ${MTP_K:-0} > 0 )) || [[ "${SPECULATIVE_CONFIG:-}" =~ \"method\"[[:space:]]*:[[:space:]]*\"mtp\" ]]
+  }; then
+    echo "ERROR: pipeline parallelism (PP>1) cannot be combined with MTP in the 0.1.x runtime." >&2
+    echo "       Use TP4/PP1 for MTP, or set MTP tokens to 0 before selecting PP2/PP4." >&2
+    return 1
+  fi
 }
 
 list_nvidia_gpus() {
@@ -1632,7 +1693,8 @@ Main menu:
   1. Weight directory: choose the checkpoint directory.
   2. Profile: choose a profile directory, apply .env route presets, select a
      chat-template preset, and edit the filled runtime parameters.
-  3. GPU / TP selection: select GPUs with Space; TP size follows GPU count.
+  3. GPU / TP / PP selection: select GPUs with Space, then choose a valid
+     tensor/pipeline layout for the selected GPU count.
   4. Launch mode: safe, normal, fast, or aggressive.
   5. Port: default 8000.
   6. Service scope: local only or local + LAN.
@@ -1662,6 +1724,11 @@ Notes:
   - thinking_token_budget is a per-request chat parameter in this vLLM runtime.
   - text+image requires a checkpoint that actually supports vision inputs.
   - Use --set KEY=VALUE for advanced envs such as VLLM_* or compiler paths.
+  - Non-interactive runs accept --tp-size together with --pp-size (or
+    --pipeline-parallel-size). The selected GPU count must equal TP * PP;
+    four GPUs support TP4/PP1, TP2/PP2, and TP1/PP4.
+  - The 0.1.x runtime does not support MTP with PP>1. Use TP4/PP1 for MTP,
+    or set MTP tokens to 0 before selecting a pipeline-parallel layout.
   - Use --unset KEY to clear inherited profile/env values and fall back to
     launcher defaults; use --set KEY= to force an empty value when allowed.
   - --print-config prints the final launch summary and exits without starting.
@@ -1759,7 +1826,11 @@ select_gpu_devices_menu() {
   if ((${#rows[@]} == 0)) || ! is_tty; then
     GPU_DEVICES=$(prompt_default "GPU devices / CUDA_VISIBLE_DEVICES" "$selected_devices") || return 0
     tp_count=$(gpu_device_count "$GPU_DEVICES")
-    (( tp_count > 0 )) && TP_SIZE="$tp_count"
+    if (( tp_count > 0 )); then
+      TP_SIZE="$tp_count"
+      PP_SIZE=1
+      select_parallelism_menu "$tp_count" || return 0
+    fi
     save_manager_state
     return 0
   fi
@@ -1769,9 +1840,9 @@ select_gpu_devices_menu() {
     clear >/dev/tty
     {
       banner
-      echo "GPU / TP selection"
+      echo "GPU / TP / PP selection"
       echo
-      echo "Space toggles a GPU. Enter confirms. TP size follows selected GPU count."
+      echo "Space toggles a GPU. Enter confirms the GPU set, then choose TP/PP."
       echo
       for i in "${!rows[@]}"; do
         current_line=${rows[$i]}
@@ -1789,7 +1860,8 @@ select_gpu_devices_menu() {
         fi
       done
       echo
-      printf 'Selected: %s    TP_SIZE: %s\n' "${selected_devices:-none}" "$(gpu_device_count "$selected_devices")"
+      printf 'Selected: %s    TP_SIZE: %s    PP_SIZE: %s\n' \
+        "${selected_devices:-none}" "${TP_SIZE:-auto}" "${PP_SIZE:-1}"
     } >/dev/tty
 
     IFS= read -rsn1 key </dev/tty || true
@@ -1829,7 +1901,10 @@ select_gpu_devices_menu() {
         continue
       fi
       GPU_DEVICES="$selected_devices"
-      TP_SIZE=$(gpu_device_count "$GPU_DEVICES")
+      tp_count=$(gpu_device_count "$GPU_DEVICES")
+      TP_SIZE="$tp_count"
+      PP_SIZE=1
+      select_parallelism_menu "$tp_count" || return 0
       save_manager_state
       return 0
     elif [[ "$key" == "q" || "$key" == "Q" ]]; then
@@ -3227,6 +3302,7 @@ build_args() {
     --served-model-name "$SERVED_NAME"
     --dtype half
     --tensor-parallel-size "${TP_SIZE:-2}"
+    --pipeline-parallel-size "${PP_SIZE:-1}"
     --generation-config vllm
     --max-model-len "$MAX_MODEL_LEN"
     --enable-chunked-prefill
@@ -3643,7 +3719,17 @@ launch_server() {
     SERVED_NAME=$(basename "$MODEL_DIR")
   fi
   GPU_DEVICES=${GPU_DEVICES:-$(detect_default_gpu_devices)}
-  TP_SIZE=${TP_SIZE:-$(gpu_device_count "$GPU_DEVICES")}
+  PP_SIZE=${PP_SIZE:-1}
+  if [[ -z "${TP_SIZE:-}" ]]; then
+    local gpu_count
+    gpu_count=$(gpu_device_count "$GPU_DEVICES")
+    if [[ "$PP_SIZE" =~ ^[1-9][0-9]*$ ]] && (( gpu_count % PP_SIZE == 0 )); then
+      TP_SIZE=$((gpu_count / PP_SIZE))
+    else
+      TP_SIZE=$gpu_count
+    fi
+  fi
+  validate_parallelism || return 1
   if [[ -z "${SERVED_NAME:-}" || "$SERVED_NAME" == "." || "$SERVED_NAME" == "/" ]]; then
     echo "ERROR: Served model name is empty. Set SERVED_NAME or choose a valid checkpoint directory." >&2
     return 1
@@ -3695,6 +3781,7 @@ launch_server() {
     echo "Mode: $MODE"
     echo "GPU devices: ${GPU_DEVICES:-}"
     echo "TP size: ${TP_SIZE:-}"
+    echo "PP size: ${PP_SIZE:-1}"
     echo "Port: $PORT"
     echo "Scope: $SERVICE_SCOPE"
     echo "MTP graph policy: VLLM_SM75_SPEC_SYNC_MODE=${VLLM_SM75_SPEC_SYNC_MODE:-auto}, VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH=${VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH:-0}"
@@ -3954,7 +4041,16 @@ prepare_runtime_defaults() {
   SERVED_NAME=${SERVED_NAME:-$(basename "$MODEL_DIR")}
   TEMPLATE_DIR=${TEMPLATE_DIR:-"$PROFILE_DIR/templates"}
   GPU_DEVICES=${GPU_DEVICES:-$(detect_default_gpu_devices)}
-  TP_SIZE=${TP_SIZE:-$(gpu_device_count "$GPU_DEVICES")}
+  PP_SIZE=${PP_SIZE:-1}
+  if [[ -z "${TP_SIZE:-}" ]]; then
+    local gpu_count
+    gpu_count=$(gpu_device_count "$GPU_DEVICES")
+    if [[ "$PP_SIZE" =~ ^[1-9][0-9]*$ ]] && (( gpu_count % PP_SIZE == 0 )); then
+      TP_SIZE=$((gpu_count / PP_SIZE))
+    else
+      TP_SIZE=$gpu_count
+    fi
+  fi
   QUANTIZATION=${QUANTIZATION:-$(guess_quantization "$MODEL_DIR")}
   MAX_MODEL_LEN=${MAX_MODEL_LEN:-$(default_context_tokens)}
   GPU_UTIL=${GPU_UTIL:-$(default_gpu_util)}
@@ -3978,6 +4074,7 @@ prepare_runtime_defaults() {
     fi
   fi
   validate_mode_kv_policy
+  validate_parallelism || return 1
 }
 
 collect_config_env() {
@@ -4011,6 +4108,7 @@ Launch summary:
   vLLM --quantization:  ${QUANTIZATION:-auto}
   W/A type:             $(guess_precision_scheme "$MODEL_DIR" "${QUANTIZATION:-}")
   GPU devices:          ${GPU_DEVICES:-$(detect_default_gpu_devices)}
+  TP / PP:               ${TP_SIZE:-} / ${PP_SIZE:-1}
   KV precision:         ${KV_CACHE_DTYPE:-fp16}
   TQ diagnostics:       $(current_tq_diagnostics_label)
   Prefix cache:         $(current_prefix_cache_label)
@@ -4094,9 +4192,10 @@ render_main_menu_item() {
 
 render_main_menu() {
   local current=${1:-1}
-  local gpu_devices tp_size kv_cache_memory_label gpu_util_label
+  local gpu_devices tp_size pp_size kv_cache_memory_label gpu_util_label
   gpu_devices=${GPU_DEVICES:-$(detect_default_gpu_devices)}
   tp_size=${TP_SIZE:-$(gpu_device_count "$gpu_devices")}
+  pp_size=${PP_SIZE:-1}
   kv_cache_memory_label=${KV_CACHE_MEMORY_BYTES:-auto}
   gpu_util_label=${GPU_UTIL:-$(default_gpu_util)}
   if [[ -n "${KV_CACHE_MEMORY_BYTES:-}" ]]; then
@@ -4128,7 +4227,7 @@ render_main_menu() {
   printf '     Chat template:    %s\n' "$(menu_value "$(current_template_label)")"
   printf '     Reasoning:        %s\n' "$(menu_value "$(current_reasoning_label)")"
   printf '     Tool calling:     %s\n' "$(menu_value "$(current_tool_calling_label)")"
-  render_main_menu_item 3 "$current" "3. GPU/TP setting:  $(menu_value "$gpu_devices") / TP $(menu_value "$tp_size")"
+  render_main_menu_item 3 "$current" "3. GPU/TP/PP setting: $(menu_value "$gpu_devices") / TP $(menu_value "$tp_size") / PP $(menu_value "$pp_size")"
   render_main_menu_item 4 "$current" "4. Launch mode:      ${MODE:-normal}"
   render_main_menu_item 5 "$current" "5. Port:             ${PORT:-8000}"
   render_main_menu_item 6 "$current" "6. Service scope:    $(current_scope_label)"
