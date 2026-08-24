@@ -173,6 +173,7 @@ def test_mamba_align_prefill_split_keeps_intermediate_chunks_aligned() -> None:
     eagle = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=block_size),
         use_eagle=True,
+        retain_mamba_align_mtp_cache_block=False,
     )
 
     assert Scheduler._mamba_block_aligned_split(eagle, short_request, 5) == 0
@@ -193,6 +194,7 @@ def test_mamba_align_prefill_split_keeps_intermediate_chunks_aligned() -> None:
     no_eagle = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=block_size),
         use_eagle=False,
+        retain_mamba_align_mtp_cache_block=False,
     )
     assert (
         Scheduler._mamba_block_aligned_split(
@@ -213,6 +215,7 @@ def test_mamba_align_eagle_split_stops_at_reusable_boundary() -> None:
     eagle = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=block_size),
         use_eagle=True,
+        retain_mamba_align_mtp_cache_block=False,
     )
 
     scheduled = Scheduler._mamba_block_aligned_split(

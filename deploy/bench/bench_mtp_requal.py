@@ -146,7 +146,9 @@ def _host_is_local(host: str) -> bool:
     the box's LAN hostname/IP, which a loopback-only check would wrongly reject.
     """
     import socket
-    if host in ("", "127.0.0.1", "localhost", "::1"):
+    if not host:
+        return False
+    if host in ("127.0.0.1", "localhost", "::1"):
         return True
     try:
         target = {ai[4][0] for ai in socket.getaddrinfo(host, None)}
@@ -158,6 +160,16 @@ def _host_is_local(host: str) -> bool:
             local.update(ai[4][0] for ai in socket.getaddrinfo(name, None))
         except OSError:
             pass
+    # gethostname()/getfqdn() often resolve only to a loopback /etc/hosts entry
+    # (e.g. Debian/Ubuntu's "127.0.1.1 <hostname>"), never the box's real LAN
+    # IP — so also probe the outbound-facing address via a UDP "connect"
+    # (no packets sent, just route lookup) and treat that as local too.
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("8.8.8.8", 80))
+            local.add(probe.getsockname()[0])
+    except OSError:
+        pass
     return bool(target & local)
 
 

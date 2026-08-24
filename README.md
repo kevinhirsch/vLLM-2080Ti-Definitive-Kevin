@@ -105,3 +105,10 @@ localflow consolidation). `deploy/docs/` has the ops runbooks.
 Modded 22 GB 2080 Tis, NVLink NV2 active (~51 GB/s) — GPU1's x4 PCIe is not a TP
 bottleneck. No ECC: soak new configs before trusting them (12-minute passes lie; use
 30-minute mixed soaks).
+
+## Upstream & license
+
+This repository is a fork of [vLLM](https://github.com/vllm-project/vllm),
+licensed under the Apache License 2.0 (see `LICENSE`), by way of the SM75
+groundwork in [weicj/vLLM-2080Ti-Definitive](https://github.com/weicj/vLLM-2080Ti-Definitive)
+(linked at the top of this document).

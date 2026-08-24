@@ -28,7 +28,9 @@ async def run(args):
         (lambda p=p: agent(p, label=p[:24], phase="Fan-out"))
         for p in LANES
     ])
-    takes = [t for t in takes if t]
+    failed = [i for i, t in enumerate(takes) if not t]
+    if failed:
+        raise RuntimeError(f"fan-out lane(s) failed: {failed}")
     for i, t in enumerate(takes):
         log(f"lane {i}: {t[:80]}")
 

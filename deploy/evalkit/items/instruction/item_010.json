@@ -12,6 +12,6 @@
   },
   "check": {
     "type": "regex_fullmatch",
-    "pattern": "-\\s+\\S.*(?:\\n-\\s+\\S.*){4}"
+    "pattern": "- \\S.*(?:\\n- \\S.*){4}"
   }
 }

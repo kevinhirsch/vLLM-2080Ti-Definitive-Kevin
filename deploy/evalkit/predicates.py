@@ -82,7 +82,7 @@ def check_predicate(args_dict, pred):
         expected = _TYPE_MAP.get(pred["value"])
         if expected is None:
             return False
-        if pred["value"] == "integer" and isinstance(value, bool):
+        if pred["value"] in ("integer", "number") and isinstance(value, bool):
             return False
         return isinstance(value, expected)
     if match == "in":
@@ -100,7 +100,11 @@ def expand_value_from_previous(pred, prev_result):
     if "value_from_previous_result" in pred:
         pred = dict(pred)
         src_path = pred.pop("value_from_previous_result")
-        pred["value"] = resolve_path(prev_result, src_path)
+        resolved = resolve_path(prev_result, src_path)
+        if pred.get("match") == "in":
+            pred["values"] = resolved
+        else:
+            pred["value"] = resolved
     return pred
 
 

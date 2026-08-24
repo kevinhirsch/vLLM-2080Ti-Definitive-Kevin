@@ -31,7 +31,8 @@ verifiers → synthesize) and the vLLM-side design in
 
 ## Overflow (the core ask)
 Agents hit the gateway `:8000`; the shim does local-first with DeepSeek overflow.
-Concurrency cap **C defaults to 12 > the shim's local budget (8)** → surplus agent
+Concurrency cap **C defaults to 12 > the shim's local budget (`SHIM_LOCAL_BUDGET`,
+see `env/shim.env.example`)** → surplus agent
 runs deterministically overflow to DeepSeek "for the additional load". Workflow
 traffic is tagged `X-Client: workflow-bg` so it **yields to interactive** Hermes/pi
 traffic. Force interactive priority with `--foreground`.

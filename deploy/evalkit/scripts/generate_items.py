@@ -1560,7 +1560,10 @@ AGENTIC_CHAIN_ITEMS = [
         steps=[
             step_tool(
                 "authenticate_user",
-                [{"path": "username", "match": "exact", "value": "jsmith"}],
+                [
+                    {"path": "username", "match": "exact", "value": "jsmith"},
+                    {"path": "password", "match": "exact", "value": "hunter2"},
+                ],
                 {"token": "tok_abc123"},
             ),
             step_tool(
