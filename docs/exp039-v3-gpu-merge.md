@@ -368,3 +368,36 @@ async-OFF** (already banked, `serve-PROFILE-copyburst.sh`) — unaffected.
 **Next increment (hard, not a tweak):** implement §9 gap-1 (event-gated scoped-H2D-before-scatter
 + overlap the sampled-token D2H). Only then re-window. Arms A (v2 cpu-list) and Z (S4-off+cap under
 async) still crash on separate/unsupported paths — out of scope for the C-vs-B verdict.
+
+---
+
+## 12. Window r3 — 2026-08-24 (post align-allocator fix): v2 RE-PROVEN at HEAD; v3 RETIRED
+
+The `num_required_blocks` crash was root-caused to the Mamba align-mode
+allocator asserting on required-below-allocated — legitimate under variable-
+width drafts (MTP cap 2 vs K=16, S4 gate flips) + rejection rollback. Fixed
+mainline (10da324, regression-tested). On the fixed code, arm A benched for
+the FIRST time at HEAD:
+
+| workload | Z (S4 off) | **A: v2 cpu-list, async-OFF** | C: v3 async-off | B: v3 async-on |
+|---|---|---|---|---|
+| rewrite | 500s† | **153.6** | 125.2 | 66.1 |
+| quote | 500s† | **181.4** (accept 6.38) | 149.1 | 63.4 |
+| mixed | 500s† | **128.4** | 84.9 | 63.2 |
+| generation | 500s† | **72.75** | 53.9 | 51.9 |
+
+† arm Z (plain MTP K=16 + DRAFT_CAP=2, no S4) still 500s: the raw width-2
+draft hits the width-16 `draft_token_ids_cpu` copy under async — the cap
+without a width-normalising merge remains an unsupported combo (separate
+finding; S4's merge is what makes the cap usable).
+
+**Verdicts:**
+1. **v2 (cpu-list, async-off) is the S4 ship path** — it beats v3 on EVERY
+   workload including generation (72.75 vs 53.9/51.9): the v3 GPU merge costs
+   more than the async-off "tax" it was built to remove, at this shape.
+2. **v3 (gpu-merge) is RETIRED** — strictly dominated in both async modes.
+3. **The 811 figure is historical and stays unreproduced** at HEAD; the
+   honest current-HEAD copy-burst numbers are quote 181.4 / rewrite 153.6 /
+   mixed 128.4 at 65536/seqs4/util.75, generation unharmed (72.75).
+4. Remaining before prod/upstream: evalkit quality gate under the v2 drafter
+   (step c) + prod-shape datapoint, then claims refresh everywhere (step d).
