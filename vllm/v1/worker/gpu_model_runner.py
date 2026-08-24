@@ -205,6 +205,7 @@ from vllm.v1.worker.ubatch_utils import (
     maybe_create_ubatch_slices,
     split_attn_metadata,
 )
+from vllm.v1.worker import xid31_trace
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.workspace import lock_workspace
 
@@ -4207,6 +4208,10 @@ class GPUModelRunner(
         ):
             # Update persistent batch states.
             deferred_state_corrections_fn = self._update_states(scheduler_output)
+            # EXP-045b: cheap periodic Xid31 suspect projection (no-op unless
+            # armed). Runs after _update_states so the high-water projection
+            # reflects the batch about to execute, not the previous step.
+            xid31_trace.periodic(self)
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -6652,6 +6657,12 @@ class GPUModelRunner(
         # Lock workspace to prevent resizing during execution.
         # Max workspace sizes should have been captured during warmup/profiling.
         lock_workspace()
+
+        # EXP-045b: arm Xid31 (max_model_len-gated MMU FAULT_PDE) instrumentation
+        # and register the now-allocated persistent buffers. No-op unless
+        # VLLM_TQ_XID31_TRACE is set; see vllm/v1/worker/xid31_trace.py.
+        xid31_trace.install()
+        xid31_trace.scan_runner(self)
 
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time
