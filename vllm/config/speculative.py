@@ -949,6 +949,22 @@ class SpeculativeConfig:
                 f"than zero ({self.num_speculative_tokens})."
             )
 
+        # [FORK] M-7 boot-time guard: VLLM_MTP_DRAFT_CAP is only ever safe when
+        # equal to num_speculative_tokens (K) -- cap < K crashes
+        # _copy_draft_token_ids_to_cpu with a tensor-width mismatch and cap > K
+        # silently deadlocks decode (both empirically reproduced). Fail fast
+        # here, at config validation, instead of live during model load or
+        # the first decode step. See vllm/v1/spec_decode/mtp_draft_cap.py for
+        # the full root-cause writeup and vllm/v1/spec_decode/
+        # llm_base_proposer.py for where the cap is actually applied.
+        import os
+
+        from vllm.v1.spec_decode.mtp_draft_cap import validate_mtp_draft_cap
+
+        validate_mtp_draft_cap(
+            os.environ.get("VLLM_MTP_DRAFT_CAP"), self.num_speculative_tokens
+        )
+
         if self.rejection_sample_method == "synthetic":
             # Consolidate to per-position rates
             self.synthetic_acceptance_rates = self._resolve_synthetic_acceptance_rates(
