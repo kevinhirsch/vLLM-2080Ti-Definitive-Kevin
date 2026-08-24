@@ -302,6 +302,10 @@ if TYPE_CHECKING:
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
+    # [FORK] Retain the final aligned Mamba state under MTP (mamba_cache_mode=
+    # align): the uncached prompt tail still runs and produces the proposer's
+    # hidden states, so that boundary state is valid and reusable. Default off.
+    VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK: bool = False
     VLLM_USE_V2_MODEL_RUNNER: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
@@ -1929,6 +1933,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_COMPILE_CACHE_SAVE_FORMAT", "binary", ["binary", "unpacked"]
     ),
     # Flag to enable v2 model runner.
+    "VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK": lambda: os.getenv(
+        "VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK", "0"
+    )
+    .strip()
+    .lower()
+    in ("1", "true", "yes", "on"),
     "VLLM_USE_V2_MODEL_RUNNER": lambda: bool(
         int(os.getenv("VLLM_USE_V2_MODEL_RUNNER", "0"))
     ),

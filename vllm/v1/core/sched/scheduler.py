@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
-import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -257,10 +256,7 @@ class Scheduler(SchedulerInterface):
             speculative_config is not None
             and speculative_config.method == "mtp"
             and self.need_mamba_block_aligned_split
-            and os.getenv(
-                "VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK", "0"
-            ).strip().lower()
-            in {"1", "true", "yes", "on"}
+            and envs.VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK
         )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
