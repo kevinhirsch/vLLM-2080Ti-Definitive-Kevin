@@ -201,6 +201,36 @@ def _print_table():
         )
 
 
+def test_last_stage_mask_pp1_all_true():
+    """pp=1: every worker is last-stage (our TP=2 prod shape)."""
+    assert M.spec_verify_last_stage_mask(1, 2, 2) == [True, True]
+
+
+def test_last_stage_mask_normal_pp():
+    """Per-DP-rank executor, pp=2 tp=2: last stage is the tail slice."""
+    assert M.spec_verify_last_stage_mask(2, 2, 4) == [False, False, True, True]
+
+
+def test_last_stage_mask_external_launcher_dp():
+    """external_launcher dp=2 pp=2 tp=1 (n_workers=4, DP outermost):
+    each DP group has its own last stage — NOT a contiguous tail.
+    This is the cubic-#131-P2 scenario."""
+    assert M.spec_verify_last_stage_mask(2, 1, 4) == [False, True, False, True]
+
+
+def test_last_stage_mask_external_launcher_dp_tp():
+    """external_launcher dp=2 pp=2 tp=2 (n_workers=8)."""
+    assert M.spec_verify_last_stage_mask(2, 2, 8) == [
+        False, False, True, True, False, False, True, True,
+    ]
+
+
+def test_last_stage_mask_defensive_fallback():
+    """Non-divisible n_workers: layout assumption is off -> reserve on all
+    (safe over-reserve, never a missed reserve on the rank that needs it)."""
+    assert M.spec_verify_last_stage_mask(2, 2, 6) == [True] * 6
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
