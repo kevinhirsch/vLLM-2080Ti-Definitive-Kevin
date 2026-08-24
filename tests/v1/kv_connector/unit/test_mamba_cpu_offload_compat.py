@@ -49,6 +49,7 @@ def test_hybrid_mamba_external_hit_is_aligned_and_does_not_crash():
     scheduler = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=16),
         use_eagle=False,
+        retain_mamba_align_mtp_cache_block=False,
     )
     model_request = SimpleNamespace(
         num_computed_tokens=0, num_prompt_tokens=33, num_tokens=34
