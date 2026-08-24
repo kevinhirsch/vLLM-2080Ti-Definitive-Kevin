@@ -830,6 +830,25 @@ class MambaManager(SingleTypeKVCacheManager):
 
         block_size = kv_cache_spec.block_size
         max_num_blocks = max_length // block_size
+        if use_eagle and max_num_blocks > 0:
+            # Full-attention/sliding-window lookup matches one extra block and
+            # then drops that final block since it's only partially accepted
+            # (vllm-project/vllm#43650). Mamba/GDN state blocks are
+            # [null, ..., state], so popping after a match removes the state;
+            # instead we just don't search the final block at all.
+            # NOTE: on this fork, `MambaSpec.supports_eagle_cache_peek` is
+            # False (see vllm/v1/kv_cache_interface.py), so
+            # HybridKVCacheCoordinator never actually calls us with
+            # use_eagle=True for a hybrid (full-attn + mamba) model -- the
+            # coordinator's cross-group min()-reduction plus the scheduler's
+            # `_mamba_block_aligned_split` retreat already keep a hybrid
+            # request's mamba hit length capped at the full-attention layer's
+            # eagle-adjusted boundary. This branch is live for
+            # UnitaryKVCacheCoordinator (pure-Mamba/linear-attn models with no
+            # full-attention group), where nothing else guards it, and is
+            # defense-in-depth for any other future caller that passes
+            # use_eagle=True directly.
+            max_num_blocks -= 1
         # Search from right to left and early stop when a match is found.
         for i in range(max_num_blocks - 1, -1, -1):
             if cached_block := block_pool.get_cached_block(

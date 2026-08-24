@@ -85,6 +85,36 @@ def _make_manager(
     )
 
 
+def _mamba_all_spec(block_size: int) -> MambaSpec:
+    # mamba_cache_mode="all" uses the plain (non-align) allocate/cache path
+    # (one real block per block_size, no null-block interleaving), so a
+    # single unaligned warm-up chunk behaves like the FullAttentionManager
+    # test below. "align" mode's null-block bookkeeping requires
+    # scheduler-driven chunk boundaries to produce a meaningful cache state,
+    # which is exercised separately in the _mamba_block_aligned_split tests.
+    return MambaSpec(
+        block_size=block_size,
+        shapes=(1, 1),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="all",
+    )
+
+
+def _make_pure_mamba_manager(block_size: int, *, use_eagle: bool) -> KVCacheManager:
+    groups = [KVCacheGroupSpec(["mamba"], _mamba_all_spec(block_size))]
+    return KVCacheManager(
+        KVCacheConfig(
+            num_blocks=100,
+            kv_cache_tensors=[],
+            kv_cache_groups=groups,
+        ),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        use_eagle=use_eagle,
+    )
+
+
 def _warm_then_lookup(
     manager: KVCacheManager,
     token_ids: list[int],
@@ -162,6 +192,44 @@ def test_full_attention_prefix_cache_eagle_regression(
     computed, num_computed = _warm_then_lookup(
         manager, token_ids, block_size
     )
+
+    assert num_computed == expected_blocks * block_size
+    assert [len(group) for group in computed.blocks] == [expected_blocks]
+
+
+@pytest.mark.parametrize(("use_eagle", "expected_blocks"), [(False, 4), (True, 3)])
+def test_pure_mamba_prefix_cache_eagle_drop(
+    use_eagle: bool,
+    expected_blocks: int,
+) -> None:
+    """Port of vllm-project/vllm#43650: MambaManager.find_longest_cache_hit
+    must drop the final matched block under eagle/MTP, mirroring
+    FullAttentionManager (test_full_attention_prefix_cache_eagle_regression
+    above) -- the recurrent state at that boundary may reflect a
+    partially-accepted draft-verification step, not a fully committed one.
+
+    This exercises the UnitaryKVCacheCoordinator path (single Mamba group, no
+    full-attention group). It's the only path in this fork that calls
+    MambaManager.find_longest_cache_hit with use_eagle=True:
+    MambaSpec.supports_eagle_cache_peek is False (fork commit 40129ea69), so
+    HybridKVCacheCoordinator never sets use_eagle=True for a hybrid model's
+    Mamba group -- there, the hit length is instead capped indirectly by the
+    coordinator's cross-group min()-reduction plus the scheduler's
+    _mamba_block_aligned_split retreat (see
+    test_hybrid_mamba_eagle_does_not_reuse_lookahead_state above). Uses
+    mamba_cache_mode="all" rather than "align": with "align" mode's
+    null-block bookkeeping, a single unaligned warm-up chunk (as used here,
+    matching test_full_attention_prefix_cache_eagle_regression) never
+    populates a real fourth cached block in the first place, so the
+    old-vs-new behavior wouldn't differ -- confirmed empirically that this
+    exact scenario reproduces the bug (4 blocks returned) with the
+    pre-#43650-port code and is fixed (3 blocks) after.
+    """
+    block_size = 16
+    token_ids = [i for i in range(4) for _ in range(block_size)] + [4] * 7
+    manager = _make_pure_mamba_manager(block_size, use_eagle=use_eagle)
+
+    computed, num_computed = _warm_then_lookup(manager, token_ids, block_size)
 
     assert num_computed == expected_blocks * block_size
     assert [len(group) for group in computed.blocks] == [expected_blocks]
