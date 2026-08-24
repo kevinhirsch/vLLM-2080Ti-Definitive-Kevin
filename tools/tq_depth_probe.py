@@ -45,16 +45,33 @@ decisive H1 test the research doc calls for.
 
 FIDELITY: the KV cache buffer is a REAL `turboquant_k3v4_nc` byte layout
 (computed from the real `TurboQuantConfig`), not a stand-in shape -- filled
-with random bytes rather than real quantized data. This is safe and
-timing-faithful, not a simplification: every bitfield the kernels derive
-from those bytes (`mse_idx`, 3-bit/4-bit value codes) is masked to its
-valid range in-kernel before being used as a gather/table index (see
-`triton_turboquant_decode.py` lines ~178-183, ~283), so random bytes
-produce the same memory-access pattern and instruction path as real
-quantized data -- only the numeric *values* are garbage, which doesn't
-matter for a timing probe. Centroids and the Hadamard rotation matrix are
-computed for real (both are cheap, pure-Python/tensor ops, see
-`get_centroids` / `_build_hadamard` below).
+with random bytes rather than real quantized data. This is timing-faithful:
+every bitfield the kernels derive from those bytes (`mse_idx`, 3-bit/4-bit
+value codes) is masked to its valid range in-kernel before being used as a
+gather/table index (see `triton_turboquant_decode.py` lines ~178-183,
+~283), so random bytes produce the same memory-access pattern and
+instruction path as real quantized data. Centroids and the Hadamard
+rotation matrix are computed for real (both are cheap, pure-Python/tensor
+ops, see `get_centroids` / `_build_hadamard` below).
+
+CORRECTNESS-MODE DATA CAVEAT (the F-2 attempt-1 "NaN at both depths" root
+cause). Three 2-byte fields per cache slot are BITCAST to fp16 by the
+kernels rather than masked: the key vector norm (at MSE_BYTES), the value
+scale and the value zero-point (at KPS+VAL_DATA_BYTES and +2). A random
+16-bit pattern is an fp16 NaN with probability 2046/65536 (~3.1%) and
++-Inf with probability 2/65536, and one NaN norm/scale poisons the online
+softmax (or the p*V accumulate) of EVERY (row, head, split) whose split
+covers that token. At depth 8K there are 8192*Hk=32K draws per field, so
+P(clean buffer) ~= 0.969^98304 ~= e^-3100 ~= 0: with raw random bytes the
+OLD kernel's output is ALWAYS NaN, the qtile kernel's output is always
+NaN, allclose(NaN, NaN) is False, and `check` mode reports NaN diffs no
+matter how correct the kernel under test is. Attempt 1's validation
+failure was therefore uninterpretable on the correctness axis (the perf
+verdict stood on its own). Fix: `build_depth_inputs` now overwrites those
+three fp16 fields (and only those -- code bitfields stay random) with
+finite values via `_sanitize_fp16_fields`, which changes neither byte
+count nor access pattern, so timing arms are unaffected and `check` mode
+becomes meaningful.
 
 FIDELITY CAVEAT (the one real simplification): `downstream_attn` prefers
 real `flash_attn_varlen_func` (matching `_continuation_prefill`'s actual
@@ -208,13 +225,41 @@ def build_common(preset: str, device: torch.device):
     }
 
 
+def _sanitize_fp16_fields(kv_cache: torch.Tensor, common: dict) -> None:
+    """Overwrite the three bitcast-as-fp16 slot fields with finite values.
+
+    Random bytes bitcast to fp16 are NaN ~3.1% of the time, which poisons
+    every attention output and makes `check` mode meaningless (see module
+    docstring, CORRECTNESS-MODE DATA CAVEAT). Only these six bytes per slot
+    are touched -- mse/value code bitfields stay random (they are masked to
+    valid index ranges in-kernel). Ranges are realistic magnitudes; any
+    finite values would do for an old-vs-new equivalence check.
+    """
+    cfg = common["cfg"]
+    field_shape = kv_cache.shape[:-1] + (1,)  # [pages, BLOCK_SIZE, HK, 1]
+
+    def put(byte_off: int, lo: float, hi: float) -> None:
+        vals = (
+            torch.empty(field_shape, device=kv_cache.device)
+            .uniform_(lo, hi)
+            .to(torch.float16)
+        )
+        kv_cache[..., byte_off:byte_off + 2] = vals.view(torch.uint8)
+
+    put(common["mse_bytes"], 0.25, 4.0)  # key vector norm
+    put(cfg.key_packed_size + common["val_data_bytes"], 1e-3, 0.1)  # v scale
+    put(cfg.key_packed_size + common["val_data_bytes"] + 2, -0.5, 0.5)  # v zero
+
+
 def build_depth_inputs(depth: int, common: dict, device: torch.device):
     """Synthetic single-sequence decode-shaped inputs at kv_len == depth.
 
     Real `turboquant_k3v4_nc` cache byte layout (see module docstring for
-    why random bytes are timing-faithful here); real Hadamard/centroids
-    from `common`; block_size-aligned depths (all entries in DEPTHS are
-    multiples of BLOCK_SIZE=16, so alloc_len == depth exactly, no padding).
+    why random bytes are timing-faithful here; the three fp16-bitcast
+    fields are sanitized to finite values so correctness mode works); real
+    Hadamard/centroids from `common`; block_size-aligned depths (all
+    entries in DEPTHS are multiples of BLOCK_SIZE=16, so alloc_len ==
+    depth exactly, no padding).
     """
     assert depth % BLOCK_SIZE == 0, f"depth {depth} must be a multiple of {BLOCK_SIZE}"
     pages = depth // BLOCK_SIZE
@@ -223,6 +268,7 @@ def build_depth_inputs(depth: int, common: dict, device: torch.device):
         0, 256, (pages, BLOCK_SIZE, HK, common["slot_size"]),
         dtype=torch.uint8, device=device,
     )
+    _sanitize_fp16_fields(kv_cache, common)
     block_table_1 = torch.arange(pages, dtype=torch.int32, device=device).unsqueeze(0)
     block_table_4 = block_table_1.expand(Q_LEN, -1).contiguous()
 
@@ -361,7 +407,6 @@ def make_stage1_qtile_call(inp: dict, common: dict):
     max_splits = inp["max_splits"]
     kv_cache = inp["kv_cache"]
     kv_group_size = HQ // HK
-    q_block = triton.next_power_of_2(Q_LEN)
     grid = (HQ, max_splits)
     block_d = triton.next_power_of_2(D)
 
@@ -398,10 +443,9 @@ def make_stage1_qtile_call(inp: dict, common: dict):
             BLOCK_KV=_DECODE_BLOCK_KV,
             KEY_FP8=0,
             Q_LEN_ACTUAL=Q_LEN,
-            Q_BLOCK=q_block,
             NORM_CORRECTION=1 if cfg.norm_correction else 0,
             FP8_FORMAT=common["fp8_format"],
-            num_warps=4,
+            num_warps=2,
             num_stages=1,
         )
 
@@ -714,9 +758,12 @@ def run_correctness(preset: str, depths: list, device: torch.device):
     For each depth, run both kernels into ZERO-initialized mid_o buffers
     (inactive KV splits are left untouched by both, so zeroing makes the
     unwritten entries compare equal), then run the shared stage2 reduce on
-    each and compare the final [Q_LEN, Hq, D] fp16 outputs. Same random-byte
-    cache feeds both, so any mismatch is a real numeric divergence, not data
-    skew. rtol 1e-2 fp16 per the F-2 acceptance note.
+    each and compare the final [Q_LEN, Hq, D] fp16 outputs. The same cache
+    feeds both -- random code bitfields, SANITIZED finite fp16 norm/scale/
+    zero fields (see _sanitize_fp16_fields; with raw random bytes both
+    outputs are guaranteed NaN and the comparison is meaningless, which is
+    what sank attempt 1's validation) -- so any mismatch is a real numeric
+    divergence, not data skew. rtol 1e-2 fp16 per the F-2 acceptance note.
     """
     from vllm.triton_utils import triton
     from vllm.v1.attention.ops.triton_turboquant_decode import (
@@ -731,7 +778,6 @@ def run_correctness(preset: str, depths: list, device: torch.device):
     cfg = common["cfg"]
     kv_group_size = HQ // HK
     block_d = triton.next_power_of_2(D)
-    q_block = triton.next_power_of_2(Q_LEN)
 
     print(f"=== F-2 correctness: old stage1 vs qtile stage1 (preset={preset}) ===")
     all_ok = True
@@ -783,9 +829,9 @@ def run_correctness(preset: str, depths: list, device: torch.device):
             KPS=cfg.key_packed_size, VQB=cfg.effective_value_quant_bits,
             VAL_DATA_BYTES=common["val_data_bytes"], ATTN_SCALE=common["scale"],
             SLIDING_WINDOW=0, BLOCK_D=block_d, BLOCK_KV=_DECODE_BLOCK_KV, KEY_FP8=0,
-            Q_LEN_ACTUAL=Q_LEN, Q_BLOCK=q_block,
+            Q_LEN_ACTUAL=Q_LEN,
             NORM_CORRECTION=1 if cfg.norm_correction else 0,
-            FP8_FORMAT=common["fp8_format"], num_warps=4, num_stages=1,
+            FP8_FORMAT=common["fp8_format"], num_warps=2, num_stages=1,
         )
         torch.cuda.synchronize()
 

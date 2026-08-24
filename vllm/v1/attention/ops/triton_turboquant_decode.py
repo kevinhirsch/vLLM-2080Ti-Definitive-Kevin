@@ -387,20 +387,60 @@ def _tq_decode_stage1(
 # Stage 1 (q-row-tiled): one KV tile load reused across ALL query rows
 # ---------------------------------------------------------------------------
 #
-# Identical numerics to `_tq_decode_stage1`, but the query-row dimension moves
-# from the grid into the program. Every query row of this program shares ONE
-# sequence's cached prefix (same seq_len, same block_table row) — the exact
-# contract of the `_spec_continuation_decode_attention` prefix leg — so a KV
-# tile's bytes are byte-identical for every row. This kernel loads that tile
-# (K bytes + centroid gather + norms, V bytes) ONCE per grid program and
-# applies all Q_LEN_ACTUAL rows to it, collapsing the redundant
-# per-row re-scan that made q_len=4 cost ~3.7x q_len=1.
+# F-2 attempt 2. Numerically identical per row to `_tq_decode_stage1`, but
+# the query-row dimension moves from the grid into the program: grid is
+# (Hq, NUM_KV_SPLITS) and each program loads a KV tile ONCE (K bytes +
+# centroid gather + norms, V bytes), then applies every query row to it.
+# Every row of a program shares ONE sequence's cached prefix (same seq_len,
+# same block_table row) — the contract of the
+# `_spec_continuation_decode_attention` prefix leg — so a tile's bytes are
+# byte-identical for every row and one load serves all of them. This
+# collapses the per-row full-KV re-scan that made q_len=4 cost ~3.7x
+# q_len=1 in the per-row-grid kernel.
 #
-# Per-row online-softmax state (m, l, acc) is kept independent along a padded
-# Q_BLOCK = next_power_of_2(Q_LEN_ACTUAL) tile dim; padded rows are masked out
-# of the final store, so the mid_o layout ([B, Hq, NUM_KV_SPLITS, D+1]) and the
-# exact set of written (row, head, split) entries are byte-compatible with
-# `_tq_decode_stage1`. Stage-2 reduce is therefore unchanged.
+# STRUCTURE (vs attempt 1, commit 8edf274f1, which measured 150-158 vs the
+# old kernel's 120-127 us/1K KV at q_len=4). Attempt 1 vectorized the q
+# rows into a tensor dimension: [Q_BLOCK, BLOCK_KV, BLOCK_D]
+# broadcast-products for the qk dot and the p*V accumulate, reduced over
+# the last axis. The initial "register spill" theory is REFUTED by offline
+# ptxas for SM75: attempt 1 compiles to 72 regs/thread at its launched
+# num_warps=4, zero spills, zero smem. What the evidence does support:
+# (1) the grid collapse (B, Hq, SPLITS)=3072 -> (Hq, SPLITS)=768 programs
+# cuts the number of independent tile-walking instruction streams per SM
+# (~16 resident CTAs/SM at the old kernel's 4K-reg footprint vs ~5-7
+# here), degrading memory-latency hiding for this gather-latency-bound
+# loop; and (2) each 2048-element 3D product + two-stage reduction sits on
+# the tile loop's serial dependency chain as one long fused computation,
+# adding per-iteration latency that the reduced CTA parallelism can no
+# longer hide. This attempt keeps the same 768-program grid (that IS the
+# 4x-traffic fix) but attacks (2): Q_LEN_ACTUAL is tl.constexpr (2..8) and
+# the per-row work is fully UNROLLED at trace time — each row keeps its
+# own q[BLOCK_D] vector and (m, l, acc[BLOCK_D]) online-softmax registers
+# and runs the old kernel's exact per-row op sequence ([BLOCK_KV, BLOCK_D]
+# -> [BLOCK_KV] masked dot, scalar max/exp rescale, [BLOCK_KV, BLOCK_D] ->
+# [BLOCK_D] weighted-value reduction). The unrolled rows are MUTUALLY
+# INDEPENDENT instruction chains interleavable by the warp scheduler —
+# in-CTA ILP that attempt 1's monolithic 3D reductions could not expose.
+# Residual under-parallelism has two launch-side antidotes to sweep in the
+# GPU window: VLLM_TURBOQUANT_MAX_KV_SPLITS (grid size is proportional to
+# splits) and VLLM_TURBOQUANT_DECODE_BLOCK_KV (memory-level parallelism
+# per iteration; pair BLOCK_KV=4/8 with num_warps=4 — ptxas shows
+# BLOCK_KV=8 spills at num_warps<=2).
+#
+# Offline ptxas -v (SM75, k3v4_nc, D=256, BLOCK_KV=2, q_len=4):
+#   this kernel  num_warps=1: 254 regs 0-spill | =2: 151 regs 0-spill
+#                num_warps=4:  93 regs 0-spill | q8 w2: 226 regs 0-spill
+#   old kernel   num_warps=1: 128 regs 0-spill (16 CTAs/SM by regs)
+#   attempt 1    num_warps=4:  72 regs 0-spill (slow anyway — see above)
+#
+# The per-row float op sequence (reduction shapes and order, softmax
+# update order, accumulate order) matches `_tq_decode_stage1` exactly and
+# the shared tile values are the same loads, so per-row results are
+# bit-identical to the old kernel. mid_o keeps its [B, Hq, NUM_KV_SPLITS,
+# D+1] layout with per-row writes at each row's own bid, and the exact set
+# of written (row, head, split) entries matches the old kernel (identical
+# split_start/split_end guard from the shared seq_len) — stage-2 reduce is
+# unchanged and shared.
 
 
 @triton.jit
@@ -443,11 +483,13 @@ def _tq_decode_stage1_qtile(
     BLOCK_KV: tl.constexpr,
     KEY_FP8: tl.constexpr,
     # Query-row tiling
-    Q_LEN_ACTUAL: tl.constexpr,  # real query rows (<= Q_BLOCK)
-    Q_BLOCK: tl.constexpr,  # next_power_of_2(Q_LEN_ACTUAL)
+    Q_LEN_ACTUAL: tl.constexpr,  # real query rows, 2..8, fully unrolled
     NORM_CORRECTION: tl.constexpr = 0,
     FP8_FORMAT: tl.constexpr = 0,
 ):
+    tl.static_assert(Q_LEN_ACTUAL >= 2, "qtile kernel requires >= 2 q rows")
+    tl.static_assert(Q_LEN_ACTUAL <= 8, "q-row unroll is capped at 8 rows")
+
     hid = tl.program_id(0)  # q_head index
     sid = tl.program_id(1)  # kv_split index
 
@@ -470,14 +512,66 @@ def _tq_decode_stage1_qtile(
     d_offs = tl.arange(0, BLOCK_D)
     d_mask = d_offs < HEAD_DIM
     kv_range = tl.arange(0, BLOCK_KV)
-    q_idx = tl.arange(0, Q_BLOCK)
-    q_mask = q_idx < Q_LEN_ACTUAL
 
-    # Load ALL query rows once: q_rot — [Q_BLOCK, BLOCK_D] float32
-    q_ptrs = Q_rot_ptr + q_idx[:, None] * stride_qb + hid * stride_qh + d_offs[None, :]
-    q_rot = tl.load(
-        q_ptrs, mask=q_mask[:, None] & d_mask[None, :], other=0.0
+    # Per-row query vector + online-softmax state (m, l, acc). Q_LEN_ACTUAL
+    # is constexpr: every `if Q_LEN_ACTUAL >= n` here and in the tile loop
+    # below is resolved at trace time, so absent rows cost zero registers
+    # and zero instructions.
+    q_base = hid * stride_qh
+    q_r0 = tl.load(
+        Q_rot_ptr + q_base + d_offs, mask=d_mask, other=0.0
     ).to(tl.float32)
+    m_0 = -float("inf")
+    l_0 = 0.0
+    acc_0 = tl.zeros([BLOCK_D], dtype=tl.float32)
+    q_r1 = tl.load(
+        Q_rot_ptr + stride_qb + q_base + d_offs, mask=d_mask, other=0.0
+    ).to(tl.float32)
+    m_1 = -float("inf")
+    l_1 = 0.0
+    acc_1 = tl.zeros([BLOCK_D], dtype=tl.float32)
+    if Q_LEN_ACTUAL >= 3:
+        q_r2 = tl.load(
+            Q_rot_ptr + 2 * stride_qb + q_base + d_offs, mask=d_mask, other=0.0
+        ).to(tl.float32)
+        m_2 = -float("inf")
+        l_2 = 0.0
+        acc_2 = tl.zeros([BLOCK_D], dtype=tl.float32)
+    if Q_LEN_ACTUAL >= 4:
+        q_r3 = tl.load(
+            Q_rot_ptr + 3 * stride_qb + q_base + d_offs, mask=d_mask, other=0.0
+        ).to(tl.float32)
+        m_3 = -float("inf")
+        l_3 = 0.0
+        acc_3 = tl.zeros([BLOCK_D], dtype=tl.float32)
+    if Q_LEN_ACTUAL >= 5:
+        q_r4 = tl.load(
+            Q_rot_ptr + 4 * stride_qb + q_base + d_offs, mask=d_mask, other=0.0
+        ).to(tl.float32)
+        m_4 = -float("inf")
+        l_4 = 0.0
+        acc_4 = tl.zeros([BLOCK_D], dtype=tl.float32)
+    if Q_LEN_ACTUAL >= 6:
+        q_r5 = tl.load(
+            Q_rot_ptr + 5 * stride_qb + q_base + d_offs, mask=d_mask, other=0.0
+        ).to(tl.float32)
+        m_5 = -float("inf")
+        l_5 = 0.0
+        acc_5 = tl.zeros([BLOCK_D], dtype=tl.float32)
+    if Q_LEN_ACTUAL >= 7:
+        q_r6 = tl.load(
+            Q_rot_ptr + 6 * stride_qb + q_base + d_offs, mask=d_mask, other=0.0
+        ).to(tl.float32)
+        m_6 = -float("inf")
+        l_6 = 0.0
+        acc_6 = tl.zeros([BLOCK_D], dtype=tl.float32)
+    if Q_LEN_ACTUAL >= 8:
+        q_r7 = tl.load(
+            Q_rot_ptr + 7 * stride_qb + q_base + d_offs, mask=d_mask, other=0.0
+        ).to(tl.float32)
+        m_7 = -float("inf")
+        l_7 = 0.0
+        acc_7 = tl.zeros([BLOCK_D], dtype=tl.float32)
 
     # Precompute byte/bit index vectors for MSE gather loads
     if not KEY_FP8:
@@ -491,11 +585,6 @@ def _tq_decode_stage1_qtile(
         val_bit_off = d_offs * 3
         val_byte_idx = val_bit_off // 8
         val_bit_shift = val_bit_off % 8
-
-    # Per-row online softmax accumulators
-    m_i = tl.full([Q_BLOCK], -float("inf"), dtype=tl.float32)
-    l_i = tl.zeros([Q_BLOCK], dtype=tl.float32)
-    acc = tl.zeros([Q_BLOCK, BLOCK_D], dtype=tl.float32)
 
     bt_base = 0  # row 0 of block table (all rows identical)
 
@@ -521,7 +610,9 @@ def _tq_decode_stage1_qtile(
         )
 
         # ============================================================
-        # KV TILE LOAD (ONCE) + SCORES: [Q_BLOCK, BLOCK_KV]
+        # K TILE LOAD (ONCE, shared by all rows): [BLOCK_KV, BLOCK_D]
+        #   k_mat      dequanted FP8 key or gathered centroid vector
+        #   k_rowscale per-token score scale (vec_norm for MSE, 1 for FP8)
         # ============================================================
         if KEY_FP8:
             k_addrs = slot_bases[:, None] + d_offs[None, :]
@@ -531,24 +622,14 @@ def _tq_decode_stage1_qtile(
                 other=0,
             )
             if FP8_FORMAT == 1:
-                k_float = k_raw.to(tl.float8e4b15, bitcast=True).to(tl.float32)
+                k_mat = k_raw.to(tl.float8e4b15, bitcast=True).to(tl.float32)
             elif FP8_FORMAT == 2:
-                k_float = k_raw.to(tl.float8e5, bitcast=True).to(tl.float32)
+                k_mat = k_raw.to(tl.float8e5, bitcast=True).to(tl.float32)
             else:
-                k_float = k_raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
-            # scores[q, n] = sum_d q_rot[q, d] * k_float[n, d]
-            scores = (
-                tl.sum(
-                    tl.where(
-                        d_mask[None, None, :],
-                        q_rot[:, None, :] * k_float[None, :, :],
-                        0.0,
-                    ),
-                    axis=2,
-                )
-                * ATTN_SCALE
-            )
-            scores = tl.where(kv_mask[None, :], scores, -float("inf"))
+                k_mat = k_raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+            # Multiplying by 1.0 is exact in fp32: lets the per-row score
+            # expression below be shared verbatim by both key paths.
+            k_rowscale = tl.full([BLOCK_KV], 1.0, dtype=tl.float32)
         else:
             # MSE unpack + norms (loaded once, shared across rows)
             mse_addrs0 = slot_bases[:, None] + mse_byte_idx[None, :]
@@ -578,16 +659,7 @@ def _tq_decode_stage1_qtile(
                 )
                 c_inv_norm = 1.0 / tl.sqrt(c_norm_sq + 1e-16)
                 c_vals = c_vals * c_inv_norm[:, None]
-
-            # term1[q, n] = sum_d q_rot[q, d] * c_vals[n, d]
-            term1 = tl.sum(
-                tl.where(
-                    d_mask[None, None, :],
-                    q_rot[:, None, :] * c_vals[None, :, :],
-                    0.0,
-                ),
-                axis=2,
-            )
+            k_mat = c_vals
 
             norm_bases = slot_bases + MSE_BYTES
             n_lo = tl.load(KV_cache_ptr + norm_bases, mask=kv_mask, other=0).to(
@@ -596,10 +668,9 @@ def _tq_decode_stage1_qtile(
             n_hi = tl.load(KV_cache_ptr + norm_bases + 1, mask=kv_mask, other=0).to(
                 tl.uint16
             )
-            vec_norms = (n_lo | (n_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-
-            scores = vec_norms[None, :] * term1 * ATTN_SCALE
-            scores = tl.where(kv_mask[None, :], scores, -float("inf"))
+            k_rowscale = (
+                (n_lo | (n_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            )
 
         # ============================================================
         # VALUE LOAD + DEQUANTIZE (ONCE): [BLOCK_KV, BLOCK_D]
@@ -670,35 +741,187 @@ def _tq_decode_stage1_qtile(
             values = v_idx * v_scales[:, None] + v_zeros[:, None]
 
         # ============================================================
-        # ONLINE SOFTMAX UPDATE (per row, vectorized over Q_BLOCK)
+        # PER-ROW QK DOT + ONLINE SOFTMAX UPDATE (constexpr-unrolled;
+        # each block is the old kernel's exact per-row op sequence)
         # ============================================================
-        n_e_max = tl.maximum(tl.max(scores, axis=1), m_i)  # [Q_BLOCK]
-        re_scale = tl.exp(m_i - n_e_max)  # [Q_BLOCK]
-        p = tl.exp(scores - n_e_max[:, None])  # [Q_BLOCK, BLOCK_KV]
-
-        # acc[q, d] = acc*re_scale + sum_n p[q, n] * values[n, d]
-        acc = acc * re_scale[:, None] + tl.sum(
-            p[:, :, None] * values[None, :, :], axis=1
+        # ---- row 0 ----
+        t_r = tl.sum(
+            tl.where(d_mask[None, :], q_r0[None, :] * k_mat, 0.0), axis=1
         )
-        l_i = l_i * re_scale + tl.sum(p, axis=1)
-        m_i = n_e_max
+        s_r = k_rowscale * t_r * ATTN_SCALE
+        s_r = tl.where(kv_mask, s_r, -float("inf"))
+        m_new = tl.maximum(tl.max(s_r, 0), m_0)
+        re_s = tl.exp(m_0 - m_new)
+        p_r = tl.exp(s_r - m_new)
+        acc_0 = acc_0 * re_s + tl.sum(p_r[:, None] * values, 0)
+        l_0 = l_0 * re_s + tl.sum(p_r, 0)
+        m_0 = m_new
+        # ---- row 1 ----
+        t_r = tl.sum(
+            tl.where(d_mask[None, :], q_r1[None, :] * k_mat, 0.0), axis=1
+        )
+        s_r = k_rowscale * t_r * ATTN_SCALE
+        s_r = tl.where(kv_mask, s_r, -float("inf"))
+        m_new = tl.maximum(tl.max(s_r, 0), m_1)
+        re_s = tl.exp(m_1 - m_new)
+        p_r = tl.exp(s_r - m_new)
+        acc_1 = acc_1 * re_s + tl.sum(p_r[:, None] * values, 0)
+        l_1 = l_1 * re_s + tl.sum(p_r, 0)
+        m_1 = m_new
+        # ---- rows 2..7 (constexpr-guarded: absent rows compile away) ----
+        if Q_LEN_ACTUAL >= 3:
+            t_r = tl.sum(
+                tl.where(d_mask[None, :], q_r2[None, :] * k_mat, 0.0), axis=1
+            )
+            s_r = k_rowscale * t_r * ATTN_SCALE
+            s_r = tl.where(kv_mask, s_r, -float("inf"))
+            m_new = tl.maximum(tl.max(s_r, 0), m_2)
+            re_s = tl.exp(m_2 - m_new)
+            p_r = tl.exp(s_r - m_new)
+            acc_2 = acc_2 * re_s + tl.sum(p_r[:, None] * values, 0)
+            l_2 = l_2 * re_s + tl.sum(p_r, 0)
+            m_2 = m_new
+        if Q_LEN_ACTUAL >= 4:
+            t_r = tl.sum(
+                tl.where(d_mask[None, :], q_r3[None, :] * k_mat, 0.0), axis=1
+            )
+            s_r = k_rowscale * t_r * ATTN_SCALE
+            s_r = tl.where(kv_mask, s_r, -float("inf"))
+            m_new = tl.maximum(tl.max(s_r, 0), m_3)
+            re_s = tl.exp(m_3 - m_new)
+            p_r = tl.exp(s_r - m_new)
+            acc_3 = acc_3 * re_s + tl.sum(p_r[:, None] * values, 0)
+            l_3 = l_3 * re_s + tl.sum(p_r, 0)
+            m_3 = m_new
+        if Q_LEN_ACTUAL >= 5:
+            t_r = tl.sum(
+                tl.where(d_mask[None, :], q_r4[None, :] * k_mat, 0.0), axis=1
+            )
+            s_r = k_rowscale * t_r * ATTN_SCALE
+            s_r = tl.where(kv_mask, s_r, -float("inf"))
+            m_new = tl.maximum(tl.max(s_r, 0), m_4)
+            re_s = tl.exp(m_4 - m_new)
+            p_r = tl.exp(s_r - m_new)
+            acc_4 = acc_4 * re_s + tl.sum(p_r[:, None] * values, 0)
+            l_4 = l_4 * re_s + tl.sum(p_r, 0)
+            m_4 = m_new
+        if Q_LEN_ACTUAL >= 6:
+            t_r = tl.sum(
+                tl.where(d_mask[None, :], q_r5[None, :] * k_mat, 0.0), axis=1
+            )
+            s_r = k_rowscale * t_r * ATTN_SCALE
+            s_r = tl.where(kv_mask, s_r, -float("inf"))
+            m_new = tl.maximum(tl.max(s_r, 0), m_5)
+            re_s = tl.exp(m_5 - m_new)
+            p_r = tl.exp(s_r - m_new)
+            acc_5 = acc_5 * re_s + tl.sum(p_r[:, None] * values, 0)
+            l_5 = l_5 * re_s + tl.sum(p_r, 0)
+            m_5 = m_new
+        if Q_LEN_ACTUAL >= 7:
+            t_r = tl.sum(
+                tl.where(d_mask[None, :], q_r6[None, :] * k_mat, 0.0), axis=1
+            )
+            s_r = k_rowscale * t_r * ATTN_SCALE
+            s_r = tl.where(kv_mask, s_r, -float("inf"))
+            m_new = tl.maximum(tl.max(s_r, 0), m_6)
+            re_s = tl.exp(m_6 - m_new)
+            p_r = tl.exp(s_r - m_new)
+            acc_6 = acc_6 * re_s + tl.sum(p_r[:, None] * values, 0)
+            l_6 = l_6 * re_s + tl.sum(p_r, 0)
+            m_6 = m_new
+        if Q_LEN_ACTUAL >= 8:
+            t_r = tl.sum(
+                tl.where(d_mask[None, :], q_r7[None, :] * k_mat, 0.0), axis=1
+            )
+            s_r = k_rowscale * t_r * ATTN_SCALE
+            s_r = tl.where(kv_mask, s_r, -float("inf"))
+            m_new = tl.maximum(tl.max(s_r, 0), m_7)
+            re_s = tl.exp(m_7 - m_new)
+            p_r = tl.exp(s_r - m_new)
+            acc_7 = acc_7 * re_s + tl.sum(p_r[:, None] * values, 0)
+            l_7 = l_7 * re_s + tl.sum(p_r, 0)
+            m_7 = m_new
 
-    # Store partial result per row (padded rows masked out)
-    safe_l = tl.where(l_i > 0.0, l_i, 1.0)
-    out_base = (
-        q_idx[:, None] * stride_mid_b + hid * stride_mid_h + sid * stride_mid_s
+    # Store per-row partials at each row's own bid (old mid_o layout)
+    out_base = hid * stride_mid_h + sid * stride_mid_s
+    safe_l = tl.where(l_0 > 0.0, l_0, 1.0)
+    tl.store(Mid_o_ptr + out_base + d_offs, acc_0 / safe_l, mask=d_mask)
+    tl.store(Mid_o_ptr + out_base + HEAD_DIM, m_0 + tl.log(safe_l))
+    safe_l = tl.where(l_1 > 0.0, l_1, 1.0)
+    tl.store(
+        Mid_o_ptr + stride_mid_b + out_base + d_offs,
+        acc_1 / safe_l,
+        mask=d_mask,
     )
     tl.store(
-        Mid_o_ptr + out_base + d_offs[None, :],
-        acc / safe_l[:, None],
-        mask=q_mask[:, None] & d_mask[None, :],
+        Mid_o_ptr + stride_mid_b + out_base + HEAD_DIM, m_1 + tl.log(safe_l)
     )
-    lse = m_i + tl.log(safe_l)
-    tl.store(
-        Mid_o_ptr + q_idx * stride_mid_b + hid * stride_mid_h + sid * stride_mid_s + HEAD_DIM,
-        lse,
-        mask=q_mask,
-    )
+    if Q_LEN_ACTUAL >= 3:
+        safe_l = tl.where(l_2 > 0.0, l_2, 1.0)
+        tl.store(
+            Mid_o_ptr + 2 * stride_mid_b + out_base + d_offs,
+            acc_2 / safe_l,
+            mask=d_mask,
+        )
+        tl.store(
+            Mid_o_ptr + 2 * stride_mid_b + out_base + HEAD_DIM,
+            m_2 + tl.log(safe_l),
+        )
+    if Q_LEN_ACTUAL >= 4:
+        safe_l = tl.where(l_3 > 0.0, l_3, 1.0)
+        tl.store(
+            Mid_o_ptr + 3 * stride_mid_b + out_base + d_offs,
+            acc_3 / safe_l,
+            mask=d_mask,
+        )
+        tl.store(
+            Mid_o_ptr + 3 * stride_mid_b + out_base + HEAD_DIM,
+            m_3 + tl.log(safe_l),
+        )
+    if Q_LEN_ACTUAL >= 5:
+        safe_l = tl.where(l_4 > 0.0, l_4, 1.0)
+        tl.store(
+            Mid_o_ptr + 4 * stride_mid_b + out_base + d_offs,
+            acc_4 / safe_l,
+            mask=d_mask,
+        )
+        tl.store(
+            Mid_o_ptr + 4 * stride_mid_b + out_base + HEAD_DIM,
+            m_4 + tl.log(safe_l),
+        )
+    if Q_LEN_ACTUAL >= 6:
+        safe_l = tl.where(l_5 > 0.0, l_5, 1.0)
+        tl.store(
+            Mid_o_ptr + 5 * stride_mid_b + out_base + d_offs,
+            acc_5 / safe_l,
+            mask=d_mask,
+        )
+        tl.store(
+            Mid_o_ptr + 5 * stride_mid_b + out_base + HEAD_DIM,
+            m_5 + tl.log(safe_l),
+        )
+    if Q_LEN_ACTUAL >= 7:
+        safe_l = tl.where(l_6 > 0.0, l_6, 1.0)
+        tl.store(
+            Mid_o_ptr + 6 * stride_mid_b + out_base + d_offs,
+            acc_6 / safe_l,
+            mask=d_mask,
+        )
+        tl.store(
+            Mid_o_ptr + 6 * stride_mid_b + out_base + HEAD_DIM,
+            m_6 + tl.log(safe_l),
+        )
+    if Q_LEN_ACTUAL >= 8:
+        safe_l = tl.where(l_7 > 0.0, l_7, 1.0)
+        tl.store(
+            Mid_o_ptr + 7 * stride_mid_b + out_base + d_offs,
+            acc_7 / safe_l,
+            mask=d_mask,
+        )
+        tl.store(
+            Mid_o_ptr + 7 * stride_mid_b + out_base + HEAD_DIM,
+            m_7 + tl.log(safe_l),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -946,11 +1169,11 @@ def triton_turboquant_decode_attention(
 
     # F-2 q-row-tiled path: only when the caller guarantees all B rows share
     # ONE sequence's cached prefix (the spec-verify prefix leg), the env flag
-    # is on, and there is more than one row to amortize over. Plain batch
-    # decode (`_decode_attention`, B = distinct sequences) never sets
-    # qtile_same_seq, so it keeps the original per-row grid unchanged.
-    if _STAGE1_QTILE and qtile_same_seq and B > 1:
-        Q_BLOCK = triton.next_power_of_2(B)
+    # is on, and there are 2..8 rows to amortize over (the kernel unrolls
+    # per-row state at trace time, capped at 8; MTP verify is K+1 = 4 rows).
+    # Plain batch decode (`_decode_attention`, B = distinct sequences) never
+    # sets qtile_same_seq, so it keeps the original per-row grid unchanged.
+    if _STAGE1_QTILE and qtile_same_seq and 1 < B <= 8:
         grid_q = (Hq, NUM_KV_SPLITS)
         _tq_decode_stage1_qtile[grid_q](
             q_rot,
@@ -984,13 +1207,16 @@ def triton_turboquant_decode_attention(
             BLOCK_KV=BLOCK_KV,
             KEY_FP8=1 if key_fp8 else 0,
             Q_LEN_ACTUAL=B,
-            Q_BLOCK=Q_BLOCK,
             NORM_CORRECTION=1 if norm_correction else 0,
             FP8_FORMAT=fp8_format,
-            # Wider per-program work than the per-row kernel (Q_BLOCK*BLOCK_KV
-            # dot products over D); more warps spread the D-reduction. Tune in
-            # the GPU window.
-            num_warps=4,
+            # Row-unrolled program. Offline ptxas (SM75, k3v4_nc, q_len=4,
+            # BLOCK_KV=2): num_warps=1/2/4 -> 254/151/93 regs, all 0-spill.
+            # Start at 2; sweep {1, 2, 4} x VLLM_TURBOQUANT_DECODE_BLOCK_KV
+            # {2, 4, 8} x VLLM_TURBOQUANT_MAX_KV_SPLITS {32, 64} in the GPU
+            # window if the first result lands within 20% of the 60 us/1K
+            # bar. Constraint: BLOCK_KV=8 requires num_warps=4 (spills at
+            # <=2); BLOCK_KV=16 spills even at 4 — do not sweep it.
+            num_warps=2,
             num_stages=1,
         )
     else:
