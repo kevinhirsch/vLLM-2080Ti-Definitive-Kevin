@@ -367,6 +367,27 @@ class Worker(WorkerBase):
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
             self.model_runner.profile_run()
+            # [FORK] Same always-on reserve diagnostic as the profiled path below:
+            # the kv_cache_memory_bytes early return would otherwise skip it and
+            # leave such boots unattributable.
+            # workspace reserve decision. Emitted HERE (before cudagraph-memory
+            # profiling) on purpose: at large num_speculative_tokens the very
+            # next step can OOM inside profile_cudagraph_memory (allocating the
+            # minimal KV cache for capture) — which is *upstream* of
+            # get_kv_cache_configs where the reserve is actually applied — so a
+            # log placed only there would never print. This makes every boot
+            # attributable either way.
+            if self.vllm_config.speculative_config is not None:
+                from vllm.v1.core.kv_cache_utils import (
+                    spec_decode_verify_reserve_decision,
+                )
+
+                _spec_reason = spec_decode_verify_reserve_decision(self.vllm_config)[1]
+                logger.info(
+                    "Speculative-decode verify workspace reserve (applied later "
+                    "in get_kv_cache_configs): %s",
+                    _spec_reason,
+                )
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
