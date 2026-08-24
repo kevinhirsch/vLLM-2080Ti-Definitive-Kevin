@@ -14,6 +14,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import (
+    NULL_BLOCK_ID,
     PAD_SLOT_ID,
     compute_causal_conv1d_metadata,
     mamba_get_block_table_tensor,
@@ -316,6 +317,24 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
             assert num_accepted_tokens is not None
             num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
+
+            # [FORK] Port of vllm-project/vllm#51508: a spec row whose async
+            # step was discarded reports num_accepted_tokens == 0. Every
+            # consumer assumes the count is in 1..K+1 and indexes state slots
+            # with count-1, so 0 becomes -1: OOB/neighbour-row read in the
+            # Triton kernels, silent state corruption on the align-mode CPU
+            # copy path. Null the whole state row instead of clamping — the
+            # existing <=0 / null-block guards in fused_recurrent,
+            # fused_sigmoid_gating and causal_conv1d_update then skip the row
+            # entirely (no initial-state read, no final-state write, which a
+            # clamp would still perform against a discarded step). Placed
+            # before the persistent-buffer copies so the cudagraph path
+            # inherits the nulled rows.
+            stale_rows = num_accepted_tokens <= 0
+            if bool(stale_rows.any()):
+                spec_state_indices_tensor[
+                    stale_rows.to(spec_state_indices_tensor.device)
+                ] = NULL_BLOCK_ID
 
         chunk_indices: torch.Tensor | None = None
         chunk_offsets: torch.Tensor | None = None
