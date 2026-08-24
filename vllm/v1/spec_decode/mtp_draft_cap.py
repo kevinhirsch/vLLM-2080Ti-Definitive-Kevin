@@ -43,6 +43,11 @@ make cap < K or cap > K actually work -- that is explicitly out of scope; see
 
 from __future__ import annotations
 
+import logging
+import os
+
+logger = logging.getLogger(__name__)
+
 
 def validate_mtp_draft_cap(raw_cap: str | None, num_speculative_tokens: int) -> None:
     """Raise ``ValueError`` if ``VLLM_MTP_DRAFT_CAP`` is set to anything other
@@ -66,6 +71,26 @@ def validate_mtp_draft_cap(raw_cap: str | None, num_speculative_tokens: int) -> 
         return
     cap = int(raw_cap)
     if cap <= 0:
+        return
+    # [FORK] S4 exemption (found 2026-08-24, same day as the guard): the S4
+    # scoped-reemission drafter's DESIGN requires cap < K (canonical pairing
+    # cap=2 / K=16, hardware re-A/B'd 2026-08-17, docs/exp039-scoped-drafter-
+    # design.md). It is runtime-safe where plain MTP is not: S4's v2 merge
+    # returns drafts as a Python list, which _copy_draft_token_ids_to_cpu
+    # short-circuits (`if not torch.is_tensor(...): return`,
+    # gpu_model_runner.py ~4867) before the width-mismatched `.copy_()` that
+    # crashes plain MTP, and v3's merge_gpu width-normalizes its tensor to K
+    # before returning. The M-7 failure mode therefore never reaches the copy
+    # site under S4. Exempting exactly that case, loudly, keeps the guard
+    # strict for everyone else.
+    if os.environ.get("VLLM_S4_SCOPED_DRAFTER") == "1":
+        logger.warning(
+            "VLLM_MTP_DRAFT_CAP=%d != K=%d permitted because "
+            "VLLM_S4_SCOPED_DRAFTER=1 (S4 design pairing; safe via the "
+            "list-draft short-circuit -- see mtp_draft_cap.py [FORK] note).",
+            cap,
+            num_speculative_tokens,
+        )
         return
     if cap != num_speculative_tokens:
         raise ValueError(
