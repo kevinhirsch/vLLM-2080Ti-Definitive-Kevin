@@ -1890,13 +1890,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TOOL_REPETITION_DETECTION_MIN_COUNT": lambda: int(
         os.getenv("VLLM_TOOL_REPETITION_DETECTION_MIN_COUNT", "0")
     ),
-    # Flag to enable v2 model runner.
+    # Reserve VRAM for the speculative-decode verify working set that memory
+    # profiling under-counts at num_speculative_tokens > 1 (see
+    # vllm/v1/core/spec_decode_workspace.py). Auto no-op when spec decoding is
+    # off or K <= 1; the multiplier bounds the peak-overshoot estimate.
     "VLLM_SPEC_RESERVE_VERIFY_WORKSPACE": lambda: bool(
         int(os.getenv("VLLM_SPEC_RESERVE_VERIFY_WORKSPACE", "1"))
     ),
     "VLLM_SPEC_VERIFY_OVERSHOOT_MULT": lambda: int(
         os.getenv("VLLM_SPEC_VERIFY_OVERSHOOT_MULT", "24")
     ),
+    # Flag to enable v2 model runner.
     "VLLM_USE_V2_MODEL_RUNNER": lambda: bool(
         int(os.getenv("VLLM_USE_V2_MODEL_RUNNER", "0"))
     ),

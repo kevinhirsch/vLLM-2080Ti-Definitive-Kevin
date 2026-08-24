@@ -2148,11 +2148,26 @@ def get_kv_cache_configs(
             "KV sizing: speculative-decode verify workspace reserve %s", spec_verify_reason
         )
     if spec_verify_reserve > 0:
+        # Only the last pipeline stage runs compute_logits + rejection
+        # sampling, so only its workers need the reserve (review: reserving on
+        # every rank shrinks earlier stages' KV for buffers they never
+        # allocate). Ranks are laid out PP-outermost / TP-innermost
+        # (parallel_state.initialize_model_parallel reshape), so the last
+        # stage is the final `world/pp` slice. With pp_size == 1 (the common
+        # case) every worker is the last stage and behavior is unchanged.
+        pp_size = max(
+            1, int(getattr(vllm_config.parallel_config, "pipeline_parallel_size", 1))
+        )
+        n_workers = len(available_memory)
+        per_stage = max(1, n_workers // pp_size)
+        last_stage_start = (pp_size - 1) * per_stage
         available_memory = [
             avail_mem
-            if not groups
+            if (not groups or idx < last_stage_start)
             else max(0, avail_mem - spec_verify_reserve)
-            for groups, avail_mem in zip(projected_groups_per_worker, available_memory)
+            for idx, (groups, avail_mem) in enumerate(
+                zip(projected_groups_per_worker, available_memory)
+            )
         ]
         logger.info(
             "Reserved %s GiB per rank for the speculative-decode verify working "
