@@ -531,7 +531,8 @@ def make_downstream_attn_call(inp: dict, common: dict):
     # Column < depth (prefix): always visible. Column >= depth (current
     # chunk): visible iff local-causal (col - depth <= row).
     mask = (col < depth) | ((col - depth) <= row)
-    attn_mask = torch.zeros(Q_LEN, total_k, dtype=torch.float32, device=device)
+    # SDPA requires the additive mask dtype to match the query dtype (half).
+    attn_mask = torch.zeros(Q_LEN, total_k, dtype=q_b.dtype, device=device)
     attn_mask.masked_fill_(~mask, float("-inf"))
     attn_mask = attn_mask.view(1, 1, Q_LEN, total_k)
 
