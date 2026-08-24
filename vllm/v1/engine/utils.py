@@ -122,6 +122,17 @@ class CoreEngineProcManager:
             "executor_class": executor_class,
             "log_stats": log_stats,
             "tensor_queue": tensor_queue,
+            # [FORK] 2026-08-24: VLLM_* env vars were observed vanishing
+            # between the APIServer (15 present, systemd EnvironmentFile) and
+            # EngineCore/workers (only the code-set MULTIPROC_METHOD left),
+            # silently disabling every env-gated feature in systemd boots
+            # while bash-launched test engines kept them — an unmeasurable
+            # config split between prod and every A/B window. Snapshot the
+            # parent's VLLM_* here and re-hydrate in the child before any
+            # env read, fixing the class regardless of which layer scrubs.
+            "parent_vllm_env": {
+                k: v for k, v in os.environ.items() if k.startswith("VLLM_")
+            },
         }
 
         if client_handshake_address:
