@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from math import lcm
 
+from vllm import envs
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
@@ -21,8 +22,53 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
 )
 from vllm.v1.request import Request
+
+
+def _validate_prefix_cache_retention_interval(
+    retention_interval: int | None,
+    kv_cache_config: KVCacheConfig,
+) -> None:
+    """Validate ``VLLM_PREFIX_CACHE_RETENTION_INTERVAL``.
+
+    Ported from upstream vLLM #43447 / #45845. Upstream also sparsifies
+    sliding-window retention; that half of #43447 was not ported into this
+    fork (only the Mamba/linear-attention extension from #45845 was), so
+    unlike upstream, a sliding-window-only model does NOT satisfy this
+    check — only a Mamba/linear-attention KV cache group does.
+    """
+    if retention_interval is None:
+        return
+
+    mamba_groups = [
+        g
+        for g in kv_cache_config.kv_cache_groups
+        if isinstance(g.kv_cache_spec, MambaSpec)
+    ]
+    if not mamba_groups:
+        raise ValueError(
+            "VLLM_PREFIX_CACHE_RETENTION_INTERVAL is set but this model has "
+            "no Mamba/linear-attention KV cache group, so retention has no "
+            "effect. Unset it (in this fork, retention-interval "
+            "sparsification only applies to Mamba/linear-attention groups; "
+            "see upstream vLLM #45845)."
+        )
+
+    if retention_interval < 0:
+        raise ValueError(
+            f"VLLM_PREFIX_CACHE_RETENTION_INTERVAL ({retention_interval}) "
+            "must be non-negative."
+        )
+    for g in mamba_groups:
+        block_size = g.kv_cache_spec.block_size
+        if retention_interval % block_size != 0:
+            raise ValueError(
+                f"VLLM_PREFIX_CACHE_RETENTION_INTERVAL ({retention_interval}) "
+                "must be a multiple of the Mamba KV cache group's "
+                f"block_size ({block_size})."
+            )
 
 
 class KVCacheCoordinator(ABC):
@@ -75,6 +121,15 @@ class KVCacheCoordinator(ABC):
                 pcp_world_size=pcp_world_size,
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
+        )
+
+        # Sparse local-checkpoint retention (ported from upstream vLLM
+        # #43447 / #45845). None = dense (default, unchanged behavior);
+        # 0 = keep only the latest replay boundary; >0 = keep one checkpoint
+        # per that-sized segment. See VLLM_PREFIX_CACHE_RETENTION_INTERVAL.
+        self.retention_interval = envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL
+        _validate_prefix_cache_retention_interval(
+            self.retention_interval, kv_cache_config
         )
 
     def get_num_blocks_to_allocate(
@@ -206,7 +261,11 @@ class KVCacheCoordinator(ABC):
                 (including tokens that are already cached).
         """
         for manager in self.single_type_managers:
-            manager.cache_blocks(request, num_computed_tokens)
+            manager.cache_blocks(
+                request,
+                num_computed_tokens,
+                retention_interval=self.retention_interval,
+            )
 
     def free(self, request_id: str) -> None:
         """

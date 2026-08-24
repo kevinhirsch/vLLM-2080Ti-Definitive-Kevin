@@ -265,6 +265,7 @@ if TYPE_CHECKING:
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
     VLLM_LOOPBACK_IP: str = ""
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
+    VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
     VLLM_ENABLE_RESPONSES_API_STORE: bool = False
     VLLM_NVFP4_GEMM_BACKEND: str | None = None
     VLLM_HAS_FLASHINFER_CUBIN: bool = False
@@ -1764,6 +1765,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TODO(lucas): Remove this flag once latency regression is resolved.
     "VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE": lambda: bool(
         int(os.getenv("VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE", "1"))
+    ),
+    # Retain local Mamba/linear-attention state-snapshot checkpoints for
+    # prefix caching. Unset (default) preserves the dense per-block-boundary
+    # checkpointing behavior. `0` retains only the latest completed prompt
+    # boundary. Positive values (must be a multiple of the Mamba KV cache
+    # group's block_size) retain checkpoints at that interval instead of
+    # every boundary, freeing up cache-pool headroom at small block sizes.
+    # Ported from upstream vLLM #45845; applies only to Mamba/linear
+    # attention groups in this fork (sliding-window retention from upstream
+    # #43447 was not ported).
+    # [FORK] Default is intentionally dense (None), the OPPOSITE of
+    # upstream's effective default (0 / sparse "semantic checkpoints only").
+    # docs/f1-partial-prefix-hits-research.md found that upstream's sparse
+    # default silently zeroes out the benefit of #53479-style per-boundary
+    # Mamba state materialization (measured on GB10: 3->2 first-hit requests
+    # only with retention_interval=block_size, not at the sparse default).
+    # This mechanism is the gating prerequisite for hybrid partial
+    # prefix-cache hits in this fork, so it must stay dense by default;
+    # do not "fix" this back to upstream's default without re-reading that
+    # doc.
+    "VLLM_PREFIX_CACHE_RETENTION_INTERVAL": lambda: (
+        int(os.environ["VLLM_PREFIX_CACHE_RETENTION_INTERVAL"])
+        if "VLLM_PREFIX_CACHE_RETENTION_INTERVAL" in os.environ
+        else None
     ),
     # Enables support for the "store" option in the OpenAI Responses API.
     # When set to 1, vLLM's OpenAI server will retain the input and output

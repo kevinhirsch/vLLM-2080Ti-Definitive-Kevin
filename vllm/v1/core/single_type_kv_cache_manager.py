@@ -274,7 +274,12 @@ class SingleTypeKVCacheManager(ABC):
         self.new_block_ids = []
         return ids
 
-    def cache_blocks(self, request: Request, num_tokens: int) -> None:
+    def cache_blocks(
+        self,
+        request: Request,
+        num_tokens: int,
+        retention_interval: int | None = None,
+    ) -> None:
         """
         Cache the blocks for the request.
 
@@ -282,6 +287,14 @@ class SingleTypeKVCacheManager(ABC):
             request: The request.
             num_tokens: The total number of tokens that need to be cached
                 (including tokens that are already cached).
+            retention_interval: Sparse local-checkpoint granularity, ported
+                from upstream vLLM #45845/#43447 (``VLLM_PREFIX_CACHE_RETENTION_INTERVAL``).
+                ``None`` keeps dense checkpointing (default, unchanged
+                behavior); ``0`` keeps only the latest replay boundary; a
+                positive multiple of this group's ``block_size`` keeps a
+                snapshot once per that-sized segment. Only groups that
+                override ``reachable_block_mask`` (currently: Mamba) act on
+                it; every other manager ignores it and stays dense.
         """
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
         num_full_blocks = num_tokens // self.block_size
@@ -289,6 +302,22 @@ class SingleTypeKVCacheManager(ABC):
         if num_cached_blocks >= num_full_blocks:
             return
 
+        # NOTE: use_eagle=False here because this fork's cache_blocks() call
+        # site has no per-group eagle-membership signal available (unlike
+        # find_longest_cache_hit, which the coordinator calls with an
+        # explicit use_eagle per group). The only reachable_block_mask
+        # override in this fork (MambaManager, ported from vLLM #45845)
+        # never consults use_eagle, so this is a no-op today; revisit if a
+        # future retention-eligible manager needs it.
+        block_mask = self.reachable_block_mask(
+            start_block=num_cached_blocks,
+            end_block=num_full_blocks,
+            alignment_tokens=self.block_size,
+            kv_cache_spec=self.kv_cache_spec,
+            use_eagle=False,
+            retention_interval=retention_interval,
+            num_prompt_tokens=request.num_prompt_tokens,
+        )
         self.block_pool.cache_full_blocks(
             request=request,
             blocks=self.req_to_blocks[request.request_id],
@@ -296,9 +325,32 @@ class SingleTypeKVCacheManager(ABC):
             num_full_blocks=num_full_blocks,
             block_size=self.block_size,
             kv_cache_group_id=self.kv_cache_group_id,
+            block_mask=block_mask,
         )
 
         self.num_cached_block[request.request_id] = num_full_blocks
+
+    @classmethod
+    def reachable_block_mask(
+        cls,
+        start_block: int,
+        end_block: int,
+        alignment_tokens: int | None,
+        kv_cache_spec: KVCacheSpec,
+        use_eagle: bool,
+        retention_interval: int | None = None,
+        num_prompt_tokens: int | None = None,
+    ) -> list[bool] | None:
+        """Per-block mask for ``cache_full_blocks``. ``None`` means cache
+        every (non-null) block — the default, and unchanged behavior for
+        every manager except the ones below that override this.
+
+        Subclasses with sparse retention semantics (currently: Mamba, ported
+        from upstream vLLM #45845) override this to skip intermediate
+        checkpoint blocks that a sparse ``retention_interval`` makes
+        unreachable.
+        """
+        return None
 
     def free(self, request_id: str) -> None:
         """
@@ -1072,17 +1124,81 @@ class MambaManager(SingleTypeKVCacheManager):
         """
         return num_computed_tokens - 1
 
-    def cache_blocks(self, request: Request, num_tokens: int) -> None:
+    @classmethod
+    def reachable_block_mask(
+        cls,
+        start_block: int,
+        end_block: int,
+        alignment_tokens: int | None,
+        kv_cache_spec: KVCacheSpec,
+        use_eagle: bool,
+        retention_interval: int | None = None,
+        num_prompt_tokens: int | None = None,
+    ) -> list[bool] | None:
+        """Sparse Mamba state-snapshot retention (ported from upstream vLLM
+        #45845, extending the retention-interval sparsification #43447 added
+        for sliding-window attention).
+
+        ``retention_interval``:
+
+          ``None`` -> dense (cache every block; default, unchanged behavior)
+          ``0``    -> keep only the latest replay boundary
+          ``> 0``  -> keep one state per ``retention_interval``-sized segment
+        """
+        if retention_interval is None or alignment_tokens is None:
+            # Dense caching (default) or no alignment constraint imposed.
+            return None
+        assert isinstance(kv_cache_spec, MambaSpec)
+        block_size = kv_cache_spec.block_size
+        mask = [False] * (end_block - start_block)
+
+        # (1) Segment-boundary states. A Mamba hit needs exactly the single
+        # state block ending on the boundary (no window, and draft models
+        # have no mamba layers, so no eagle shift). Block ``i`` ends at
+        # token ``(i + 1) * block_size``.
+        segment_tokens = None if retention_interval == 0 else retention_interval
+        if segment_tokens is not None:
+            per_segment = segment_tokens // block_size
+            if per_segment <= 1:
+                # Interval at/below the block size: every block is a boundary.
+                return None
+            first_boundary = (
+                start_block + per_segment
+            ) // per_segment * per_segment - 1
+            for i in range(first_boundary - start_block, len(mask), per_segment):
+                mask[i] = True
+
+        # (2) Replay boundary. ``find_longest_cache_hit`` caps hits at
+        # ``num_prompt - 1``, so an exact prompt replay lands on the latest
+        # fine-aligned boundary. Sparse retention would otherwise skip its
+        # state, so keep it explicitly.
+        if num_prompt_tokens is not None:
+            latest = (num_prompt_tokens - 1) // alignment_tokens * alignment_tokens
+            boundary_block = latest // block_size - 1
+            if start_block <= boundary_block < end_block:
+                mask[boundary_block - start_block] = True
+
+        return mask
+
+    def cache_blocks(
+        self,
+        request: Request,
+        num_tokens: int,
+        retention_interval: int | None = None,
+    ) -> None:
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
-        super().cache_blocks(request, num_tokens)
+        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
         if num_cached_blocks_after > num_cached_blocks_before:
             for block in self.req_to_blocks[request.request_id][
                 num_cached_blocks_before:num_cached_blocks_after
             ]:
-                if block.is_null:
+                # Skip null blocks (align-mode skipped states) and blocks
+                # that were not cached this step — with sparse retention
+                # (reachable_block_mask) the intermediate state snapshots
+                # carry no hash and must not be recorded as cached-this-step.
+                if block.is_null or block.block_hash is None:
                     continue
-                assert block.block_hash is not None
                 self.cached_blocks_this_step.add(block.block_hash)
 
     def new_step_starts(self) -> None:
@@ -1103,7 +1219,12 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         # requests, so  `new_computed_blocks` should always be empty.
         assert len(new_computed_blocks) == 0
 
-    def cache_blocks(self, request: Request, num_tokens: int) -> None:
+    def cache_blocks(
+        self,
+        request: Request,
+        num_tokens: int,
+        retention_interval: int | None = None,
+    ) -> None:
         # We do not cache blocks for cross-attention to be shared between
         # requests, so this method is not relevant.
         raise ValueError("Should not be called as prefix caching is disabled.")
