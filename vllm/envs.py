@@ -81,6 +81,14 @@ if TYPE_CHECKING:
     VLLM_TURBOQUANT_FORCE_CONTINUATION_SDPA: bool = False
     VLLM_TURBOQUANT_FORCE_DECODE_SDPA_MAX_QK_CELLS: int = 131072
     VLLM_TURBOQUANT_MAX_KV_SPLITS: int | None = None
+    # [FORK] Reserve VRAM for the speculative-decode verify working set that KV
+    # profiling under-counts at large num_speculative_tokens (see
+    # vllm/v1/core/spec_decode_workspace.py). Default on; auto no-op when no
+    # speculative_config or num_speculative_tokens<=1.
+    VLLM_SPEC_RESERVE_VERIFY_WORKSPACE: bool = True
+    # [FORK] Peak-overshoot multiplier for that reserve (concurrent full-vocab
+    # fp32 verify buffers + un-instrumented residual). 0 disables the reserve.
+    VLLM_SPEC_VERIFY_OVERSHOOT_MULT: int = 24
     VLLM_TURBOQUANT_DECODE_BLOCK_KV: int = 2
     VLLM_TURBOQUANT_K8V4_FP8_FORMAT: str = "auto"
     VLLM_TURBOQUANT_CUDAGRAPH_SPEC_DECODE_SAFE: bool = False
@@ -878,6 +886,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_TQ_XID31_TRACE_SNAPSHOT": lambda: os.getenv(
         "VLLM_TQ_XID31_TRACE_SNAPSHOT", "/tmp/xid31_mem_snapshot.pickle"
+    ),
+    # [FORK] Speculative-decode verify working-set reserve (see
+    # vllm/v1/core/spec_decode_workspace.py).
+    "VLLM_SPEC_RESERVE_VERIFY_WORKSPACE": lambda: bool(
+        int(os.getenv("VLLM_SPEC_RESERVE_VERIFY_WORKSPACE", "1"))
+    ),
+    "VLLM_SPEC_VERIFY_OVERSHOOT_MULT": lambda: int(
+        os.getenv("VLLM_SPEC_VERIFY_OVERSHOOT_MULT", "24")
     ),
     "VLLM_TURBOQUANT_CONTINUATION_SDPA_Q_CHUNK": lambda: int(
         os.getenv("VLLM_TURBOQUANT_CONTINUATION_SDPA_Q_CHUNK", "0")
