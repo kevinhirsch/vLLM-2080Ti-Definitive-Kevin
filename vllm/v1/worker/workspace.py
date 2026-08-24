@@ -207,6 +207,22 @@ def is_workspace_manager_initialized() -> bool:
     return _manager is not None
 
 
+def workspace_manager_total_bytes() -> int:
+    """Total bytes currently allocated across all ubatch workspace arenas.
+
+    0 when the manager is not initialized. Used by memory profiling to keep
+    the turboquant workspace out of the measured non-KV footprint so the
+    explicit boot-time reserve (VLLM_TQ_RESERVE_PREFILL_WORKSPACE) is applied
+    exactly once regardless of when the arena happened to be allocated.
+    """
+    mgr = _manager
+    if mgr is None:
+        return 0
+    return sum(
+        mgr._workspace_size_bytes(ws) for ws in mgr._current_workspaces
+    )
+
+
 def current_workspace_manager() -> "WorkspaceManager":
     """Get the current workspace manager instance.
 

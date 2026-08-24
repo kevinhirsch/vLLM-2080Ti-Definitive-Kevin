@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3Next model."""
 
+import os
 from collections.abc import Iterable
 from itertools import islice
 
@@ -257,7 +258,7 @@ class Qwen3NextAttention(nn.Module):
 
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
-            max_position=config.max_position_embeddings,
+            max_position=int(os.getenv("VLLM_ROPE_MAX_POSITION") or config.max_position_embeddings),  # EXP-017 rope ctx extension
             rope_parameters=config.rope_parameters,
             dual_chunk_attention_config=self.dual_chunk_attention_config,
         )

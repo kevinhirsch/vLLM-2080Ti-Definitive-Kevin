@@ -1,0 +1,84 @@
+{
+  "id": "agentic_chain_002",
+  "category": "agentic_chain",
+  "description": "order status -> tracking lookup, answer must use tracking result",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_order_status",
+        "description": "Get the status of an order.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "order_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "order_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "track_package",
+        "description": "Track a package by tracking number.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "tracking_number": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "tracking_number"
+          ]
+        }
+      }
+    }
+  ],
+  "user": "What's the delivery ETA for order ORD-9001?",
+  "steps": [
+    {
+      "expect_tool": "get_order_status",
+      "arg_checks": [
+        {
+          "path": "order_id",
+          "match": "exact",
+          "value": "ORD-9001"
+        }
+      ],
+      "inject_result": {
+        "status": "shipped",
+        "tracking_number": "1Z999AA10123456784"
+      },
+      "max_tokens": 300
+    },
+    {
+      "expect_tool": "track_package",
+      "arg_checks": [
+        {
+          "path": "tracking_number",
+          "match": "exact",
+          "value_from_previous_result": "tracking_number"
+        }
+      ],
+      "inject_result": {
+        "eta": "2026-08-20",
+        "carrier": "UPS"
+      },
+      "max_tokens": 300
+    },
+    {
+      "final": true,
+      "answer_check": {
+        "pattern": "2026-08-20",
+        "must_not_pattern": "\\b(not|n't|unable|fail(ed|s)?|couldn't|cannot|can't|never|didn't|wasn't|isn't|error|sorry|unfortunately)\\b"
+      },
+      "max_tokens": 150
+    }
+  ]
+}

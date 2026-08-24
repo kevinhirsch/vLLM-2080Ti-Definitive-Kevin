@@ -1,0 +1,51 @@
+{
+  "id": "tool_call_002",
+  "category": "tool_call",
+  "description": "single tool, arithmetic expression arg",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is 47 * 89? Use the calculate tool to work it out."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "calculate",
+          "description": "Evaluate a basic arithmetic expression.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "expression": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "expression"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "max_tokens": 400
+  },
+  "check": {
+    "type": "tool_call",
+    "expected_calls": [
+      {
+        "name": "calculate",
+        "args": [
+          {
+            "path": "expression",
+            "match": "regex",
+            "pattern": "47.*89|89.*47"
+          }
+        ]
+      }
+    ],
+    "mode": "in_order"
+  }
+}

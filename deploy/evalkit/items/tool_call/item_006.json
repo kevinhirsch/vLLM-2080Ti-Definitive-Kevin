@@ -1,0 +1,98 @@
+{
+  "id": "tool_call_006",
+  "category": "tool_call",
+  "description": "tool choice among 3 similar weather-domain distractors",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Give me the 5-day weather forecast for Berlin."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get the current weather for a city.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string",
+                "description": "City name"
+              }
+            },
+            "required": [
+              "city"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "get_forecast",
+          "description": "Get a multi-day weather forecast for a city.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string"
+              },
+              "days": {
+                "type": "integer",
+                "description": "Number of days to forecast"
+              }
+            },
+            "required": [
+              "city",
+              "days"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather_alerts",
+          "description": "Get active severe weather alerts for a region.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "region": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "region"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "max_tokens": 400
+  },
+  "check": {
+    "type": "tool_call",
+    "expected_calls": [
+      {
+        "name": "get_forecast",
+        "args": [
+          {
+            "path": "city",
+            "match": "regex",
+            "pattern": "(?i)berlin"
+          },
+          {
+            "path": "days",
+            "match": "numeric",
+            "value": 5
+          }
+        ]
+      }
+    ],
+    "mode": "in_order"
+  }
+}

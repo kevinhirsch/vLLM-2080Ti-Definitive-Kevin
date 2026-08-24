@@ -1,0 +1,17 @@
+{
+  "id": "instruction_006",
+  "category": "instruction",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Reply with exactly the following 10 characters and nothing else: the digits 0 through 9 in increasing order, with no spaces or separators between them."
+      }
+    ],
+    "max_tokens": 300
+  },
+  "check": {
+    "type": "exact",
+    "value": "0123456789"
+  }
+}

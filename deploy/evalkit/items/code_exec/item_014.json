@@ -1,0 +1,20 @@
+{
+  "id": "code_exec_014",
+  "category": "code_exec",
+  "description": "run_length_encode",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Write a Python function `run_length_encode(s)` that returns the run-length encoding of string s as a string, e.g. 'aaab' -> 'a3b1' (each run written as char followed by its count, no separators). An empty string encodes to an empty string.\n\nReply with a single Python code block containing only your function definition(s) (imports allowed if needed). Do not include any example usage, test calls, or print statements of your own -- a separate test harness will be run against your function afterward. Do not print anything else outside the code block."
+      }
+    ],
+    "max_tokens": 900
+  },
+  "check": {
+    "type": "code_exec",
+    "expected_stdout": "\na1\na3b1\na2b2c2\na1b1c1d1e1f1\na10\n",
+    "timeout_sec": 10,
+    "harness": "for s in ['', 'a', 'aaab', 'aabbcc', 'abcdef', 'aaaaaaaaaa']:\n    print(run_length_encode(s))"
+  }
+}

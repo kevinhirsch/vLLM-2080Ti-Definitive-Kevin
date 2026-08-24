@@ -152,6 +152,36 @@ class EngineCoreClient(ABC):
     ) -> bool:
         raise NotImplementedError
 
+    # EXP-038 Stage-1 attn KV pin/unpin utility surface (env-gated on the
+    # EngineCore side by VLLM_TQ_GDN_SNAPSHOT; see core.py). Mirrors how
+    # reset_prefix_cache travels from the driver to the scheduler process.
+    def pin_request_kv_blocks(self, req_id: str | None = None) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def verify_pinned_blocks(self, handle_id: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def get_request_kv_block_ids(
+        self, req_id: str | None = None, all_running: bool = False
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def get_pin_handle(self, handle_id: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def unpin_kv_blocks(self, handle_id: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+    # EXP-038 Stage-4 fork API: fork a pinned handle into N children (each with
+    # its own sampling params) WITHOUT resubmit; env-gated on the EngineCore side.
+    def fork_from_handle(
+        self,
+        handle_id: str,
+        child_specs: list[dict[str, Any]],
+        max_steps: int | None = None,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
     def reset_encoder_cache(self) -> None:
         raise NotImplementedError
 
@@ -315,6 +345,31 @@ class InprocClient(EngineCoreClient):
         return self.engine_core.reset_prefix_cache(
             reset_running_requests, reset_connector
         )
+
+    def pin_request_kv_blocks(self, req_id: str | None = None) -> dict[str, Any]:
+        return self.engine_core.pin_request_kv_blocks(req_id)
+
+    def verify_pinned_blocks(self, handle_id: str) -> dict[str, Any]:
+        return self.engine_core.verify_pinned_blocks(handle_id)
+
+    def get_request_kv_block_ids(
+        self, req_id: str | None = None, all_running: bool = False
+    ) -> dict[str, Any]:
+        return self.engine_core.get_request_kv_block_ids(req_id, all_running)
+
+    def get_pin_handle(self, handle_id: str) -> dict[str, Any]:
+        return self.engine_core.get_pin_handle(handle_id)
+
+    def unpin_kv_blocks(self, handle_id: str) -> dict[str, Any]:
+        return self.engine_core.unpin_kv_blocks(handle_id)
+
+    def fork_from_handle(
+        self,
+        handle_id: str,
+        child_specs: list[dict[str, Any]],
+        max_steps: int | None = None,
+    ) -> dict[str, Any]:
+        return self.engine_core.fork_from_handle(handle_id, child_specs, max_steps)
 
     def reset_encoder_cache(self) -> None:
         self.engine_core.reset_encoder_cache()
@@ -842,6 +897,35 @@ class SyncMPClient(MPClient):
             "reset_prefix_cache", reset_running_requests, reset_connector
         )
 
+    def pin_request_kv_blocks(self, req_id: str | None = None) -> dict[str, Any]:
+        return self.call_utility("pin_request_kv_blocks", req_id)
+
+    def verify_pinned_blocks(self, handle_id: str) -> dict[str, Any]:
+        return self.call_utility("verify_pinned_blocks", handle_id)
+
+    def get_request_kv_block_ids(
+        self, req_id: str | None = None, all_running: bool = False
+    ) -> dict[str, Any]:
+        return self.call_utility(
+            "get_request_kv_block_ids", req_id, all_running
+        )
+
+    def get_pin_handle(self, handle_id: str) -> dict[str, Any]:
+        return self.call_utility("get_pin_handle", handle_id)
+
+    def unpin_kv_blocks(self, handle_id: str) -> dict[str, Any]:
+        return self.call_utility("unpin_kv_blocks", handle_id)
+
+    def fork_from_handle(
+        self,
+        handle_id: str,
+        child_specs: list[dict[str, Any]],
+        max_steps: int | None = None,
+    ) -> dict[str, Any]:
+        return self.call_utility(
+            "fork_from_handle", handle_id, child_specs, max_steps
+        )
+
     def reset_encoder_cache(self) -> None:
         self.call_utility("reset_encoder_cache")
 
@@ -1133,6 +1217,42 @@ class AsyncMPClient(MPClient):
             "collective_rpc", method, timeout, args, kwargs
         )
 
+    # EXP-038 Stage-1/4 async utility surface (mirrors the SyncMPClient methods
+    # above). Env-gated on the EngineCore side by VLLM_TQ_GDN_SNAPSHOT; these
+    # just carry the call over the async utility RPC like reset_prefix_cache_async.
+    # They exist so the OpenAI api_server path (AsyncLLM, not the sync LLM) can
+    # drive pin / fork / unpin. NEVER exercise against the production :8001 serve.
+    async def pin_request_kv_blocks_async(
+        self, req_id: str | None = None
+    ) -> dict[str, Any]:
+        return await self.call_utility_async("pin_request_kv_blocks", req_id)
+
+    async def verify_pinned_blocks_async(self, handle_id: str) -> dict[str, Any]:
+        return await self.call_utility_async("verify_pinned_blocks", handle_id)
+
+    async def get_request_kv_block_ids_async(
+        self, req_id: str | None = None, all_running: bool = False
+    ) -> dict[str, Any]:
+        return await self.call_utility_async(
+            "get_request_kv_block_ids", req_id, all_running
+        )
+
+    async def get_pin_handle_async(self, handle_id: str) -> dict[str, Any]:
+        return await self.call_utility_async("get_pin_handle", handle_id)
+
+    async def unpin_kv_blocks_async(self, handle_id: str) -> dict[str, Any]:
+        return await self.call_utility_async("unpin_kv_blocks", handle_id)
+
+    async def fork_from_handle_async(
+        self,
+        handle_id: str,
+        child_specs: list[dict[str, Any]],
+        max_steps: int | None = None,
+    ) -> dict[str, Any]:
+        return await self.call_utility_async(
+            "fork_from_handle", handle_id, child_specs, max_steps
+        )
+
 
 class DPAsyncMPClient(AsyncMPClient):
     """Asyncio-compatible client for multi-proc, multi-engine (data parallel)
@@ -1314,6 +1434,21 @@ class DPAsyncMPClient(AsyncMPClient):
         return self.core_engine
 
 
+# EXP-038 snapshot utilities that assume a single owning engine (one in-flight
+# request). Broadcasting these across load-balanced engines pins/forks the wrong
+# request and orphans handles, so DPLBAsyncMPClient rejects them.
+_TQ_SNAPSHOT_SINGLE_ENGINE_UTILITIES = frozenset(
+    {
+        "pin_request_kv_blocks",
+        "verify_pinned_blocks",
+        "get_request_kv_block_ids",
+        "get_pin_handle",
+        "unpin_kv_blocks",
+        "fork_from_handle",
+    }
+)
+
+
 class DPLBAsyncMPClient(DPAsyncMPClient):
     """Asyncio-compatible client for multi-proc, multi-engine (data parallel)
     EngineCore. Load-balances between multiple engine processes."""
@@ -1378,6 +1513,18 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         return chosen_engine
 
     async def call_utility_async(self, method: str, *args) -> Any:
+        # EXP-038 snapshot utilities are single-engine only: under internal DP
+        # load balancing this method broadcasts to EVERY engine, which would
+        # pin/fork on non-owning engines (their running[0] is a different or no
+        # request) and create orphaned handles the caller never receives to
+        # unpin. Reject them here rather than corrupting state; the feature is a
+        # throwaway single-engine serve (VLLM_TQ_GDN_SNAPSHOT), never DPLB.
+        if method in _TQ_SNAPSHOT_SINGLE_ENGINE_UTILITIES:
+            raise RuntimeError(
+                f"EXP-038 utility {method!r} is single-engine only and cannot "
+                "run under DP load balancing (this client broadcasts to every "
+                "engine). Use a throwaway single-engine serve, never DPLB."
+            )
         # Only the result from the first engine is returned.
         return (
             await asyncio.gather(

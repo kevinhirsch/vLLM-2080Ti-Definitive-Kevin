@@ -926,6 +926,66 @@ class AsyncLLM(EngineClient):
     async def reset_encoder_cache(self) -> None:
         await self.engine_core.reset_encoder_cache_async()
 
+    # ------------------------------------------------------------------
+    # EXP-038 Stage-1/4 — async pin / fork / unpin surface for the OpenAI
+    # api_server path (this AsyncLLM, NOT the sync LLM class). Each delegates to
+    # the async EngineCore utility, which is env-gated by VLLM_TQ_GDN_SNAPSHOT
+    # (raises when the feature is inert). Used by the /tq/* custom HTTP routes;
+    # see vllm/entrypoints/openai/tq_snapshot_router.py. NEVER use against :8001.
+    # ------------------------------------------------------------------
+    async def pin_request_kv_blocks(
+        self, req_id: str | None = None
+    ) -> dict[str, Any]:
+        """Pin a live request's KV blocks; returns an opaque handle dict.
+
+        ``req_id=None`` auto-picks the single in-flight request (the snapshot
+        engine runs one keepalive request at a time). Release with
+        :meth:`unpin_kv_blocks`.
+        """
+        return await self.engine_core.pin_request_kv_blocks_async(req_id)
+
+    async def verify_pinned_blocks(self, handle_id: str) -> dict[str, Any]:
+        """Read-only residency check (ref_cnt >= 1) for a pin handle."""
+        return await self.engine_core.verify_pinned_blocks_async(handle_id)
+
+    async def get_request_kv_block_ids(
+        self, req_id: str | None = None, all_running: bool = False
+    ) -> dict[str, Any]:
+        """Read-only per-group KV block ids of a live request."""
+        return await self.engine_core.get_request_kv_block_ids_async(
+            req_id, all_running
+        )
+
+    async def get_pin_handle(self, handle_id: str) -> dict[str, Any]:
+        """Read-only accessor for a pin handle's forkable metadata (EXP-038 v2).
+
+        Returns ``{handle_id, req_id, prompt_token_ids, prefix_len,
+        num_computed_tokens, cache_salt}``. The server-layer ``/tq/fork2`` route
+        uses this to source the pinned prefix (token ids + salt) by handle_id and
+        fan the fork out as ordinary ``generate()`` calls. Raises ``KeyError``
+        for a released/unknown handle (that IS the pin-check)."""
+        return await self.engine_core.get_pin_handle_async(handle_id)
+
+    async def unpin_kv_blocks(self, handle_id: str) -> dict[str, Any]:
+        """Release a pin handle (frees the pinned blocks)."""
+        return await self.engine_core.unpin_kv_blocks_async(handle_id)
+
+    async def fork_from_handle(
+        self,
+        handle_id: str,
+        child_specs: list[dict[str, Any]],
+        max_steps: int | None = None,
+    ) -> dict[str, Any]:
+        """Fork a pinned handle into ``len(child_specs)`` children WITHOUT
+        resubmit (EXP-038 Stage-4). Each ``child_specs[i]`` is a dict of
+        ``SamplingParams`` kwargs. Children are built + driven to completion
+        inside EngineCore (the busy loop is blocked for the duration — cap
+        ``children x max_tokens``). The pin is NOT released.
+        """
+        return await self.engine_core.fork_from_handle_async(
+            handle_id, child_specs, max_steps
+        )
+
     async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         await self.engine_core.sleep_async(level, mode)
 

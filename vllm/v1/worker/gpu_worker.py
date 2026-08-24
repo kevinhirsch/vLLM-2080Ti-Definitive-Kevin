@@ -395,6 +395,26 @@ class Worker(WorkerBase):
                 "allocated_bytes.all.peak", 0
             )
 
+            # [FORK] Always-on diagnostic of the speculative-decode verify
+            # workspace reserve decision. Emitted HERE (before cudagraph-memory
+            # profiling) on purpose: at large num_speculative_tokens the very
+            # next step can OOM inside profile_cudagraph_memory (allocating the
+            # minimal KV cache for capture) — which is *upstream* of
+            # get_kv_cache_configs where the reserve is actually applied — so a
+            # log placed only there would never print. This makes every boot
+            # attributable either way.
+            if self.vllm_config.speculative_config is not None:
+                from vllm.v1.core.kv_cache_utils import (
+                    spec_decode_verify_reserve_decision,
+                )
+
+                _spec_reason = spec_decode_verify_reserve_decision(self.vllm_config)[1]
+                logger.info(
+                    "Speculative-decode verify workspace reserve (applied later "
+                    "in get_kv_cache_configs): %s",
+                    _spec_reason,
+                )
+
             # Profile CUDA graph memory if graphs will be captured.
             # Skip on ROCm/HIP/XPU as graph pool handles and mem_get_info behave
             # differently and can produce incorrect/negative estimates.
@@ -404,6 +424,18 @@ class Worker(WorkerBase):
                 and self.vllm_config.compilation_config.cudagraph_mode
                 != CUDAGraphMode.NONE
             ):
+                # [FORK] profile_run leaves its (1+K)-wide activation peak in the
+                # caching allocator as reserved-but-unallocated blocks. The next
+                # call, profile_cudagraph_memory -> _init_minimal_kv_cache_for_
+                # profiling, must allocate a *fresh contiguous* minimal KV cache
+                # (min_blocks = max_cudagraph_capture_size); at K=16/seqs=16 the
+                # fragmented cache cannot serve it and CUDA has <1 GiB free, so
+                # it OOM'd here (868 MiB) before the KV budget was ever sized.
+                # Return the cache to the driver so the minimal-KV alloc + graph
+                # capture have contiguous room. Peak was already recorded above
+                # (profile_torch_peak), so this does not perturb the measurement.
+                gc.collect()
+                torch.accelerator.empty_cache()
                 cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
 
         # Use the pre-cudagraph torch peak to avoid double-counting.
@@ -445,6 +477,39 @@ class Worker(WorkerBase):
             - profile_result.non_kv_cache_memory
             - cudagraph_memory_estimate_applied
         )
+
+        # [FORK] With VLLM_TQ_RESERVE_PREFILL_WORKSPACE the turboquant
+        # continuation workspace is explicitly subtracted at KV-sizing time
+        # (get_kv_cache_configs). Whether the arena was ALSO captured in the
+        # profiled torch peak depends on allocation timing (load-time vs lazy
+        # first-touch), which made available memory vary boot-to-boot and
+        # intermittently double-counted the reserve. Add back whatever arena
+        # exists at measurement time so the explicit reserve applies exactly
+        # once, deterministically.
+        if envs.VLLM_TQ_RESERVE_PREFILL_WORKSPACE:
+            from vllm.v1.core.kv_cache_utils import (
+                _turboquant_prefill_workspace_reserve_bytes,
+            )
+            from vllm.v1.worker.workspace import workspace_manager_total_bytes
+
+            # Add back ONLY the portion of the arena the KV-sizing reserve will
+            # re-subtract (review #111: the arena is shared with the decode /
+            # DCP / fused-moe workspaces, and the reserve is 0 for
+            # non-turboquant caches — adding back the whole arena would inflate
+            # the KV budget with no matching reserve).
+            _tq_reserve_bytes = _turboquant_prefill_workspace_reserve_bytes(
+                self.vllm_config
+            )
+            _tq_add_back = min(workspace_manager_total_bytes(), _tq_reserve_bytes)
+            if _tq_add_back > 0:
+                self.available_kv_cache_memory_bytes += _tq_add_back
+                logger.info(
+                    "Excluding %s GiB of the workspace arena (the turboquant "
+                    "continuation reserve portion) from the profiled non-KV "
+                    "footprint; the explicit reserve is applied once at KV "
+                    "sizing.",
+                    format_gib(_tq_add_back),
+                )
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
         logger.debug(

@@ -1,0 +1,17 @@
+{
+  "id": "instruction_003",
+  "category": "instruction",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Write a two-sentence product description for a ceramic coffee mug. Your response must start with the exact word 'INTRODUCING' (all caps)."
+      }
+    ],
+    "max_tokens": 300
+  },
+  "check": {
+    "type": "starts_with",
+    "value": "INTRODUCING"
+  }
+}

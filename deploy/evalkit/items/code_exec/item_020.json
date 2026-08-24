@@ -1,0 +1,20 @@
+{
+  "id": "code_exec_020",
+  "category": "code_exec",
+  "description": "extract_emails",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Write a Python function `extract_emails(text)` using the `re` module that returns a list of all email addresses found in text, in the order they appear.\n\nReply with a single Python code block containing only your function definition(s) (imports allowed if needed). Do not include any example usage, test calls, or print statements of your own -- a separate test harness will be run against your function afterward. Do not print anything else outside the code block."
+      }
+    ],
+    "max_tokens": 900
+  },
+  "check": {
+    "type": "code_exec",
+    "expected_stdout": "['help@example.com', 'sales@example.co.uk']\n[]\n['a@b.com', 'c.d+tag@e-f.org']\n[]\n",
+    "timeout_sec": 10,
+    "harness": "print(extract_emails('contact us at help@example.com or sales@example.co.uk today'))\nprint(extract_emails('no emails here'))\nprint(extract_emails('a@b.com, c.d+tag@e-f.org; end'))\nprint(extract_emails(''))"
+  }
+}

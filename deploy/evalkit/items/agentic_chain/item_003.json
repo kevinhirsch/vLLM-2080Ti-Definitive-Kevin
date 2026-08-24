@@ -1,0 +1,125 @@
+{
+  "id": "agentic_chain_003",
+  "category": "agentic_chain",
+  "description": "3-step: search product -> add to cart -> checkout, answer states order id",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "search_product",
+        "description": "Search the catalog for a product.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "add_to_cart",
+        "description": "Add a product to the shopping cart.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "product_id": {
+              "type": "string"
+            },
+            "quantity": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "product_id",
+            "quantity"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "checkout",
+        "description": "Check out the current cart.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "cart_total": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "cart_total"
+          ]
+        }
+      }
+    }
+  ],
+  "user": "Find a wireless mouse, add 2 to my cart, and check out.",
+  "steps": [
+    {
+      "expect_tool": "search_product",
+      "arg_checks": [
+        {
+          "path": "query",
+          "match": "regex",
+          "pattern": "(?i)wireless mouse|mouse"
+        }
+      ],
+      "inject_result": {
+        "product_id": "p_77",
+        "price": 49.99
+      },
+      "max_tokens": 300
+    },
+    {
+      "expect_tool": "add_to_cart",
+      "arg_checks": [
+        {
+          "path": "product_id",
+          "match": "exact",
+          "value_from_previous_result": "product_id"
+        },
+        {
+          "path": "quantity",
+          "match": "numeric",
+          "value": 2
+        }
+      ],
+      "inject_result": {
+        "cart_total": 99.98
+      },
+      "max_tokens": 300
+    },
+    {
+      "expect_tool": "checkout",
+      "arg_checks": [
+        {
+          "path": "cart_total",
+          "match": "numeric",
+          "value_from_previous_result": "cart_total",
+          "tol": 0.01
+        }
+      ],
+      "inject_result": {
+        "order_id": "ORD-3301"
+      },
+      "max_tokens": 300
+    },
+    {
+      "final": true,
+      "answer_check": {
+        "pattern": "ORD-3301",
+        "must_not_pattern": "\\b(not|n't|unable|fail(ed|s)?|couldn't|cannot|can't|never|didn't|wasn't|isn't|error|sorry|unfortunately)\\b"
+      },
+      "max_tokens": 150
+    }
+  ]
+}

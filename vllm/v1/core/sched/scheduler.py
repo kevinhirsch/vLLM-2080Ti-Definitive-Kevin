@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -252,6 +253,15 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        self.retain_mamba_align_mtp_cache_block = (
+            speculative_config is not None
+            and speculative_config.method == "mtp"
+            and self.need_mamba_block_aligned_split
+            and os.getenv(
+                "VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK", "0"
+            ).strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
@@ -282,7 +292,16 @@ class Scheduler(SchedulerInterface):
             # reusable Mamba boundary one block earlier so all hybrid groups
             # describe the same prefix length.
             last_cache_position = round_down(request.num_tokens, block_size)
-            if self.use_eagle:
+            # [FORK] MTP follows the EAGLE scheduler path, but an uncached
+            # prompt tail still runs and produces the hidden states needed by
+            # the proposer. In that case the final aligned Mamba state is valid
+            # and retaining it avoids throwing away a full (often ~2K-token)
+            # prefix block. Gated by VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK.
+            retain_final_mtp_block = (
+                self.retain_mamba_align_mtp_cache_block
+                and last_cache_position < request.num_tokens
+            )
+            if self.use_eagle and not retain_final_mtp_block:
                 last_cache_position = max(last_cache_position - block_size, 0)
 
             chunk_end = num_computed_tokens + num_new_tokens

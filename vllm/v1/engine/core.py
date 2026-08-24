@@ -6,6 +6,7 @@ import queue
 import signal
 import threading
 import time
+import uuid
 from collections import defaultdict, deque
 from collections.abc import Callable, Generator
 from concurrent.futures import Future
@@ -609,6 +610,516 @@ class EngineCore:
         return self.scheduler.reset_prefix_cache(
             reset_running_requests, reset_connector
         )
+
+    # ------------------------------------------------------------------
+    # EXP-038 Stage-1 — attn KV block pin/unpin (scheduler / EngineCore side).
+    #
+    # SNAPSHOT's attn side is pure refcount pinning: ``block_pool.touch`` a
+    # finished prefix's KV blocks so they survive the producing request's
+    # ``free()`` (block_pool.py touch/free_blocks). The block pool and
+    # kv_cache_manager live in THIS (EngineCore) process, not the worker, so
+    # these are utility methods reachable from the ``LLM`` driver via
+    # ``call_utility`` -> ``getattr(self, name)`` (see core_client.py, exactly
+    # how reset_prefix_cache travels). The whole feature is env-gated
+    # (``VLLM_TQ_GDN_SNAPSHOT``, default off) and pins/allocates nothing until
+    # ``pin_request_kv_blocks`` is called. NEVER exercise against the
+    # production :8001 serve. Every returned value is a plain dict of
+    # str/int/list so it serializes across the ZMQ utility boundary.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _tq_snapshot_require_enabled() -> None:
+        import vllm.envs as envs
+
+        if not envs.VLLM_TQ_GDN_SNAPSHOT:
+            raise RuntimeError(
+                "EXP-038 pin/unpin requires VLLM_TQ_GDN_SNAPSHOT=1 "
+                "(the snapshot feature is inert by default)"
+            )
+
+    def _tq_pin_registry(self) -> dict[str, Any]:
+        reg = getattr(self, "_tq_pin_registry_store", None)
+        if reg is None:
+            reg = {}
+            self._tq_pin_registry_store = reg
+        return reg
+
+    def _tq_kv_cache_manager(self):
+        kvm = getattr(self.scheduler, "kv_cache_manager", None)
+        if kvm is None:
+            raise RuntimeError(
+                "scheduler has no kv_cache_manager (prefix caching disabled?)"
+            )
+        return kvm
+
+    def _tq_resolve_req_id(self, req_id: str | None) -> str:
+        sched = self.scheduler
+        if req_id is not None:
+            if req_id not in sched.requests:
+                raise KeyError(f"req {req_id!r} not known to the scheduler")
+            return req_id
+        # Auto-pick the single in-flight request (mirrors the Stage-0 worker
+        # self-test picking from mamba_state_idx). The throwaway PoC engine
+        # runs one request at a time under the driver's controlled flow.
+        running = list(getattr(sched, "running", []) or [])
+        if not running:
+            raise RuntimeError(
+                "no running request to operate on; call while a request is "
+                "in flight (mid-generation polling pattern)"
+            )
+        # The snapshot feature is throwaway-single-engine, one request at a
+        # time (design: req_id=None picks the sole in-flight request). Under
+        # concurrent traffic running[0] is ambiguous, so reject rather than
+        # silently pinning/forking the wrong request.
+        if len(running) != 1:
+            raise RuntimeError(
+                f"req_id must be provided when {len(running)} requests are "
+                "running; EXP-038 auto-pick requires exactly one in-flight "
+                "request (throwaway single-request feature)"
+            )
+        return running[0].request_id
+
+    def _tq_group_label(self, group_id: int) -> str:
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        spec = self.scheduler.kv_cache_config.kv_cache_groups[group_id].kv_cache_spec
+        return "mamba" if isinstance(spec, MambaSpec) else "attn"
+
+    def pin_request_kv_blocks(self, req_id: str | None = None) -> dict[str, Any]:
+        """Pin a request's resident KV blocks so they outlive its ``free()``.
+
+        Stage-1 primitive: ``block_pool.touch`` every non-null block of the
+        request's groups, bumping ``ref_cnt`` by one. When the producing
+        request later finishes, the scheduler's ``free_blocks`` decrements
+        ``ref_cnt`` once, leaving the pinned blocks resident (``ref_cnt >= 1``)
+        and out of the free queue -- available for a RESTORE. Records the pin
+        in an EngineCore-side registry keyed by an opaque handle id (auditable
+        pin/unpin ownership, per EXP-038 Risk #1).
+
+        The full-attn groups are the Stage-1 target. The mamba group is pinned
+        too, which keeps its by-hash-cached GDN *full* blocks (immutable, like
+        attn full blocks) resident so the zero-kernel Stage-2 restore's
+        find_longest_cache_hit still returns them (design lines 26-30). NOTE the
+        mamba running-state block is mutable and is NOT a stable snapshot when
+        pinned in place — Stage-0's dedicated park pool (batch_copy_slots) is
+        the mechanism for freezing the running state; this pin only guarantees
+        the cached prefix blocks survive eviction. Each group is labelled
+        ("attn"/"mamba") in the return so a driver can assert against whichever
+        it needs.
+
+        Returns a plain-dict handle: ``{handle_id, req_id, num_computed_tokens,
+        groups: {gid: {spec, block_ids}}, num_pinned_blocks}``.
+        """
+        self._tq_snapshot_require_enabled()
+        sched = self.scheduler
+        block_pool = self._tq_kv_cache_manager().block_pool
+        coordinator = self._tq_kv_cache_manager().coordinator
+        req_id = self._tq_resolve_req_id(req_id)
+        req = sched.requests[req_id]
+
+        blocks_per_group = coordinator.get_blocks(req_id)
+        groups_out: dict[str, Any] = {}
+        num_pinned = 0
+        for group_id, blocks in enumerate(blocks_per_group):
+            # Disjoint block-id spaces across groups (one shared pool, one
+            # physical block belongs to at most one (request, group)), so each
+            # block is touched exactly once. Skip null/sentinel blocks
+            # (remove_skipped_blocks replaces evicted mamba blocks with the
+            # null block; touching it is meaningless).
+            live = [b for b in blocks if not b.is_null]
+            block_pool.touch(live)
+            num_pinned += len(live)
+            groups_out[str(group_id)] = {
+                "spec": self._tq_group_label(group_id),
+                "block_ids": [b.block_id for b in live],
+            }
+
+        handle_id = f"tqpin-{req_id}-{uuid.uuid4().hex[:12]}"
+        self._tq_pin_registry()[handle_id] = {
+            "req_id": req_id,
+            "num_computed_tokens": int(req.num_computed_tokens),
+            "prompt_token_ids": list(req.prompt_token_ids or []),
+            # Persist the donor's cache_salt: the prefix-cache block hash mixes
+            # it in (generate_block_hash_extra_keys), so a fork child built
+            # without it would hash differently and fail to adopt the pinned
+            # blocks. None for the unsalted default path.
+            "cache_salt": getattr(req, "cache_salt", None),
+            "groups": groups_out,
+        }
+        return {
+            "handle_id": handle_id,
+            "req_id": req_id,
+            "num_computed_tokens": int(req.num_computed_tokens),
+            "groups": groups_out,
+            "num_pinned_blocks": num_pinned,
+        }
+
+    def verify_pinned_blocks(self, handle_id: str) -> dict[str, Any]:
+        """Read-only residency check for a pinned handle (Stage-1 assertion).
+
+        Asserts every pinned block is still resident: ``ref_cnt >= 1`` and not
+        a null block (ref_cnt==0 <=> the block is back in the free queue and
+        evictable, so ref_cnt>=1 == "resident"). Meant to be called AFTER the
+        producing request has finished, to prove the pin -- not luck -- kept
+        the blocks alive. Returns per-block ref_cnts plus the pool's free-block
+        count so the driver can see the pinned blocks are not in the free pool.
+        """
+        self._tq_snapshot_require_enabled()
+        reg = self._tq_pin_registry()
+        entry = reg.get(handle_id)
+        if entry is None:
+            raise KeyError(f"unknown pin handle {handle_id!r}")
+        block_pool = self._tq_kv_cache_manager().block_pool
+        per_group: dict[str, Any] = {}
+        min_ref: int | None = None
+        all_resident = True
+        for group_id, group in entry["groups"].items():
+            rows = []
+            for bid in group["block_ids"]:
+                block = block_pool.blocks[bid]
+                rc = int(block.ref_cnt)
+                resident = rc >= 1 and not block.is_null
+                all_resident = all_resident and resident
+                min_ref = rc if min_ref is None else min(min_ref, rc)
+                rows.append(
+                    {"block_id": bid, "ref_cnt": rc, "resident": resident}
+                )
+            per_group[group_id] = {"spec": group["spec"], "blocks": rows}
+        return {
+            "handle_id": handle_id,
+            "ok": bool(all_resident),
+            "min_ref_cnt": int(min_ref) if min_ref is not None else 0,
+            "num_free_blocks": int(block_pool.get_num_free_blocks()),
+            "groups": per_group,
+        }
+
+    def get_request_kv_block_ids(
+        self, req_id: str | None = None, all_running: bool = False
+    ) -> dict[str, Any]:
+        """Read-only snapshot of a live request's per-group KV block ids.
+
+        Used by the Stage-2 restore proof to assert that a resubmitted
+        request's prefix block ids equal the pinned handle's block ids -- i.e.
+        the restore provably reused the same physical (pinned) blocks rather
+        than re-allocating fresh ones.
+
+        ``all_running=True`` (EXP-038 Stage-3 fork corroboration) returns EVERY
+        in-flight request's block table keyed by req_id in one read, because
+        ``req_id=None`` auto-picks only when EXACTLY ONE request is in flight
+        (``_tq_resolve_req_id`` raises otherwise) and so cannot observe two
+        co-scheduled fork children at once. The per-request payload shape is
+        identical to the
+        single-request case (``{"spec", "block_ids"}`` per group); the multi
+        shape is ``{"req_ids": [...], "requests": {req_id: {"groups": {...}}}}``.
+        Read-only: no touch/free/alloc, so it never perturbs the very sharing
+        it is meant to witness.
+        """
+        self._tq_snapshot_require_enabled()
+        coordinator = self._tq_kv_cache_manager().coordinator
+
+        def _blocks_for(rid: str) -> dict[str, Any]:
+            blocks_per_group = coordinator.get_blocks(rid)
+            out: dict[str, Any] = {}
+            for group_id, blocks in enumerate(blocks_per_group):
+                out[str(group_id)] = {
+                    "spec": self._tq_group_label(group_id),
+                    "block_ids": [b.block_id for b in blocks if not b.is_null],
+                }
+            return out
+
+        if all_running:
+            running = list(getattr(self.scheduler, "running", []) or [])
+            requests_out = {
+                r.request_id: {"groups": _blocks_for(r.request_id)}
+                for r in running
+            }
+            return {
+                "req_ids": [r.request_id for r in running],
+                "requests": requests_out,
+            }
+
+        req_id = self._tq_resolve_req_id(req_id)
+        return {"req_id": req_id, "groups": _blocks_for(req_id)}
+
+    def unpin_kv_blocks(self, handle_id: str) -> dict[str, Any]:
+        """Release a pin handle: ``free_blocks`` its blocks, drop the registry
+        entry. Exactly undoes ``pin_request_kv_blocks``' ``touch`` (one release
+        per pin, per EXP-038 Risk #1). Idempotent: releasing an unknown or
+        already-released handle is a no-op that reports ``ok: False``.
+        """
+        self._tq_snapshot_require_enabled()
+        reg = self._tq_pin_registry()
+        entry = reg.pop(handle_id, None)
+        if entry is None:
+            return {
+                "handle_id": handle_id,
+                "ok": False,
+                "detail": "unknown or already-released handle",
+                "num_freed_blocks": 0,
+            }
+        block_pool = self._tq_kv_cache_manager().block_pool
+        num_freed = 0
+        for group in entry["groups"].values():
+            blocks = [block_pool.blocks[bid] for bid in group["block_ids"]]
+            block_pool.free_blocks(blocks)
+            num_freed += len(blocks)
+        return {
+            "handle_id": handle_id,
+            "ok": True,
+            "num_freed_blocks": num_freed,
+        }
+
+    def get_pin_handle(self, handle_id: str) -> dict[str, Any]:
+        """Read-only accessor for a pin handle's forkable metadata (EXP-038 v2).
+
+        Returns the serializable fields the SERVER-LAYER fork (``/tq/fork2``)
+        needs to fan out children by handle_id alone: the donor's cached
+        ``prompt_token_ids`` and ``cache_salt`` (the two inputs a child prompt
+        must reproduce to hash-match and adopt the pinned blocks), plus the
+        prefix length and computed-token count. Purely reads the pin registry
+        the Stage-1 ``pin_request_kv_blocks`` already populated — NO touch, free,
+        alloc, or step, so it can never perturb the pinned blocks it describes.
+
+        This is the read side of the pin registry (a sibling of the read-only
+        ``verify_pinned_blocks`` / ``get_request_kv_block_ids`` accessors), NOT
+        new fork machinery: the v2 non-blocking fork path deliberately keeps all
+        fan-out / streaming / stop-token semantics in the server layer's normal
+        ``generate()`` path (see docs/exp038-fork-v2.md). Presence in the
+        registry IS the pin-check — ``unpin_kv_blocks`` pops the entry, so a
+        released handle raises ``KeyError`` here just as it would for a fork.
+        """
+        self._tq_snapshot_require_enabled()
+        reg = self._tq_pin_registry()
+        entry = reg.get(handle_id)
+        if entry is None:
+            raise KeyError(f"unknown pin handle {handle_id!r}")
+        prompt_token_ids = list(entry.get("prompt_token_ids") or [])
+        return {
+            "handle_id": handle_id,
+            "req_id": entry.get("req_id"),
+            "prompt_token_ids": prompt_token_ids,
+            "prefix_len": len(prompt_token_ids),
+            "num_computed_tokens": int(entry.get("num_computed_tokens", 0)),
+            "cache_salt": entry.get("cache_salt"),
+        }
+
+    # ------------------------------------------------------------------
+    # EXP-038 Stage-4 — scheduler-level FORK API (fork WITHOUT resubmit).
+    #
+    # ``fork_from_handle`` constructs N child Requests INSIDE EngineCore from a
+    # pinned handle's cached prefix (each with its OWN sampling params) and drives
+    # them to completion, letting the EXISTING local prefix-cache adoption
+    # (``find_longest_cache_hit`` ref-count touch for attn + align-mode GDN
+    # copy-out for mamba, i.e. the proven Stage-2/3 path) adopt the pinned donor
+    # blocks at admission. This is the least-invasive insertion point: NO
+    # scheduler / kv_cache_manager / connector / worker changes — a pure
+    # scheduler-side utility like the Stage-1 pin set. See
+    # docs/exp038-stage4-fork-api.md for the full insertion-point analysis, the
+    # honest "win" definition (per-child sampling divergence is NOT unique to fork
+    # — block hashes exclude sampling params), and the residual gap (the single
+    # internal cache-hit prefill schedule per child is not eliminated — that would
+    # need a direct running-seed, too invasive for staged work). Env-gated
+    # (``VLLM_TQ_GDN_SNAPSHOT``), default-inert. NEVER run against :8001.
+    # ------------------------------------------------------------------
+    def _tq_block_tables_for(self, req_ids: list[str]) -> dict[str, Any]:
+        """Read-only per-group block table for each of ``req_ids`` (fork mid-gen
+        witness). Same payload shape as ``get_request_kv_block_ids``. Skips
+        req_ids not currently resident in the coordinator."""
+        coordinator = self._tq_kv_cache_manager().coordinator
+        out: dict[str, Any] = {}
+        for rid in req_ids:
+            try:
+                blocks_per_group = coordinator.get_blocks(rid)
+            except Exception:  # noqa: BLE001 - not resident (finished/never sched)
+                continue
+            groups: dict[str, Any] = {}
+            for group_id, blocks in enumerate(blocks_per_group):
+                groups[str(group_id)] = {
+                    "spec": self._tq_group_label(group_id),
+                    "block_ids": [b.block_id for b in blocks if not b.is_null],
+                }
+            out[rid] = {"groups": groups}
+        return out
+
+    def fork_from_handle(
+        self,
+        handle_id: str,
+        child_specs: list[dict[str, Any]],
+        max_steps: int | None = None,
+    ) -> dict[str, Any]:
+        """Fork a pinned handle into ``len(child_specs)`` children WITHOUT resubmit.
+
+        Each child is a fresh ``Request`` built engine-side from the pinned
+        handle's cached ``prompt_token_ids`` with its OWN sampling params
+        (``child_specs[i]`` is a dict of ``SamplingParams`` kwargs, e.g.
+        ``{"temperature": 0.0, "max_tokens": 64, "logprobs": 1}``). Children are
+        admitted through the normal scheduler path and adopt the pinned donor
+        blocks via the local prefix cache (attn full blocks touched -> ``ref_cnt``
+        bumped; mamba GDN full block copied out to a fresh running slot by align
+        mode). The children are then driven to completion on the busy-loop thread
+        (single-threaded: this runs inside the utility handler, before the outer
+        ``_process_engine_step``, so it is not re-entrant and no child outputs leak
+        to the client output socket).
+
+        The pin is NOT released here — ownership stays with the caller's
+        ``unpin_kv_blocks(handle_id)`` (EXP-038 Risk #1). Returns plain dicts:
+        per-child token_ids + ``num_cached_tokens`` (the ~zero-prefill-compute
+        proxy) + finish_reason, a widest-catch mid-gen block-table snapshot, and
+        the pre/post free-block counts for the leak invariant.
+        """
+        self._tq_snapshot_require_enabled()
+        from vllm.sampling_params import SamplingParams
+
+        if not child_specs:
+            raise ValueError("fork_from_handle requires at least one child spec")
+        if self.request_block_hasher is None:
+            raise RuntimeError(
+                "fork_from_handle requires prefix caching (request_block_hasher "
+                "is None); enable_prefix_caching must be on so children can adopt "
+                "the pinned donor blocks via the local prefix cache"
+            )
+        reg = self._tq_pin_registry()
+        entry = reg.get(handle_id)
+        if entry is None:
+            raise KeyError(f"unknown pin handle {handle_id!r}")
+        prompt_token_ids = list(entry["prompt_token_ids"])
+        if not prompt_token_ids:
+            raise RuntimeError(
+                f"pin handle {handle_id!r} has no prompt_token_ids to fork from"
+            )
+
+        sched = self.scheduler
+        block_pool = self._tq_kv_cache_manager().block_pool
+        pre_free_blocks = int(block_pool.get_num_free_blocks())
+
+        # Build + admit the children. n is implied by len(child_specs) so each
+        # child's sampling params are first-class / independently divergent.
+        child_ids: list[str] = []
+        child_state: dict[str, dict[str, Any]] = {}
+        for i, spec in enumerate(child_specs):
+            spec = dict(spec)
+            spec.setdefault("max_tokens", 16)
+            sampling_params = SamplingParams(**spec)
+            req_id = f"tqfork-{handle_id}-{i}-{uuid.uuid4().hex[:8]}"
+            req = Request(
+                request_id=req_id,
+                prompt_token_ids=list(prompt_token_ids),
+                sampling_params=sampling_params,
+                pooling_params=None,
+                arrival_time=time.time(),
+                block_hasher=self.request_block_hasher,
+                # Carry the donor's cache_salt so the child's prefix hashes
+                # match the pinned donor blocks (else the salted prefix cannot
+                # cache-hit). None for the unsalted default path.
+                cache_salt=entry.get("cache_salt"),
+            )
+            self.add_request(req)
+            child_ids.append(req_id)
+            child_state[req_id] = {
+                "req_id": req_id,
+                "token_ids": [],
+                "num_cached_tokens": None,
+                "finish_reason": None,
+                "spec": spec,
+            }
+
+        # Bounded decode loop. Cap = sum(max_tokens) + one prefill step per child
+        # + slack, so a stuck request can never spin the busy loop forever.
+        if max_steps is None:
+            total_max = sum(int(s.get("max_tokens", 16)) for s in child_specs)
+            max_steps = total_max + 2 * len(child_specs) + 8
+        pending = set(child_ids)
+        midgen: dict[str, Any] = {}
+        midgen_best_n = -1
+        steps = 0
+        # Use the engine's own stepping path (self.step for the PoC engine; the
+        # batch-queue variant may return outputs=None mid-batch, handled below).
+        step_fn = getattr(self, "step_fn", None) or self.step
+        while pending and steps < max_steps:
+            outputs, model_executed = step_fn()
+            # Mirror _process_engine_step: post_step updates spec-decode draft
+            # token state after each step. Bypassing it would leave the
+            # scheduler/worker sampling state inconsistent after the fork on
+            # spec-decode / CUDAGraph configs (no-op when spec decode is off).
+            self.post_step(model_executed)
+            steps += 1
+            for _client_idx, eco in (outputs.items() if outputs else ()):
+                for o in getattr(eco, "outputs", ()) or ():
+                    st = child_state.get(o.request_id)
+                    if st is None:
+                        continue
+                    if o.new_token_ids:
+                        st["token_ids"].extend(int(t) for t in o.new_token_ids)
+                    if (
+                        o.prefill_stats is not None
+                        and st["num_cached_tokens"] is None
+                    ):
+                        st["num_cached_tokens"] = int(
+                            o.prefill_stats.num_cached_tokens
+                        )
+                    if o.finish_reason is not None:
+                        st["finish_reason"] = str(o.finish_reason)
+                        pending.discard(o.request_id)
+            # Widest mid-gen catch: keep the block tables from the step where the
+            # most children were co-running (the window that shows the shared attn
+            # block + distinct mamba running slots).
+            running_child_ids = [
+                r.request_id
+                for r in getattr(sched, "running", []) or []
+                if r.request_id in child_state
+            ]
+            if len(running_child_ids) > midgen_best_n:
+                snap = self._tq_block_tables_for(running_child_ids)
+                if snap:
+                    midgen = snap
+                    midgen_best_n = len(running_child_ids)
+
+        # Any still-pending child hit the safety bound; mark it so the driver sees
+        # it rather than silently trusting a truncated result.
+        for rid in pending:
+            if child_state[rid]["finish_reason"] is None:
+                child_state[rid]["finish_reason"] = "length_or_bound"
+
+        # Abort any child still scheduled at the bound BEFORE measuring free
+        # blocks. Otherwise the leftover Requests stay in scheduler.running and
+        # the outer _process_engine_step keeps decoding them after this utility
+        # returns — leaking outputs to the client socket for req_ids the driver
+        # never issued, and holding KV blocks that would break the
+        # post_free_blocks == pre_free_blocks leak invariant.
+        if pending:
+            self.abort_requests(list(pending))
+
+        post_free_blocks = int(block_pool.get_num_free_blocks())
+
+        children_out = []
+        for rid in child_ids:
+            st = child_state[rid]
+            children_out.append(
+                {
+                    "req_id": rid,
+                    "token_ids": st["token_ids"],
+                    "num_cached_tokens": (
+                        st["num_cached_tokens"]
+                        if st["num_cached_tokens"] is not None
+                        else 0
+                    ),
+                    "num_output_tokens": len(st["token_ids"]),
+                    "finish_reason": st["finish_reason"],
+                    "spec": st["spec"],
+                }
+            )
+        return {
+            "handle_id": handle_id,
+            "n": len(child_ids),
+            "prefix_len": len(prompt_token_ids),
+            "children": children_out,
+            "midgen_block_tables": {
+                "n_running": midgen_best_n if midgen_best_n > 0 else 0,
+                "requests": midgen,
+            },
+            "pre_free_blocks": pre_free_blocks,
+            "post_free_blocks": post_free_blocks,
+            "steps": steps,
+        }
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
