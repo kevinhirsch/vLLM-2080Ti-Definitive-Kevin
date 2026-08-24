@@ -389,6 +389,65 @@ class ChunkGatedDeltaRule(CustomOp):
                 core_flat[: out_flat.numel()].copy_(out_flat)
             return output, final_state
 
+        # [FORK][EXP-046] Varlen unbatching: a packed multi-sequence prefill
+        # (cu_seqlens with N>1 sequences) can be served by the fast legacy
+        # kernel one sequence at a time — N extra kernel launches (~10us each)
+        # against ms-scale chunk prefills. Only the chunk-indexed layouts
+        # (chunk_indices/chunk_offsets) genuinely need the Triton path.
+        # Env-gated default-OFF until benched (VLLM_FLASHQLA_VARLEN_LOOP=1).
+        import os as _os
+        if (
+            _os.environ.get("VLLM_FLASHQLA_VARLEN_LOOP", "0") == "1"
+            and q.ndim == 4
+            and k.ndim == 4
+            and v.ndim == 4
+            and q.shape[0] == 1
+            and cu_seqlens is not None
+            and int(cu_seqlens.numel()) > 2
+            and chunk_indices is None
+            and chunk_offsets is None
+        ):
+            bounds = cu_seqlens.tolist()
+            n_seqs = len(bounds) - 1
+            out_packed = torch.empty_like(v)
+            final_states = []
+            for i in range(n_seqs):
+                s0, s1 = int(bounds[i]), int(bounds[i + 1])
+                if s1 <= s0:
+                    # empty slot: keep state untouched
+                    final_states.append(
+                        initial_state[i : i + 1]
+                        if initial_state is not None
+                        else None
+                    )
+                    continue
+                seq_out, seq_state = flashqla_legacy_chunk_gated_delta_rule(
+                    q=q[:, s0:s1].contiguous(),
+                    k=k[:, s0:s1].contiguous(),
+                    v=v[:, s0:s1].contiguous(),
+                    g=g[:, s0:s1].contiguous() if g is not None else None,
+                    beta=beta[:, s0:s1].contiguous() if beta is not None else None,
+                    initial_state=(
+                        initial_state[i : i + 1].contiguous()
+                        if initial_state is not None
+                        else None
+                    ),
+                    output_final_state=output_final_state,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                )
+                out_packed[:, s0:s1].copy_(seq_out)
+                final_states.append(seq_state)
+            final_state = (
+                torch.cat(final_states, dim=0)
+                if output_final_state and final_states and final_states[0] is not None
+                else None
+            )
+            if core_attn_out is not None:
+                out_flat = out_packed.squeeze(0).reshape(-1)
+                core_flat = core_attn_out.reshape(-1)
+                core_flat[: out_flat.numel()].copy_(out_flat)
+            return out_packed, final_state
+
         logger.warning_once(
             "FlashQLA legacy GDN prefill received unsupported varlen/chunked "
             "metadata; falling back to Triton/FLA for this call."
