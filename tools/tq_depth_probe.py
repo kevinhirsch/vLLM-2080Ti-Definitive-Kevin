@@ -18,6 +18,10 @@ Timed arms (see "ARM NOTES" below for what each one stands in for):
     stage1_decode1    _tq_decode_stage1 kernel alone, B=1  (plain decode)
     stage1_mtp4       _tq_decode_stage1 kernel alone, B=4  (MTP verify-width
                        prefix leg, matches _spec_continuation_decode_attention)
+    stage1_mtp4_qtile _tq_decode_stage1_qtile kernel alone, Q_LEN=4 rows
+                       tiled into ONE program per (head, split) -- the F-2
+                       fix (VLLM_TURBOQUANT_STAGE1_QTILE=1). Direct A/B partner
+                       for stage1_mtp4; same mid_o layout, so stage2 unchanged.
     stage2_reduce      _fwd_kernel_stage2 alone, B=4 (LSE reduce across splits)
     fused_wrapper_mtp4 triton_turboquant_decode_attention() end-to-end, B=4
                        (real Python launcher: q_rot GEMM + stage1 + stage2 --
@@ -72,6 +76,9 @@ command at the bottom of this docstring's companion report.
 
 Usage (engine-free window only):
     python3 tools/tq_depth_probe.py [preset] [depths_csv] [warmup] [reps]
+    python3 tools/tq_depth_probe.py check [preset] [depths_csv]
+        # F-2 equivalence: old stage1 vs qtile stage1, final-output allclose
+        # (rtol 1e-2 fp16) at each depth. Default depths 8K,64K.
 
     preset      TQ_PRESETS key, default turboquant_k3v4_nc (matches the
                 production preset behind the measured staircase)
@@ -331,6 +338,76 @@ def make_stage1_call(B: int, inp: dict, common: dict):
     return _call
 
 
+def make_stage1_qtile_call(inp: dict, common: dict):
+    """F-2 q-row-tiled stage1: one KV-tile load reused across all Q_LEN rows.
+
+    Direct A/B partner for `stage1_mtp4` (the current per-row-grid kernel).
+    Same mid_o output buffer/layout, so stage2_reduce is unchanged. Grid is
+    (Hq, NUM_KV_SPLITS) -- the query-row dim moves from the grid into the
+    program. This is what VLLM_TURBOQUANT_STAGE1_QTILE=1 dispatches the MTP
+    verify prefix leg to.
+    """
+    from vllm.triton_utils import triton
+    from vllm.v1.attention.ops.triton_turboquant_decode import (
+        _DECODE_BLOCK_KV,
+        _tq_decode_stage1_qtile,
+    )
+
+    cfg = common["cfg"]
+    q_rot = inp["q_rot_4"]
+    block_table = inp["block_table_4"]
+    seq_lens = inp["seq_lens_4"]
+    mid_o = inp["mid_o_4"]
+    max_splits = inp["max_splits"]
+    kv_cache = inp["kv_cache"]
+    kv_group_size = HQ // HK
+    q_block = triton.next_power_of_2(Q_LEN)
+    grid = (HQ, max_splits)
+    block_d = triton.next_power_of_2(D)
+
+    def _call():
+        _tq_decode_stage1_qtile[grid](
+            q_rot,
+            kv_cache,
+            block_table,
+            seq_lens,
+            common["centroids"],
+            mid_o,
+            q_rot.stride(0),
+            q_rot.stride(1),
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            kv_cache.stride(2),
+            block_table.stride(0),
+            mid_o.stride(0),
+            mid_o.stride(1),
+            mid_o.stride(2),
+            NUM_KV_HEADS=HK,
+            HEAD_DIM=D,
+            BLOCK_SIZE=BLOCK_SIZE,
+            NUM_KV_SPLITS=max_splits,
+            KV_GROUP_SIZE=kv_group_size,
+            MSE_BITS=cfg.key_mse_bits,
+            MSE_BYTES=common["mse_bytes"],
+            KPS=cfg.key_packed_size,
+            VQB=cfg.effective_value_quant_bits,
+            VAL_DATA_BYTES=common["val_data_bytes"],
+            ATTN_SCALE=common["scale"],
+            SLIDING_WINDOW=0,
+            BLOCK_D=block_d,
+            BLOCK_KV=_DECODE_BLOCK_KV,
+            KEY_FP8=0,
+            Q_LEN_ACTUAL=Q_LEN,
+            Q_BLOCK=q_block,
+            NORM_CORRECTION=1 if cfg.norm_correction else 0,
+            FP8_FORMAT=common["fp8_format"],
+            num_warps=4,
+            num_stages=1,
+        )
+
+    return _call
+
+
 def make_stage2_call(inp: dict):
     from vllm.triton_utils import triton
     from vllm.v1.attention.ops.triton_decode_attention import _fwd_kernel_stage2
@@ -549,6 +626,7 @@ def make_downstream_attn_call(inp: dict, common: dict):
 ARM_ORDER = [
     "stage1_decode1",
     "stage1_mtp4",
+    "stage1_mtp4_qtile",
     "stage2_reduce",
     "fused_wrapper_mtp4",
     "full_dequant_kv",
@@ -564,6 +642,7 @@ def run_depth(depth: int, common: dict, warmup: int, reps: int, results: dict, n
     arms = {
         "stage1_decode1": make_stage1_call(1, inp, common),
         "stage1_mtp4": make_stage1_call(Q_LEN, inp, common),
+        "stage1_mtp4_qtile": make_stage1_qtile_call(inp, common),
         "stage2_reduce": make_stage2_call(inp),
         "fused_wrapper_mtp4": make_fused_wrapper_call(inp, common),
         "full_dequant_kv": make_full_dequant_call(inp, common),
@@ -629,7 +708,115 @@ def print_table(results: dict, depths: list):
         print("".join(c.ljust(col_w) for c in row))
 
 
+def run_correctness(preset: str, depths: list, device: torch.device):
+    """F-2 equivalence: old per-row-grid stage1 vs new q-row-tiled stage1.
+
+    For each depth, run both kernels into ZERO-initialized mid_o buffers
+    (inactive KV splits are left untouched by both, so zeroing makes the
+    unwritten entries compare equal), then run the shared stage2 reduce on
+    each and compare the final [Q_LEN, Hq, D] fp16 outputs. Same random-byte
+    cache feeds both, so any mismatch is a real numeric divergence, not data
+    skew. rtol 1e-2 fp16 per the F-2 acceptance note.
+    """
+    from vllm.triton_utils import triton
+    from vllm.v1.attention.ops.triton_turboquant_decode import (
+        _DECODE_BLOCK_KV,
+        _tq_decode_stage1,
+        _tq_decode_stage1_qtile,
+    )
+    from vllm.v1.attention.ops.triton_decode_attention import _fwd_kernel_stage2
+
+    common = build_common(preset, device)
+    common["device"] = device
+    cfg = common["cfg"]
+    kv_group_size = HQ // HK
+    block_d = triton.next_power_of_2(D)
+    q_block = triton.next_power_of_2(Q_LEN)
+
+    print(f"=== F-2 correctness: old stage1 vs qtile stage1 (preset={preset}) ===")
+    all_ok = True
+    for depth in depths:
+        inp = build_depth_inputs(depth, common, device)
+        q_rot = inp["q_rot_4"]
+        bt = inp["block_table_4"]
+        sl = inp["seq_lens_4"]
+        max_splits = inp["max_splits"]
+        kv_cache = inp["kv_cache"]
+
+        def _stage2(mid_o):
+            out = torch.empty(Q_LEN, HQ, D, dtype=torch.float16, device=device)
+            lse = torch.empty(Q_LEN, HQ, dtype=torch.float32, device=device)
+            _fwd_kernel_stage2[(Q_LEN, HQ)](
+                mid_o, out, lse, sl,
+                mid_o.stride(0), mid_o.stride(1), mid_o.stride(2),
+                out.stride(0), out.stride(1), lse.stride(0),
+                NUM_KV_SPLITS=max_splits, BLOCK_DV=block_d, Lv=D,
+                OUTPUT_FP16=1, SLIDING_WINDOW=0, num_warps=4, num_stages=2,
+            )
+            return out
+
+        mid_old = torch.zeros(Q_LEN, HQ, max_splits, D + 1, dtype=torch.float32, device=device)
+        _tq_decode_stage1[(Q_LEN, HQ, max_splits)](
+            q_rot, kv_cache, bt, sl, common["centroids"], mid_old,
+            q_rot.stride(0), q_rot.stride(1),
+            kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
+            bt.stride(0), mid_old.stride(0), mid_old.stride(1), mid_old.stride(2),
+            NUM_KV_HEADS=HK, HEAD_DIM=D, BLOCK_SIZE=BLOCK_SIZE,
+            NUM_KV_SPLITS=max_splits, KV_GROUP_SIZE=kv_group_size,
+            MSE_BITS=cfg.key_mse_bits, MSE_BYTES=common["mse_bytes"],
+            KPS=cfg.key_packed_size, VQB=cfg.effective_value_quant_bits,
+            VAL_DATA_BYTES=common["val_data_bytes"], ATTN_SCALE=common["scale"],
+            SLIDING_WINDOW=0, BLOCK_D=block_d, BLOCK_KV=_DECODE_BLOCK_KV, KEY_FP8=0,
+            NORM_CORRECTION=1 if cfg.norm_correction else 0,
+            FP8_FORMAT=common["fp8_format"], num_warps=1, num_stages=1,
+        )
+
+        mid_new = torch.zeros(Q_LEN, HQ, max_splits, D + 1, dtype=torch.float32, device=device)
+        _tq_decode_stage1_qtile[(HQ, max_splits)](
+            q_rot, kv_cache, bt, sl, common["centroids"], mid_new,
+            q_rot.stride(0), q_rot.stride(1),
+            kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
+            bt.stride(0), mid_new.stride(0), mid_new.stride(1), mid_new.stride(2),
+            NUM_KV_HEADS=HK, HEAD_DIM=D, BLOCK_SIZE=BLOCK_SIZE,
+            NUM_KV_SPLITS=max_splits, KV_GROUP_SIZE=kv_group_size,
+            MSE_BITS=cfg.key_mse_bits, MSE_BYTES=common["mse_bytes"],
+            KPS=cfg.key_packed_size, VQB=cfg.effective_value_quant_bits,
+            VAL_DATA_BYTES=common["val_data_bytes"], ATTN_SCALE=common["scale"],
+            SLIDING_WINDOW=0, BLOCK_D=block_d, BLOCK_KV=_DECODE_BLOCK_KV, KEY_FP8=0,
+            Q_LEN_ACTUAL=Q_LEN, Q_BLOCK=q_block,
+            NORM_CORRECTION=1 if cfg.norm_correction else 0,
+            FP8_FORMAT=common["fp8_format"], num_warps=4, num_stages=1,
+        )
+        torch.cuda.synchronize()
+
+        mid_ok = torch.allclose(mid_old, mid_new, rtol=1e-2, atol=1e-3)
+        out_old = _stage2(mid_old)
+        out_new = _stage2(mid_new)
+        torch.cuda.synchronize()
+        out_ok = torch.allclose(out_old, out_new, rtol=1e-2, atol=1e-3)
+        max_abs = (out_old.float() - out_new.float()).abs().max().item()
+        ok = mid_ok and out_ok
+        all_ok = all_ok and ok
+        print(f"  depth={depth // 1024}K  mid_o_allclose={mid_ok}  "
+              f"out_allclose={out_ok}  max_abs_out_diff={max_abs:.3e}  "
+              f"{'OK' if ok else 'FAIL'}")
+        del inp, mid_old, mid_new
+        torch.cuda.empty_cache()
+    print(f"=== correctness: {'ALL OK' if all_ok else 'FAILURES PRESENT'} ===")
+    return all_ok
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "check":
+        preset = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_PRESET
+        depths = (
+            [int(x) for x in sys.argv[3].split(",")]
+            if len(sys.argv) > 3
+            else [8192, 65536]
+        )
+        run_correctness(preset, depths, torch.device("cuda:0"))
+        return
+
     preset = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_PRESET
     depths = (
         [int(x) for x in sys.argv[2].split(",")] if len(sys.argv) > 2 else DEPTHS
