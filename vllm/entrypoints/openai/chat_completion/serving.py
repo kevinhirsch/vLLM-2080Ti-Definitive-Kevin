@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 from fastapi import Request
 
+from vllm import envs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
@@ -342,13 +343,13 @@ class OpenAIServingChat(OpenAIServing):
                 if (
                     _tool_calling_requested(request)
                     and sampling_params.repetition_detection is None
+                    and envs.VLLM_TOOL_REPETITION_DETECTION_MIN_COUNT > 0
                 ):
                     sampling_params.repetition_detection = RepetitionDetectionParams(
                         max_pattern_size=32,
                         min_pattern_size=1,
-                        min_count=8,
+                        min_count=envs.VLLM_TOOL_REPETITION_DETECTION_MIN_COUNT,
                     )
-
             self._log_inputs(
                 sub_request_id,
                 engine_input,

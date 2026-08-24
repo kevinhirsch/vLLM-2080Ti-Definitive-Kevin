@@ -302,6 +302,7 @@ if TYPE_CHECKING:
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
+    VLLM_TOOL_REPETITION_DETECTION_MIN_COUNT: int = 0
     # [FORK] Retain the final aligned Mamba state under MTP (mamba_cache_mode=
     # align): the uncached prompt tail still runs and produces the proposer's
     # hidden states, so that boundary state is valid and reusable. Default off.
@@ -1932,7 +1933,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_COMPILE_CACHE_SAVE_FORMAT": env_with_choices(
         "VLLM_COMPILE_CACHE_SAVE_FORMAT", "binary", ["binary", "unpacked"]
     ),
+    # Tool arguments commonly contain repeated markdown/code structure. Keep
+    # the generic repetition detector opt-in for tool calls because its
+    # default n-gram heuristic can terminate a valid JSON argument mid-string.
+    "VLLM_TOOL_REPETITION_DETECTION_MIN_COUNT": lambda: int(
+        os.getenv("VLLM_TOOL_REPETITION_DETECTION_MIN_COUNT", "0")
+    ),
     # Flag to enable v2 model runner.
+    # Minimum repeat count before the repetition detector applies to tool-call
+    # argument streams (0 disables it there): the generic n-gram heuristic can
+    # terminate a valid JSON argument mid-string (upstream #128).
+    "VLLM_TOOL_REPETITION_DETECTION_MIN_COUNT": lambda: int(
+        os.getenv("VLLM_TOOL_REPETITION_DETECTION_MIN_COUNT", "0")
+    ),
     "VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK": lambda: os.getenv(
         "VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK", "0"
     )
