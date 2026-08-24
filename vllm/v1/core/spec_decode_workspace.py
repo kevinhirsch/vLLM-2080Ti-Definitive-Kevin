@@ -230,3 +230,26 @@ def spec_verify_reserve_decision(
         f"({b / (1 << 30):.3f} GiB)"
     )
     return b, reason
+
+
+def spec_verify_last_stage_mask(
+    pp_size: int, inner_size: int, n_workers: int
+) -> list[bool]:
+    """Per-worker mask of last-pipeline-stage membership.
+
+    Worker lists follow the parallel_state rank layout (DP x) PP x PCP x TP
+    with TP innermost. A per-DP-rank executor covers PP*PCP*TP workers;
+    ``external_launcher`` folds DP in outermost, so the last stage is NOT a
+    contiguous tail slice there -- each DP group has its own last stage.
+    Deriving the stage from the PCP*TP inner block size is correct in both
+    modes: ``stage(idx) = (idx // (pcp*tp)) % pp``.
+
+    Defensive: if n_workers is not a multiple of inner_size * pp_size the
+    layout assumption is off, so reserve on every worker (safe over-reserve
+    rather than a missed reserve on the rank that actually needs it).
+    """
+    if pp_size <= 1:
+        return [True] * n_workers
+    if n_workers % (inner_size * pp_size) != 0:
+        return [True] * n_workers
+    return [(idx // inner_size) % pp_size == pp_size - 1 for idx in range(n_workers)]

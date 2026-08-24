@@ -18,7 +18,10 @@ from vllm.logger import init_logger
 from vllm.utils.hashing import sha256_cbor, xxhash_cbor
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
-from vllm.v1.core.spec_decode_workspace import spec_verify_reserve_decision
+from vllm.v1.core.spec_decode_workspace import (
+    spec_verify_last_stage_mask,
+    spec_verify_reserve_decision,
+)
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
@@ -2050,17 +2053,21 @@ def get_kv_cache_configs(
         )
     if spec_verify_reserve > 0:
         # Only the last pipeline stage runs compute_logits + rejection
-        # sampling, so only its workers need the reserve. Ranks are laid out
-        # PP-outermost / TP-innermost; pp_size == 1 (our prod) is unchanged.
-        pp_size = max(
-            1, int(getattr(vllm_config.parallel_config, "pipeline_parallel_size", 1))
+        # sampling, so only its workers need the reserve. pp_size == 1 (our
+        # prod) is unchanged: every worker is last-stage.
+        pc = vllm_config.parallel_config
+        last_stage = spec_verify_last_stage_mask(
+            pp_size=max(1, int(getattr(pc, "pipeline_parallel_size", 1))),
+            inner_size=max(
+                1,
+                int(getattr(pc, "prefill_context_parallel_size", 1))
+                * int(getattr(pc, "tensor_parallel_size", 1)),
+            ),
+            n_workers=len(available_memory),
         )
-        n_workers = len(available_memory)
-        per_stage = max(1, n_workers // pp_size)
-        last_stage_start = (pp_size - 1) * per_stage
         available_memory = [
             avail_mem
-            if (not groups or idx < last_stage_start)
+            if (not groups or not last_stage[idx])
             else max(0, avail_mem - spec_verify_reserve)
             for idx, (groups, avail_mem) in enumerate(
                 zip(projected_groups_per_worker, available_memory)
