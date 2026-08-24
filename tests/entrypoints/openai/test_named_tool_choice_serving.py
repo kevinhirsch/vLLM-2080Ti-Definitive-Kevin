@@ -207,9 +207,11 @@ def test_named_tool_choice_mistral_stream_uses_mistral_id():
 
 
 def test_named_tool_choice_stream_truncated_preserves_length():
-    # Truncated by max_tokens mid-arguments -> finish_reason "length". A
-    # streamed named tool call must not flip the final finish_reason to
-    # "tool_calls", or clients would execute a truncated argument blob.
+    # CONTRACT (matches OpenAI): a generation truncated by max_tokens
+    # mid-arguments surfaces the PARTIAL argument deltas (already emitted;
+    # streaming cannot retract them) but the final chunk's finish_reason must
+    # stay "length" — never "tool_calls" — so a conforming client knows not to
+    # execute the truncated blob as a complete call.
     choices = asyncio.run(_stream([("{", None), ('"city": "Shang', "length")]))
     tool_deltas = [
         choice["delta"]["tool_calls"][0]
@@ -226,14 +228,28 @@ def test_named_tool_choice_stream_truncated_preserves_length():
     assert "type" not in tool_deltas[1]
     assert "name" not in tool_deltas[1]["function"]
     assert tool_deltas[1]["function"]["arguments"] == '"city": "Shang'
+    # No chunk may claim the call completed: "tool_calls" must never appear as
+    # a finish_reason anywhere in the stream, and the final one is "length".
+    assert all(c.get("finish_reason") != "tool_calls" for c in choices)
     assert choices[-1]["finish_reason"] == "length"
 
 
 def test_named_tool_choice_full_truncated_preserves_length():
+    # CONTRACT (matches OpenAI): the truncated call IS surfaced with its
+    # partial arguments (clients may want them for resumption/debugging), but
+    # finish_reason stays "length" — the signal that the arguments are NOT a
+    # complete call. Pinning both sides so neither can silently regress:
+    # dropping finish_reason preservation would make clients execute garbage;
+    # dropping the partial surfacing would silently diverge from OpenAI.
     response = asyncio.run(
         _full('{"city": "Shang', _PlainContentParser(), finish_reason="length")
     )
     choice = response.choices[0]
 
-    # A truncated named tool call keeps its real finish_reason.
+    # A truncated named tool call keeps its real finish_reason...
     assert choice.finish_reason == "length"
+    # ...and surfaces the partial arguments verbatim (OpenAI-compatible).
+    assert choice.message.tool_calls is not None
+    assert len(choice.message.tool_calls) == 1
+    assert choice.message.tool_calls[0].function.name == "get_weather"
+    assert choice.message.tool_calls[0].function.arguments == '{"city": "Shang'
