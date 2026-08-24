@@ -146,3 +146,23 @@ if __name__ == "__main__":
     if failed:
         raise SystemExit(f"{failed}/{len(tests)} tests failed")
     print(f"All {len(tests)} tests passed.")
+
+
+def test_s4_exemption_permits_cap_below_k():
+    """S4 pairing (cap=2, K=16) must boot when the drafter env is set."""
+    import os as _os
+    _os.environ["VLLM_S4_SCOPED_DRAFTER"] = "1"
+    try:
+        M.validate_mtp_draft_cap("2", 16)  # must NOT raise
+    finally:
+        del _os.environ["VLLM_S4_SCOPED_DRAFTER"]
+
+
+def test_no_s4_still_raises():
+    import os as _os
+    _os.environ.pop("VLLM_S4_SCOPED_DRAFTER", None)
+    try:
+        M.validate_mtp_draft_cap("2", 16)
+    except ValueError:
+        return
+    raise AssertionError("guard did not fire without S4")
