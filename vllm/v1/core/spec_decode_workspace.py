@@ -210,7 +210,9 @@ def spec_verify_reserve_decision(
             "(nothing beyond the profiled K=1 baseline)"
         )
     if int(overshoot_mult) <= 0:
-        return 0, "skipped: VLLM_SPEC_VERIFY_OVERSHOOT_MULT=0"
+        return 0, (
+            f"skipped: VLLM_SPEC_VERIFY_OVERSHOOT_MULT={overshoot_mult} <= 0"
+        )
     if int(max_num_seqs) <= 0 or int(vocab_size) <= 0:
         return 0, (
             f"skipped: degenerate (max_num_seqs={max_num_seqs}, "
