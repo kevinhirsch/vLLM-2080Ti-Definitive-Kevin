@@ -1489,6 +1489,70 @@ class LLM:
             reset_running_requests, reset_connector
         )
 
+    # ------------------------------------------------------------------
+    # EXP-038 Stage-1 attn KV block pin/unpin (snapshot/park/fork PoC).
+    #
+    # SNAPSHOT's attn side = refcount pinning of a finished prefix's KV blocks
+    # so they survive the producing request's free(). The block pool lives in
+    # the EngineCore process, so these route through the utility RPC surface
+    # (same path as reset_prefix_cache). Env-gated on the EngineCore side by
+    # VLLM_TQ_GDN_SNAPSHOT; default-inert. NEVER use against :8001.
+    # ------------------------------------------------------------------
+    def pin_request_kv_blocks(self, req_id: str | None = None) -> dict[str, Any]:
+        """Pin an in-flight request's KV blocks; returns an opaque handle dict.
+
+        Call ``req_id=None`` to auto-pick the single in-flight request. Release
+        with :meth:`unpin_kv_blocks`.
+        """
+        return self.llm_engine.pin_request_kv_blocks(req_id)
+
+    def verify_pinned_blocks(self, handle_id: str) -> dict[str, Any]:
+        """Read-only residency check (ref_cnt >= 1) for a pin handle."""
+        return self.llm_engine.verify_pinned_blocks(handle_id)
+
+    def get_request_kv_block_ids(
+        self, req_id: str | None = None, all_running: bool = False
+    ) -> dict[str, Any]:
+        """Read-only per-group KV block ids of a live request.
+
+        ``all_running=True`` returns every in-flight request's block table
+        keyed by req_id (EXP-038 Stage-3 fork: observe two co-scheduled
+        children in one read; ``req_id=None`` sees only the first).
+        """
+        return self.llm_engine.get_request_kv_block_ids(req_id, all_running)
+
+    def get_pin_handle(self, handle_id: str) -> dict[str, Any]:
+        """Read-only accessor for a pin handle's forkable metadata (EXP-038 v2:
+        ``prompt_token_ids`` + ``cache_salt`` + prefix/computed lengths). Raises
+        ``KeyError`` for a released/unknown handle."""
+        return self.llm_engine.get_pin_handle(handle_id)
+
+    def unpin_kv_blocks(self, handle_id: str) -> dict[str, Any]:
+        """Release a pin handle (frees the pinned blocks)."""
+        return self.llm_engine.unpin_kv_blocks(handle_id)
+
+    def fork_from_handle(
+        self,
+        handle_id: str,
+        child_specs: list[dict[str, Any]],
+        max_steps: int | None = None,
+    ) -> dict[str, Any]:
+        """EXP-038 Stage-4: fork a pinned handle into ``len(child_specs)``
+        children WITHOUT resubmit.
+
+        Each ``child_specs[i]`` is a dict of ``SamplingParams`` kwargs (e.g.
+        ``{"temperature": 0.0, "max_tokens": 64, "logprobs": 1}``) so children may
+        diverge in sampling / max_tokens. Children are built engine-side from the
+        pinned handle's cached prefix and adopt the pinned donor blocks via the
+        local prefix cache (attn ref-count touch + align-mode GDN copy-out), then
+        are driven to completion inside EngineCore. The pin is NOT released — call
+        :meth:`unpin_kv_blocks` when done. Returns per-child token_ids +
+        ``num_cached_tokens`` (~zero-prefill-compute proxy), a mid-gen block-table
+        snapshot, and pre/post free-block counts (leak invariant). Env-gated by
+        ``VLLM_TQ_GDN_SNAPSHOT``; NEVER use against :8001.
+        """
+        return self.llm_engine.fork_from_handle(handle_id, child_specs, max_steps)
+
     def sleep(self, level: int = 1, mode: PauseMode = "abort"):
         """
         Put the engine to sleep. The engine should not process any requests.

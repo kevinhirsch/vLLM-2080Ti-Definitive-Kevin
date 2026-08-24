@@ -341,6 +341,35 @@ class LLMEngine:
             reset_running_requests, reset_connector
         )
 
+    # EXP-038 Stage-1 attn KV pin/unpin (env-gated on the EngineCore side by
+    # VLLM_TQ_GDN_SNAPSHOT). See vllm/v1/engine/core.py for semantics.
+    def pin_request_kv_blocks(self, req_id: str | None = None) -> dict[str, Any]:
+        return self.engine_core.pin_request_kv_blocks(req_id)
+
+    def verify_pinned_blocks(self, handle_id: str) -> dict[str, Any]:
+        return self.engine_core.verify_pinned_blocks(handle_id)
+
+    def get_request_kv_block_ids(
+        self, req_id: str | None = None, all_running: bool = False
+    ) -> dict[str, Any]:
+        return self.engine_core.get_request_kv_block_ids(req_id, all_running)
+
+    def get_pin_handle(self, handle_id: str) -> dict[str, Any]:
+        return self.engine_core.get_pin_handle(handle_id)
+
+    def unpin_kv_blocks(self, handle_id: str) -> dict[str, Any]:
+        return self.engine_core.unpin_kv_blocks(handle_id)
+
+    # EXP-038 Stage-4 fork API (env-gated on the EngineCore side). Fork a pinned
+    # handle into len(child_specs) children WITHOUT resubmit; see core.py.
+    def fork_from_handle(
+        self,
+        handle_id: str,
+        child_specs: list[dict[str, Any]],
+        max_steps: int | None = None,
+    ) -> dict[str, Any]:
+        return self.engine_core.fork_from_handle(handle_id, child_specs, max_steps)
+
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
 

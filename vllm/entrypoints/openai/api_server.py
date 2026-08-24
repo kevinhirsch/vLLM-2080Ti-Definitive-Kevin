@@ -202,6 +202,15 @@ def build_app(
 
         register_generate_api_routers(app)
 
+        # EXP-038 (VLLM_TQ_GDN_SNAPSHOT) prefill-once/fork-N routes. Default-inert:
+        # attach_router is a no-op unless the env gate is set, so this is a safe
+        # no-op on the production serve. NEVER enable against :8001.
+        from vllm.entrypoints.openai.tq_snapshot_router import (
+            attach_router as attach_tq_snapshot_router,
+        )
+
+        attach_tq_snapshot_router(app)
+
         from vllm.entrypoints.serve.disagg.api_router import (
             attach_router as attach_disagg_router,
         )
