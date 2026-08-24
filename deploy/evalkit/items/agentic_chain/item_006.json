@@ -66,6 +66,10 @@
           "path": "title",
           "match": "contains",
           "value": "VPN down"
+        },
+        {
+          "path": "description",
+          "match": "exists"
         }
       ],
       "inject_result": {
@@ -80,6 +84,11 @@
           "path": "ticket_id",
           "match": "exact",
           "value_from_previous_result": "ticket_id"
+        },
+        {
+          "path": "assignee",
+          "match": "regex",
+          "pattern": "(?i)support"
         }
       ],
       "inject_result": {

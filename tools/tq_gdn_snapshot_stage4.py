@@ -173,151 +173,174 @@ def main() -> int:
         f"mamba_blocks={len(pinned_mamba)} ref_continuation={ref_tokens[:8]}..."
     )
 
-    # Let the finish/free step land, then confirm the pin held across the free.
-    time.sleep(1.0)
-    v = llm.verify_pinned_blocks(handle_id)
-    print(
-        f"[2/6] post-free verify: ok={v.get('ok')} "
-        f"min_ref_cnt={v.get('min_ref_cnt')} "
-        f"num_free_blocks={v.get('num_free_blocks')}"
-    )
-    if not v.get("ok"):
-        print("pinned blocks did not survive source free", file=sys.stderr)
-        llm.unpin_kv_blocks(handle_id)
-        return 1
-
-    # ---- [3/6] Optional cache pressure ----------------------------------
-    if args.churn_fillers > 0:
-        print(f"[3/6] churning cache with {args.churn_fillers} filler prompts ...")
-        for i in range(args.churn_fillers):
-            filler = _build_block_aligned_prompt(
-                args.block_aligned_tokens, seed=100 + i
-            )
-            llm.generate(
-                {"prompt_token_ids": filler},
-                SamplingParams(max_tokens=1, temperature=0.0),
-            )
-        vv = llm.verify_pinned_blocks(handle_id)
-        if not vv.get("ok"):
-            print("pinned blocks evicted under churn (unexpected)", file=sys.stderr)
-            llm.unpin_kv_blocks(handle_id)
-            return 1
-    else:
-        print("[3/6] no cache churn (--churn-fillers 0)")
-
-    # ---- [4/6] FORK via fork_from_handle: 3 DIFFERENT sampling params ----
-    # child 0: greedy  (must reproduce the reference continuation byte-exactly)
-    # child 1: temperature 0.7, fixed seed (divergent sampling)
-    # child 2: temperature 1.0, fixed seed, DISTINCT (smaller) max_tokens
-    child2_max = max(8, args.continuation_tokens // 2)
-    child_specs = [
-        {"temperature": 0.0, "max_tokens": args.continuation_tokens, "logprobs": 1},
-        {"temperature": 0.7, "top_p": 0.95, "seed": 1234,
-         "max_tokens": args.continuation_tokens},
-        {"temperature": 1.0, "top_p": 0.95, "seed": 5678,
-         "max_tokens": child2_max},
-    ]
-    print(
-        f"[4/6] fork_from_handle(n=3): greedy(max={args.continuation_tokens}), "
-        f"temp0.7(max={args.continuation_tokens}), temp1.0(max={child2_max}) ..."
-    )
+    # Everything below through the end of the [5/6] assertions runs under one
+    # try/finally: the [6/6] verify+unpin cleanup in `finally` always fires
+    # exactly once — on a normal fall-through, an early `return 1`, or an
+    # unexpected exception (e.g. from fork_from_handle or from child-result
+    # processing) — so the pinned handle can never be leaked.
+    post: dict = {}
+    released: dict = {}
     try:
-        fork = llm.fork_from_handle(handle_id, child_specs)
-    except BaseException:  # noqa: BLE001 - fork raised/timed out; never leak the pin
-        # Best-effort unpin, isolated so a cleanup failure never masks the
-        # primary fork error (which is what the caller needs to see).
-        try:
-            llm.unpin_kv_blocks(handle_id)
-        except BaseException as cleanup_err:  # noqa: BLE001 - even SystemExit/
-            # KeyboardInterrupt raised mid-cleanup must not replace the primary
-            # fork error; log and let the original propagate via the outer raise.
+        # Let the finish/free step land, then confirm the pin held across the
+        # free.
+        time.sleep(1.0)
+        v = llm.verify_pinned_blocks(handle_id)
+        print(
+            f"[2/6] post-free verify: ok={v.get('ok')} "
+            f"min_ref_cnt={v.get('min_ref_cnt')} "
+            f"num_free_blocks={v.get('num_free_blocks')}"
+        )
+        if not v.get("ok"):
+            print("pinned blocks did not survive source free", file=sys.stderr)
+            return 1
+
+        # ---- [3/6] Optional cache pressure -------------------------------
+        if args.churn_fillers > 0:
             print(
-                f"warning: unpin failed during fork-error cleanup: {cleanup_err!r}",
+                f"[3/6] churning cache with {args.churn_fillers} filler prompts ..."
+            )
+            for i in range(args.churn_fillers):
+                filler = _build_block_aligned_prompt(
+                    args.block_aligned_tokens, seed=100 + i
+                )
+                llm.generate(
+                    {"prompt_token_ids": filler},
+                    SamplingParams(max_tokens=1, temperature=0.0),
+                )
+            vv = llm.verify_pinned_blocks(handle_id)
+            if not vv.get("ok"):
+                print(
+                    "pinned blocks evicted under churn (unexpected)",
+                    file=sys.stderr,
+                )
+                return 1
+        else:
+            print("[3/6] no cache churn (--churn-fillers 0)")
+
+        # ---- [4/6] FORK via fork_from_handle: 3 DIFFERENT sampling params ----
+        # child 0: greedy  (must reproduce the reference continuation byte-exactly)
+        # child 1: temperature 0.7, fixed seed (divergent sampling)
+        # child 2: temperature 1.0, fixed seed, DISTINCT (smaller) max_tokens
+        child2_max = max(8, args.continuation_tokens // 2)
+        child_specs = [
+            {"temperature": 0.0, "max_tokens": args.continuation_tokens,
+             "logprobs": 1},
+            {"temperature": 0.7, "top_p": 0.95, "seed": 1234,
+             "max_tokens": args.continuation_tokens},
+            {"temperature": 1.0, "top_p": 0.95, "seed": 5678,
+             "max_tokens": child2_max},
+        ]
+        print(
+            f"[4/6] fork_from_handle(n=3): greedy(max={args.continuation_tokens}), "
+            f"temp0.7(max={args.continuation_tokens}), temp1.0(max={child2_max}) ..."
+        )
+        # NB: if fork_from_handle raises/times out, that exception propagates
+        # straight out of this try unmodified (message and type intact) — the
+        # `finally` below still runs the unpin exactly once on the way out.
+        fork = llm.fork_from_handle(handle_id, child_specs)
+        children = fork.get("children", [])
+        if len(children) != 3:
+            print(
+                f"fork returned {len(children)} children (expected 3)",
                 file=sys.stderr,
             )
-        raise
-    children = fork.get("children", [])
-    if len(children) != 3:
+            return 1
+        c0, c1, c2 = children
+        for idx, c in enumerate(children):
+            print(
+                f"  child{idx}: num_cached_tokens={c['num_cached_tokens']}/{n_prefix} "
+                f"({c['num_cached_tokens'] / max(1, n_prefix):.0%})  "
+                f"out_tokens={c['num_output_tokens']}  finish={c['finish_reason']}  "
+                f"temp={c['spec'].get('temperature')}"
+            )
+        mid = fork.get("midgen_block_tables", {})
+        n_running_caught = int(mid.get("n_running", 0))
+        pre_free = int(fork.get("pre_free_blocks", -1))
+        post_free = int(fork.get("post_free_blocks", -2))
         print(
-            f"fork returned {len(children)} children (expected 3)", file=sys.stderr
+            f"  widest mid-gen catch: {n_running_caught} children co-running; "
+            f"pre_free_blocks={pre_free} post_free_blocks={post_free} "
+            f"steps={fork.get('steps')}"
         )
-        llm.unpin_kv_blocks(handle_id)
-        return 1
-    c0, c1, c2 = children
-    for idx, c in enumerate(children):
-        print(
-            f"  child{idx}: num_cached_tokens={c['num_cached_tokens']}/{n_prefix} "
-            f"({c['num_cached_tokens'] / max(1, n_prefix):.0%})  "
-            f"out_tokens={c['num_output_tokens']}  finish={c['finish_reason']}  "
-            f"temp={c['spec'].get('temperature')}"
+
+        # ---- [5/6] Assertions -------------------------------------------
+        # (A) greedy child byte-exact vs reference (token ids — the
+        # state-correctness signal per Stage-3 Fable adjudication).
+        greedy_tokens = [int(t) for t in c0["token_ids"]]
+        cond_a = greedy_tokens == ref_tokens
+
+        # (B) every child rode the cache (~zero prefill compute).
+        per_child_cached = [
+            c["num_cached_tokens"] > 0.5 * n_prefix for c in children
+        ]
+        cond_b = all(per_child_cached)
+
+        # (C) mid-gen: shared attn full block across children + distinct mamba
+        # running slot per child. Only decisive if we caught >=2 children
+        # co-running.
+        reqs = mid.get("requests", {})
+        caught = list(reqs.keys())
+        shared_attn: set[int] = set()
+        per_child_run_mamba: list[set[int]] = []
+        shared_mamba_running = False
+        if len(caught) >= 2:
+            attn_sets = []
+            for rid in caught:
+                a, m = _split_groups(reqs[rid]["groups"])
+                attn_sets.append(a)
+                per_child_run_mamba.append(m - pinned_mamba)  # running slot(s)
+            # SHARED full-attn cache-hit block = in every caught child AND pinned.
+            shared_attn = (
+                set.intersection(*attn_sets) & pinned_attn if attn_sets else set()
+            )
+            # Distinct running mamba slots: pairwise-disjoint across children.
+            seen: set[int] = set()
+            for rm in per_child_run_mamba:
+                if rm & seen:
+                    shared_mamba_running = True
+                seen |= rm
+        cond_c = (
+            len(caught) >= 2
+            and len(shared_attn) > 0
+            and not shared_mamba_running
+            and all(len(rm) > 0 for rm in per_child_run_mamba)
         )
-    mid = fork.get("midgen_block_tables", {})
-    n_running_caught = int(mid.get("n_running", 0))
-    pre_free = int(fork.get("pre_free_blocks", -1))
-    post_free = int(fork.get("post_free_blocks", -2))
-    print(
-        f"  widest mid-gen catch: {n_running_caught} children co-running; "
-        f"pre_free_blocks={pre_free} post_free_blocks={post_free} "
-        f"steps={fork.get('steps')}"
-    )
 
-    # ---- [5/6] Assertions -----------------------------------------------
-    # (A) greedy child byte-exact vs reference (token ids — the state-correctness
-    # signal per Stage-3 Fable adjudication).
-    greedy_tokens = [int(t) for t in c0["token_ids"]]
-    cond_a = greedy_tokens == ref_tokens
+        # (D) leak invariant: free-block count returns to the pre-fork baseline.
+        cond_d = pre_free >= 0 and post_free >= 0 and post_free == pre_free
 
-    # (B) every child rode the cache (~zero prefill compute).
-    per_child_cached = [c["num_cached_tokens"] > 0.5 * n_prefix for c in children]
-    cond_b = all(per_child_cached)
-
-    # (C) mid-gen: shared attn full block across children + distinct mamba
-    # running slot per child. Only decisive if we caught >=2 children co-running.
-    reqs = mid.get("requests", {})
-    caught = list(reqs.keys())
-    shared_attn: set[int] = set()
-    per_child_run_mamba: list[set[int]] = []
-    shared_mamba_running = False
-    if len(caught) >= 2:
-        attn_sets = []
-        for rid in caught:
-            a, m = _split_groups(reqs[rid]["groups"])
-            attn_sets.append(a)
-            per_child_run_mamba.append(m - pinned_mamba)  # running slot(s)
-        # SHARED full-attn cache-hit block = in every caught child AND pinned.
-        shared_attn = set.intersection(*attn_sets) & pinned_attn if attn_sets else set()
-        # Distinct running mamba slots: pairwise-disjoint across children.
-        seen: set[int] = set()
-        for rm in per_child_run_mamba:
-            if rm & seen:
-                shared_mamba_running = True
-            seen |= rm
-    cond_c = (
-        len(caught) >= 2
-        and len(shared_attn) > 0
-        and not shared_mamba_running
-        and all(len(rm) > 0 for rm in per_child_run_mamba)
-    )
-
-    # (D) leak invariant: free-block count returns to the pre-fork baseline.
-    cond_d = pre_free >= 0 and post_free >= 0 and post_free == pre_free
-
-    # Divergence demonstration (informational): child 2 honored a distinct
-    # max_tokens, and the temperature children need not equal the greedy child.
-    child2_len_ok = c2["num_output_tokens"] <= child2_max
-    temp_diverged = (
-        [int(t) for t in c1["token_ids"]] != greedy_tokens
-        or [int(t) for t in c2["token_ids"]] != greedy_tokens
-    )
-
-    # ---- [6/6] Post-fork verify, then release the pin --------------------
-    post = llm.verify_pinned_blocks(handle_id)
-    released = llm.unpin_kv_blocks(handle_id)
-    print(
-        f"[6/6] post-fork verify: ok={post.get('ok')} "
-        f"min_ref_cnt={post.get('min_ref_cnt')} | unpin ok={released.get('ok')} "
-        f"num_freed_blocks={released.get('num_freed_blocks')}"
-    )
+        # Divergence demonstration (informational): child 2 honored a distinct
+        # max_tokens, and the temperature children need not equal the greedy
+        # child.
+        child2_len_ok = c2["num_output_tokens"] <= child2_max
+        temp_diverged = (
+            [int(t) for t in c1["token_ids"]] != greedy_tokens
+            or [int(t) for t in c2["token_ids"]] != greedy_tokens
+        )
+    finally:
+        # ---- [6/6] Post-fork verify, then release the pin ----------------
+        # Isolated in its own try/except so a cleanup failure here never
+        # masks/replaces a primary exception already propagating out of the
+        # try block above (e.g. a fork_from_handle error) — matches the
+        # narrower guard this used to be around fork_from_handle alone, now
+        # generalized to the whole [2/6]-[5/6] span.
+        try:
+            post = llm.verify_pinned_blocks(handle_id)
+            released = llm.unpin_kv_blocks(handle_id)
+            print(
+                f"[6/6] post-fork verify: ok={post.get('ok')} "
+                f"min_ref_cnt={post.get('min_ref_cnt')} | "
+                f"unpin ok={released.get('ok')} "
+                f"num_freed_blocks={released.get('num_freed_blocks')}"
+            )
+        except BaseException as cleanup_err:  # noqa: BLE001 - even SystemExit/
+            # KeyboardInterrupt raised mid-cleanup must not replace a primary
+            # error already propagating; log and let it continue upward.
+            print(
+                f"warning: post-fork verify/unpin failed during cleanup: "
+                f"{cleanup_err!r}",
+                file=sys.stderr,
+            )
 
     # ---- Verdict --------------------------------------------------------
     print("verdict:")

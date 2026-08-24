@@ -192,6 +192,9 @@ class Orchestrator:
         # The fork prefix has no role separation; fold any system preamble in.
         full = f"{system}\n\n{shared_prompt}" if system else shared_prompt
 
+        if self.agent_count + len(agent_specs) > MAX_AGENTS:
+            raise RuntimeError(f"agent cap {MAX_AGENTS} exceeded (fork_agents preflight)")
+
         try:
             pin = await asyncio.to_thread(self._tq_post, "/tq/pin",
                                           {"prompt": full}, engine_url)
@@ -233,6 +236,10 @@ class Orchestrator:
         except urllib.error.HTTPError as e:
             body = e.read().decode()[:160] if hasattr(e, "read") else ""
             _emit(f"  [{ph}] fork_agents: /tq/fork HTTP {e.code} {body} — fallback")
+            return await self._fork_fallback(shared_prompt, agent_specs,
+                                             system=system, phase=ph)
+        except (urllib.error.URLError, ConnectionError, OSError) as e:
+            _emit(f"  [{ph}] fork_agents: /tq/fork unreachable ({type(e).__name__}) — fallback")
             return await self._fork_fallback(shared_prompt, agent_specs,
                                              system=system, phase=ph)
         finally:
@@ -375,6 +382,8 @@ def main():
                    help="tag as interactive (not bg) — competes with Hermes/pi traffic")
     p.add_argument("--args", default=None, help="JSON passed to run(args)")
     a = p.parse_args()
+    if a.concurrency < 1:
+        p.error("--concurrency must be >= 1")
     asyncio.run(_main_async(a))
 
 

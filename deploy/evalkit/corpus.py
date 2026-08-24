@@ -15,12 +15,14 @@ random.Random(seed).randint(...) with a seed string derived only from
 corpus content and the same expected answers.
 """
 import json
+import os
 import random
 from pathlib import Path
 
 from config import VLLM_SOURCE_DIR, CHARS_PER_TOKEN
 
 CORPUS_DIR = Path(__file__).parent / "corpus"
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DEPTHS = (20, 50, 80)
 SENTINEL_LOW, SENTINEL_HIGH = 100000, 999999
 
@@ -34,7 +36,7 @@ def _gather_source_text(max_chars):
     total = 0
     for f in files:
         try:
-            text = f.read_text(errors="ignore")
+            text = f.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
         chunk = f"\n# ==== FILE: {f.relative_to(src)} ====\n" + text
@@ -95,7 +97,7 @@ def build_corpus(target_tokens):
         "approx_tokens": round(len(text) / CHARS_PER_TOKEN),
         "chars_per_token": CHARS_PER_TOKEN,
         "sentinels": sentinels,
-        "source_dir": VLLM_SOURCE_DIR,
+        "source_dir": os.path.relpath(VLLM_SOURCE_DIR, REPO_ROOT),
     }
     txt_path.write_text(text)
     meta_path.write_text(json.dumps(meta, indent=2))

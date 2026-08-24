@@ -24,7 +24,7 @@ def _check_type(obj, t):
         return isinstance(obj, bool)
     if t == "null":
         return obj is None
-    return True  # unknown type name: don't block on it
+    return False  # unknown type name: fail closed instead of silently passing
 
 
 def validate_schema(obj, schema, path="$"):
@@ -73,8 +73,12 @@ def validate_schema(obj, schema, path="$"):
             errors.append(f"{path}: length {len(obj)} < minLength {schema['minLength']}")
         if "maxLength" in schema and len(obj) > schema["maxLength"]:
             errors.append(f"{path}: length {len(obj)} > maxLength {schema['maxLength']}")
-        if "pattern" in schema and re.search(schema["pattern"], obj) is None:
-            errors.append(f"{path}: {obj!r} does not match pattern {schema['pattern']!r}")
+        if "pattern" in schema:
+            try:
+                if re.search(schema["pattern"], obj) is None:
+                    errors.append(f"{path}: {obj!r} does not match pattern {schema['pattern']!r}")
+            except re.error:
+                errors.append(f"{path}: invalid pattern {schema['pattern']!r} in schema")
 
     elif t in ("integer", "number"):
         if "minimum" in schema and obj < schema["minimum"]:

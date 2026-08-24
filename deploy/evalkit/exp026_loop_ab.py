@@ -216,7 +216,8 @@ def print_report(tag, by_profile, rows_by_profile):
     print(f"=== EXP-026 loop_probe A/B report ({tag}) ===")
     print(f"{'profile':<28}{'pass':>6}{'/':>1}{'total':<8}{'order_ok':>10}{'distinct_ok':>13}"
           f"{'self_stop_short':>17}{'hit_maxtok':>12}{'tot_dupes':>11}{'avg_dupes':>11}{'avg_lines':>11}")
-    for key, profile in PROFILES.items():
+    for key in rows_by_profile.keys():
+        profile = PROFILES[key]
         s = by_profile[key]
         print(
             f"{profile['label']:<28}{s['pass']:>6}{'/':>1}{s['total']:<8}{s['order_ok']:>10}"
@@ -224,7 +225,7 @@ def print_report(tag, by_profile, rows_by_profile):
             f"{s['total_duplicates']:>11}{s['avg_duplicates']:>11}{s['avg_n_lines_parsed']:>11}"
         )
     print()
-    for key in PROFILES:
+    for key in rows_by_profile.keys():
         print(f"--- {PROFILES[key]['label']} per-item ---")
         for r in rows_by_profile[key]:
             d = r["degeneration"]

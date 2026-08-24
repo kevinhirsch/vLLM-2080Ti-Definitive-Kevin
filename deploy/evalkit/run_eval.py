@@ -17,6 +17,7 @@ Usage:
 """
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 import time
@@ -245,6 +246,8 @@ def main():
     ap.add_argument("--tag", required=True)
     ap.add_argument("--categories", default=None, help="comma-separated category filter")
     ap.add_argument("--limit-per-category", type=int, default=None)
+    ap.add_argument("--force", action="store_true",
+                     help="clear pre-existing results under --tag instead of failing")
     args = ap.parse_args()
 
     categories = set(args.categories.split(",")) if args.categories else None
@@ -254,6 +257,16 @@ def main():
         sys.exit(1)
 
     out_dir = RESULTS_DIR / args.tag
+    if out_dir.exists() and any(out_dir.glob("*.json")):
+        if args.force:
+            shutil.rmtree(out_dir)
+        else:
+            print(
+                f"Results dir {out_dir} already has result files -- "
+                "pick a fresh --tag or pass --force to clear it.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     summary = {"tag": args.tag, "started": datetime.now(timezone.utc).isoformat(), "items": []}

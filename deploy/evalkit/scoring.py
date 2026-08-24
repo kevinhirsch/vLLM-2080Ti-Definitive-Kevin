@@ -7,6 +7,7 @@ Both run_eval.py (live, right after each response) and score_only.py
 lives in exactly one place and re-scoring is a real recomputation, not a
 replay of cached booleans.
 """
+import ast
 import calendar
 import json
 import os
@@ -278,6 +279,23 @@ def run_python(code, timeout_sec=10):
             pass
 
 
+def _calls_itself(code, func_name):
+    """AST check: does the function named func_name call itself somewhere
+    in its own body? Used to gate style-constrained items (e.g. 'write this
+    recursively') where a correct-stdout iterative or lookup-table solution
+    would otherwise pass score_code_exec's stdout-only diff."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_name:
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name) and inner.func.id == func_name:
+                    return True
+    return False
+
+
 def score_code_exec(item, content):
     check = item["check"]
     code = extract_code(content)
@@ -295,7 +313,15 @@ def score_code_exec(item, content):
     run = run_python(full_code, check.get("timeout_sec", 10))
     expected = check["expected_stdout"].rstrip("\n")
     actual = run["stdout"].rstrip("\n")
-    passed = (not run["timed_out"]) and run["returncode"] == 0 and actual == expected
+    # HOLE FIX: stdout-diffing alone can't tell a genuine implementation of a
+    # style-constrained item (e.g. "using recursion") from one that just
+    # hardcodes/looks up the right answers for the harness's fixed inputs.
+    # An item can opt into an AST-level check by setting
+    # check.require_recursive to the name of the function that must call
+    # itself; items that don't set it are scored exactly as before.
+    require_recursive = check.get("require_recursive")
+    recursive_ok = _calls_itself(code, require_recursive) if require_recursive else True
+    passed = (not run["timed_out"]) and run["returncode"] == 0 and actual == expected and recursive_ok
     return {
         "passed": passed,
         "extracted_code": code,
@@ -305,6 +331,7 @@ def score_code_exec(item, content):
         "stderr": run["stderr"][-4000:],
         "returncode": run["returncode"],
         "timed_out": run["timed_out"],
+        "recursive_ok": recursive_ok,
     }
 
 
@@ -368,7 +395,10 @@ def score_instruction(item, content):
     text = content or ""
 
     if t == "line_count":
-        n = len(text.strip("\n").split("\n"))
+        # HOLE FIX: "".strip("\n").split("\n") == [""], so n was 1 for an
+        # empty (or newlines-only) response instead of the correct 0 lines.
+        stripped = text.strip("\n")
+        n = len(stripped.split("\n")) if stripped else 0
         return {"passed": n == check["value"], "actual": n}
     if t == "word_count":
         n = len(text.split())
@@ -377,7 +407,11 @@ def score_instruction(item, content):
         found = re.findall(r"[aeiouAEIOU]", text)
         return {"passed": len(found) == 0, "found": found[:20]}
     if t == "starts_with":
-        return {"passed": text.strip().startswith(check["value"])}
+        # HOLE FIX: bare startswith() also matched e.g. "INTRODUCINGLY..."
+        # for a required prefix of "INTRODUCING". Require a word boundary
+        # right after the prefix so only the exact leading token counts.
+        pattern = re.escape(check["value"]) + r"(?!\w)"
+        return {"passed": re.match(pattern, text.strip()) is not None}
     if t == "regex_fullmatch":
         # HOLE FIX: this used to hardcode re.DOTALL, which silently makes
         # every '.' in a pattern cross line boundaries. For a pattern like
@@ -516,7 +550,12 @@ def score_long_ctx(item, content):
     if t == "multi_fact":
         expected_list = check["expected_numbers"]
         found = [int(x) for x in _SIX_DIGIT_RE.findall(text)]
-        passed = all(e in found for e in expected_list)
+        # HOLE FIX: plain membership over `found` (every 6-digit number in
+        # the response) accepted the right numbers in any order, plus extra
+        # numbers, as a pass. The prompt demands exactly these three numbers,
+        # in this order, and nothing else -- require an exact positional
+        # match against the full extracted sequence.
+        passed = found == expected_list
         return {"passed": passed, "expected_numbers": expected_list, "found_numbers": found}
 
     if t == "purpose":

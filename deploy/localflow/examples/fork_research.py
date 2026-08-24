@@ -112,7 +112,7 @@ async def run(args):
         f"[{spec['label']}]\n{v}" for spec, v in zip(specs, verdicts) if v)
     if not joined:
         log("no verdicts returned — nothing to synthesize")
-        return {"n_forks": len(specs), "verdicts": verdicts, "synthesis": None}
+        return {"claim": CLAIM, "n_forks": len(specs), "verdicts": verdicts, "synthesis": None}
 
     synthesis = await agent(
         "Four verifier agents independently judged the SAME claim against the "

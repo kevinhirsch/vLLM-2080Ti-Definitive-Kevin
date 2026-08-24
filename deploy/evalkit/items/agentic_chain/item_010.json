@@ -46,11 +46,15 @@
             },
             "destination": {
               "type": "string"
+            },
+            "flight_id": {
+              "type": "string"
             }
           },
           "required": [
             "origin",
-            "destination"
+            "destination",
+            "flight_id"
           ]
         }
       }
@@ -70,6 +74,11 @@
           "path": "destination",
           "match": "exact",
           "value": "ORD"
+        },
+        {
+          "path": "date",
+          "match": "exact",
+          "value": "2026-09-10"
         }
       ],
       "inject_result": {
@@ -85,6 +94,16 @@
           "path": "origin",
           "match": "exact",
           "value": "SFO"
+        },
+        {
+          "path": "destination",
+          "match": "exact",
+          "value": "ORD"
+        },
+        {
+          "path": "flight_id",
+          "match": "exact",
+          "value_from_previous_result": "flight_id"
         }
       ],
       "inject_result": {

@@ -75,24 +75,28 @@ async def run(args):
     phase("Verify")
     async def _verify_one(claim):
         votes = await parallel([
-            (lambda c=claim: agent(
+            (lambda c=claim, i=i: agent(
                 f"Try to REFUTE this claim. Default refuted=true if uncertain.\n"
-                f"Claim: {c}\nReturn JSON {{refuted, why}}.",
-                schema=VERDICT_SCHEMA, label="refute", phase="Verify"))
-            for _ in range(3)
+                f"Vote: {i}\nClaim: {c}\nReturn JSON {{refuted, why}}.",
+                schema=VERDICT_SCHEMA, label=f"refute[{i}]", phase="Verify"))
+            for i in range(3)
         ])
-        refutes = sum(1 for v in votes if v and v.get("refuted"))
+        refutes = sum(1 for v in votes if v is None or v.get("refuted"))
         return {"claim": claim, "survives": refutes < 2, "refutes": refutes}
     verified = await parallel([(lambda c=c: _verify_one(c)) for c in uniq])
     survivors = [v["claim"] for v in verified if v and v["survives"]]
     log(f"{len(survivors)}/{len(uniq)} claims survived 3-vote verification")
 
     phase("Synthesize")
-    body = "\n".join(f"- {s}" for s in survivors)
-    answer = await agent(
-        f"Question: {question}\n\nVerified claims:\n{body}\n\n"
-        "Write a clear, well-structured answer grounded ONLY in these claims.",
-        label="synthesize", phase="Synthesize")
+    if not survivors:
+        log("no claims survived verification — skipping synthesis")
+        answer = None
+    else:
+        body = "\n".join(f"- {s}" for s in survivors)
+        answer = await agent(
+            f"Question: {question}\n\nVerified claims:\n{body}\n\n"
+            "Write a clear, well-structured answer grounded ONLY in these claims.",
+            label="synthesize", phase="Synthesize")
     return {"question": question, "angles": angles,
             "claims_total": len(uniq), "claims_survived": len(survivors),
             "answer": answer}

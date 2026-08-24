@@ -80,6 +80,16 @@
           "path": "amount",
           "match": "numeric",
           "value": 500
+        },
+        {
+          "path": "from_currency",
+          "match": "regex",
+          "pattern": "(?i)usd"
+        },
+        {
+          "path": "to_currency",
+          "match": "regex",
+          "pattern": "(?i)gbp"
         }
       ],
       "inject_result": {
@@ -90,7 +100,7 @@
     {
       "final": true,
       "answer_check": {
-        "pattern": "395(\\.0)?",
+        "pattern": "(?i)(?=.*395(\\.0)?)(?=.*\\bgbp\\b)",
         "must_not_pattern": "\\b(not|n't|unable|fail(ed|s)?|couldn't|cannot|can't|never|didn't|wasn't|isn't|error|sorry|unfortunately)\\b"
       },
       "max_tokens": 150

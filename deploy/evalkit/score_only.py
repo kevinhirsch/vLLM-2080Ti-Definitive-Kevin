@@ -112,7 +112,12 @@ def main():
         print(f"No raw result files found under {results_dir}", file=sys.stderr)
         sys.exit(1)
 
-    rescored = [rescore_one(f) for f in raw_files]
+    rescored = []
+    for f in raw_files:
+        try:
+            rescored.append(rescore_one(f))
+        except Exception as e:
+            rescored.append({"id": f.stem, "category": None, "passed": False, "reason": f"rescore error: {e!r}"})
 
     by_cat = {}
     for r in rescored:

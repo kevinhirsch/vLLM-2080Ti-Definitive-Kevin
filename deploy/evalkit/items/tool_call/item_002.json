@@ -41,7 +41,7 @@
           {
             "path": "expression",
             "match": "regex",
-            "pattern": "47.*89|89.*47"
+            "pattern": "47\\s*\\*\\s*89|89\\s*\\*\\s*47"
           }
         ]
       }

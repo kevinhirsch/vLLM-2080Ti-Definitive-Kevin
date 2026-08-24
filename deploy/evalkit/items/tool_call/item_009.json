@@ -72,6 +72,11 @@
             "path": "title",
             "match": "contains",
             "value": "Budget Review"
+          },
+          {
+            "path": "time",
+            "match": "regex",
+            "pattern": "(?i)\\b3(:00)?\\s*p\\.?m\\.?\\b|\\b15:00\\b"
           }
         ]
       },
@@ -82,6 +87,11 @@
             "path": "to",
             "match": "exact",
             "value": "alice@example.com"
+          },
+          {
+            "path": "body",
+            "match": "regex",
+            "pattern": "(?i)budget review"
           }
         ]
       }
