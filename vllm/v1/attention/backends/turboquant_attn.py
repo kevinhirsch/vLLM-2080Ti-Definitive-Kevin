@@ -1614,6 +1614,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             lse_buf=prefix_lse,
             max_num_kv_splits=self.max_num_kv_splits,
             sliding_window=self._decode_sliding_window,
+            # F-2: all q_len rows here share ONE sequence's cached prefix, so
+            # the stage-1 kernel can load each KV tile once and reuse it across
+            # rows. Actual dispatch is gated by VLLM_TURBOQUANT_STAGE1_QTILE.
+            qtile_same_seq=True,
         )
 
         # Current chunk attention from raw K/V. This is tiny for MTP
