@@ -268,6 +268,12 @@ def preprocess_mamba(
         # And use block 1 to save the running state.
         curr_state_idx = num_blocks - 1 - num_speculative_blocks
         mamba_state_idx[req_id] = curr_state_idx
+        # [FORK] vllm-project/vllm#51508: a stale async row reports
+        # num_accepted_tokens == 0; the copy below indexes with count-1 and
+        # -1 is a *valid* Python index, so it would silently read the wrong
+        # state slot. The discarded step advanced no state — skip entirely.
+        if input_batch.num_accepted_tokens_cpu[i] <= 0:
+            continue
         if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
             collect_mamba_copy_meta(
                 copy_bufs,
@@ -310,6 +316,11 @@ def postprocess_mamba(
         num_draft_tokens = len(scheduled_spec_decode_tokens_dict.get(req_id, []))
         num_scheduled_tokens = num_scheduled_tokens_dict[req_id]
         num_accepted_tokens = num_accepted_tokens_cpu[i]
+        # [FORK] vllm-project/vllm#51508: stale async rows (count == 0) have
+        # no valid state to promote to a full block — skip, mirroring the
+        # preprocess guard.
+        if num_accepted_tokens <= 0:
+            continue
         num_tokens_running_state = (
             num_computed_tokens + num_scheduled_tokens - num_draft_tokens
         )
