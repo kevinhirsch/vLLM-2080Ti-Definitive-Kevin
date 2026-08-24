@@ -1579,6 +1579,26 @@ class EngineCoreProc(EngineCore):
     def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
         """Launch EngineCore busy loop in background process."""
 
+        # [FORK] Re-hydrate the parent's VLLM_* env before ANY env-gated code
+        # reads os.environ (see the snapshot comment in engine/utils.py:
+        # systemd-booted children were observed arriving with these vars
+        # scrubbed, silently disabling env-gated features in prod only).
+        # Existing child values win — an explicitly-set child env is respected.
+        parent_vllm_env: dict[str, str] = kwargs.pop("parent_vllm_env", {}) or {}
+        restored = 0
+        for k, v in parent_vllm_env.items():
+            if k not in os.environ:
+                os.environ[k] = v
+                restored += 1
+        if parent_vllm_env:
+            logger.info(
+                "EngineCore VLLM_* env re-hydration: %d in parent snapshot, "
+                "%d restored, %d now present.",
+                len(parent_vllm_env),
+                restored,
+                sum(1 for k in os.environ if k.startswith("VLLM_")),
+            )
+
         # Ensure we can serialize transformer config after spawning
         maybe_register_config_serialize_by_value()
 
