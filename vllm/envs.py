@@ -1732,6 +1732,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Ported from upstream vLLM #45845; applies only to Mamba/linear
     # attention groups in this fork (sliding-window retention from upstream
     # #43447 was not ported).
+    # [FORK] Default is intentionally dense (None), the OPPOSITE of
+    # upstream's effective default (0 / sparse "semantic checkpoints only").
+    # docs/f1-partial-prefix-hits-research.md found that upstream's sparse
+    # default silently zeroes out the benefit of #53479-style per-boundary
+    # Mamba state materialization (measured on GB10: 3->2 first-hit requests
+    # only with retention_interval=block_size, not at the sparse default).
+    # This mechanism is the gating prerequisite for hybrid partial
+    # prefix-cache hits in this fork, so it must stay dense by default;
+    # do not "fix" this back to upstream's default without re-reading that
+    # doc.
     "VLLM_PREFIX_CACHE_RETENTION_INTERVAL": lambda: (
         int(os.environ["VLLM_PREFIX_CACHE_RETENTION_INTERVAL"])
         if "VLLM_PREFIX_CACHE_RETENTION_INTERVAL" in os.environ
