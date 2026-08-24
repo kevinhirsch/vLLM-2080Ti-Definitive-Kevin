@@ -168,6 +168,20 @@ class SpinCondition:
             logger.debug("Canceling waiting reads on SHM Buffer")
             self.write_cancel_socket.send(b"\x00")
 
+    def _poll_notifications(self):
+        """Non-blocking poll of the ZMQ notification socket.
+
+        Drains any pending notify or cancel message that arrived on the
+        underlying sockets.  Returns without blocking even when no message
+        is available.
+        """
+        events = dict(self.poller.poll(timeout=0))
+        if self.read_cancel_socket in events:
+            logger.debug("Poller received cancel event (hot-path)")
+        elif self.local_notify_socket in events:
+            logger.debug("Poller received notify event (hot-path)")
+            self.local_notify_socket.recv(flags=zmq.NOBLOCK, copy=False)
+
     def wait(self, timeout_ms: int | None = None) -> None:
         """Wait for data on the shared memory buffer.
 
@@ -181,6 +195,12 @@ class SpinCondition:
 
         current_time = time.monotonic()
         if current_time <= self.last_read + self.busy_loop_s:
+            # Poll the ZMQ socket even during the hot-path to prevent
+            # notification loss.  The writer may call notify() while the
+            # reader is in the busy-loop phase; without this poll the ZMQ
+            # CONFLATE option would discard the notification and the reader
+            # would never know a new message is available.
+            self._poll_notifications()
             sched_yield()
         else:
             events = dict(self.poller.poll(timeout=timeout_ms))
@@ -554,6 +574,15 @@ class MessageQueue:
 
                     # Release the processor to other threads
                     sched_yield()
+
+                    # Readers may be in the SpinCondition cold-path (blocked
+                    # on zmq.Poller.poll()) waiting for a write notification.
+                    # Without waking them here, the writer would spin forever:
+                    # readers never wake to ACK the ring buffer slot, the
+                    # writer never exits acquire_write to call notify(), and
+                    # readers stay stuck in the cold path.
+                    if self._spin_condition is not None:
+                        self._spin_condition.notify()
 
                     # if we time out, raise an exception
                     elapsed = time.monotonic() - start_time
