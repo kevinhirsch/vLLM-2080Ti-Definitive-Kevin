@@ -43,7 +43,7 @@ Launch modes:
 `profiles/templates/` contains optional chat-template presets. They are selected
 from the launcher as a global service setting; route profiles do not store chat
 templates, GPU devices, ports, reasoning defaults, or tool-calling defaults.
-For the shipped Qwen3/Qwen3.6 routes, the launcher fills in `qwen3` as the
+For the shipped Qwen3/Qwen3.x routes, the launcher fills in `qwen3` as the
 reasoning parser when one is not set so startup smoke and chat parsing stay
 aligned with the model's default reasoning behavior. Set `REASONING_PARSER=off`
 if you need to run without a reasoning parser for diagnostics.
@@ -61,7 +61,7 @@ KV positioning:
   profiles.
 - `tqk8v4`: TurboQuant K8V4 compression route; currently shipped only for
   quality-passed `fast` profiles.
-- Official Qwen3.6 35B currently ships as FP8 weight + FP16 KV presets for
+- Official Qwen3.x 35B currently ships as FP8 weight + FP16 KV presets for
   both text-only and text+image.
 
 The shipped TQK8V4 profiles use `MAX_BATCHED_TOKENS=2560`, which is the
@@ -70,9 +70,11 @@ blocks.
 
 ## Validated Profiles
 
-### Qwen3.6 27B FP8
+### Qwen3.x 27B
 
-Tested checkpoint: Jackrong/Qwopus3.6-27B-v2-FP8, about 29G.
+Tested checkpoints: official [Qwen/Qwen3.8-27B-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8),
+[Qwen/Qwen3.6-27B-FP8](https://huggingface.co/Qwen/Qwen3.6-27B-FP8), and
+Jackrong/Qwopus3.6-27B-v2-FP8 (about 29G for the latter).
 
 | Profile | Compatible modes | Context | KV | MTP | Messages | Seqs | Throughput |
 |---|---|---:|---|---:|---|---:|---:|
@@ -82,7 +84,7 @@ Tested checkpoint: Jackrong/Qwopus3.6-27B-v2-FP8, about 29G.
 | `qwen27b/fast/fp8/tqk8v4-256K-mtp3-text-only.env` | fast | 256K | TQK8V4 | 3 | text-only | 1 | 1615.81 / 81.06 |
 | `qwen27b/fast/fp8/tqk8v4-240K-mtp3-text-image.env` | fast | 240K | TQK8V4 | 3 | text+image | 1 | 1605.61 / 80.67 |
 
-### Qwen3.6 35B FP8
+### Qwen3.x 35B
 
 Tested checkpoint target: Qwen/Qwen3.6-35B-A3B-FP8, about 36G.
 
@@ -94,7 +96,7 @@ Tested checkpoint target: Qwen/Qwen3.6-35B-A3B-FP8, about 36G.
 | `qwen35b/aggressive/fp8/fp16kv-136K-nomtp-text-image.env` | aggressive | 136K | FP16 | 0 | text+image | 1 | 5422.83 / 124.11 |
 | `qwen35b/fast/fp8/fp16kv-178K-mtp3-text-only.env` | fast | 178K | FP16 | 3 | text-only | 1 | 5889.20 / 195.95 |
 
-### Qwen3.6 27B AWQ/GPTQ-INT4
+### Qwen3.x 27B
 
 Tested checkpoints: QuantTrio/Qwen3.6-27B-AWQ, mconcat/Qwopus3.6-27B-v2-AWQ-4bit,
 and llmfan46/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-GPTQ-Int4,

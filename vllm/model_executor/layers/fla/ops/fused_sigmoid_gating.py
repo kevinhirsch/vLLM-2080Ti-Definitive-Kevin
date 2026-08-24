@@ -10,6 +10,7 @@
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 
 @triton.heuristics(
@@ -51,6 +52,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     stride_final_state_token: tl.constexpr,
     stride_indices_seq: tl.constexpr,
     stride_indices_tok: tl.constexpr,
+    null_block_id: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,  # whether to use initial state
     INPLACE_FINAL_STATE: tl.constexpr,  # whether to store final state inplace
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
@@ -110,8 +112,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
                 tl.int64
             )
-            # Skip if state index is invalid (NULL_BLOCK_ID=0)
-            if state_idx <= 0:
+            if state_idx < 0 or state_idx == null_block_id:
                 return
             p_h0 = h0 + state_idx * stride_init_state_token
         else:
@@ -159,8 +160,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             final_state_idx = tl.load(
                 ssm_state_indices + i_n * stride_indices_seq + i_t
             ).to(tl.int64)
-            # Only store if state index is valid (not NULL_BLOCK_ID=0)
-            if final_state_idx > 0:
+            if final_state_idx >= 0 and final_state_idx != null_block_id:
                 p_ht = ht + final_state_idx * stride_final_state_token
                 p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
                 tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
@@ -196,6 +196,7 @@ def fused_sigmoid_gating_delta_rule_update(
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     is_kda: bool = False,
+    null_block_id: int = NULL_BLOCK_ID,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -269,6 +270,7 @@ def fused_sigmoid_gating_delta_rule_update(
         stride_final_state_token=stride_final_state_token,
         stride_indices_seq=stride_indices_seq,
         stride_indices_tok=stride_indices_tok,
+        null_block_id=null_block_id,
         INPLACE_FINAL_STATE=inplace_final_state,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_KDA=is_kda,

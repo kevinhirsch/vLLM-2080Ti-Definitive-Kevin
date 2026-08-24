@@ -15,7 +15,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     TransferJob,
 )
 from vllm.logger import init_logger
-from vllm.utils.math_utils import cdiv
+from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -80,6 +80,18 @@ def get_sliding_window_size_in_blocks(
 
     assert isinstance(kv_cache_spec, FullAttentionSpec)
     return None
+
+
+def resolve_mamba_align_size(spec: "OffloadingSpec") -> int | None:
+    """Return the offloaded token boundary required by Mamba align mode."""
+    mamba_align_size: int | None = None
+    for idx, gpu_block_size in enumerate(spec.gpu_block_size):
+        kv_spec = spec.kv_cache_config.kv_cache_groups[idx].kv_cache_spec
+        if isinstance(kv_spec, MambaSpec) and kv_spec.mamba_cache_mode == "align":
+            offload_block_size = gpu_block_size * spec.block_size_factor
+            assert mamba_align_size is None or mamba_align_size == offload_block_size
+            mamba_align_size = offload_block_size
+    return mamba_align_size
 
 
 class SchedulerOffloadConfig(NamedTuple):
@@ -208,6 +220,7 @@ class OffloadingConnectorScheduler:
         # used by _lookup
         self._sliding_window_groups: tuple[int, ...] = tuple(sliding_window_groups)
         self._lookup_groups = tuple(full_attention_groups) + self._sliding_window_groups
+        self._mamba_align_size: int | None = resolve_mamba_align_size(spec)
 
         self._req_status: dict[ReqId, RequestOffloadState] = {}
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
@@ -321,6 +334,12 @@ class OffloadingConnectorScheduler:
             # for sliding window attention, we must reduce by 1 to make sure
             # we still have a hit after reduction
             max_hit_size_tokens -= 1
+        if self._mamba_align_size is not None:
+            # Mamba align stores a single recurrent state at block boundaries.
+            # Never load a partial boundary or a state beyond the valid hit.
+            max_hit_size_tokens = round_down(
+                max_hit_size_tokens, self._mamba_align_size
+            )
         num_hit_tokens: int = 0
         defer_lookup = False
         lookup_groups = self._lookup_groups
