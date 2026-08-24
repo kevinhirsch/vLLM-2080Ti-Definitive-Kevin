@@ -1,0 +1,73 @@
+{
+  "id": "tool_call_016",
+  "category": "tool_call",
+  "description": "optional-param handling: explicit optional bool requested",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Find flights from SFO to JFK on 2026-09-01, nonstop only please."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "search_flights",
+          "description": "Search for flights.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "origin": {
+                "type": "string"
+              },
+              "destination": {
+                "type": "string"
+              },
+              "date": {
+                "type": "string"
+              },
+              "nonstop": {
+                "type": "boolean",
+                "description": "Optional: restrict to nonstop flights"
+              }
+            },
+            "required": [
+              "origin",
+              "destination",
+              "date"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "max_tokens": 400
+  },
+  "check": {
+    "type": "tool_call",
+    "expected_calls": [
+      {
+        "name": "search_flights",
+        "args": [
+          {
+            "path": "origin",
+            "match": "exact",
+            "value": "SFO"
+          },
+          {
+            "path": "destination",
+            "match": "exact",
+            "value": "JFK"
+          },
+          {
+            "path": "nonstop",
+            "match": "exact",
+            "value": true
+          }
+        ]
+      }
+    ],
+    "mode": "in_order"
+  }
+}

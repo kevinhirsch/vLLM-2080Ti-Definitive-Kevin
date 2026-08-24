@@ -1,0 +1,62 @@
+{
+  "id": "tool_call_007",
+  "category": "tool_call",
+  "description": "parallel calls: same tool, two cities",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "What's the weather in New York City and in London? Call the tool once for each city, in the same turn."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get the current weather for a city.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string",
+                "description": "City name"
+              }
+            },
+            "required": [
+              "city"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "max_tokens": 400
+  },
+  "check": {
+    "type": "tool_call",
+    "expected_calls": [
+      {
+        "name": "get_weather",
+        "args": [
+          {
+            "path": "city",
+            "match": "regex",
+            "pattern": "(?i)new york"
+          }
+        ]
+      },
+      {
+        "name": "get_weather",
+        "args": [
+          {
+            "path": "city",
+            "match": "regex",
+            "pattern": "(?i)london"
+          }
+        ]
+      }
+    ],
+    "mode": "any_order"
+  }
+}

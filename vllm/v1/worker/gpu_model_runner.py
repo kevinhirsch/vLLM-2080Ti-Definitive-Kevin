@@ -183,6 +183,7 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
     update_ngram_gpu_tensors_incremental,
     update_scheduler_for_invalid_drafts,
 )
+from vllm.v1.spec_decode.scoped_reemission import ScopedReemissionDrafter
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
@@ -205,6 +206,7 @@ from vllm.v1.worker.ubatch_utils import (
     maybe_create_ubatch_slices,
     split_attn_metadata,
 )
+from vllm.v1.worker import xid31_trace
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.workspace import lock_workspace
 
@@ -590,6 +592,36 @@ class GPUModelRunner(
                     except Exception as e:
                         self.suffix_overlay = None
                         logger.warning("Suffix overlay unavailable: %s", e)
+                # EXP-039 (S4): FSM-gated scoped drafter for verbatim re-emission.
+                # Layers on MTP: only overrides a request's draft when the last G
+                # generated tokens uniquely match a prompt span (verbatim copy);
+                # otherwise MTP-K2 is left untouched. Unlike the always-on suffix
+                # overlay above, this is gated -> no drag on generation-shaped work.
+                # Requires VLLM_MTP_DRAFT_CAP to keep MTP's GPU chain short while
+                # the pipeline is sized for K_scoped. See docs/exp039-*.md.
+                if os.environ.get("VLLM_S4_SCOPED_DRAFTER", "0") == "1":
+                    if self.speculative_config.disable_padded_drafter_batch:
+                        # EXP-039 (S4): the scoped merge's effective-tail splice
+                        # assumes it runs PRE-bookkeeping (padded path), where
+                        # token_ids_cpu / num_tokens_no_spec do NOT yet include this
+                        # step's sampled tokens. With disable_padded_drafter_batch
+                        # the drafter runs AFTER _bookkeeping_sync (execute_model's
+                        # propose_drafts_after_bookkeeping path), so those tokens
+                        # are already committed and the splice would double-count and
+                        # misalign the gate. Refuse rather than draft misaligned.
+                        self.scoped_drafter = None
+                        logger.warning(
+                            "S4 scoped drafter disabled: incompatible with "
+                            "disable_padded_drafter_batch=True (runs post-bookkeeping)."
+                        )
+                    else:
+                        try:
+                            self.scoped_drafter = ScopedReemissionDrafter(
+                                self.vllm_config
+                            )
+                        except Exception as e:
+                            self.scoped_drafter = None
+                            logger.warning("S4 scoped drafter unavailable: %s", e)
                 if self.speculative_config.method == "eagle3":
                     self.use_aux_hidden_state_outputs = (
                         self.drafter.eagle3_use_aux_hidden_state
@@ -888,6 +920,14 @@ class GPUModelRunner(
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
+        # EXP-038 GDN snapshot/park/fork PoC state. All inert unless
+        # VLLM_TQ_GDN_SNAPSHOT is set (park pool allocated lazily on first
+        # snapshot). park pool: layer_name -> [park_tensor per state],
+        # each shaped (num_park, *state_shape). A park slot id indexes the
+        # first dim uniformly across every GDN layer (like a shared block id).
+        self._mamba_park_pool: dict[str, list[torch.Tensor]] | None = None
+        self._mamba_park_free: list[int] = []
+        self._mamba_park_num_slots: int = 0
         self.layerwise_nvtx_hooks_registered = False
 
     def update_max_model_len(self, max_model_len: int) -> None:
@@ -996,6 +1036,253 @@ class GPUModelRunner(
                 self._make_buffer,
             )
         return self._mamba_copy_bufs
+
+    # ------------------------------------------------------------------
+    # EXP-038 GDN snapshot / park / restore (Stage-0 PoC).
+    #
+    # Worker-side (GPUModelRunner) methods driven via ``collective_rpc`` so each
+    # TP rank operates on its own GDN-state shard. The whole feature is env-
+    # gated (``VLLM_TQ_GDN_SNAPSHOT``, default off) and allocates nothing until
+    # the first snapshot. This is a byte-exact D2D park of a live sequence's
+    # recurrent state — no scheduler, refcount, or attn-side changes (those are
+    # Stage 1+). NEVER exercise this against the production :8001 serve.
+    # ------------------------------------------------------------------
+    def _ensure_mamba_park_pool(self) -> None:
+        """Lazily allocate the worker-local GDN park pool.
+
+        One contiguous tensor per (layer, state) shaped ``(num_park,
+        *state_shape)`` living on the same device as the live KV state. A park
+        slot is a row index shared across every GDN layer. Kept separate from
+        the KV-cache block pool (which lives in the scheduler process and is
+        not reachable from the worker) so Stage 0 needs no scheduler coupling.
+        """
+        if self._mamba_park_pool is not None:
+            return
+        num_park = max(1, envs.VLLM_TQ_GDN_SNAPSHOT_PARK_BLOCKS)
+        mamba_group_ids, _ = mamba_utils.get_mamba_groups(self.kv_cache_config)
+        forward_context = self.compilation_config.static_forward_context
+        pool: dict[str, list[torch.Tensor]] = {}
+        for group_id in mamba_group_ids:
+            layer_names = self.kv_cache_config.kv_cache_groups[group_id].layer_names
+            for layer_name in layer_names:
+                states: list[torch.Tensor] = forward_context[layer_name].kv_cache
+                pool[layer_name] = [
+                    torch.empty(
+                        (num_park, *tuple(state.shape[1:])),
+                        dtype=state.dtype,
+                        device=state.device,
+                    )
+                    for state in states
+                ]
+        self._mamba_park_pool = pool
+        self._mamba_park_free = list(range(num_park))
+        self._mamba_park_num_slots = num_park
+
+    @torch.inference_mode()
+    def snapshot_mamba_state(self, req_id: str) -> dict[str, Any]:
+        """Snapshot the live GDN recurrent state of ``req_id`` into a park slot.
+
+        Copies the running-state slot at ``mamba_state_idx[req_id]`` for every
+        GDN layer x state tensor (conv + temporal) into a freshly reserved park
+        slot via the fused ``batch_memcpy`` primitive. Returns an opaque handle
+        (park slot id + token_ids + num_computed_tokens) consumed by
+        :meth:`restore_mamba_state`. Byte-exact: a full running-state slot copy
+        is identical to the align-mode per-step copy for accept==1.
+        """
+        if not envs.VLLM_TQ_GDN_SNAPSHOT:
+            raise RuntimeError(
+                "snapshot_mamba_state requires VLLM_TQ_GDN_SNAPSHOT=1"
+            )
+        if self.cache_config.mamba_cache_mode != "align":
+            raise RuntimeError(
+                "snapshot_mamba_state requires --mamba-cache-mode align "
+                f"(got {self.cache_config.mamba_cache_mode!r})"
+            )
+        req_state = self.requests[req_id]
+        src_block_idx = self.mamba_state_idx.get(req_id)
+        if src_block_idx is None:
+            raise KeyError(
+                f"no live mamba running-state slot for req {req_id!r}; "
+                "snapshot after at least one preprocess_mamba step"
+            )
+        self._ensure_mamba_park_pool()
+        assert self._mamba_park_pool is not None
+        if not self._mamba_park_free:
+            raise RuntimeError(
+                "mamba park pool exhausted; raise "
+                "VLLM_TQ_GDN_SNAPSHOT_PARK_BLOCKS or release handles"
+            )
+        park_slot = self._mamba_park_free.pop()
+
+        # The slot is reserved (popped) BEFORE the copy below. If anything after
+        # the pop raises, this method never returns a handle, so the caller has
+        # nothing to release -- reclaim the slot here or it leaks permanently.
+        try:
+            mamba_group_ids, _ = mamba_utils.get_mamba_groups(self.kv_cache_config)
+            forward_context = self.compilation_config.static_forward_context
+            src_slots: list[torch.Tensor] = []
+            dst_slots: list[torch.Tensor] = []
+            for group_id, layer_name, state_index, state in (
+                mamba_utils.iter_mamba_state_tensors(
+                    self.kv_cache_config, mamba_group_ids, forward_context
+                )
+            ):
+                live_block_id = req_state.block_ids[group_id][src_block_idx]
+                src_slots.append(state[live_block_id])
+                dst_slots.append(
+                    self._mamba_park_pool[layer_name][state_index][park_slot]
+                )
+
+            mamba_utils.batch_copy_slots(
+                self._get_mamba_copy_bufs(), src_slots, dst_slots
+            )
+            # Park must be complete before the handle is usable across steps.
+            torch.cuda.current_stream().synchronize()
+        except BaseException:
+            if park_slot not in self._mamba_park_free:
+                self._mamba_park_free.append(park_slot)
+            raise
+
+        return {
+            "park_slot": park_slot,
+            "mamba_group_ids": list(mamba_group_ids),
+            "num_computed_tokens": int(req_state.num_computed_tokens),
+        }
+
+    @torch.inference_mode()
+    def restore_mamba_state(self, handle: dict[str, Any], new_req_id: str) -> None:
+        """Copy a parked GDN state back into ``new_req_id``'s running slot.
+
+        ``new_req_id`` must already be resident with a registered
+        ``mamba_state_idx`` (i.e. the scheduler has allocated its running
+        block) BEFORE the first ``preprocess_mamba`` of the resumed request.
+        The park slot is NOT released here — call :meth:`release_mamba_snapshot`
+        once the handle is no longer needed (a fork restores one handle into N
+        children).
+        """
+        if not envs.VLLM_TQ_GDN_SNAPSHOT:
+            raise RuntimeError(
+                "restore_mamba_state requires VLLM_TQ_GDN_SNAPSHOT=1"
+            )
+        assert self._mamba_park_pool is not None, "no park pool; snapshot first"
+        park_slot = handle["park_slot"]
+        mamba_group_ids = handle["mamba_group_ids"]
+        req_state = self.requests[new_req_id]
+        dst_block_idx = self.mamba_state_idx.get(new_req_id)
+        if dst_block_idx is None:
+            raise KeyError(
+                f"req {new_req_id!r} has no running-state slot; register "
+                "mamba_state_idx (allocate its running block) before restore"
+            )
+        forward_context = self.compilation_config.static_forward_context
+        src_slots: list[torch.Tensor] = []
+        dst_slots: list[torch.Tensor] = []
+        for group_id, layer_name, state_index, state in (
+            mamba_utils.iter_mamba_state_tensors(
+                self.kv_cache_config, mamba_group_ids, forward_context
+            )
+        ):
+            dst_block_id = req_state.block_ids[group_id][dst_block_idx]
+            src_slots.append(self._mamba_park_pool[layer_name][state_index][park_slot])
+            dst_slots.append(state[dst_block_id])
+
+        mamba_utils.batch_copy_slots(
+            self._get_mamba_copy_bufs(), src_slots, dst_slots
+        )
+        torch.cuda.current_stream().synchronize()
+
+    def release_mamba_snapshot(self, handle: dict[str, Any]) -> None:
+        """Return a snapshot handle's park slot to the free list."""
+        park_slot = handle.get("park_slot")
+        if park_slot is None or self._mamba_park_pool is None:
+            return
+        # Validate before appending: a malformed handle crossing the RPC
+        # boundary must not poison _mamba_park_free (a bad index would later
+        # corrupt snapshot/restore copies into the wrong pool row). Use an exact
+        # type check, not isinstance: bool is an int subclass, so True/False
+        # would otherwise pass as slot 1/0.
+        if type(park_slot) is not int or not (
+            0 <= park_slot < self._mamba_park_num_slots
+        ):
+            raise ValueError(f"invalid park_slot {park_slot!r}")
+        if park_slot not in self._mamba_park_free:
+            self._mamba_park_free.append(park_slot)
+
+    @torch.inference_mode()
+    def snapshot_mamba_self_test(self, req_id: str | None = None) -> dict[str, Any]:
+        """Stage-0 atom self-test (per TP rank).
+
+        Snapshots a live sequence's GDN state into a park slot and asserts
+        ``torch.equal(parked, live)`` for every GDN layer x state tensor on THIS
+        rank's shard, then releases the slot. Returns a per-rank result dict.
+
+        Drive via ``collective_rpc("snapshot_mamba_self_test")`` and assert
+        every rank's ``ok`` is True — that proves the park copy is byte-exact on
+        both shards. Requires VLLM_TQ_GDN_SNAPSHOT=1 and at least one in-flight
+        request with a registered running-state slot. NEVER run against :8001.
+        """
+        from vllm.distributed import get_tp_group
+
+        try:
+            rank = get_tp_group().rank_in_group
+        except Exception:  # noqa: BLE001 - single-GPU / no TP group fallback
+            rank = 0
+        result: dict[str, Any] = {
+            "rank": rank,
+            "ok": False,
+            "req_id": None,
+            "num_state_tensors_checked": 0,
+            "detail": "",
+        }
+        handle: dict[str, Any] | None = None
+        try:
+            if not envs.VLLM_TQ_GDN_SNAPSHOT:
+                raise RuntimeError("set VLLM_TQ_GDN_SNAPSHOT=1")
+            if req_id is None:
+                if not self.mamba_state_idx:
+                    raise RuntimeError(
+                        "no in-flight request with a mamba running-state slot"
+                    )
+                req_id = next(iter(self.mamba_state_idx))
+            result["req_id"] = req_id
+
+            handle = self.snapshot_mamba_state(req_id)
+            park_slot = handle["park_slot"]
+            req_state = self.requests[req_id]
+            src_block_idx = self.mamba_state_idx[req_id]
+            forward_context = self.compilation_config.static_forward_context
+            assert self._mamba_park_pool is not None
+
+            checked = 0
+            for group_id, layer_name, state_index, state in (
+                mamba_utils.iter_mamba_state_tensors(
+                    self.kv_cache_config, handle["mamba_group_ids"], forward_context
+                )
+            ):
+                live_block_id = req_state.block_ids[group_id][src_block_idx]
+                live = state[live_block_id]
+                parked = self._mamba_park_pool[layer_name][state_index][park_slot]
+                if not torch.equal(parked, live):
+                    raise AssertionError(
+                        f"byte mismatch layer={layer_name} state_index={state_index}"
+                    )
+                checked += 1
+
+            result["ok"] = True
+            result["num_state_tensors_checked"] = checked
+            result["detail"] = (
+                f"parked {handle['num_computed_tokens']} tok; "
+                f"torch.equal held across {checked} GDN state tensors"
+            )
+        except Exception as e:  # noqa: BLE001 - report failure to the driver
+            result["detail"] = f"{type(e).__name__}: {e}"
+        finally:
+            # Always return the reserved park slot to the free list, even when
+            # the byte-equal assertion (or anything after the snapshot) raised —
+            # otherwise a failed self-test leaks the slot.
+            if handle is not None:
+                self.release_mamba_snapshot(handle)
+        return result
 
     def _init_model_kwargs(self):
         model_kwargs = dict[str, Any]()
@@ -3952,6 +4239,10 @@ class GPUModelRunner(
         ):
             # Update persistent batch states.
             deferred_state_corrections_fn = self._update_states(scheduler_output)
+            # EXP-045b: cheap periodic Xid31 suspect projection (no-op unless
+            # armed). Runs after _update_states so the high-water projection
+            # reflects the batch about to execute, not the previous step.
+            xid31_trace.periodic(self)
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -4912,7 +5203,59 @@ class GPUModelRunner(
                     draft_token_ids, _suffix_drafts
                 )
 
+            # EXP-039 (S4): gate MTP against the prompt-scoped drafter. Per
+            # request, override the MTP draft with a verbatim continuation ONLY
+            # when the FSM gate is open; otherwise MTP passes through untouched.
+            # v2 (CPU list) returns a list -> incompatible with the async
+            # on-device scatter, so config disables async for it. v3
+            # (VLLM_S4_GPU_MERGE=1) returns a padded tensor and is async-safe.
+            # _scoped_gate_merge dispatches and is a strict no-op for the one
+            # combination that would break the pipeline (v2 list under async).
+            if getattr(self, "scoped_drafter", None) is not None:
+                draft_token_ids = self._scoped_gate_merge(
+                    draft_token_ids, sampled_token_ids
+                )
+
         return draft_token_ids
+
+    def _scoped_gate_merge(
+        self,
+        draft_token_ids: list[list[int]] | torch.Tensor,
+        sampled_token_ids: torch.Tensor | list[list[int]],
+    ) -> list[list[int]] | torch.Tensor:
+        """EXP-039 (S4): merge MTP drafts with the FSM-gated scoped drafter.
+
+        Dispatch:
+          * GPU merge on + tensor drafts -> ``merge_gpu`` (returns a padded tensor;
+            keeps async scheduling's on-device draft scatter intact).
+          * async spec decode + tensor drafts + GPU merge OFF -> strict no-op
+            (the v2 list draft would break the async scatter; config normally
+            forbids this combo, this is belt-and-suspenders).
+          * otherwise -> v2 CPU-list ``merge``.
+
+        Fail-safe: on any error return the MTP drafts unchanged -- as a tensor if
+        drafts came in as a tensor (async-safe), else the cleaned list -- so the
+        spec pipeline is never broken by the scoped path."""
+        drafts_are_tensor = isinstance(draft_token_ids, torch.Tensor)
+        try:
+            if self.scoped_drafter.gpu_merge and drafts_are_tensor:
+                return self.scoped_drafter.merge_gpu(
+                    draft_token_ids, self.input_batch, sampled_token_ids
+                )
+            if self.use_async_spec_decode and drafts_are_tensor:
+                # v2 list path under async would break the on-device scatter.
+                return draft_token_ids
+            return self.scoped_drafter.merge(
+                draft_token_ids, self.input_batch, sampled_token_ids
+            )
+        except Exception as e:
+            if self._suffix_overlay_log_countdown > 0:
+                self._suffix_overlay_log_countdown -= 1
+                logger.warning("S4 scoped drafter skipped: %s", e)
+            if drafts_are_tensor:
+                # Preserve the tensor so async scheduling is not broken on error.
+                return draft_token_ids
+            return [[t for t in row if t != -1] for row in draft_token_ids]
 
     def _suffix_early(
         self,
@@ -6397,6 +6740,12 @@ class GPUModelRunner(
         # Lock workspace to prevent resizing during execution.
         # Max workspace sizes should have been captured during warmup/profiling.
         lock_workspace()
+
+        # EXP-045b: arm Xid31 (max_model_len-gated MMU FAULT_PDE) instrumentation
+        # and register the now-allocated persistent buffers. No-op unless
+        # VLLM_TQ_XID31_TRACE is set; see vllm/v1/worker/xid31_trace.py.
+        xid31_trace.install()
+        xid31_trace.scan_runner(self)
 
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time

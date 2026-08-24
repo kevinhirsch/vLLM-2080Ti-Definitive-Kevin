@@ -29,6 +29,10 @@ except Exception:
 
 logger = init_logger(__name__)
 
+# [FORK] custom AR disable flag during profiling (128K IPC leak debug).
+# Defined after all imports to satisfy Ruff E402 (review #108 round 7 P3).
+_PROFILING_CAR_DISABLED = False
+
 
 def _can_p2p(rank: int, world_size: int) -> bool:
     for i in range(world_size):
@@ -57,7 +61,7 @@ class CustomAllreduce:
         self,
         group: ProcessGroup,
         device: int | str | torch.device,
-        max_size=8192 * 1024,
+        max_size=32 * 1024 * 1024,  # EXP-040: SM75 (not in size table) → 32MiB custom-AR cap; >8MiB was NCCL-fallback (slow + overnight-crash path). Revert to 8192*1024 if wrong/crash.
         symm_mem_enabled=False,
     ) -> None:
         """

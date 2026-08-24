@@ -67,6 +67,37 @@ BIG_OUTPUT       = int(os.environ.get("SHIM_BIG_OUTPUT", "32000"))
 # local. Route them straight to remote up front. Default ≈ FIRST_TOKEN_MAX×PREFILL_TPS (what local
 # can actually prefill in time). 0 = disabled. Raise it (with FIRST_TOKEN_MAX) to keep more on local.
 BIG_PROMPT       = int(os.environ.get("SHIM_BIG_PROMPT", "24000"))
+# MONSTER-IN-FLIGHT bypass (2026-08-16, Local Context Lane Guarantee): while a huge prefill is
+# chewing engine steps, concurrent decode advances ~1 tok per chunk-step (~4s at mnbt 3584 —
+# a one-line reply measured 118s). While shim-tracked in-flight prompt tokens >= this, NEW
+# arrivals route straight to remote until the monster drains. Only sees shim-routed monsters
+# (direct-:8001 probes are invisible — acceptable: production traffic enters here). 0 = off.
+MONSTER_INFLIGHT = int(os.environ.get("SHIM_MONSTER_INFLIGHT", "120000"))
+# FOREIGN-LOAD sensing (2026-08-17): direct-:8001 traffic (probes, benches) is
+# invisible to the shim's own admission tracking, so a foreign monster prefill
+# starved gateway traffic at ~1 tok per chunk-step (observed: Hermes scheduler
+# "unreasonably slow" during probe campaigns). Scrape the engine's own running
+# count on the health poll; if it exceeds what WE admitted, treat it like a
+# monster in flight and route new arrivals remote. 0 = off.
+FOREIGN_LOAD_GUARD = int(os.environ.get("SHIM_FOREIGN_LOAD_GUARD", "1"))
+# --- CRASH-ADAPTIVE big_prompt guard (2026-08-16) ---
+# Kevin's manual pattern after a local crash has been to hand-lower SHIM_BIG_PROMPT to reduce
+# OOM risk, and never raise it back -- a one-way crash -> degrade -> lower-the-floor spiral.
+# When enabled, this automates both halves: on a detected local crash (see trigger_backoff(),
+# fed by real EngineDead/OOM/503 failures only -- NOT routine busy/wedged failovers), if
+# BIG_PROMPT is currently above the safe floor it is saved to _big_prompt_restore and dropped
+# to CRASH_ADAPTIVE_FLOOR immediately. It is restored automatically once local has proven
+# itself stable again: BIG_PROMPT_RESTORE_N consecutive LOCAL completions whose prompt size is
+# "big" relative to the (lowered) floor land cleanly. Master-switched off by default so there
+# is no behaviour change until Kevin opts in.
+CRASH_ADAPTIVE        = os.environ.get("SHIM_CRASH_ADAPTIVE", "0") not in ("0", "false", "")
+BIG_PROMPT_RESTORE_N  = int(os.environ.get("SHIM_BIG_PROMPT_RESTORE_N", "5"))
+CRASH_ADAPTIVE_FLOOR  = 24000
+# A completion with ptok >= the CURRENT (possibly-floored) BIG_PROMPT never reaches local -- the
+# big-prompt guard above routes it straight to remote -- so the "clean streak" evidence has to be
+# gathered from prompts sized close to (but under) the active floor, not at/above it. Fraction of
+# CRASH_ADAPTIVE_FLOOR a local completion's prompt must reach to count as restore-evidence.
+BIG_PROMPT_QUALIFY_FRAC = float(os.environ.get("SHIM_BIG_PROMPT_QUALIFY_FRAC", "0.8"))
 # Bound local generation: a request with max_tokens ABSENT or 0 is unbounded (vLLM would generate up
 # to the context limit) — a runaway long generation on local that saturates the box. When we route
 # such a request to LOCAL, inject this cap so local only ever does bounded generations. Explicit
@@ -100,6 +131,19 @@ THINK_BUDGET_MIN  = int(os.environ.get("SHIM_THINK_BUDGET_MIN", "128"))
 THINK_BUDGET_MAX  = int(os.environ.get("SHIM_THINK_BUDGET_MAX", "4096"))
 THINK_OFF_UNDER = int(os.environ.get("SHIM_THINK_OFF_UNDER", "600"))
 THINK_LOW_UNDER = int(os.environ.get("SHIM_THINK_LOW_UNDER", "1400"))
+# --- non-thinking sampling profile (EXP-026, 2026-08-16) ---
+# Qwen3's official NON-THINKING sampling profile fixes long-generation repetition loops
+# (measured EXP-026: loop_probe 5/10->8/10, dupes 5->1) that our gencfg default (temp 0.6,
+# top_p 0.95, pp 0) falls into. Injected for LOCAL non-thinking requests ONLY (chat_template_kwargs
+# .enable_thinking=False); THINKING-mode requests must keep presence_penalty=0 per Qwen's official
+# guidance, so this never touches them. Each param is applied only when the caller did NOT already
+# provide it -- an explicit caller value always wins. Disable with SHIM_NONTHINK_PROFILE=0; tune the
+# individual values via SHIM_NONTHINK_{PP,TOP_P,TEMP,TOP_K}.
+NONTHINK_PROFILE = os.environ.get("SHIM_NONTHINK_PROFILE", "1") not in ("0", "false", "")
+NONTHINK_PP      = float(os.environ.get("SHIM_NONTHINK_PP", "1.5"))
+NONTHINK_TOP_P   = float(os.environ.get("SHIM_NONTHINK_TOP_P", "0.80"))
+NONTHINK_TEMP    = float(os.environ.get("SHIM_NONTHINK_TEMP", "0.7"))
+NONTHINK_TOP_K   = int(os.environ.get("SHIM_NONTHINK_TOP_K", "20"))
 # MASTER SWITCH: 1 = FULL REMOTE (every completion -> DeepSeek; local engine untouched —
 # for maintenance/repro/debugging), 0 = normal local-first. Toggle live from the dashboard.
 FORCE_REMOTE = 1 if os.environ.get("SHIM_FORCE_REMOTE", "0").lower() in ("1", "true", "on") else 0
@@ -155,6 +199,8 @@ LOG_REQUESTS      = os.environ.get("SHIM_LOG_REQUESTS", "1") not in ("0", "false
 LOG_PREVIEW_CHARS = int(os.environ.get("SHIM_LOG_PREVIEW_CHARS", "70"))
 # vLLM-only params that a remote OpenAI endpoint would reject — stripped on overflow.
 REMOTE_STRIP = ("chat_template_kwargs", "mamba_cache_mode", "guided_decoding_backend")
+# Force non-thinking on the DeepSeek failover (see remap_for_remote). Disable with SHIM_REMOTE_NO_THINK=0.
+REMOTE_NO_THINK = os.environ.get("SHIM_REMOTE_NO_THINK", "1") not in ("0", "false", "")
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout,
                     format="%(asctime)s [gateway] %(levelname)s %(message)s")
@@ -263,6 +309,7 @@ _CFG = {
     "SHIM_BIG_TOKENS":       ("BIG_TOKENS",       int),
     "SHIM_BIG_OUTPUT":       ("BIG_OUTPUT",       int),
     "SHIM_BIG_PROMPT":       ("BIG_PROMPT",       int),
+    "SHIM_MONSTER_INFLIGHT": ("MONSTER_INFLIGHT", int),
     "SHIM_MAX_LOCAL_TOKENS": ("MAX_LOCAL_TOKENS", int),
     "SHIM_LOCAL_MAX_OUT":    ("LOCAL_MAX_OUT",    int),
     "SHIM_FIRST_TOKEN_MAX":  ("FIRST_TOKEN_MAX",  float),
@@ -289,6 +336,12 @@ _CFG = {
     "SHIM_THINK_LOW_UNDER":  ("THINK_LOW_UNDER", int),
     "SHIM_NO_THINK_IPS":     ("NO_THINK_IPS", lambda v: {i.strip() for i in str(v).split(",") if i.strip()}),
     "SHIM_LOG_REQUESTS":     ("LOG_REQUESTS", lambda v: str(v).lower() not in ("0","false","")),
+    # non-thinking sampling profile (EXP-026)
+    "SHIM_NONTHINK_PROFILE": ("NONTHINK_PROFILE", lambda v: str(v).lower() not in ("0","false","")),
+    "SHIM_NONTHINK_PP":      ("NONTHINK_PP",    float),
+    "SHIM_NONTHINK_TOP_P":   ("NONTHINK_TOP_P", float),
+    "SHIM_NONTHINK_TEMP":    ("NONTHINK_TEMP",  float),
+    "SHIM_NONTHINK_TOP_K":   ("NONTHINK_TOP_K", int),
 }
 # A single request whose est. (prompt + max_tokens) exceeds this will OOM local even at
 # budget=1 (context + generation peaks past this box's tiny free VRAM), so route it straight
@@ -323,6 +376,8 @@ LOG_REQUESTS      = os.environ.get("SHIM_LOG_REQUESTS", "1") not in ("0", "false
 LOG_PREVIEW_CHARS = int(os.environ.get("SHIM_LOG_PREVIEW_CHARS", "70"))
 # vLLM-only params that a remote OpenAI endpoint would reject — stripped on overflow.
 REMOTE_STRIP = ("chat_template_kwargs", "mamba_cache_mode", "guided_decoding_backend")
+# Force non-thinking on the DeepSeek failover (see remap_for_remote). Disable with SHIM_REMOTE_NO_THINK=0.
+REMOTE_NO_THINK = os.environ.get("SHIM_REMOTE_NO_THINK", "1") not in ("0", "false", "")
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout,
                     format="%(asctime)s [gateway] %(levelname)s %(message)s")
@@ -491,6 +546,57 @@ def trigger_backoff(reason):
     global _backoff_until
     _backoff_until = time.time() + OOM_BACKOFF
     log.warning("LOCAL backoff -> budget=1 for %ss (%s)", OOM_BACKOFF, reason)
+    # CRASH-ADAPTIVE big_prompt guard: trigger_backoff() only fires on a real detected local
+    # crash (OOM/EngineDead/503 -- see _is_oom()), never on a routine busy/wedged failover, so
+    # it's the correct single hook for "a local crash just happened".
+    if CRASH_ADAPTIVE:
+        _crash_adaptive_on_crash(reason)
+
+
+# ---------------- CRASH-ADAPTIVE big_prompt guard (SHIM_CRASH_ADAPTIVE=1, default off) --------
+_big_prompt_restore = None   # prior BIG_PROMPT value while the crash-adaptive floor is active
+                              # (None = no drop in effect)
+_big_prompt_clean_n  = 0     # consecutive clean big-prompt local completions since the drop
+
+
+def _crash_adaptive_on_crash(reason):
+    """On a detected local crash: if BIG_PROMPT is currently above the safe floor, save it as
+    _big_prompt_restore and drop BIG_PROMPT to CRASH_ADAPTIVE_FLOOR. If a drop is already in
+    effect and another crash lands before the restore streak completes, just reset the streak
+    (the ceiling stays floored -- local hasn't earned it back yet)."""
+    global _big_prompt_restore, _big_prompt_clean_n, BIG_PROMPT
+    if BIG_PROMPT > CRASH_ADAPTIVE_FLOOR:
+        _big_prompt_restore = BIG_PROMPT
+        BIG_PROMPT = CRASH_ADAPTIVE_FLOOR
+        _big_prompt_clean_n = 0
+        log.warning("CRASH-ADAPTIVE: local crash (%s) -> big_prompt %d -> %d; will restore after "
+                    "%d consecutive clean big-prompt local completions",
+                    reason, _big_prompt_restore, CRASH_ADAPTIVE_FLOOR, BIG_PROMPT_RESTORE_N)
+    elif _big_prompt_restore is not None:
+        _big_prompt_clean_n = 0
+        log.warning("CRASH-ADAPTIVE: another local crash (%s) while big_prompt already floored "
+                    "at %d -- clean streak reset", reason, BIG_PROMPT)
+
+
+def _crash_adaptive_note_local_completion(ptok):
+    """Call after a CLEAN (non-failover) local completion. Counts it toward the restore streak
+    if a drop is in effect and the prompt was big enough (relative to the floor) to be
+    meaningful evidence; once BIG_PROMPT_RESTORE_N land in a row, restores the prior ceiling."""
+    global _big_prompt_restore, _big_prompt_clean_n, BIG_PROMPT
+    if _big_prompt_restore is None:
+        return  # no drop in effect -- nothing to track
+    if ptok < CRASH_ADAPTIVE_FLOOR * BIG_PROMPT_QUALIFY_FRAC:
+        return  # too small to count as evidence at this scale
+    _big_prompt_clean_n += 1
+    log.info("CRASH-ADAPTIVE: clean big-prompt local completion %d/%d (ptok=%d)",
+             _big_prompt_clean_n, BIG_PROMPT_RESTORE_N, ptok)
+    if _big_prompt_clean_n >= BIG_PROMPT_RESTORE_N:
+        restored = _big_prompt_restore
+        BIG_PROMPT = restored
+        _big_prompt_restore = None
+        _big_prompt_clean_n = 0
+        log.warning("CRASH-ADAPTIVE: big_prompt restored -> %d after %d consecutive clean "
+                    "big-prompt local completions", restored, BIG_PROMPT_RESTORE_N)
 
 
 def _est_tokens(body):
@@ -507,6 +613,12 @@ def _est_tokens(body):
             for b in c:
                 if isinstance(b, dict):
                     chars += len(b.get("text", "") or "")
+    # tool definitions are part of the actual prompt the engine processes — omitting them
+    # undercounts by ~20K tokens for a 34-tool Hermes request, producing a first-token
+    # timeout that expires before prefill completes
+    tools = j.get("tools")
+    if tools:
+        chars += len(json.dumps(tools))
     if not EXACT_TOKENS:
         return int(chars / CHARS_PER_TOK)
     # A char count can only ever correspond to FEWER tokens than chars/MIN_CHARS_PER_TOK.
@@ -516,6 +628,10 @@ def _est_tokens(body):
     if chars / MIN_CHARS_PER_TOK < _min_decision_threshold():
         return int(chars / CHARS_PER_TOK)
     exact = _tokenize_exact(_prompt_text(j))
+    # add tool-definition estimate on top of exact message-content count — /tokenize
+    # only counts message text, not tool schemas
+    if exact is not None and tools:
+        exact += int(len(json.dumps(tools)) / CHARS_PER_TOK)
     return exact if exact is not None else int(chars / CHARS_PER_TOK)
 
 
@@ -758,6 +874,44 @@ def thinking_budget_guard(body):
     return json.dumps(j).encode()
 
 
+def nonthinking_sampling_profile(body):
+    """Inject Qwen3's official NON-THINKING sampling profile for LOCAL non-thinking requests.
+
+    EXP-026 (measured 2026-08-16): the official non-thinking profile (temperature 0.7, top_p
+    0.80, top_k 20, presence_penalty 1.5) fixed Qwen3's long-generation repetition (loop_probe
+    5/10 -> 8/10, dupes 5 -> 1) where our gencfg default (temp 0.6, top_p 0.95, pp 0) looped.
+
+    Fires ONLY when the request is non-thinking -- chat_template_kwargs.enable_thinking is False
+    (which thinking_budget_guard may itself have just set, so this must run AFTER it in the chain).
+    THINKING-mode requests must keep presence_penalty=0 per Qwen's official guidance, so they are
+    left untouched. Each of presence_penalty/top_p/temperature/top_k is applied ONLY if the caller
+    did not already provide that key -- an explicit caller value always wins. Exception-safe: any
+    error returns the body unchanged so it can never break forwarding. Disable with
+    SHIM_NONTHINK_PROFILE=0; tune via SHIM_NONTHINK_{PP,TOP_P,TEMP,TOP_K}.
+    """
+    if not NONTHINK_PROFILE:
+        return body
+    try:
+        j = json.loads(body)
+        if (j.get("chat_template_kwargs") or {}).get("enable_thinking") is not False:
+            return body                                    # thinking / unspecified -> untouched
+        applied = False
+        for key, val in (("presence_penalty", NONTHINK_PP), ("top_p", NONTHINK_TOP_P),
+                         ("temperature", NONTHINK_TEMP), ("top_k", NONTHINK_TOP_K)):
+            if key not in j:                               # never override an explicit caller value
+                j[key] = val
+                applied = True
+        if not applied:                                    # caller set everything -> nothing to do
+            return body
+        if not getattr(nonthinking_sampling_profile, "_logged", False):
+            nonthinking_sampling_profile._logged = True
+            log.info("non-thinking sampling profile active (pp=%s top_p=%s temp=%s top_k=%s)",
+                     NONTHINK_PP, NONTHINK_TOP_P, NONTHINK_TEMP, NONTHINK_TOP_K)
+        return json.dumps(j).encode()
+    except Exception:
+        return body
+
+
 def bound_local_output(body):
     """Ensure a request routed to LOCAL has a bounded max_tokens. Absent/0 (unbounded) OR an
     oversized explicit ceiling (e.g. Hermes's 65536 — a ceiling, not real usage: typical turns
@@ -793,6 +947,20 @@ def remap_for_remote(body):
     j["model"] = REMOTE_MODEL
     for k in REMOTE_STRIP:
         j.pop(k, None)
+    rf = j.get("response_format")
+    if isinstance(rf, dict) and rf.get("type") == "json_schema":
+        j["response_format"] = {"type": "json_object"}
+    # DeepSeek's THINKING mode (V4) rejects any conversation that ends on a tool result whose
+    # preceding assistant tool_call lacks reasoning_content — "The `reasoning_content` in the
+    # thinking mode must be passed back to the API" (verified 2026-08-19). Hermes/pi histories are
+    # generated by the LOCAL model (Qwen) and never carry DeepSeek reasoning_content, and Hermes
+    # sends reasoning_effort=medium on every turn, which puts DeepSeek in thinking mode. Any tool-
+    # using agent that failed over mid-loop hit an unconditional 400 → "model provider failed".
+    # Force non-thinking on the DeepSeek failover: it removes the passback requirement entirely,
+    # matches the gateway's existing no-think policy for Hermes (NO_THINK_IPS), and a degraded-mode
+    # overflow wants a fast correct answer over deep CoT. thinking:disabled beats reasoning_effort.
+    if REMOTE_NO_THINK and "deepseek" in (REMOTE_BASE or "").lower():
+        j["thinking"] = {"type": "disabled"}
     return json.dumps(j).encode()
 
 
@@ -801,13 +969,26 @@ async def local_healthy():
     if now - _health["at"] < HEALTH_TTL:
         return _health["ok"]
     ok = False
+    foreign = 0
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(f"{LOCAL}/health", timeout=aiohttp.ClientTimeout(total=2)) as r:
                 ok = (r.status == 200)
+            if ok and FOREIGN_LOAD_GUARD:
+                try:
+                    async with s.get(f"{LOCAL.rsplit('/v1',1)[0] if LOCAL.endswith('/v1') else LOCAL}/metrics",
+                                     timeout=aiohttp.ClientTimeout(total=2)) as m:
+                        if m.status == 200:
+                            for line in (await m.text()).splitlines():
+                                if line.startswith("vllm:num_requests_running"):
+                                    running = int(float(line.rsplit(" ", 1)[-1]))
+                                    foreign = max(0, running - _inflight)
+                                    break
+                except Exception:
+                    foreign = 0
     except Exception:
         ok = False
-    _health.update(ok=ok, at=now)
+    _health.update(ok=ok, at=now, foreign=foreign)
     return ok
 
 
@@ -834,13 +1015,17 @@ FIRST_GATE_MAX_CHUNKS = 8
 
 
 def _looks_meaningful(text):
-    """True once the upstream emitted real generated progress (a content/reasoning token
-    or a finish_reason) — the safe point to commit the response to the client."""
+    """True once the upstream emitted real generated progress (a content/reasoning token,
+    a tool call, or a finish_reason) — the safe point to commit the response to the client."""
     i = text.find('"reasoning_content":"')
     if i != -1 and text[i + 21:i + 22] not in ("", '"'):
         return True
     i = text.find('"content":"')
     if i != -1 and text[i + 11:i + 12] not in ("", '"'):
+        return True
+    # tool-call responses stream function name/args in tool_calls, not content — without
+    # this check, a tool-call-only response hits the first-token timeout and false-failovers
+    if '"tool_calls":[' in text or '"function_call":{' in text:
         return True
     if '"finish_reason":"' in text:
         return True
@@ -881,6 +1066,21 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1):
             pass
         await up.release(); await session.close()
         return "fail", (up.status, text, _is_oom(up.status, text))
+
+    # streaming 4xx: the response is an error body, not a real event stream — log it
+    # and return it directly instead of entering the first-token gate (which would hang
+    # waiting for SSE content that will never come)
+    if streaming and 400 <= up.status < 500:
+        try:
+            data = await up.read()
+            log.warning("upstream %s returned streaming %d: %s", base, up.status,
+                        data[:500].decode("utf-8", "replace"))
+            ct = up.headers.get("Content-Type", "application/json").split(";")[0]
+            await session.close()
+            return "ok", web.Response(body=data, status=up.status, content_type=ct)
+        except Exception as e:
+            await session.close()
+            return "fail", (up.status, f"streaming 4xx read error: {e}", False)
 
     if not streaming:
         try:
@@ -993,22 +1193,29 @@ async def handle_completions(request):
         record_event("remote", "forced", request, units, 0, **ev)
         return await _forward_remote(request, path, body, streaming)
 
+    # LOCAL-PIN: X-Client containing "local-pin" means the caller (coder_loop,
+    # localflow local lane) exists to burn FREE local tokens — never divert it to
+    # paid remote for congestion reasons (size/big-out/big-prompt/monster/foreign).
+    # It queues behind whatever is running instead. A truly dead local still
+    # falls through to the local-down branch (remote beats a hard failure).
+    local_pin = "local-pin" in (request.headers.get("X-Client") or "").lower()
+
     # size cap: too-big-for-this-box requests OOM local even at budget=1 -> send straight to remote
-    if REMOTE_ENABLED and over_local_cap(body):
+    if REMOTE_ENABLED and not local_pin and over_local_cap(body):
         log.info("route %s est prompt+max > %d -> remote(size)", path, MAX_LOCAL_TOKENS)
         record_event("remote", "size", request, units, 0, **ev)
         return await _forward_remote(request, path, body, streaming)
 
     # big-OUTPUT requests (e.g. Hermes max_tokens=65536): long generations that saturate this slow
     # box and hang interactive clients -> straight to remote (DeepSeek serves them far faster).
-    if REMOTE_ENABLED and BIG_OUTPUT > 0 and maxtok >= BIG_OUTPUT:
+    if REMOTE_ENABLED and not local_pin and BIG_OUTPUT > 0 and maxtok >= BIG_OUTPUT:
         log.info("route %s maxtok=%d >= %d -> remote(big-out)", path, maxtok, BIG_OUTPUT)
         record_event("remote", "big-out", request, units, 0, **ev)
         return await _forward_remote(request, path, body, streaming)
 
     # big-PROMPT requests (e.g. a pi session whose context has grown huge): can't prefill within the
     # first-token cap on this slow box and would saturate/OOM local -> straight to remote up front.
-    if REMOTE_ENABLED and BIG_PROMPT > 0 and ptok >= BIG_PROMPT:
+    if REMOTE_ENABLED and not local_pin and BIG_PROMPT > 0 and ptok >= BIG_PROMPT:
         log.info("route %s ptok=%d >= %d -> remote(big-prompt)", path, ptok, BIG_PROMPT)
         record_event("remote", "big-prompt", request, units, 0, **ev)
         return await _forward_remote(request, path, body, streaming)
@@ -1019,6 +1226,18 @@ async def handle_completions(request):
             log.info("route %s local unhealthy -> remote(local-down)", path)
             record_event("remote", "local-down", request, units, 0, **ev)
             return await _forward_remote(request, path, body, streaming)
+
+    # MONSTER-IN-FLIGHT bypass: a huge prefill is monopolizing engine steps; anything admitted
+    # now would crawl (~1 tok per chunk-step). Route new arrivals remote until it drains.
+    _foreign = _health.get("foreign", 0) if FOREIGN_LOAD_GUARD else 0
+    if REMOTE_ENABLED and not local_pin and (
+        (MONSTER_INFLIGHT > 0 and _inflight_tokens >= MONSTER_INFLIGHT)
+        or _foreign > 0
+    ):
+        log.info("route %s monster/foreign inflight tok=%d foreign=%d -> remote(monster)",
+                 path, _inflight_tokens, _foreign)
+        record_event("remote", "monster", request, units, 0, **ev)
+        return await _forward_remote(request, path, body, streaming)
 
     # TINY fast-lane: negligible-VRAM micro-calls skip the queue-first wait and use headroom slots
     # BEYOND the big-request budget (bounded by TINY_EXTRA_LANES, staying within max-num-seqs), so a
@@ -1034,7 +1253,7 @@ async def handle_completions(request):
                 # tiny fast-lane needs the same thinking guard as the main path: these are
                 # exactly the small-max_tokens calls that get starved to an empty response.
                 kind, payload = await _relay(request, LOCAL, path,
-                                             repetition_guard(thinking_budget_guard(bound_local_output(body))),
+                                             repetition_guard(nonthinking_sampling_profile(thinking_budget_guard(bound_local_output(body)))),
                                              None, streaming, concurrency=1)
                 if kind == "ok":
                     record_event("local", "tiny", request, units, 0, **ev)
@@ -1126,7 +1345,7 @@ async def handle_completions(request):
         except Exception as e:
             log.warning("flightrec: %s", e)
     try:
-        _lb = repetition_guard(thinking_budget_guard(bound_local_output(body)))
+        _lb = repetition_guard(nonthinking_sampling_profile(thinking_budget_guard(bound_local_output(body))))
         if (background and BG_NO_THINK) or (getattr(request, "remote", None) in NO_THINK_IPS):
             _lb = strip_thinking(_lb)
         kind, payload = await _relay(request, LOCAL, path, _lb, None, streaming, concurrency=admitted_conc)
@@ -1145,8 +1364,12 @@ async def handle_completions(request):
                                                False, concurrency=admitted_conc)
                 if kind2 == "ok" and not _is_empty_thinking_response(payload2):
                     record_event("local", "empty-retry", request, units, waited, **ev)
+                    if CRASH_ADAPTIVE:
+                        _crash_adaptive_note_local_completion(ptok)
                     return payload2
             record_event("local", "-", request, units, waited, **ev)
+            if CRASH_ADAPTIVE:
+                _crash_adaptive_note_local_completion(ptok)
             return payload
         status, text, oom = payload
         if oom:
@@ -1162,10 +1385,13 @@ async def handle_completions(request):
 # ---------------- passthrough (dynamic; no hardcoded models) ----------------
 async def _passthrough(request):
     body = await request.read()
+    # /tq/* (EXP-038 snapshot pin/fork) can carry a multi-100K-token prefill;
+    # 30s would abort it mid-prefill. Everything else keeps the tight timeout.
+    total = 900 if request.path.startswith("/tq/") else 30
     async with aiohttp.ClientSession() as s:
         async with s.request(request.method, f"{LOCAL}{request.rel_url}", data=body or None,
                 headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=30)) as up:
+                timeout=aiohttp.ClientTimeout(total=total)) as up:
             data = await up.read()
             ct = up.headers.get("Content-Type", "application/json").split(";")[0]
             return web.Response(body=data, status=up.status, content_type=ct)
@@ -1227,6 +1453,7 @@ async def gateway_stats(request):
         "backoff": max(0, int(_backoff_until - time.time())),
         "remote_model": REMOTE_MODEL, "remote_enabled": REMOTE_ENABLED,
         "local_wait": LOCAL_WAIT,
+        "monster_inflight": MONSTER_INFLIGHT,
         "total": _stats["total"], "local": _stats["local"], "remote": _stats["remote"],
         "local_pct": round(100 * _stats["local"] / total, 1),
         "remote_pct": round(100 * _stats["remote"] / total, 1),

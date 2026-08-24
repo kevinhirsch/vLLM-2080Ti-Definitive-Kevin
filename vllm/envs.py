@@ -69,16 +69,37 @@ if TYPE_CHECKING:
     VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE: Literal["off", "on", "auto"] = "auto"
     VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE_MIN_TOKENS: int = 20480
     VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS: int = 0
+    VLLM_TQ_RESERVE_PREFILL_WORKSPACE: bool = True
+    # EXP-045b: Xid31 (max_model_len-gated MMU FAULT_PDE) instrumentation.
+    VLLM_TQ_XID31_TRACE: bool = False
+    VLLM_TQ_XID31_TRACE_MIN_MB: int = 64
+    VLLM_TQ_XID31_TRACE_EVERY_N: int = 64
+    VLLM_TQ_XID31_TRACE_SNAPSHOT: str = "/tmp/xid31_mem_snapshot.pickle"
     VLLM_TURBOQUANT_CONTINUATION_SDPA_Q_CHUNK: int = 0
     VLLM_TURBOQUANT_CONTINUATION_SDPA_MAX_QK_CELLS: int = 0
     VLLM_TURBOQUANT_FORCE_DECODE_SDPA: bool = False
     VLLM_TURBOQUANT_FORCE_CONTINUATION_SDPA: bool = False
     VLLM_TURBOQUANT_FORCE_DECODE_SDPA_MAX_QK_CELLS: int = 131072
     VLLM_TURBOQUANT_MAX_KV_SPLITS: int | None = None
+    # [FORK] Reserve VRAM for the speculative-decode verify working set that KV
+    # profiling under-counts at large num_speculative_tokens (see
+    # vllm/v1/core/spec_decode_workspace.py). Default on; auto no-op when no
+    # speculative_config or num_speculative_tokens<=1.
+    VLLM_SPEC_RESERVE_VERIFY_WORKSPACE: bool = True
+    # [FORK] Peak-overshoot multiplier for that reserve (concurrent full-vocab
+    # fp32 verify buffers + un-instrumented residual). 0 disables the reserve.
+    VLLM_SPEC_VERIFY_OVERSHOOT_MULT: int = 24
     VLLM_TURBOQUANT_DECODE_BLOCK_KV: int = 2
     VLLM_TURBOQUANT_K8V4_FP8_FORMAT: str = "auto"
     VLLM_TURBOQUANT_CUDAGRAPH_SPEC_DECODE_SAFE: bool = False
     VLLM_TURBOQUANT_SKIP_PREFILL_STORE: bool = False
+    # EXP-038 GDN snapshot/park/fork PoC. Default OFF: the whole feature is
+    # inert (no park pool allocated, snapshot/restore raise) until explicitly
+    # enabled on a throwaway engine. Never enable on the production :8001 serve.
+    VLLM_TQ_GDN_SNAPSHOT: bool = False
+    # Number of park slots reserved per mamba group when the snapshot feature is
+    # enabled (one snapshot handle consumes one slot across all GDN layers).
+    VLLM_TQ_GDN_SNAPSHOT_PARK_BLOCKS: int = 4
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
@@ -841,6 +862,39 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS": lambda: int(
         os.getenv("VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS", "0")
     ),
+    # When serving a turboquant_* KV cache, reserve VRAM for the runtime
+    # continuation-prefill dequant workspace *before* the KV cache budget is
+    # sized, so max_model_len auto-caps to a value where KV + workspace fit.
+    # Default ON: it only makes sizing safer (never allocates more, only caps).
+    # Set to 0 to restore the legacy behaviour (KV cache sized ignoring the
+    # workspace, which can crash with an illegal memory access at deep prefill).
+    "VLLM_TQ_RESERVE_PREFILL_WORKSPACE": lambda: bool(
+        int(os.getenv("VLLM_TQ_RESERVE_PREFILL_WORKSPACE", "1"))
+    ),
+    # EXP-045b: arm Xid31 instrumentation (buffer registry + int32/2GiB offset
+    # projection + CUDA memory-history snapshot on fault). Default OFF; negligible
+    # overhead in the hot path when unset. See vllm/v1/worker/xid31_trace.py.
+    "VLLM_TQ_XID31_TRACE": lambda: os.getenv("VLLM_TQ_XID31_TRACE", "0")
+    .strip()
+    .lower()
+    in ("1", "true", "yes", "on"),
+    "VLLM_TQ_XID31_TRACE_MIN_MB": lambda: int(
+        os.getenv("VLLM_TQ_XID31_TRACE_MIN_MB", "64")
+    ),
+    "VLLM_TQ_XID31_TRACE_EVERY_N": lambda: int(
+        os.getenv("VLLM_TQ_XID31_TRACE_EVERY_N", "64")
+    ),
+    "VLLM_TQ_XID31_TRACE_SNAPSHOT": lambda: os.getenv(
+        "VLLM_TQ_XID31_TRACE_SNAPSHOT", "/tmp/xid31_mem_snapshot.pickle"
+    ),
+    # [FORK] Speculative-decode verify working-set reserve (see
+    # vllm/v1/core/spec_decode_workspace.py).
+    "VLLM_SPEC_RESERVE_VERIFY_WORKSPACE": lambda: bool(
+        int(os.getenv("VLLM_SPEC_RESERVE_VERIFY_WORKSPACE", "1"))
+    ),
+    "VLLM_SPEC_VERIFY_OVERSHOOT_MULT": lambda: int(
+        os.getenv("VLLM_SPEC_VERIFY_OVERSHOOT_MULT", "24")
+    ),
     "VLLM_TURBOQUANT_CONTINUATION_SDPA_Q_CHUNK": lambda: int(
         os.getenv("VLLM_TURBOQUANT_CONTINUATION_SDPA_Q_CHUNK", "0")
     ),
@@ -872,6 +926,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_TURBOQUANT_SKIP_PREFILL_STORE": lambda: bool(
         int(os.getenv("VLLM_TURBOQUANT_SKIP_PREFILL_STORE", "0"))
+    ),
+    # EXP-038 GDN snapshot/park/fork PoC. OFF by default; only enable on a
+    # throwaway engine, never on the production :8001 serve.
+    "VLLM_TQ_GDN_SNAPSHOT": lambda: bool(
+        int(os.getenv("VLLM_TQ_GDN_SNAPSHOT", "0"))
+    ),
+    "VLLM_TQ_GDN_SNAPSHOT_PARK_BLOCKS": lambda: int(
+        os.getenv("VLLM_TQ_GDN_SNAPSHOT_PARK_BLOCKS", "4")
     ),
     # Allow hybrid Mamba/GDN speculative decode to keep full decode CUDA
     # graphs. This is unsafe for production because accepted speculative
@@ -2091,6 +2153,13 @@ def compile_factors() -> dict[str, object]:
         "VLLM_ENABLE_CUDA_COMPATIBILITY",
         "VLLM_CUDA_COMPATIBILITY_PATH",
         "VLLM_SKIP_MODEL_NAME_VALIDATION",
+        # EXP-045b: Xid31 diagnostics — pure instrumentation (trace on/off,
+        # cadence, size threshold, snapshot path). None affect the compiled
+        # graph, so keep them out of the compile-cache key.
+        "VLLM_TQ_XID31_TRACE",
+        "VLLM_TQ_XID31_TRACE_MIN_MB",
+        "VLLM_TQ_XID31_TRACE_EVERY_N",
+        "VLLM_TQ_XID31_TRACE_SNAPSHOT",
         "LOCAL_RANK",
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",
