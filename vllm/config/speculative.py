@@ -961,9 +961,14 @@ class SpeculativeConfig:
 
         from vllm.v1.spec_decode.mtp_draft_cap import validate_mtp_draft_cap
 
-        validate_mtp_draft_cap(
-            os.environ.get("VLLM_MTP_DRAFT_CAP"), self.num_speculative_tokens
-        )
+        if self.method == "mtp":
+            # cap is consumed only by the MTP proposer path; do not let an
+            # MTP-only env var reject unrelated methods (review catch).
+            validate_mtp_draft_cap(
+                os.environ.get("VLLM_MTP_DRAFT_CAP"),
+                self.num_speculative_tokens,
+                s4_scoped_drafter=os.environ.get("VLLM_S4_SCOPED_DRAFTER") == "1",
+            )
 
         if self.rejection_sample_method == "synthetic":
             # Consolidate to per-position rates

@@ -132,6 +132,29 @@ def test_negative_cap_is_treated_as_unset():
     validate("-1", 3)  # must not raise
 
 
+
+def test_s4_exemption_permits_cap_below_k():
+    """S4 pairing (cap=2, K=16): exempt when the flag is injected."""
+    validate("2", 16, s4_scoped_drafter=True)  # must not raise
+
+
+def test_s4_exemption_does_not_cover_cap_above_k():
+    """Review catch: cap > K is the deadlock case — S4 must NOT exempt it."""
+    try:
+        validate("32", 16, s4_scoped_drafter=True)
+    except ValueError:
+        return
+    raise AssertionError("cap > K escaped the guard under S4")
+
+
+def test_no_s4_still_raises():
+    try:
+        validate("2", 16)
+    except ValueError:
+        return
+    raise AssertionError("guard did not fire without S4")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
@@ -148,21 +171,3 @@ if __name__ == "__main__":
     print(f"All {len(tests)} tests passed.")
 
 
-def test_s4_exemption_permits_cap_below_k():
-    """S4 pairing (cap=2, K=16) must boot when the drafter env is set."""
-    import os as _os
-    _os.environ["VLLM_S4_SCOPED_DRAFTER"] = "1"
-    try:
-        M.validate_mtp_draft_cap("2", 16)  # must NOT raise
-    finally:
-        del _os.environ["VLLM_S4_SCOPED_DRAFTER"]
-
-
-def test_no_s4_still_raises():
-    import os as _os
-    _os.environ.pop("VLLM_S4_SCOPED_DRAFTER", None)
-    try:
-        M.validate_mtp_draft_cap("2", 16)
-    except ValueError:
-        return
-    raise AssertionError("guard did not fire without S4")
