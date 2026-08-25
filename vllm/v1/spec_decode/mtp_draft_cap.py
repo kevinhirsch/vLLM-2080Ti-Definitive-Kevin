@@ -49,7 +49,11 @@ import os
 logger = logging.getLogger(__name__)
 
 
-def validate_mtp_draft_cap(raw_cap: str | None, num_speculative_tokens: int) -> None:
+def validate_mtp_draft_cap(
+    raw_cap: str | None,
+    num_speculative_tokens: int,
+    s4_scoped_drafter: bool = False,
+) -> None:
     """Raise ``ValueError`` if ``VLLM_MTP_DRAFT_CAP`` is set to anything other
     than ``num_speculative_tokens`` (K).
 
@@ -83,7 +87,10 @@ def validate_mtp_draft_cap(raw_cap: str | None, num_speculative_tokens: int) -> 
     # before returning. The M-7 failure mode therefore never reaches the copy
     # site under S4. Exempting exactly that case, loudly, keeps the guard
     # strict for everyone else.
-    if os.environ.get("VLLM_S4_SCOPED_DRAFTER") == "1":
+    # Exemption is cap < K ONLY (review catch: cap > K is the deadlock case
+    # and must stay guarded even under S4). Flag injected by the caller for
+    # purity; config call site passes the env read.
+    if s4_scoped_drafter and cap < num_speculative_tokens:
         logger.warning(
             "VLLM_MTP_DRAFT_CAP=%d != K=%d permitted because "
             "VLLM_S4_SCOPED_DRAFTER=1 (S4 design pairing; safe via the "
