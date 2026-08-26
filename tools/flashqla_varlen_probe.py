@@ -43,11 +43,13 @@ def make_inputs(device):
 
 def main():
     device = "cuda:0"
+    # Rebase rename: the varlen loop + forward_native/forward_cuda live on
+    # ChunkGatedDeltaRule (gdn_linear_attn.py:226; gate read at :397-400).
     from vllm.model_executor.layers.mamba.gdn_linear_attn import (  # noqa: E402
-        GDNLinearAttentionBackend,
+        ChunkGatedDeltaRule,
     )
 
-    be = GDNLinearAttentionBackend.__new__(GDNLinearAttentionBackend)
+    be = ChunkGatedDeltaRule.__new__(ChunkGatedDeltaRule)
     inp = make_inputs(device)
 
     def run(path):
