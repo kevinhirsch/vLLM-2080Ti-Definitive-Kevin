@@ -370,3 +370,60 @@ that. Treat every number in §5 as an upper bound, not a forecast.
   serving path) is structured independently of vLLM's V1/V2 runner split;
   if so it may be a cleaner algorithmic reference than vLLM's V2-coupled
   code for the parts we have to write from scratch anyway.
+
+---
+
+## 2026-08-25 addendum: TnzGit independent port — study synthesis (study-only per Kevin)
+
+Source: `TnzGit/vLLM-2080Ti-Definitive-dflash2` (standalone republication of the 0.2.x
+branch + 12 agent-authored commits), local read-only clone at
+`~/Desktop/.f3-study-tnzgit-dflash2`. Their docs (`docs/dflash2-adaptation/`) are a
+complete, honest evidence chain. Materially updates this file's port estimate.
+
+**What they proved (changes our discount):**
+- A V1-runner DFlash2 greedy proposer works end-to-end on THIS fork family
+  (correctness token-identical vs baseline at 32K) — the "no V1 speculator exists"
+  premise of our LARGE-port estimate is now false: `bd57d36` (V1 proposer,
+  greedy lattice walk) + `8a7ab04` (drafter port) + `5a9748a` (V2 speculator, opt-in).
+- **Central-pool geometry conflict is real and they solved it**: draft 5-layer SWA
+  fp16 natural pages (32KB/block16, 2KB/token/layer) get padded 51× to 1.676MB by
+  `unify_kv_cache_spec_page_size` next to TQ groups (block 2112-2160,
+  ~749 B/token/layer measured), and block sizes 16 vs 2160 are indivisible →
+  coordinator assert. Fix that works: **private draft KV pool** owned by the
+  proposer (`VLLM_DFLASH_OWN_KV_POOL=1`, extraction pattern mirrors
+  HiddenStateCacheSpec at kv_cache_utils.py:1823). This is the architectural
+  answer for ANY non-TQ-geometry drafter here — reusable beyond DFlash2.
+- Same-code MTP3 baseline arm reproduces an external user benchmark at 0.3%
+  (91.81 vs 92.09 tok/s, FP8+MTP3+K8V4 32K-arm method) — their methodology holds.
+
+**Their sole remaining blocker (two faces of FULL-graph × DFlash scheduling):**
+- normal/PIECEWISE: correct output but ~505ms target-forward per 8-token step —
+  the piecewise decode graph replays at capture width 1024 (= mnbt). py-spy: 43%
+  gdn/causal_conv + 24% turboquant_store inside target forward; round-2 suspicion
+  of full-context `precompute_and_store_context_kv` rewrites per step (sglang does
+  this incrementally).
+- fast/FULL decode graph: ~112 tok/s observed BUT Xid31 MMU fault at CAPTURE
+  (FAULT_PDE VIRT_READ @0x1000, dual-GPU, no traceback) → NaN logits → token-0
+  garbage. They correctly identified garbage-output and Xid31 as one defect.
+
+**Our-side mapping (why the port cost drops if we ever engage F-3):**
+1. Their piecewise-1024 mystery is our known class: pin
+   `cudagraph_capture_sizes=[K+1]` / `max_cudagraph_capture_size` (our prod uses
+   [4]) instead of default-width capture. Likely removes the 505ms face outright.
+2. Their capture-time Xid31 signature matches the block-table overrun class our
+   guards target (`896b1013f` env-gated write-side bound, `ecced0014` pages>width
+   early-out + reader-guard). Arming `VLLM_TQ_XID31_TRACE=1` would name the
+   faulting kernel in one run.
+3. Their K-bisection + compute-sanitizer + capture-time pool-tensor-visibility
+   plan (HANDOVER §5.4) is sound; item 4 (private-pool data_ptr stability across
+   capture) is the most likely true root for the capture fault.
+4. lued-DFlash2-W8-draft can halve draft weights (3.85→1.9GB) if pool math gets
+   tight on a port.
+
+**Revised F-3 posture:** the LARGE-port estimate no longer holds — a port would be
+"their commits + our two known fixes," post-0.2.x. Remaining genuine unknowns:
+their per-step GDN store semantics under lookahead (their next work item), DFlash
+prefix-cache bug class upstream (#47926/#48459) under our multi-turn workload, and
+acceptance-length on OUR agentic traces vs their greedy benchmark shapes.
+Contact remains OFF (study-only). Their user benchmark also contributes a
+Beat-The-Fork cell: 92.09 tok/s decode @ FP8+MTP3+K8V4 128K util .95 on 2×2080Ti.
