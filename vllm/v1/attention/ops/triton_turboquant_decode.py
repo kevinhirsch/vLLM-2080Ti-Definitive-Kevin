@@ -57,6 +57,13 @@ _DECODE_BLOCK_KV = _read_decode_block_kv()
 # OFF so prod ships it via a gated A/B window. See
 # docs/f2-tq-depth-cost-research.md.
 _STAGE1_QTILE = os.getenv("VLLM_TURBOQUANT_STAGE1_QTILE", "0") == "1"
+# Sweep knob for the qtile kernel's launch width (F-2 60us bar). Offline
+# ptxas (SM75, k3v4_nc, q_len=4, BLOCK_KV=2): warps 1/2/4 -> 254/151/93
+# regs, all 0-spill. Default 2 = shipped behavior; values outside {1,2,4}
+# are clamped back to 2.
+_STAGE1_QTILE_WARPS = int(os.getenv("VLLM_TURBOQUANT_STAGE1_QTILE_WARPS", "2"))
+if _STAGE1_QTILE_WARPS not in (1, 2, 4):
+    _STAGE1_QTILE_WARPS = 2
 
 
 def _fp8_format_code(device: int = 0) -> int:
@@ -1216,7 +1223,7 @@ def triton_turboquant_decode_attention(
             # window if the first result lands within 20% of the 60 us/1K
             # bar. Constraint: BLOCK_KV=8 requires num_warps=4 (spills at
             # <=2); BLOCK_KV=16 spills even at 4 — do not sweep it.
-            num_warps=2,
+            num_warps=_STAGE1_QTILE_WARPS,
             num_stages=1,
         )
     else:
