@@ -125,6 +125,56 @@ def is_layer_gptq_quantized(
     return is_quantized
 
 
+def dynamic_match_prefix(
+    config: GPTQConfig | GPTQMarlinConfig,
+    prefix: str,
+) -> str:
+    """Resolve the layer name that `dynamic` rules should be matched against.
+
+    GPTQModel writes ``dynamic`` rules against checkpoint module names, where
+    q/k/v (and gate/up) projections are separate modules. vLLM fuses them
+    (``qkv_proj``/``gate_up_proj``/...), so a rule like
+    ``.*\\.self_attn\\.(q_proj|k_proj|v_proj)`` never matches the vLLM-side
+    ``prefix`` and the override is silently dropped — the layer is then built
+    at the base config's bits and weight loading fails with a shape-mismatch
+    assert (or silently mis-sizes). ``is_layer_gptq_quantized`` already
+    translates fused names for the quantize-membership check; this applies the
+    same translation to dynamic-rule matching.
+
+    Resolution order:
+    1. If any rule matches the fused vLLM name directly, keep the fused name.
+    2. Otherwise, if the trailing component is a known fused module, match the
+       unfused shard names. All shards must resolve to the same rule outcome;
+       a fused module cannot mix quantization schemes.
+    3. Fall back to the original prefix.
+    """
+    if not getattr(config, "dynamic", None):
+        return prefix
+    if get_dynamic_override(config, prefix) is not None:
+        return prefix
+    proj_name = prefix.split(".")[-1]
+    fused_mapping = getattr(config, "packed_modules_mapping", None) or {}
+    shard_names = fused_mapping.get(proj_name)
+    if not shard_names:
+        return prefix
+    shard_prefixes = [
+        prefix[: len(prefix) - len(proj_name)] + shard_name
+        for shard_name in shard_names
+    ]
+    overrides = [get_dynamic_override(config, p) for p in shard_prefixes]
+    first = overrides[0]
+    if any(override != first for override in overrides[1:]):
+        raise ValueError(
+            f"Detected conflicting dynamic quantization rules across the "
+            f"shards of fused layer {prefix} "
+            f"({dict(zip(shard_prefixes, overrides))}). All shards of a "
+            "fused layer must resolve to the same dynamic override."
+        )
+    if first is None:
+        return prefix
+    return shard_prefixes[0]
+
+
 def get_linear_quant_method(
     config: GPTQConfig | GPTQMarlinConfig,
     layer: torch.nn.Module,
@@ -141,18 +191,21 @@ def get_linear_quant_method(
             quantized_layers=cloned_config.modules_in_block_to_quantize,
             fused_mapping=cloned_config.packed_modules_mapping,
         )
+        # Fused modules (qkv_proj/gate_up_proj/...) match dynamic rules via
+        # their unfused checkpoint names when no rule targets the fused name.
+        match_prefix = dynamic_match_prefix(cloned_config, prefix)
         # False = skip module, None = no override, else = Positive match
         if get_dynamic_override(  # noqa: E712
             cloned_config,  # noqa: E712
-            layer_name=prefix,
+            layer_name=match_prefix,
         ) == False or (not is_layer_quantized):  # noqa: E712
             if parallel_lm_head_quantized:
                 return UnquantizedEmbeddingMethod()
             return UnquantizedLinearMethod()
 
-        if prefix:
+        if match_prefix:
             # Dynamic per module/layer rules may override base config
-            override_config(cloned_config, prefix=prefix)
+            override_config(cloned_config, prefix=match_prefix)
 
         return linear_method_cls(cloned_config)
     return None
