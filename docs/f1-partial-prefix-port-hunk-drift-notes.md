@@ -20,11 +20,19 @@ at the top of that file.
 
 - `state`: OPEN, `mergeable`: MERGEABLE, `reviewDecision`: REVIEW_REQUIRED —
   unchanged from the research doc. Still zero maintainer/codeowner review.
-- `pre-run-check` (pre-commit workflow): **FAILURE**, completed
-  `2026-08-24T19:51:56Z`. Same failing check the doc saw; timestamp shows it has
-  **not been re-run** since the `b99d152` push (which landed at `19:52:00Z`, one
-  push after the failing check — i.e. the failing CI run predates the current
-  code and has not been refreshed against it).
+- `pre-run-check` (pre-commit workflow): **FAILURE**, ran `19:51:50Z`-`19:51:56Z`
+  (a 6-second run — consistent with a fast lint/pre-commit-style gate, not the
+  full test suite). **Correction after double-checking my own first pass on
+  this:** I initially misread this as stale/pre-dating the current head. It is
+  not — `gh pr view --json commits` shows exactly 2 commits on this PR, and the
+  current head (`b99d152`, "retention-aware boundary stops; keep the EAGLE...")
+  has `committedDate: 2026-08-24T19:20:51Z`, ~31 minutes before this check ran;
+  kamb-code's "Pushed (`b99d152`)" comment lands at `19:52:00Z`, 4 seconds after
+  the check completed — consistent with the local commit (19:20:51) being
+  pushed to GitHub around 19:51:5x (triggering CI immediately) and the comment
+  following right after. **So this check most likely DID run against the
+  current head** and failed fast — almost certainly a lint/pre-commit issue,
+  not a logic failure, but still an unresolved red X on the current diff.
 - `pre-commit` job: SKIPPED. DCO: SUCCESS. Meta Internal-Only Changes Check:
   SUCCESS. Mergify Summary: SUCCESS. readthedocs build: SUCCESS.
 - No full upstream test-suite CI run recorded (still needs a maintainer `/ci run`).
