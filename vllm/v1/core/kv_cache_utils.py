@@ -1971,11 +1971,18 @@ def _turboquant_prefill_workspace_reserve_bytes(vllm_config: VllmConfig) -> int:
     if block_size <= 0:
         return 0
 
-    reserve_tokens = max(
-        max_batched_tokens,
-        int(getattr(vllm_config.model_config, "max_model_len", 0)),
-        int(envs.VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS),
+    configured_reserve = int(
+        envs.VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS
     )
+    if configured_reserve > 0:
+        # Operator override — mirror of _reserve_continuation_workspace:
+        # explicit env bound wins over the max_model_len floor.
+        reserve_tokens = max(max_batched_tokens, configured_reserve)
+    else:
+        reserve_tokens = max(
+            max_batched_tokens,
+            int(getattr(vllm_config.model_config, "max_model_len", 0)),
+        )
     reserve_cached_len = math.ceil(reserve_tokens / block_size) * block_size
     if reserve_cached_len <= 0:
         return 0

@@ -873,11 +873,14 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             getattr(model_cfg, "max_model_len", 0) if model_cfg is not None else 0
         )
         configured_reserve = _TQ_CONTINUATION_WORKSPACE_RESERVE_TOKENS
-        reserve_tokens = max(
-            max_batched_tokens,
-            max_model_len,
-            configured_reserve,
-        )
+        if configured_reserve > 0:
+            # Operator override: a route that provisions VRAM headroom for its
+            # real continuation depth can bound the reserve explicitly instead
+            # of pre-carving max_model_len (≥1 GiB/rank at 512K-class
+            # profiles, directly shrinking the KV pool).
+            reserve_tokens = max(max_batched_tokens, configured_reserve)
+        else:
+            reserve_tokens = max(max_batched_tokens, max_model_len)
         reserve_cached_len = math.ceil(reserve_tokens / block_size) * block_size
         if reserve_cached_len <= 0:
             self._continuation_workspace_reserved = True
