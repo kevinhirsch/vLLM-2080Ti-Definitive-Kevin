@@ -3042,7 +3042,29 @@ guess_model_family() {
 }
 
 guess_quantization() {
-  local dir=${1,,}
+  local raw=${1:-}
+  local dir=${raw,,}
+  # The checkpoint's own quantization_config.quant_method is authoritative.
+  # Directory names lie: community checkpoints named "...-AWQ-INT4" can be
+  # compressed-tensors inside (weicj#139) — a name-based guess then selects
+  # the wrong backend and the boot fails. Known methods map directly; absent
+  # or unrecognized configs fall through to the historical name heuristics.
+  if [[ -n "$raw" && -f "$raw/config.json" ]]; then
+    local method
+    method=$(python3 -c "
+import json,sys
+try: cfg=json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+print(((cfg.get('quantization_config') or {}).get('quant_method') or '').lower())
+" "$raw/config.json" 2>/dev/null)
+    case "$method" in
+      compressed-tensors) echo compressed-tensors; return ;;
+      gptq) echo gptq_marlin; return ;;
+      awq) echo awq_marlin; return ;;
+      fp8) echo fp8; return ;;
+      quark) echo quark; return ;;
+    esac
+  fi
   if [[ "$dir" == *fp8* ]]; then
     echo fp8
   elif [[ "$dir" == *gptq* ]]; then
