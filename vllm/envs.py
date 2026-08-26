@@ -70,6 +70,12 @@ if TYPE_CHECKING:
     VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE_MIN_TOKENS: int = 20480
     VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS: int = 0
     VLLM_TURBOQUANT_FLASHINFER_PREFILL_PLAN_CACHE_MAXSIZE: int = 16
+    VLLM_TQ_RESERVE_PREFILL_WORKSPACE: bool = True
+    # EXP-045b: Xid31 (max_model_len-gated MMU FAULT_PDE) instrumentation.
+    VLLM_TQ_XID31_TRACE: bool = False
+    VLLM_TQ_XID31_TRACE_MIN_MB: int = 64
+    VLLM_TQ_XID31_TRACE_EVERY_N: int = 64
+    VLLM_TQ_XID31_TRACE_SNAPSHOT: str = "/tmp/xid31_mem_snapshot.pickle"
     VLLM_TURBOQUANT_CONTINUATION_SDPA_Q_CHUNK: int = 0
     VLLM_TURBOQUANT_CONTINUATION_SDPA_MAX_QK_CELLS: int = 0
     VLLM_TURBOQUANT_FORCE_DECODE_SDPA: bool = False
@@ -88,6 +94,13 @@ if TYPE_CHECKING:
     VLLM_TURBOQUANT_K8V4_FP8_FORMAT: str = "auto"
     VLLM_TURBOQUANT_CUDAGRAPH_SPEC_DECODE_SAFE: bool = False
     VLLM_TURBOQUANT_SKIP_PREFILL_STORE: bool = False
+    # EXP-038 GDN snapshot/park/fork PoC. Default OFF: the whole feature is
+    # inert (no park pool allocated, snapshot/restore raise) until explicitly
+    # enabled on a throwaway engine. Never enable on the production :8001 serve.
+    VLLM_TQ_GDN_SNAPSHOT: bool = False
+    # Number of park slots reserved per mamba group when the snapshot feature is
+    # enabled (one snapshot handle consumes one slot across all GDN layers).
+    VLLM_TQ_GDN_SNAPSHOT_PARK_BLOCKS: int = 4
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
@@ -291,6 +304,7 @@ if TYPE_CHECKING:
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
+    VLLM_TOOL_REPETITION_DETECTION_MIN_COUNT: int = 0
     # [FORK] Retain the final aligned Mamba state under MTP (mamba_cache_mode=
     # align): the uncached prompt tail still runs and produces the proposer's
     # hidden states, so that boundary state is valid and reusable. Default off.
@@ -858,6 +872,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TURBOQUANT_FLASHINFER_PREFILL_PLAN_CACHE_MAXSIZE": lambda: int(
         os.getenv("VLLM_TURBOQUANT_FLASHINFER_PREFILL_PLAN_CACHE_MAXSIZE", "16")
     ),
+    # When serving a turboquant_* KV cache, reserve VRAM for the runtime
+    # continuation-prefill dequant workspace *before* the KV cache budget is
+    # sized, so max_model_len auto-caps to a value where KV + workspace fit.
+    # Default ON: it only makes sizing safer (never allocates more, only caps).
+    # Set to 0 to restore the legacy behaviour (KV cache sized ignoring the
+    # workspace, which can crash with an illegal memory access at deep prefill).
+    "VLLM_TQ_RESERVE_PREFILL_WORKSPACE": lambda: bool(
+        int(os.getenv("VLLM_TQ_RESERVE_PREFILL_WORKSPACE", "1"))
+    ),
+    # EXP-045b: arm Xid31 instrumentation (buffer registry + int32/2GiB offset
+    # projection + CUDA memory-history snapshot on fault). Default OFF; negligible
+    # overhead in the hot path when unset. See vllm/v1/worker/xid31_trace.py.
+    "VLLM_TQ_XID31_TRACE": lambda: os.getenv("VLLM_TQ_XID31_TRACE", "0")
+    .strip()
+    .lower()
+    in ("1", "true", "yes", "on"),
+    "VLLM_TQ_XID31_TRACE_MIN_MB": lambda: int(
+        os.getenv("VLLM_TQ_XID31_TRACE_MIN_MB", "64")
+    ),
+    "VLLM_TQ_XID31_TRACE_EVERY_N": lambda: int(
+        os.getenv("VLLM_TQ_XID31_TRACE_EVERY_N", "64")
+    ),
+    "VLLM_TQ_XID31_TRACE_SNAPSHOT": lambda: os.getenv(
+        "VLLM_TQ_XID31_TRACE_SNAPSHOT", "/tmp/xid31_mem_snapshot.pickle"
+    ),
     # [FORK] Speculative-decode verify working-set reserve (see
     # vllm/v1/core/spec_decode_workspace.py).
     "VLLM_SPEC_RESERVE_VERIFY_WORKSPACE": lambda: bool(
@@ -897,6 +936,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_TURBOQUANT_SKIP_PREFILL_STORE": lambda: bool(
         int(os.getenv("VLLM_TURBOQUANT_SKIP_PREFILL_STORE", "0"))
+    ),
+    # EXP-038 GDN snapshot/park/fork PoC. OFF by default; only enable on a
+    # throwaway engine, never on the production :8001 serve.
+    "VLLM_TQ_GDN_SNAPSHOT": lambda: bool(
+        int(os.getenv("VLLM_TQ_GDN_SNAPSHOT", "0"))
+    ),
+    "VLLM_TQ_GDN_SNAPSHOT_PARK_BLOCKS": lambda: int(
+        os.getenv("VLLM_TQ_GDN_SNAPSHOT_PARK_BLOCKS", "4")
     ),
     # Allow hybrid Mamba/GDN speculative decode to keep full decode CUDA
     # graphs. This is unsafe for production because accepted speculative
@@ -1915,7 +1962,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_COMPILE_CACHE_SAVE_FORMAT": env_with_choices(
         "VLLM_COMPILE_CACHE_SAVE_FORMAT", "binary", ["binary", "unpacked"]
     ),
+    # Tool arguments commonly contain repeated markdown/code structure. Keep
+    # the generic repetition detector opt-in for tool calls because its
+    # default n-gram heuristic can terminate a valid JSON argument mid-string.
+    "VLLM_TOOL_REPETITION_DETECTION_MIN_COUNT": lambda: int(
+        os.getenv("VLLM_TOOL_REPETITION_DETECTION_MIN_COUNT", "0")
+    ),
     # Flag to enable v2 model runner.
+    # Minimum repeat count before the repetition detector applies to tool-call
+    # argument streams (0 disables it there): the generic n-gram heuristic can
+    # terminate a valid JSON argument mid-string (upstream #128).
+    "VLLM_TOOL_REPETITION_DETECTION_MIN_COUNT": lambda: int(
+        os.getenv("VLLM_TOOL_REPETITION_DETECTION_MIN_COUNT", "0")
+    ),
     "VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK": lambda: os.getenv(
         "VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK", "0"
     )
@@ -2146,6 +2205,13 @@ def compile_factors() -> dict[str, object]:
         "VLLM_ENABLE_CUDA_COMPATIBILITY",
         "VLLM_CUDA_COMPATIBILITY_PATH",
         "VLLM_SKIP_MODEL_NAME_VALIDATION",
+        # EXP-045b: Xid31 diagnostics — pure instrumentation (trace on/off,
+        # cadence, size threshold, snapshot path). None affect the compiled
+        # graph, so keep them out of the compile-cache key.
+        "VLLM_TQ_XID31_TRACE",
+        "VLLM_TQ_XID31_TRACE_MIN_MB",
+        "VLLM_TQ_XID31_TRACE_EVERY_N",
+        "VLLM_TQ_XID31_TRACE_SNAPSHOT",
         "LOCAL_RANK",
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",
