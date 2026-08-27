@@ -452,6 +452,34 @@ class ChunkGatedDeltaRule(CustomOp):
             "FlashQLA legacy GDN prefill received unsupported varlen/chunked "
             "metadata; falling back to Triton/FLA for this call."
         )
+        # Instrument-only, env-gated default OFF; no behavior change.
+        # Counts fallback occurrences and classifies by the failing guard so
+        # we can decide whether to extend the loop to cover the residual
+        # variant (backlog R6). Emits one INFO line every 200 fallbacks.
+        if _os.environ.get("VLLM_FLASHQLA_VARLEN_FALLBACK_INSTRUMENT", "0") == "1":
+            _dims_ok = (q.ndim == 4 and k.ndim == 4 and v.ndim == 4)
+            _batch1 = _dims_ok and q.shape[0] == 1
+            _cu_ok = cu_seqlens is not None and int(cu_seqlens.numel()) > 2
+            if chunk_indices is not None or chunk_offsets is not None:
+                _tag = "chunked-prefill"
+            elif not _dims_ok:
+                _tag = "ndim!=4"
+            elif not _batch1:
+                _tag = "batch!=1"
+            elif cu_seqlens is None:
+                _tag = "no-cu_seqlens"
+            elif int(cu_seqlens.numel()) <= 2:
+                _tag = "single-seq"
+            else:
+                _tag = "other"
+            _c = getattr(self, "_fbk_counts", None)
+            if _c is None:
+                _c = {}
+                object.__setattr__(self, "_fbk_counts", _c)
+            _c[_tag] = _c.get(_tag, 0) + 1
+            _total = sum(_c.values())
+            if _total % 200 == 0:
+                logger.info("[FLASHQLA-FALLBACK-INSTR] total=%d by-tag=%s", _total, sorted(_c.items(), key=lambda kv: -kv[1]))
         return self.forward_native(
             q=q,
             k=k,
