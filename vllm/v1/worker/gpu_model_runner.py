@@ -6752,6 +6752,17 @@ class GPUModelRunner(
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
+        # F-5 fix (2026-08-27): lock workspace BEFORE capture opens.
+        # WorkspaceManager._ensure_workspace_size() reallocates (new data_ptr)
+        # on growth; a resize INSIDE the capture window silently corrupts any
+        # captured op that referenced the old buffer (the deadlock/garble/Xid31
+        # family we ship VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH=0 to avoid).
+        # Reservation via _reserve_continuation_workspace() has pre-sized the
+        # workspace by this point, so locking here is safe and converts any
+        # surprise resize into a clean AssertionError instead of silent
+        # corruption. The lock_workspace() call after the with-block stays as
+        # an idempotent safety net.
+        lock_workspace()
         set_cudagraph_capturing_enabled(True)
         with self._freeze_gc(), graph_capture(device=self.device):
             torch.accelerator.synchronize()
