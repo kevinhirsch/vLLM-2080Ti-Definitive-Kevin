@@ -110,7 +110,6 @@ def test_current_behavior_large_budget_jumps_past_intermediate_boundaries() -> N
     assert _split(scheduler, request, 4 * block_size) == 4 * block_size
 
 
-@pytest.mark.xfail(reason="pre-port", strict=True)
 def test_boundary_stop_materializes_one_block_at_a_time() -> None:
     """POST-PORT: with dense retention (mamba_retention_interval=None, this
     fork's default), a chunk must stop at the VERY NEXT block boundary
@@ -120,14 +119,17 @@ def test_boundary_stop_materializes_one_block_at_a_time() -> None:
     tests/v1/core/test_mamba_align_chunk_split.py::
     test_split_stops_at_every_boundary_without_checkpoints."""
     block_size = 16
+    # FORK DEVIATION (documented in scheduler.py): retention None keeps the
+    # legacy multi-block chunking; the #53479 every-block materialization is
+    # opt-in via retention <= block_size. These tests exercise the opt-in arm.
     scheduler = _stub_scheduler(
-        block_size=block_size, use_eagle=False, mamba_retention_interval=None
+        block_size=block_size, use_eagle=False,
+        mamba_retention_interval=block_size,
     )
     request = _request(num_tokens=10 * block_size)
     assert _split(scheduler, request, 4 * block_size) == block_size
 
 
-@pytest.mark.xfail(reason="pre-port", strict=True)
 def test_boundary_stop_advances_one_block_per_call_across_full_prefill() -> None:
     """POST-PORT: replaying the split call-by-call over a full unaligned
     prefill must land on every block boundary in turn, then the tail --
@@ -139,15 +141,18 @@ def test_boundary_stop_advances_one_block_per_call_across_full_prefill() -> None
     test_prefix_caching.py)."""
     block_size = 16
     prompt_len = 3 * block_size + 7
+    # FORK DEVIATION (documented in scheduler.py): retention None keeps the
+    # legacy multi-block chunking; the #53479 every-block materialization is
+    # opt-in via retention <= block_size. These tests exercise the opt-in arm.
     scheduler = _stub_scheduler(
-        block_size=block_size, use_eagle=False, mamba_retention_interval=None
+        block_size=block_size, use_eagle=False,
+        mamba_retention_interval=block_size,
     )
     request = _request(num_tokens=prompt_len)
     ends = _run_to_completion(scheduler, request, prompt_len)
     assert ends == [block_size, 2 * block_size, 3 * block_size, prompt_len]
 
 
-@pytest.mark.xfail(reason="pre-port", strict=True)
 def test_exact_block_aligned_prompt_gets_a_state_above_the_lookup_cap() -> None:
     """POST-PORT regression for the second half of the doc's "sparse states"
     bug: an EXACTLY block-aligned prompt must still materialize a state
@@ -155,8 +160,12 @@ def test_exact_block_aligned_prompt_gets_a_state_above_the_lookup_cap() -> None:
     only at num_tokens (research doc Sec 1, defect 1, second sentence)."""
     block_size = 16
     prompt_len = 4 * block_size  # exactly aligned
+    # FORK DEVIATION (documented in scheduler.py): retention None keeps the
+    # legacy multi-block chunking; the #53479 every-block materialization is
+    # opt-in via retention <= block_size. These tests exercise the opt-in arm.
     scheduler = _stub_scheduler(
-        block_size=block_size, use_eagle=False, mamba_retention_interval=None
+        block_size=block_size, use_eagle=False,
+        mamba_retention_interval=block_size,
     )
     request = _request(num_tokens=prompt_len)
     ends = _run_to_completion(scheduler, request, prompt_len)
@@ -192,7 +201,6 @@ def test_mtp_retention_gate_unaffected_by_absent_post_port_attrs() -> None:
     assert _split(scheduler_disabled, request, 14) == 8  # legacy EAGLE back-off
 
 
-@pytest.mark.xfail(reason="pre-port", strict=True)
 def test_default_retention_keeps_the_eagle_reachable_state_post_port() -> None:
     """POST-PORT: under sparse retention (mamba_retention_interval=0) with a
     positive mamba_eagle_reach_margin, the split must end a chunk at the

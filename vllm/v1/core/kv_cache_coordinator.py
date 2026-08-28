@@ -318,6 +318,16 @@ class KVCacheCoordinator(ABC):
             for manager in self.single_type_managers
         )
 
+    @property
+    def eagle_reach_margin(self) -> int:
+        """Tokens by which an EAGLE/MTP lookup's reusable boundary trails the
+        replay boundary (ported from vLLM #53479).
+
+        0 without speculative decoding or without an eagle-affected attention
+        group. Subclasses with eagle groups override.
+        """
+        return 0
+
     @abstractmethod
     def find_longest_cache_hit(
         self,
@@ -542,6 +552,34 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             for i, (_, group_ids, _) in enumerate(self.attention_groups)
             if any(gid in self.eagle_group_ids for gid in group_ids)
         }
+
+        # Ported from vLLM #53479: expose the speculative reach margin to
+        # every single-type manager so sparse retention keeps the
+        # eagle-reachable boundary state (MambaManager.reachable_block_mask
+        # part 3).
+        margin = self.eagle_reach_margin
+        for manager in self.single_type_managers:
+            manager.eagle_reach_margin = margin
+
+    @property
+    def eagle_reach_margin(self) -> int:
+        # Ported from vLLM #53479, collapsed for this fork: upstream scales
+        # the margin by hash_block_size under fine-grained partial hash hits
+        # (enable_partial_hash_hits / supports_fine_grained_hash_lookup),
+        # neither of which exists here. Our find_longest_cache_hit drops
+        # exactly one full block per eagle group (the drop_eagle_block path
+        # below), so the reusable boundary trails the replay boundary by one
+        # full attention block — unconditionally. A margin that is too large
+        # only retains one extra boundary state (wasted memory, never
+        # incorrect); too small only misses a cache hit.
+        for idx, (spec, _group_ids, _manager_cls) in enumerate(
+            self.attention_groups
+        ):
+            if idx in self.eagle_attn_group_indices and not isinstance(
+                spec, MambaSpec
+            ):
+                return spec.block_size
+        return 0
 
     def find_longest_cache_hit(
         self,

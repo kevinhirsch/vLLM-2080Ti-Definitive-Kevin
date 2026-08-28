@@ -258,6 +258,22 @@ class Scheduler(SchedulerInterface):
             and self.need_mamba_block_aligned_split
             and envs.VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK
         )
+        # Ported from vLLM #53479 (partial prefix-cache hits): retention-aware
+        # boundary stops for the mamba-align chunk splitter. The coordinator
+        # owns retention_interval on this fork (reads
+        # VLLM_PREFIX_CACHE_RETENTION_INTERVAL directly; upstream plumbs it via
+        # KVCacheConfig). eagle_reach_margin mirrors what
+        # find_longest_cache_hit drops for eagle groups (one full block here).
+        self.mamba_retention_interval = (
+            self.kv_cache_manager.coordinator.retention_interval
+            if self.need_mamba_block_aligned_split
+            else None
+        )
+        self.mamba_eagle_reach_margin = (
+            self.kv_cache_manager.coordinator.eagle_reach_margin
+            if self.need_mamba_block_aligned_split
+            else 0
+        )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
@@ -301,7 +317,57 @@ class Scheduler(SchedulerInterface):
                 last_cache_position = max(last_cache_position - block_size, 0)
 
             chunk_end = num_computed_tokens + num_new_tokens
-            if num_computed_tokens < last_cache_position:
+
+            # Ported from vLLM #53479, stops-tuple pattern, trimmed to the
+            # four stops this fork supports (no fine-grained hash hits, no
+            # internal prefill checkpoints, no Marconi junction stop).
+            #
+            # FORK DEVIATION from upstream, deliberate: upstream applies
+            # boundary_stop = next_block_boundary under retention None/<=bs,
+            # which forces every-block chunk termination (denser boundary
+            # materialization, the #53479 mechanism, at a known prefill cost
+            # per extra boundary). Here retention None (the fork default)
+            # keeps boundary_stop OFF, preserving the existing multi-block
+            # chunk shape byte-for-byte; setting
+            # VLLM_PREFIX_CACHE_RETENTION_INTERVAL opts in to the
+            # materialization machinery. One-variable shipping: the gate
+            # window A/Bs the env explicitly.
+            retention = self.mamba_retention_interval
+            next_block_boundary = (
+                num_computed_tokens // block_size + 1
+            ) * block_size
+            if retention is None or retention == 0:
+                boundary_stop = 0
+            elif retention <= block_size:
+                boundary_stop = next_block_boundary
+            else:
+                boundary_stop = (
+                    num_computed_tokens // retention + 1
+                ) * retention
+            replay_boundary = eagle_reach = 0
+            if retention is not None:
+                replay_end = request.num_prompt_tokens - 1
+                replay_boundary = round_down(replay_end, block_size)
+                if self.mamba_eagle_reach_margin > 0:
+                    eagle_reach = max(
+                        round_down(
+                            replay_end - self.mamba_eagle_reach_margin,
+                            block_size,
+                        ),
+                        0,
+                    )
+            stops = (
+                boundary_stop,
+                replay_boundary,
+                eagle_reach,
+                last_cache_position,
+            )
+            candidates = [
+                s for s in stops if num_computed_tokens < s < chunk_end
+            ]
+            if candidates:
+                chunk_end = min(candidates)
+            elif num_computed_tokens < last_cache_position:
                 chunk_end = min(
                     round_down(chunk_end, block_size), last_cache_position
                 )

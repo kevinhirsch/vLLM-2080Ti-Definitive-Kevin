@@ -28,6 +28,12 @@ from vllm.v1.request import Request
 
 
 class SingleTypeKVCacheManager(ABC):
+    # Ported from vLLM #53479: tokens by which an EAGLE/MTP lookup's reusable
+    # boundary trails the replay boundary. Assigned by the coordinator after
+    # construction (HybridKVCacheCoordinator wires its eagle_reach_margin
+    # onto every manager); 0 = no speculative margin.
+    eagle_reach_margin: int = 0
+
     """
     An abstract base class for a manager that handle the kv cache management
     logic of one specific type of attention layer.
@@ -317,6 +323,7 @@ class SingleTypeKVCacheManager(ABC):
             use_eagle=False,
             retention_interval=retention_interval,
             num_prompt_tokens=request.num_prompt_tokens,
+            eagle_reach_margin=self.eagle_reach_margin,
         )
         self.block_pool.cache_full_blocks(
             request=request,
@@ -340,6 +347,7 @@ class SingleTypeKVCacheManager(ABC):
         use_eagle: bool,
         retention_interval: int | None = None,
         num_prompt_tokens: int | None = None,
+        eagle_reach_margin: int = 0,
     ) -> list[bool] | None:
         """Per-block mask for ``cache_full_blocks``. ``None`` means cache
         every (non-null) block — the default, and unchanged behavior for
@@ -1134,6 +1142,7 @@ class MambaManager(SingleTypeKVCacheManager):
         use_eagle: bool,
         retention_interval: int | None = None,
         num_prompt_tokens: int | None = None,
+        eagle_reach_margin: int = 0,
     ) -> list[bool] | None:
         """Sparse Mamba state-snapshot retention (ported from upstream vLLM
         #45845, extending the retention-interval sparsification #43447 added
@@ -1177,6 +1186,20 @@ class MambaManager(SingleTypeKVCacheManager):
             boundary_block = latest // block_size - 1
             if start_block <= boundary_block < end_block:
                 mask[boundary_block - start_block] = True
+
+        # (3) EAGLE/MTP-reachable boundary (ported from vLLM #53479): under a
+        # speculative lookup the deepest reusable state trails the replay
+        # boundary by ``eagle_reach_margin`` tokens (this fork: one full
+        # attention block, see KVCacheCoordinator.eagle_reach_margin). Sparse
+        # retention would otherwise skip it, so keep it explicitly.
+        if num_prompt_tokens is not None and eagle_reach_margin > 0:
+            eagle_latest = max(num_prompt_tokens - 1 - eagle_reach_margin, 0)
+            eagle_latest = (
+                eagle_latest // alignment_tokens * alignment_tokens
+            )
+            eagle_boundary_block = eagle_latest // block_size - 1
+            if start_block <= eagle_boundary_block < end_block:
+                mask[eagle_boundary_block - start_block] = True
 
         return mask
 
