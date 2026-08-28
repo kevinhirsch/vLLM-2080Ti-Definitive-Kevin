@@ -287,9 +287,15 @@ def _stream_chat(
                 if choices:
                     delta = choices[0].get("delta") or {}
                     content = delta.get("content")
+                    reasoning = delta.get("reasoning_content")
+                    # TTFT = first streamed token of EITHER kind. Prod serves
+                    # a reasoning parser (qwen3), so the first tokens arrive
+                    # as reasoning_content; keying t_first on content alone
+                    # left most turns with ttft=None (the 08-24 "n=2-3 valid
+                    # turns" mystery — instrument blind spot, not noise).
+                    if (content or reasoning) and t_first is None:
+                        t_first = time.monotonic()
                     if content:
-                        if t_first is None:
-                            t_first = time.monotonic()
                         text_parts.append(content)
     except Exception as exc:  # noqa: BLE001
         error = f"{type(exc).__name__}: {exc}"
