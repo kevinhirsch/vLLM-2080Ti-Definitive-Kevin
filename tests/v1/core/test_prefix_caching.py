@@ -244,6 +244,7 @@ def test_mamba_align_prefill_split_keeps_intermediate_chunks_aligned() -> None:
         retain_mamba_align_mtp_cache_block=False,
         mamba_retention_interval=None,
         mamba_eagle_reach_margin=0,
+        mamba_state_block_size=block_size,
     )
 
     assert Scheduler._mamba_block_aligned_split(eagle, short_request, 5) == 0
@@ -267,6 +268,7 @@ def test_mamba_align_prefill_split_keeps_intermediate_chunks_aligned() -> None:
         retain_mamba_align_mtp_cache_block=False,
         mamba_retention_interval=None,
         mamba_eagle_reach_margin=0,
+        mamba_state_block_size=block_size,
     )
     assert (
         Scheduler._mamba_block_aligned_split(
@@ -290,6 +292,7 @@ def test_mamba_align_eagle_split_stops_at_reusable_boundary() -> None:
         retain_mamba_align_mtp_cache_block=False,
         mamba_retention_interval=None,
         mamba_eagle_reach_margin=0,
+        mamba_state_block_size=block_size,
     )
 
     scheduled = Scheduler._mamba_block_aligned_split(

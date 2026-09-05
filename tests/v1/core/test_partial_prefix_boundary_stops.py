@@ -57,6 +57,12 @@ def _stub_scheduler(
         retain_mamba_align_mtp_cache_block=retain_mamba_align_mtp_cache_block,
         mamba_retention_interval=mamba_retention_interval,
         mamba_eagle_reach_margin=mamba_eagle_reach_margin,
+        # [FORK] vllm-project/vllm#54076: every test in this file uses a
+        # single homogeneous block_size (no heterogeneous KV-cache-group
+        # scenario), so None correctly falls back to cache_config.block_size
+        # via `self.mamba_state_block_size or self.cache_config.block_size`
+        # -- identical to this attribute not existing, for every case here.
+        mamba_state_block_size=None,
     )
 
 
@@ -267,25 +273,44 @@ def test_sparse_retention_without_eagle_margin_matches_current_chunking() -> Non
 
 
 def test_true_eagle_back_off_still_applies_today() -> None:
-    """PRE-PORT, PASSING TODAY: true EAGLE (retain_mamba_align_mtp_cache_block
-    =False, i.e. every non-MTP eagle-family method on this fork today) must
-    still pay the one-block back-off -- the invariant doc's load-bearing
-    safety property for EAGLE's shifted resume point. Whatever the post-port
-    shape turns out to be (keep our narrow MTP gate vs. adopt upstream's
-    unconditional removal backed by dense boundary materialization -- an
-    OPEN decision per correspondence.md Sec B2, not resolved by this test
-    file), true EAGLE must never silently lose this protection without the
-    compensating dense-boundary-state guarantee landing atomically alongside
-    it. No xfail twin: which post-port shape is correct is itself the
-    decision, not a fact this file can assert in advance. An earlier draft of
-    this file had a "post-port" xfail test here asserting the back-off is
-    gone; it was dropped after hand-verification showed it XPASSed today by
-    coincidence (an aligned 3-block prompt makes the legacy back-off boundary
-    and the dense-materialization boundary land on the same position) --
-    exactly the kind of false-confidence result a strict xfail is supposed to
+    """[FORK] vllm-project/vllm#53802 landed after this file was written
+    (see tests/v1/core/sched/scheduler.py and its commit message): a lookup
+    is capped at num_tokens - 1, so the pre-backoff boundary for this
+    aligned 48-token / 16-token-block prompt is round_down(47, 16) = 32, not
+    round_down(48, 16) = 48. EAGLE's one-block back-off is measured from
+    THAT corrected boundary, landing on 16 (= block_size), not 32
+    (= 2 * block_size) -- matches upstream's own reference formula,
+    `_last_hittable_boundary(48, 16, eagle_block_drop=True) == 16`. The
+    pre-#53802 value of 32 coincided with the lookup cap itself (zero real
+    safety margin); 16 is the genuine one-block-below-the-true-boundary
+    margin the docstring below describes. Expectation updated 2x -> 1x
+    block_size to match; the "PRE-PORT, PASSING TODAY" framing and open
+    post-port-shape decision this docstring originally described are
+    unaffected -- #53802 fixed the boundary math both shapes build on, it
+    did not resolve the narrow-MTP-gate-vs-unconditional-removal question.
+    ---
+    True EAGLE (retain_mamba_align_mtp_cache_block=False, i.e. every non-MTP
+    eagle-family method on this fork today) must still pay the one-block
+    back-off -- the invariant doc's load-bearing safety property for
+    EAGLE's shifted resume point. Whatever the post-port shape turns out to
+    be (keep our narrow MTP gate vs. adopt upstream's unconditional removal
+    backed by dense boundary materialization -- an OPEN decision per
+    correspondence.md Sec B2, not resolved by this test file), true EAGLE
+    must never silently lose this protection without the compensating
+    dense-boundary-state guarantee landing atomically alongside it. No
+    xfail twin: which post-port shape is correct is itself the decision,
+    not a fact this file can assert in advance. An earlier draft of this
+    file had a "post-port" xfail test here asserting the back-off is gone;
+    it was dropped after hand-verification showed it XPASSed today by
+    coincidence (an aligned 3-block prompt makes the legacy back-off
+    boundary and the dense-materialization boundary land on the same
+    position) -- exactly the kind of false-confidence result a strict
+    xfail is supposed to
     catch, and did."""
     block_size = 16
     scheduler = _stub_scheduler(block_size=block_size, use_eagle=True)
     request = _request(num_tokens=3 * block_size)
-    # Aligned prompt: legacy back-off drops one full block below the end.
-    assert _split(scheduler, request, 3 * block_size) == 2 * block_size
+    # Aligned prompt: #53802 floors the pre-backoff boundary from
+    # num_tokens - 1 (47 -> 32), then EAGLE's back-off drops one more full
+    # block below that (32 -> 16).
+    assert _split(scheduler, request, 3 * block_size) == block_size
