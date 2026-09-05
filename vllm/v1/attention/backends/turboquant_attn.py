@@ -132,6 +132,96 @@ def _tq_continuation_prefix_combine_enabled(seq_len: int) -> bool:
     return False
 
 
+# --------------------------------------------------------------------------
+# Continuation-prefill index math + block-table safety helpers.
+#
+# Pulled out to module level (pure Python / plain tensor ops, no Triton, no
+# device-specific control flow) so they can be unit-tested on CPU without a
+# GPU. See tq-crash lane ANALYSIS.md / MECHANISMS.md for the investigation
+# that motivated these (nightly `torch.AcceleratorError: an illegal memory
+# access was encountered` in `_continuation_prefill`'s TurboQuant dequant
+# kernel launch).
+# --------------------------------------------------------------------------
+
+
+def _tq_compute_pages_and_alloc_len(cached_len: int, block_size: int) -> tuple[int, int]:
+    """Pure index math shared by the continuation-prefill dequant path.
+
+    Returns ``(pages, alloc_len)``: the number of block-table pages needed
+    to cover ``cached_len`` tokens, and the block-aligned length the dequant
+    kernel's grid dimension 0 actually spans (``_tq_full_dequant_kv``'s grid
+    is ``(alloc_len, Hk)``, not ``(cached_len, Hk)``). ``alloc_len >=
+    cached_len`` always, rounded up to a ``block_size`` multiple, and every
+    position in ``[0, alloc_len)`` still maps to ``page_idx = pos //
+    block_size < pages``, i.e. stays inside the pages this function
+    reports — the padding in ``[cached_len, alloc_len)`` is wasted compute
+    on stale-but-in-bounds bytes, never an out-of-bounds one.
+    """
+    if cached_len <= 0:
+        return 0, 0
+    pages = math.ceil(cached_len / block_size)
+    alloc_len = pages * block_size
+    return pages, alloc_len
+
+
+def _tq_clamp_cached_len_to_width(
+    cached_len: int, q_len: int, block_size: int, width: int
+) -> tuple[int, int, bool]:
+    """Structural guard: if ``cached_len`` needs more pages than the block
+    table's width (number of columns) can address, clamp ``cached_len``
+    down to what the table can actually cover and adjust ``seq_len`` to
+    preserve the ``seq_len == cached_len + q_len`` invariant the caller
+    relies on for its downstream concat/slice sizing.
+
+    Returns ``(clamped_cached_len, adjusted_seq_len, was_clamped)``.
+    """
+    if cached_len <= 0:
+        return cached_len, cached_len + q_len, False
+    pages = math.ceil(cached_len / block_size)
+    if pages <= width:
+        return cached_len, cached_len + q_len, False
+    clamped_cached_len = width * block_size
+    return clamped_cached_len, clamped_cached_len + q_len, True
+
+
+def _tq_block_ids_out_of_range(
+    block_ids: list[int], num_blocks: int
+) -> tuple[bool, int, int]:
+    """Pure CPU/Python check over already-materialized block ids (e.g. from
+    ``.tolist()``). Returns ``(any_out_of_range, min_id, max_id)``;
+    ``(False, -1, -1)`` for an empty sequence.
+    """
+    if len(block_ids) == 0:
+        return False, -1, -1
+    bt_min = min(block_ids)
+    bt_max = max(block_ids)
+    return (bt_min < 0 or bt_max >= num_blocks), bt_min, bt_max
+
+
+def _tq_clamp_block_table_pages(
+    block_table: torch.Tensor, pages: int, num_blocks: int
+) -> torch.Tensor:
+    """Return a block table whose first ``pages`` columns are clamped into
+    ``[0, num_blocks)``.
+
+    Always returns a fresh tensor (never mutates the caller's
+    ``block_table``) and performs no host synchronization — this is the
+    "bound" half of "bound > detect > predict": it is cheap enough to call
+    unconditionally on every launch, not just when a problem is already
+    suspected via an expensive ``.item()`` check. It is a no-op in the
+    (expected common) case where every entry is already valid, and only
+    changes behavior in the case that used to crash, where it substitutes a
+    bounded-but-possibly-wrong read for an out-of-bounds one. Works on CPU
+    or CUDA tensors identically (no CUDA-specific ops), which is what makes
+    it unit-testable without a GPU.
+    """
+    if pages <= 0 or num_blocks <= 0:
+        return block_table
+    safe = block_table.clone()
+    safe[:, :pages] = safe[:, :pages].clamp(0, num_blocks - 1)
+    return safe
+
+
 def _normalize_turboquant_flashinfer_backend(value: str) -> str:
     normalized = value.strip().lower()
     if normalized in ("1", "true", "yes", "on"):
@@ -2160,14 +2250,17 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             # letting page_idx run past the table width would read
             # adjacent-row garbage and resolve to a bogus KV cache offset.
             if cached_len > 0:
-                pages = math.ceil(cached_len / block_size)
                 width = block_table.shape[1]
-                if pages > width:
+                pre_clamp_pages = math.ceil(cached_len / block_size)
+                cached_len, seq_len, was_clamped = _tq_clamp_cached_len_to_width(
+                    cached_len, q_len, block_size, width
+                )
+                if was_clamped:
                     logger.error(
                         "TQ continuation pages>width: pages=%s width=%s "
                         "cached_len=%s block_size=%s seq_len=%s q_len=%s "
                         "layer=%s",
-                        pages,
+                        pre_clamp_pages,
                         width,
                         cached_len,
                         block_size,
@@ -2175,7 +2268,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         q_len,
                         getattr(layer, "layer_name", None),
                     )
-                    cached_len = width * block_size
                     # Keep the seq_len == cached_len + q_len invariant that the
                     # downstream concat relies on (k_full is sized to seq_len and
                     # filled as [ :cached_len ] = cached, [ cached_len: ] =
@@ -2184,7 +2276,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     # that assignment a shape mismatch and crash the non-prefix-
                     # combine (flash / SDPA) path instead of continuing. Attention
                     # then runs over the truncated-but-in-bounds context.
-                    seq_len = cached_len + q_len
+                    # (_tq_clamp_cached_len_to_width already adjusted seq_len.)
 
             BLOCK_D = triton.next_power_of_2(D)
 
@@ -2194,7 +2286,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             # Dequant cached K/V from TQ cache
             # Allocate slightly over to align to block_size for the grid.
             # Reuse cached buffers to avoid per-call allocation (~16MB at 8K).
-            alloc_len = math.ceil(cached_len / block_size) * block_size
+            pages, alloc_len = _tq_compute_pages_and_alloc_len(cached_len, block_size)
             buf_shape = (1, Hk, alloc_len, D)
             # Keep continuation dequant buffers on WorkspaceManager even for
             # prefix-combine so long-prefix runs avoid allocator churn and stay
