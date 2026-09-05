@@ -8,6 +8,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -22,6 +23,8 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
+
+logger = init_logger(__name__)
 
 
 def neutralize_stale_accept_rows(
@@ -388,6 +391,25 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             # inherits the nulled rows.
             stale_rows = num_accepted_tokens <= 0
             if bool(stale_rows.any()):
+                if envs.VLLM_GDN_SPEC_ACCEPT_TRACE:
+                    # [FORK] Diagnostic for the upstream-fixes lane's GPU
+                    # validation window (see LANE/REPORT.md): confirms
+                    # whether num_accepted_tokens<=0 rows -- the read-side
+                    # i_t=-1 hazard's precondition -- actually occur in a
+                    # given traffic pattern, independent of whether the
+                    # clamp below is also enabled. Rate-limited by
+                    # logger.warning_once's own dedup on the formatted
+                    # message; pays a device-to-host sync only on the (rare,
+                    # by design) stale-row path, never in the common case.
+                    logger.warning_once(
+                        "VLLM_GDN_SPEC_ACCEPT_TRACE: %d stale spec-decode "
+                        "row(s) this step (num_accepted_tokens<=0 at batch "
+                        "positions %s) -- read-side i_t=-1 hazard is live "
+                        "unless VLLM_GDN_SPEC_ACCEPT_INDEX_CLAMP=1; see "
+                        "projects/lanes/upstream-fixes/{ARTIFACTS,PORT}.md.",
+                        int(stale_rows.sum().item()),
+                        stale_rows.nonzero(as_tuple=True)[0].tolist(),
+                    )
                 spec_state_indices_tensor[
                     stale_rows.to(spec_state_indices_tensor.device)
                 ] = NULL_BLOCK_ID
