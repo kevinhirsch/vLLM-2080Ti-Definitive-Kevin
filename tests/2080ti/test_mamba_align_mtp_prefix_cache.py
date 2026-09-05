@@ -10,6 +10,11 @@ def _split_with_mtp_cache_retention(enabled: bool, num_tokens: int = 14) -> int:
     scheduler.use_eagle = True
     scheduler.retain_mamba_align_mtp_cache_block = enabled
     scheduler.cache_config = SimpleNamespace(block_size=4)
+    # [FORK] vllm-project/vllm#54076: fake scheduler needs its own
+    # mamba_state_block_size now that _mamba_block_aligned_split reads it
+    # instead of cache_config.block_size directly; same value here since
+    # this test's scenario is homogeneous (single KV-cache-group geometry).
+    scheduler.mamba_state_block_size = 4
     # [FORK][LANE f1-provenance] (/home/kevin/projects/lanes/f1-provenance)
     # This stub predates the 2026-08-27 port (25436c5a0, vLLM #53479) that
     # added these two attributes as unconditionally-read Scheduler state
@@ -47,4 +52,13 @@ def test_mamba_align_mtp_can_retain_final_cache_boundary() -> None:
     # MTP still computes the two-token tail, so the 12-token state is valid.
     assert _split_with_mtp_cache_retention(enabled=True) == 12
     # Without a tail, preserve EAGLE's safety block.
-    assert _split_with_mtp_cache_retention(enabled=True, num_tokens=12) == 8
+    #
+    # [FORK] vllm-project/vllm#53802: the highest position any future lookup
+    # can register a hit at is round_down(num_tokens - 1, block_size) = 8
+    # here (KVCacheManager.get_computed_blocks caps lookups at
+    # num_tokens - 1 = 11), not round_down(num_tokens, block_size) = 12.
+    # EAGLE's one-block safety margin is measured from that corrected
+    # boundary (8), landing on 4 -- not from the pre-#53802 value (12),
+    # which happened to coincide with the lookup cap itself and so gave a
+    # "safety" margin of zero. Expectation updated 8 -> 4 to match.
+    assert _split_with_mtp_cache_retention(enabled=True, num_tokens=12) == 4
