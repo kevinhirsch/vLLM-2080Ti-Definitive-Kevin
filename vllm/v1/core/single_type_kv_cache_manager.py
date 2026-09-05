@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
 
-from vllm.utils.math_utils import cdiv
+from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
     BlockHashList,
@@ -33,6 +33,18 @@ class SingleTypeKVCacheManager(ABC):
     # construction (HybridKVCacheCoordinator wires its eagle_reach_margin
     # onto every manager); 0 = no speculative margin.
     eagle_reach_margin: int = 0
+
+    # [FORK][LANE f1-provenance] (/home/kevin/projects/lanes/f1-provenance)
+    # Mirrors HybridKVCacheCoordinator.mtp_retain_active -- True iff this
+    # model has the write-side VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK
+    # mechanism active (method="mtp" + hybrid Mamba-align + the env on).
+    # Assigned by the coordinator after construction, the same way
+    # eagle_reach_margin is (HybridKVCacheCoordinator.
+    # verify_and_split_kv_cache_groups); False for every manager under
+    # every other coordinator (Unitary, NoPrefixCache never set it).
+    # Consulted by cache_blocks() below to know when it is even possible
+    # for this call to be committing the one retained-boundary block.
+    mtp_retain_active: bool = False
 
     """
     An abstract base class for a manager that handle the kv cache management
@@ -325,15 +337,60 @@ class SingleTypeKVCacheManager(ABC):
             num_prompt_tokens=request.num_prompt_tokens,
             eagle_reach_margin=self.eagle_reach_margin,
         )
+        blocks = self.req_to_blocks[request.request_id]
         self.block_pool.cache_full_blocks(
             request=request,
-            blocks=self.req_to_blocks[request.request_id],
+            blocks=blocks,
             num_cached_blocks=num_cached_blocks,
             num_full_blocks=num_full_blocks,
             block_size=self.block_size,
             kv_cache_group_id=self.kv_cache_group_id,
             block_mask=block_mask,
         )
+
+        # [FORK][LANE f1-provenance] Mark KVCacheBlock.retained_mtp_boundary
+        # on the ONE block this call commits at
+        # Scheduler._mamba_block_aligned_split's retain_final_mtp_block
+        # boundary, so the read side (HybridKVCacheCoordinator.
+        # find_longest_cache_hit) can later verify a candidate last block
+        # really is that provably-safe boundary instead of assuming it from
+        # a coarse, model-level flag alone. See LANE/DESIGN.md
+        # (/home/kevin/projects/lanes/f1-provenance) for the full argument;
+        # summary of the condition below:
+        #
+        # `last_cache_position = round_down(request.num_tokens, block_size)`
+        # is the same floor _mamba_block_aligned_split computes from the
+        # SAME (during prefill, unchanging) request.num_tokens. That
+        # function only ever leaves last_cache_position AT this floor, un-
+        # retreated, when retain_final_mtp_block fired for THIS request --
+        # i.e. mtp_retain_active AND a genuine unaligned tail
+        # (last_cache_position < request.num_tokens). Any OTHER scheduling
+        # path (retention inactive, or no tail to retain) instead either
+        # retreats the target a full block earlier before capping the
+        # chunk, or -- since it never stops there at all -- lets a later,
+        # bigger chunk jump straight past this exact value to
+        # request.num_tokens. So `num_tokens == last_cache_position` (this
+        # call's own commit boundary landing EXACTLY on that floor, still
+        # short of the request's full token count) is only ever true for
+        # the one call that performs the retained commit; it is false both
+        # for a legacy/non-retained final chunk (which commits
+        # request.num_tokens directly, skipping this value) and for every
+        # ordinary earlier chunk (which commits less than the floor).
+        # Since num_tokens strictly increases across calls for a given
+        # request, this can fire at most once per request lifetime.
+        #
+        # The block_hash/is_null check confirms cache_full_blocks actually
+        # hashed this exact block in THIS call rather than skipping it as
+        # null or sparse-retention-masked -- never mark a placeholder.
+        if self.mtp_retain_active and num_full_blocks > 0:
+            last_cache_position = round_down(request.num_tokens, self.block_size)
+            if (
+                last_cache_position < request.num_tokens
+                and num_tokens == last_cache_position
+            ):
+                boundary_block = blocks[num_full_blocks - 1]
+                if not boundary_block.is_null and boundary_block.block_hash is not None:
+                    boundary_block.retained_mtp_boundary = True
 
         self.num_cached_block[request.request_id] = num_full_blocks
 

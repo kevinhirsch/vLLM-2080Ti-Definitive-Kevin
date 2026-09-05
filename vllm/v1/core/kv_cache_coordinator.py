@@ -71,6 +71,34 @@ def _validate_prefix_cache_retention_interval(
             )
 
 
+def _last_matched_block_has_mtp_provenance(
+    hit_blocks: tuple[list[KVCacheBlock], ...],
+) -> bool:
+    """[FORK][LANE f1-provenance] True iff the deepest block this lookup
+    matched (``hit_blocks[0][-1]``, the one an eagle-affected group would
+    otherwise unconditionally drop) is proven to be the one boundary
+    ``Scheduler._mamba_block_aligned_split``'s ``retain_final_mtp_block``
+    branch protects, per ``KVCacheBlock.retained_mtp_boundary``.
+
+    ``hit_blocks[0]`` is the same representative group
+    ``HybridKVCacheCoordinator.find_longest_cache_hit`` already uses to
+    derive ``_new_hit_length`` -- every KV cache group sharing this spec is
+    committed together, in the same ``SingleTypeKVCacheManager.cache_blocks``
+    step, by the identical write-side condition, so they carry the same
+    provenance value; checking one is checking all of them.
+
+    False (never crash) for an empty match, and for a null placeholder --
+    a null block can never legitimately carry the bit (SingleTypeKVCacheManager.
+    cache_blocks skips null/masked-out blocks when marking it), but this is
+    still checked explicitly rather than relied upon implicitly.
+    """
+    candidates = hit_blocks[0]
+    if not candidates:
+        return False
+    block = candidates[-1]
+    return not block.is_null and block.retained_mtp_boundary
+
+
 class KVCacheCoordinator(ABC):
     """
     Coordinate the KV cache of different KV cache groups.
@@ -571,6 +599,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         margin = self.eagle_reach_margin
         for manager in self.single_type_managers:
             manager.eagle_reach_margin = margin
+            # [FORK][LANE f1-provenance] Same propagation pattern as
+            # eagle_reach_margin above: every manager needs to know whether
+            # the write-side MTP align-retention mechanism is active for
+            # this model so SingleTypeKVCacheManager.cache_blocks can mark
+            # KVCacheBlock.retained_mtp_boundary on the one boundary it
+            # protects. See docs/mtp-retention-invariant.md and
+            # LANE/DESIGN.md (/home/kevin/projects/lanes/f1-provenance).
+            manager.mtp_retain_active = self.mtp_retain_active
 
     @property
     def eagle_reach_margin(self) -> int:
@@ -656,8 +692,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     and spec.supports_eagle_cache_peek
                 )
 
-                # [FORK][LANE f1-lookup] Read-side counterpart to
-                # VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK (see
+                # [FORK][LANE f1-lookup, hardened by LANE f1-provenance --
+                # /home/kevin/projects/lanes/f1-provenance] Read-side
+                # counterpart to VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK (see
                 # docs/mtp-retention-invariant.md, LANE/MAP.md under
                 # /home/kevin/projects/lanes/f1-lookup). The unconditional
                 # pop below exists for vllm-project/vllm#43650: a matched
@@ -673,25 +710,31 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 # involved, and mtp-retention-invariant.md's "Proposer
                 # state" argument shows MTP's proposer never needs a hidden
                 # state at or before that boundary either way. So when both
-                # gates are on we skip the pop (and the extra one-block
-                # peek it needs) entirely for this candidate, recovering at
-                # most the one block the write side actually retained.
+                # gates are on we consider skipping the pop entirely for
+                # this candidate, recovering at most the one block the
+                # write side actually retained.
                 #
-                # Residual approximation (see LANE/REPORT.md "risks"):
-                # block-hash identity carries no provenance, so this cannot
-                # distinguish "the retained prefill-tail boundary" from an
-                # ordinary decode-time boundary that happens to be the last
-                # match -- it relaxes the drop for ANY eagle-affected
-                # candidate once both flags are on, not only the specific
-                # retained one. The cross-group fixed point below and the
-                # final full-attention truncation still cap the result at
-                # whatever every group's OWN hash chain actually supports,
-                # so this can never manufacture a hit past the hashed
-                # prefix -- it can only mis-skip a recompute that upstream
-                # would have forced. Treat as experimental (gate-window.md)
-                # until an evalkit-style quality check clears it, exactly
-                # like VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK's own
-                # "Default posture" required before promotion.
+                # f1-lookup's own risk note: block-hash identity ALONE
+                # carries no provenance, so the double env/flag gate cannot
+                # by itself distinguish "the retained prefill-tail boundary"
+                # from an ordinary decode-time boundary that happens to be
+                # the last match. f1-provenance closes this: KVCacheBlock.
+                # retained_mtp_boundary (kv_cache_utils.py) is set ONLY by
+                # SingleTypeKVCacheManager.cache_blocks, exactly when it
+                # commits that one specific boundary (see LANE/DESIGN.md for
+                # the write-side condition and why the bit cannot go
+                # stale). Below, `use_retained_mtp_block` still only means
+                # "the coarse, model-level gates allow considering the
+                # relaxation" -- the actual no-pop decision additionally
+                # requires the CANDIDATE block itself to carry the bit
+                # (checked immediately after the lookup call, once we know
+                # what that candidate is); otherwise we re-run with the
+                # original unconditional-drop arguments, byte-identical to
+                # what always ran here before f1-lookup existed. The
+                # cross-group fixed point below and the final full-attention
+                # truncation still cap the result at whatever every group's
+                # OWN hash chain actually supports, so this can never
+                # manufacture a hit past the hashed prefix.
                 use_retained_mtp_block = (
                     drop_eagle_block
                     and self.mtp_retain_active
@@ -714,6 +757,35 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     use_eagle=effective_drop_eagle_block,
                     alignment_tokens=self.lcm_block_size,
                 )
+                if use_retained_mtp_block and not _last_matched_block_has_mtp_provenance(
+                    hit_blocks
+                ):
+                    # [FORK][LANE f1-provenance] The coarse gates said the
+                    # relaxation MIGHT apply, but the specific candidate
+                    # block this lookup landed on isn't proven safe (no
+                    # provenance bit -- e.g. an ordinary decode-time
+                    # boundary that happens to be this lookup's last
+                    # match). Re-run with the SAME arguments the
+                    # always-on baseline (pre-f1-lookup) code would have
+                    # used -- use_eagle=True with the peeked bound -- so
+                    # the fallback is byte-identical to the unconditional
+                    # drop, not a hand-rolled approximation of it (this
+                    # also keeps any alignment_tokens != block_size
+                    # trimming inside find_longest_cache_hit in its
+                    # original eagle-pop-then-align-trim order; see
+                    # LANE/DESIGN.md).
+                    _max_length = min(
+                        curr_hit_length + spec.block_size, max_cache_hit_length
+                    )
+                    hit_blocks = manager_cls.find_longest_cache_hit(
+                        block_hashes=_get_block_hashes(spec),
+                        max_length=_max_length,
+                        kv_cache_group_ids=group_ids,
+                        block_pool=self.block_pool,
+                        kv_cache_spec=spec,
+                        use_eagle=True,
+                        alignment_tokens=self.lcm_block_size,
+                    )
                 _new_hit_length = len(hit_blocks[0]) * spec.block_size
                 if drop_eagle_block:
                     eagle_verified.add(idx)
