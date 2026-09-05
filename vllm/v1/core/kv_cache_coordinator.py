@@ -88,10 +88,19 @@ class KVCacheCoordinator(ABC):
         pcp_world_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        mtp_retain_active: bool = False,
     ):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
+        # [FORK][LANE f1-lookup] True iff the write-side
+        # VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK mechanism is active for this
+        # model (method="mtp" + align-mode Mamba + the env on -- computed by
+        # the scheduler, which has speculative_config; see
+        # docs/mtp-retention-invariant.md). Unused outside
+        # HybridKVCacheCoordinator; defaults to False so every other
+        # coordinator/caller is unaffected.
+        self.mtp_retain_active = mtp_retain_active
 
         self.block_pool = BlockPool(
             kv_cache_config.num_blocks,
@@ -476,6 +485,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         pcp_world_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        mtp_retain_active: bool = False,
     ):
         super().__init__(
             kv_cache_config,
@@ -488,6 +498,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            mtp_retain_active=mtp_retain_active,
         )
         # hash_block_size: the block size used to compute block hashes.
         # The actual block size usually equals hash_block_size, but in cases where
@@ -645,8 +656,51 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     and spec.supports_eagle_cache_peek
                 )
 
+                # [FORK][LANE f1-lookup] Read-side counterpart to
+                # VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK (see
+                # docs/mtp-retention-invariant.md, LANE/MAP.md under
+                # /home/kevin/projects/lanes/f1-lookup). The unconditional
+                # pop below exists for vllm-project/vllm#43650: a matched
+                # final block MAY reflect a partially-accepted
+                # draft-verification step, so it isn't trusted as a full
+                # hit. That risk is specific to DECODE-time boundaries. The
+                # one boundary VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK
+                # actually retains is provably not one of those: it only
+                # ever fires on a PREFILL boundary (Scheduler.
+                # _mamba_block_aligned_split, guarded by
+                # num_computed_tokens < prefill_end) at the tail of some
+                # ancestor request's own prompt, with no draft/verify step
+                # involved, and mtp-retention-invariant.md's "Proposer
+                # state" argument shows MTP's proposer never needs a hidden
+                # state at or before that boundary either way. So when both
+                # gates are on we skip the pop (and the extra one-block
+                # peek it needs) entirely for this candidate, recovering at
+                # most the one block the write side actually retained.
+                #
+                # Residual approximation (see LANE/REPORT.md "risks"):
+                # block-hash identity carries no provenance, so this cannot
+                # distinguish "the retained prefill-tail boundary" from an
+                # ordinary decode-time boundary that happens to be the last
+                # match -- it relaxes the drop for ANY eagle-affected
+                # candidate once both flags are on, not only the specific
+                # retained one. The cross-group fixed point below and the
+                # final full-attention truncation still cap the result at
+                # whatever every group's OWN hash chain actually supports,
+                # so this can never manufacture a hit past the hashed
+                # prefix -- it can only mis-skip a recompute that upstream
+                # would have forced. Treat as experimental (gate-window.md)
+                # until an evalkit-style quality check clears it, exactly
+                # like VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK's own
+                # "Default posture" required before promotion.
+                use_retained_mtp_block = (
+                    drop_eagle_block
+                    and self.mtp_retain_active
+                    and envs.VLLM_PREFIX_CACHE_USE_RETAINED_MTP_BLOCK
+                )
+                effective_drop_eagle_block = drop_eagle_block and not use_retained_mtp_block
+
                 _max_length = curr_hit_length
-                if drop_eagle_block:
+                if effective_drop_eagle_block:
                     # Eagle needs to match one more block and then pop the last.
                     _max_length = min(
                         curr_hit_length + spec.block_size, max_cache_hit_length
@@ -657,7 +711,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     kv_cache_group_ids=group_ids,
                     block_pool=self.block_pool,
                     kv_cache_spec=spec,
-                    use_eagle=drop_eagle_block,
+                    use_eagle=effective_drop_eagle_block,
                     alignment_tokens=self.lcm_block_size,
                 )
                 _new_hit_length = len(hit_blocks[0]) * spec.block_size
@@ -700,7 +754,12 @@ def get_kv_cache_coordinator(
     pcp_world_size: int,
     hash_block_size: int,
     metrics_collector: KVCacheMetricsCollector | None = None,
+    mtp_retain_active: bool = False,
 ) -> KVCacheCoordinator:
+    # [FORK][LANE f1-lookup] mtp_retain_active only means anything to
+    # HybridKVCacheCoordinator (see its find_longest_cache_hit); the other
+    # two coordinator types below don't take the parameter at all, so it is
+    # simply not forwarded to them.
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
             kv_cache_config,
@@ -737,4 +796,5 @@ def get_kv_cache_coordinator(
         pcp_world_size=pcp_world_size,
         hash_block_size=hash_block_size,
         metrics_collector=metrics_collector,
+        mtp_retain_active=mtp_retain_active,
     )

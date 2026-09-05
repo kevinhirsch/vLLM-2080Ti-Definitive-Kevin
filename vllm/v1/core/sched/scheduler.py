@@ -221,6 +221,25 @@ class Scheduler(SchedulerInterface):
         # Create the KV cache manager.
         if hash_block_size is None:
             hash_block_size = block_size
+        # [FORK][LANE f1-lookup] Computed here (ahead of
+        # self.retain_mamba_align_mtp_cache_block below, which is only
+        # assigned once self.need_mamba_block_aligned_split exists) because
+        # HybridKVCacheCoordinator needs to know at CONSTRUCTION time whether
+        # the write-side MTP align-retention mechanism
+        # (VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK) is active for this model,
+        # to gate the read-side counterpart
+        # (VLLM_PREFIX_CACHE_USE_RETAINED_MTP_BLOCK; see
+        # HybridKVCacheCoordinator.find_longest_cache_hit and
+        # docs/mtp-retention-invariant.md). Same predicate as
+        # self.retain_mamba_align_mtp_cache_block below -- reused there
+        # instead of recomputed so the two can never drift apart.
+        _mtp_retain_active = (
+            speculative_config is not None
+            and speculative_config.method == "mtp"
+            and kv_cache_config.has_mamba_layers
+            and self.cache_config.mamba_cache_mode == "align"
+            and envs.VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK
+        )
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -233,6 +252,7 @@ class Scheduler(SchedulerInterface):
             pcp_world_size=self.pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
+            mtp_retain_active=_mtp_retain_active,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -252,12 +272,13 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
-        self.retain_mamba_align_mtp_cache_block = (
-            speculative_config is not None
-            and speculative_config.method == "mtp"
-            and self.need_mamba_block_aligned_split
-            and envs.VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK
-        )
+        # [FORK][LANE f1-lookup] Same predicate as _mtp_retain_active above
+        # (computed earlier because KVCacheManager/the coordinator needed it
+        # too, before self.need_mamba_block_aligned_split existed); reused
+        # here as the single source of truth for both the write-side gate
+        # (this attribute) and the read-side one already wired into
+        # self.kv_cache_manager.coordinator, so the two can never drift.
+        self.retain_mamba_align_mtp_cache_block = _mtp_retain_active
         # Ported from vLLM #53479 (partial prefix-cache hits): retention-aware
         # boundary stops for the mamba-align chunk splitter. The coordinator
         # owns retention_interval on this fork (reads

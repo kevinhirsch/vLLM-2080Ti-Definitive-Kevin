@@ -309,6 +309,25 @@ if TYPE_CHECKING:
     # align): the uncached prompt tail still runs and produces the proposer's
     # hidden states, so that boundary state is valid and reusable. Default off.
     VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK: bool = False
+    # [FORK][LANE f1-lookup] Read-side counterpart to the write-side flag
+    # above. The prefix-cache LOOKUP (HybridKVCacheCoordinator.
+    # find_longest_cache_hit) unconditionally pops the last matched block for
+    # any EAGLE/MTP-affected attention group (vllm-project/vllm#43650: "a
+    # partially-accepted block shouldn't be trusted as a full cache hit").
+    # When VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK actually retained that
+    # block (a genuine prefill-tail boundary, never a decode/verify one --
+    # see docs/mtp-retention-invariant.md), the pop just re-discards state
+    # that write side already made safe to reuse. This flag lets the lookup
+    # count that retained block as a hit instead. It is a strict no-op unless
+    # VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK is ALSO set (both gates are
+    # required); default off => byte-identical lookup behavior. See
+    # docs/mtp-retention-invariant.md and the f1-lookup lane's MAP.md/
+    # REPORT.md (LANE=/home/kevin/projects/lanes/f1-lookup) for the full
+    # analysis, including the residual approximation this does NOT close
+    # (block-hash lookups carry no per-block provenance, so the read side
+    # still cannot prove that a given matched final block, rather than an
+    # ordinary decode-time one, is specifically the retained one).
+    VLLM_PREFIX_CACHE_USE_RETAINED_MTP_BLOCK: bool = False
     VLLM_USE_V2_MODEL_RUNNER: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
@@ -1977,6 +1996,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK": lambda: os.getenv(
         "VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK", "0"
+    )
+    .strip()
+    .lower()
+    in ("1", "true", "yes", "on"),
+    # [FORK][LANE f1-lookup] See the declaration above for the full rationale.
+    "VLLM_PREFIX_CACHE_USE_RETAINED_MTP_BLOCK": lambda: os.getenv(
+        "VLLM_PREFIX_CACHE_USE_RETAINED_MTP_BLOCK", "0"
     )
     .strip()
     .lower()
