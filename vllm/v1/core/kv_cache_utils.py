@@ -134,6 +134,25 @@ class KVCacheBlock:
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
+    # [FORK][LANE f1-provenance] (/home/kevin/projects/lanes/f1-provenance)
+    # Write-side provenance for the one MTP align-mode retention boundary.
+    # Set to True ONLY by SingleTypeKVCacheManager.cache_blocks, at the
+    # exact call that commits the boundary Scheduler._mamba_block_aligned_
+    # split's retain_final_mtp_block branch protects (see
+    # docs/mtp-retention-invariant.md and LANE/DESIGN.md). Consulted by
+    # HybridKVCacheCoordinator.find_longest_cache_hit so the
+    # VLLM_PREFIX_CACHE_USE_RETAINED_MTP_BLOCK relaxation can verify --
+    # rather than assume -- that a given candidate last block is that
+    # specific, provably-safe boundary and not an ordinary decode-time
+    # block that just happens to be some lookup's last match. Always False
+    # for every other block/model; a plain bool keeps the dataclass slot
+    # cheap. Cleared by reset_hash() (see below) so it can never go stale
+    # across a free+reuse or a re-hash under a different request -- the
+    # block_hash setter's own assertion (immediately below) guarantees a
+    # block can only ever get a NEW hash after reset_hash() has run, so
+    # this bit is always freshly False before any new commit decides it.
+    retained_mtp_boundary: bool = False
+
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
         return self._block_hash
@@ -148,6 +167,14 @@ class KVCacheBlock:
     def reset_hash(self):
         """Reset the block hash when the block is evicted."""
         self._block_hash = None
+        # [FORK][LANE f1-provenance] The block's identity is being wiped
+        # (evicted for recycling via BlockPool._maybe_evict_cached_block,
+        # or a bulk BlockPool.reset_prefix_cache) -- any provenance claim
+        # about its PREVIOUS content is no longer meaningful. Whatever
+        # hash/content this block gets next (if any) will go through
+        # cache_full_blocks -> SingleTypeKVCacheManager.cache_blocks again,
+        # which recomputes this bit from scratch for the new occupant.
+        self.retained_mtp_boundary = False
 
     def __repr__(self) -> str:
         # Use block_id instead of KVCacheBlock object to avoid calling __repr__
@@ -159,7 +186,8 @@ class KVCacheBlock:
             f"ref_cnt={self.ref_cnt}, "
             f"_block_hash={self._block_hash!r}, "
             f"prev_free_block={prev_block_id}, "
-            f"next_free_block={next_block_id})"
+            f"next_free_block={next_block_id}, "
+            f"retained_mtp_boundary={self.retained_mtp_boundary})"
         )
 
 
