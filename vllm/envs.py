@@ -952,6 +952,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH": lambda: bool(
         int(os.getenv("VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH", "0"))
     ),
+    # [F-5] backlog RANK 2, f5-forced-k lane: opt-in mitigation for the
+    # doubled-token defect seen under VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH=1
+    # (see that flag's comment above -- this is the concrete "recurrent
+    # state update patterns" risk it warns about). When set alongside that
+    # flag, refuses FULL cudagraph replay (falls back to PIECEWISE/eager for
+    # that step only) on any decode step where a scheduled request's mamba
+    # running-state block is about to be promoted (align mode), which is
+    # the leading suspected stale-slot window -- see LANE/MAP.md and
+    # LANE/PROBE.md hypothesis H1 for the mechanism this targets, and
+    # LANE/REPORT.md for what remains unvalidated without a GPU. No effect
+    # unless VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH=1 and
+    # --mamba-cache-mode=align are both also set.
+    "VLLM_F5_REFUSE_CAPTURE_ON_ACCEPTANCE_BOUNDARY": lambda: bool(
+        int(os.getenv("VLLM_F5_REFUSE_CAPTURE_ON_ACCEPTANCE_BOUNDARY", "0"))
+    ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
     # (CPU backend only) CPU key-value cache space.

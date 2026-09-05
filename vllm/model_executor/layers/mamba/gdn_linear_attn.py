@@ -67,6 +67,7 @@ from vllm.utils.torch_utils import (
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.worker import f5_probe_trace
 
 # Optional ROCm AITER Triton kernels for the GDN decode fast-path.
 # Availability is checked centrally via rocm_aiter_ops; the actual function
@@ -1525,6 +1526,15 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
+            # [F-5] forced-K probe trace (backlog RANK 2, f5-forced-k lane,
+            # see LANE/PROBE.md Hook C). No-op unless VLLM_F5_PROBE_TRACE=1;
+            # the .tolist() calls are a real device sync, gated so they only
+            # happen when the diagnostic is explicitly armed.
+            if f5_probe_trace.ENABLED:
+                f5_probe_trace.log_fanout(
+                    num_accepted_tokens=num_accepted_tokens.tolist(),
+                    state_indices=spec_state_indices_tensor.tolist(),
+                )
             core_attn_out_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,

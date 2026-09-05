@@ -207,6 +207,7 @@ from vllm.v1.worker.ubatch_utils import (
     split_attn_metadata,
 )
 from vllm.v1.worker import xid31_trace
+from vllm.v1.worker import f5_accept_boundary, f5_probe_trace
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.workspace import lock_workspace
 
@@ -3975,6 +3976,17 @@ class GPUModelRunner(
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
+        # [F-5] Opt-in mitigation for the FULL-cudagraph + MTP/Mamba
+        # doubled-token defect (backlog RANK 2, f5-forced-k lane). Only ever
+        # True when VLLM_F5_REFUSE_CAPTURE_ON_ACCEPTANCE_BOUNDARY=1 AND the
+        # caller has already determined (via f5_accept_boundary, from data
+        # available before this call) that some scheduled request's mamba
+        # running-state block is promoted this step. Defaults False, so
+        # behavior is byte-identical to before this lane when the env var
+        # is unset -- see LANE/MAP.md for why this specific condition was
+        # chosen and LANE/REPORT.md for what remains unvalidated (no GPU
+        # available to this lane).
+        force_disable_full_accept_boundary: bool = False,
     ) -> tuple[
         CUDAGraphMode,
         BatchDescriptor,
@@ -4016,8 +4028,20 @@ class GPUModelRunner(
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
-            num_tokens_padded, disable_full=use_cascade_attn or has_encoder_output
+            num_tokens_padded,
+            disable_full=(
+                use_cascade_attn
+                or has_encoder_output
+                or force_disable_full_accept_boundary
+            ),
         )
+        if f5_probe_trace.ENABLED:
+            f5_probe_trace.log_dispatch(
+                cudagraph_mode=cudagraph_mode.name,
+                num_tokens=batch_descriptor.num_tokens,
+                num_reqs=num_reqs,
+                uniform=uniform_decode,
+            )
         num_tokens_padded = batch_descriptor.num_tokens
         if self.compilation_config.pass_config.enable_sp:
             assert (
@@ -4299,6 +4323,41 @@ class GPUModelRunner(
                     scheduler_output.num_common_prefix_blocks,
                 )
 
+            # [F-5] Opt-in mitigation (backlog RANK 2, f5-forced-k lane; see
+            # LANE/MAP.md, LANE/PROBE.md hypothesis H1): when a request's
+            # mamba running-state block is about to be promoted this step
+            # (preprocess_mamba(), later in this same function, will reset
+            # its num_accepted_tokens to the align-mode neutral value), the
+            # GDN/Mamba K+1-way fan-out-select kernels' read of that shared
+            # tensor is the suspected stale-slot window under FULL decode
+            # cudagraphs + MTP. Computed BEFORE preprocess_mamba runs (using
+            # the same formula it uses, factored into f5_accept_boundary.py)
+            # so the very step that would promote a block never replays a
+            # captured FULL graph. Off by default (envs.py default 0); zero
+            # overhead beyond one bool test when off or when the model has
+            # no mamba layers / spec decode is inactive.
+            force_disable_full_accept_boundary = False
+            if (
+                envs.VLLM_F5_REFUSE_CAPTURE_ON_ACCEPTANCE_BOUNDARY
+                and self.cache_config.mamba_cache_mode == "align"
+                and scheduler_output.scheduled_spec_decode_tokens
+            ):
+                mamba_spec = self._get_mamba_copy_bufs().mamba_spec
+                force_disable_full_accept_boundary = (
+                    f5_accept_boundary.batch_has_pending_boundary_crossing(
+                        req_ids=req_ids,
+                        num_computed_tokens_by_req={
+                            rid: self.requests[rid].num_computed_tokens
+                            for rid in req_ids
+                            if rid in self.requests
+                        },
+                        num_scheduled_tokens_by_req=scheduler_output.num_scheduled_tokens,
+                        mamba_state_idx=self.mamba_state_idx,
+                        block_size=mamba_spec.block_size,
+                        num_speculative_blocks=mamba_spec.num_speculative_blocks,
+                    )
+                )
+
             (
                 cudagraph_mode,
                 batch_desc,
@@ -4312,6 +4371,7 @@ class GPUModelRunner(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                force_disable_full_accept_boundary=force_disable_full_accept_boundary,
             )
 
             logger.debug(
@@ -6805,6 +6865,21 @@ class GPUModelRunner(
         # VLLM_TQ_XID31_TRACE is set; see vllm/v1/worker/xid31_trace.py.
         xid31_trace.install()
         xid31_trace.scan_runner(self)
+
+        # F-5 (backlog RANK 2): arm the forced-K probe trace for the FULL
+        # cudagraph + MTP/Mamba doubled-token investigation. No-op unless
+        # VLLM_F5_PROBE_TRACE is set; see vllm/v1/worker/f5_probe_trace.py
+        # and the f5-forced-k lane's MAP.md/PROBE.md.
+        if self.kv_cache_config is not None and self.kv_cache_config.has_mamba_layers:
+            _f5_mamba_spec = self._get_mamba_copy_bufs().mamba_spec
+            f5_probe_trace.install(
+                mamba_block_size=_f5_mamba_spec.block_size,
+                num_spec=(
+                    self.vllm_config.speculative_config.num_speculative_tokens
+                    if self.vllm_config.speculative_config
+                    else 0
+                ),
+            )
 
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time

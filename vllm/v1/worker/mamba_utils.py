@@ -12,10 +12,10 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
 )
 from vllm.triton_utils import tl, triton
-from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
+from vllm.v1.worker import f5_accept_boundary, f5_probe_trace
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
 
@@ -251,10 +251,6 @@ def preprocess_mamba(
             prev_state_idx = (req_state.num_computed_tokens - 1) // block_size
 
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-        num_blocks: int = (
-            cdiv(req_state.num_computed_tokens + num_scheduled_tokens, block_size)
-            + num_speculative_blocks
-        )
 
         # We always save the current running state at the last
         # (1 + num_speculative_blocks) block.
@@ -266,15 +262,30 @@ def preprocess_mamba(
         # Block 2: speculative block
         # Block 3: speculative block
         # And use block 1 to save the running state.
-        curr_state_idx = num_blocks - 1 - num_speculative_blocks
+        # [F-5] Extracted to f5_accept_boundary.compute_curr_state_idx() so
+        # the VLLM_F5_REFUSE_CAPTURE_ON_ACCEPTANCE_BOUNDARY mitigation and
+        # the VLLM_F5_PROBE_TRACE diagnostic (both in the f5-forced-k lane,
+        # see LANE/MAP.md) can predict/observe this exact boundary from one
+        # source of truth instead of re-deriving the formula. Arithmetically
+        # unchanged from the original inline computation.
+        curr_state_idx = f5_accept_boundary.compute_curr_state_idx(
+            req_state.num_computed_tokens,
+            num_scheduled_tokens,
+            block_size,
+            num_speculative_blocks,
+        )
+        boundary_crossed = f5_accept_boundary.crosses_boundary(
+            prev_state_idx, curr_state_idx
+        )
         mamba_state_idx[req_id] = curr_state_idx
+        accepted_pre = int(input_batch.num_accepted_tokens_cpu[i])
         # [FORK] vllm-project/vllm#51508: a stale async row reports
         # num_accepted_tokens == 0; the copy below indexes with count-1 and
         # -1 is a *valid* Python index, so it would silently read the wrong
         # state slot. The discarded step advanced no state — skip entirely.
         if input_batch.num_accepted_tokens_cpu[i] <= 0:
             continue
-        if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
+        if boundary_crossed:
             collect_mamba_copy_meta(
                 copy_bufs,
                 kv_cache_config,
@@ -287,6 +298,17 @@ def preprocess_mamba(
                 forward_context,
             )
             input_batch.num_accepted_tokens_cpu[i] = 1
+        if f5_probe_trace.ENABLED:
+            f5_probe_trace.log_preprocess(
+                req_id=req_id,
+                prev_state_idx=prev_state_idx,
+                curr_state_idx=curr_state_idx,
+                boundary_crossed=boundary_crossed,
+                accepted_pre=accepted_pre,
+                accepted_post=int(input_batch.num_accepted_tokens_cpu[i]),
+                block_size=block_size,
+                num_speculative_blocks=num_speculative_blocks,
+            )
     do_mamba_copy_block(copy_bufs)
 
 
