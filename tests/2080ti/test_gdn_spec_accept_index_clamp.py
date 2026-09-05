@@ -218,6 +218,32 @@ class TestEnvVarDefaultAndRoundTrip:
         monkeypatch.delenv("VLLM_GDN_SPEC_ACCEPT_INDEX_CLAMP", raising=False)
         importlib.reload(envs)
 
+    def test_trace_flag_default_is_off_and_independent_of_clamp(self, monkeypatch):
+        """VLLM_GDN_SPEC_ACCEPT_TRACE (the diagnostic companion) must default
+        off and must be settable independently of VLLM_GDN_SPEC_ACCEPT_INDEX_
+        CLAMP -- the whole point is to run the trace alone first, in a GPU
+        validation window, before deciding whether to also enable the fix.
+        """
+        import importlib
+
+        import vllm.envs as envs
+
+        monkeypatch.delenv("VLLM_GDN_SPEC_ACCEPT_TRACE", raising=False)
+        monkeypatch.delenv("VLLM_GDN_SPEC_ACCEPT_INDEX_CLAMP", raising=False)
+        importlib.reload(envs)
+        assert envs.VLLM_GDN_SPEC_ACCEPT_TRACE is False
+        assert envs.VLLM_GDN_SPEC_ACCEPT_INDEX_CLAMP is False
+
+        monkeypatch.setenv("VLLM_GDN_SPEC_ACCEPT_TRACE", "1")
+        importlib.reload(envs)
+        assert envs.VLLM_GDN_SPEC_ACCEPT_TRACE is True
+        assert envs.VLLM_GDN_SPEC_ACCEPT_INDEX_CLAMP is False, (
+            "enabling the trace must not implicitly enable the clamp"
+        )
+
+        monkeypatch.delenv("VLLM_GDN_SPEC_ACCEPT_TRACE", raising=False)
+        importlib.reload(envs)
+
 
 def test_cpu_only_no_gpu_allocation_guard():
     """Sanity guard for this file itself: everything above must run with no

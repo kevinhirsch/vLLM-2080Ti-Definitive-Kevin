@@ -327,6 +327,18 @@ if TYPE_CHECKING:
     # the GPU validation window; see LANE/PORT.md
     # (upstream-fixes) for the analysis. Unset behavior is unchanged.
     VLLM_GDN_SPEC_ACCEPT_INDEX_CLAMP: bool = False
+    # [FORK] Diagnostic companion to VLLM_GDN_SPEC_ACCEPT_INDEX_CLAMP, for the
+    # upstream-fixes lane's 23:30/65 GPU validation window: logs (once per
+    # occurrence, rate-limited via logger.warning_once per distinct message)
+    # whenever a spec-decode step has any num_accepted_tokens<=0 row, i.e.
+    # whenever the read-side i_t=-1 hazard the clamp fixes would otherwise
+    # fire. Independent of the clamp itself -- can be run alone first to
+    # confirm whether stale rows occur at all in a given traffic pattern,
+    # matching this fork's VLLM_TQ_CONTINUATION_TRACE / VLLM_F5_PROBE_TRACE
+    # diagnose-before-fix convention. Pays a device-to-host sync
+    # (.nonzero()/.tolist()) only when stale rows exist -- do not leave on
+    # in steady-state production. Default off.
+    VLLM_GDN_SPEC_ACCEPT_TRACE: bool = False
     VLLM_USE_V2_MODEL_RUNNER: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
@@ -2004,6 +2016,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_GDN_SPEC_ACCEPT_INDEX_CLAMP": lambda: os.getenv(
         "VLLM_GDN_SPEC_ACCEPT_INDEX_CLAMP", "0"
+    )
+    .strip()
+    .lower()
+    in ("1", "true", "yes", "on"),
+    "VLLM_GDN_SPEC_ACCEPT_TRACE": lambda: os.getenv(
+        "VLLM_GDN_SPEC_ACCEPT_TRACE", "0"
     )
     .strip()
     .lower()
