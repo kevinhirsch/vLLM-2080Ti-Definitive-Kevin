@@ -527,6 +527,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         )
 
         num_accepted_tokens = torch.diff(m.query_start_loc)
-        num_decode_draft_tokens_cpu = (num_accepted_tokens - 1).cpu()
+        # [FORK] vllm-project/vllm#55404: `build_for_cudagraph_capture` is not
+        # capture-only -- `_dummy_run` re-stages FULL-graph metadata through
+        # it with for_capture=True on every dummy step (e.g. an idle/padding
+        # rank under TP or DP with nothing scheduled this step), so the old
+        # `(num_accepted_tokens - 1).cpu()` device-to-host copy drained the
+        # whole stream on that hot path. `query_start_loc_cpu` is already
+        # host-resident (populated once when the common metadata was built),
+        # so deriving the same values from it is byte-identical with no sync.
+        num_decode_draft_tokens_cpu = torch.diff(m.query_start_loc_cpu).sub_(1)
+        assert num_decode_draft_tokens_cpu.shape == num_accepted_tokens.shape
 
         return self.build(0, m, num_accepted_tokens, num_decode_draft_tokens_cpu)
