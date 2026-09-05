@@ -309,6 +309,24 @@ if TYPE_CHECKING:
     # align): the uncached prompt tail still runs and produces the proposer's
     # hidden states, so that boundary state is valid and reusable. Default off.
     VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK: bool = False
+    # [FORK] Research-and-port of vllm-project/vllm#50021 ("Bound accepted-
+    # token state lookups in GDN/KDA spec decode"), completing the existing
+    # #51508 port in gdn_attn.py: that port nulls a stale (num_accepted_
+    # tokens<=0) row's own spec_state_indices_tensor entries, but leaves
+    # num_accepted_tokens[row]==0 in place, which still drives
+    # `i_t = num_accepted_tokens[row] - 1 == -1` in
+    # fused_recurrent_gated_delta_rule_fwd_kernel /
+    # fused_sigmoid_gating_delta_rule_update_kernel / causal_conv1d_update's
+    # spec-decode path *before* any of them index ssm_state_indices /
+    # conv_state_indices with it -- i_t=-1 reads the *previous* row's last
+    # column (or is truly out-of-bounds for row 0), not this row's own
+    # (already-nulled) column 0. When enabled, forces such rows' accepted
+    # count to 1 (the same "neutral" value used elsewhere in this codebase),
+    # which the #51508 null-write already makes safe at i_t=0. Pure
+    # host-side tensor op, no kernel signature changes. Default off pending
+    # the GPU validation window; see LANE/PORT.md
+    # (upstream-fixes) for the analysis. Unset behavior is unchanged.
+    VLLM_GDN_SPEC_ACCEPT_INDEX_CLAMP: bool = False
     VLLM_USE_V2_MODEL_RUNNER: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
@@ -1984,6 +2002,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_V2_MODEL_RUNNER": lambda: bool(
         int(os.getenv("VLLM_USE_V2_MODEL_RUNNER", "0"))
     ),
+    "VLLM_GDN_SPEC_ACCEPT_INDEX_CLAMP": lambda: os.getenv(
+        "VLLM_GDN_SPEC_ACCEPT_INDEX_CLAMP", "0"
+    )
+    .strip()
+    .lower()
+    in ("1", "true", "yes", "on"),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
     # with quantization methods and attention backends.
