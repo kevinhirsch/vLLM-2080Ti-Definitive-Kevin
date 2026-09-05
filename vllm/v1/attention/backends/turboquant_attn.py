@@ -352,6 +352,14 @@ _TQ_FI_PREFILL_PLAN_CACHE_MAXSIZE = max(
 _TQ_FI_PREFILL_CUDAGRAPH_SAFE = (
     os.getenv("VLLM_TURBOQUANT_FLASHINFER_PREFILL_CUDAGRAPH_SAFE", "0") == "1"
 )
+# tq-crash lane candidate fix, MECHANISMS.md Rank 4 (see the call site in
+# _get_or_plan_flashinfer_prefill_wrapper for the full rationale). Default
+# off: only meant for a deliberate diagnostic window testing whether
+# unsynchronized FlashInfer prefill-wrapper plan-cache eviction is
+# implicated in the nightly continuation-prefill crash.
+_TQ_FI_PREFILL_SYNC_BEFORE_EVICT = (
+    os.getenv("VLLM_TURBOQUANT_FI_PREFILL_SYNC_BEFORE_EVICT", "0") == "1"
+)
 _TQ_CONTINUATION_WORKSPACE_RESERVE_TOKENS = int(
     os.getenv("VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS", "0")
 )
@@ -910,6 +918,45 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 # wrapper owns an auxiliary GPU workspace, so evicting after
                 # planning briefly requires maxsize + 1 workspaces and can
                 # OOM at the exact point this bound is meant to protect.
+                #
+                # tq-crash lane candidate fix (MECHANISMS.md Rank 4, ranked
+                # below Ranks 1-3 after checking this deployment appears
+                # single-stream, which would make a same-stream FIFO
+                # ordering argument hold without this): dropping the
+                # evicted wrapper here frees its private GPU buffers
+                # (flashinfer/prefill.py's BatchPrefillWithRaggedKVCacheWrapper
+                # allocates its own `_int_workspace_buffer` per instance) with
+                # no synchronization. On a single CUDA stream this is safe
+                # by construction (a later-enqueued kernel reusing the freed
+                # memory necessarily runs after this wrapper's own kernels,
+                # which were enqueued earlier in program order on the same
+                # stream) -- but this file cannot fully audit whether
+                # FlashInfer's own custom-kernel dispatch ever launches
+                # outside the caller's current stream. Confirmed separately
+                # (ANALYSIS.md / MECHANISMS.md Rank 4): the plan-cache key
+                # embeds q_len/cached_len/seq_len, which change on every
+                # chunk of a growing continuation, so this cache misses and
+                # evicts constantly for exactly the workload that crashes --
+                # independent of whether eviction itself is unsafe.
+                #
+                # Default off: adds a real host sync to a (normally
+                # infrequent, but -- per the above -- not infrequent for
+                # long chunked continuations) eviction event. Enable for a
+                # diagnostic window to test the eviction-race hypothesis
+                # directly: if turning this on alone makes the crash
+                # disappear, this mechanism is confirmed despite the
+                # single-stream argument above.
+                if _TQ_FI_PREFILL_SYNC_BEFORE_EVICT:
+                    torch.cuda.synchronize()
+                if _TQ_CONTINUATION_TRACE:
+                    logger.info(
+                        "VLLM_TQ_CONTINUATION_TRACE fi-prefill-plan-cache "
+                        "evict: size=%s maxsize=%s evicted_key=%s new_key=%s",
+                        len(_TQ_FI_PREFILL_WRAPPERS),
+                        _TQ_FI_PREFILL_PLAN_CACHE_MAXSIZE,
+                        next(iter(_TQ_FI_PREFILL_WRAPPERS), None),
+                        cache_key,
+                    )
                 _TQ_FI_PREFILL_WRAPPERS.popitem(last=False)
 
             workspace = _get_shared_flashinfer_prefill_workspace(
