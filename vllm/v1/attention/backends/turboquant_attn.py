@@ -56,6 +56,7 @@ from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
     is_workspace_manager_initialized,
+    workspace_manager_total_bytes,
 )
 from vllm.v1.attention.ops.triton_turboquant_decode import (
     _tq_full_dequant_kv,
@@ -222,6 +223,59 @@ def _tq_clamp_block_table_pages(
     return safe
 
 
+def _tq_trace_pre_launch_continuation(
+    *,
+    layer: Any,
+    cached_len: int,
+    seq_len: int,
+    q_len: int,
+    pages: int,
+    alloc_len: int,
+    block_size: int,
+    block_table: torch.Tensor,
+    num_blocks: int,
+    required_bytes: int,
+) -> None:
+    """VLLM_TQ_CONTINUATION_TRACE=1 diagnostic: log the exact index math and
+    block-table validity for one `_tq_full_dequant_kv` launch, immediately
+    before it is issued. Pays a host sync (`.item()`) to read bt_min/bt_max
+    — acceptable here because this whole function only runs when the trace
+    env is explicitly set for a diagnostic session, never in steady state.
+    See MECHANISMS.md ranks 1/2/3/5/6/7 — this single log line carries the
+    numbers needed to evaluate all of them for one launch.
+    """
+    width = block_table.shape[1]
+    pages_eff = min(pages, width) if pages > 0 else 0
+    if pages_eff > 0:
+        bt_slice = block_table[0, :pages_eff]
+        bt_min = int(bt_slice.min().item())
+        bt_max = int(bt_slice.max().item())
+    else:
+        bt_min, bt_max = -1, -1
+    total_bytes = workspace_manager_total_bytes()
+    logger.info(
+        "VLLM_TQ_CONTINUATION_TRACE dequant-launch: layer=%s cached_len=%s "
+        "seq_len=%s q_len=%s pages=%s alloc_len=%s block_size=%s width=%s "
+        "num_blocks=%s bt_min=%s bt_max=%s bt_in_range=%s "
+        "workspace_total_bytes=%s required_bytes=%s workspace_headroom_bytes=%s",
+        getattr(layer, "layer_name", None),
+        cached_len,
+        seq_len,
+        q_len,
+        pages,
+        alloc_len,
+        block_size,
+        width,
+        num_blocks,
+        bt_min,
+        bt_max,
+        bool(0 <= bt_min and bt_max < num_blocks) if pages_eff > 0 else True,
+        total_bytes,
+        required_bytes,
+        total_bytes - required_bytes,
+    )
+
+
 def _normalize_turboquant_flashinfer_backend(value: str) -> str:
     normalized = value.strip().lower()
     if normalized in ("1", "true", "yes", "on"):
@@ -310,6 +364,16 @@ _TQ_CONTINUATION_SDPA_MAX_QK_CELLS = int(
 _TQ_CONTINUATION_BOUNDS_CHECK = (
     os.getenv("VLLM_TURBOQUANT_CONTINUATION_BOUNDS_CHECK", "0") == "1"
 )
+# tq-crash lane diagnostic (see /home/kevin/projects/lanes/tq-crash/MECHANISMS.md
+# Rank 1/2/3/5/6/7 instruments): when set, log the continuation-prefill dequant
+# launch's index math + block-table validity *before* every
+# `_tq_full_dequant_kv` launch and force a `torch.cuda.synchronize()`
+# immediately after it, so that if this specific launch is the one that
+# faults, the AcceleratorError is raised here instead of at some unrelated
+# later synchronization point. Default OFF: this adds a host sync to every
+# continuation-prefill chunk, which is a real throughput cost — intended for
+# a deliberate repro/diagnostic window, not steady-state production.
+_TQ_CONTINUATION_TRACE = os.getenv("VLLM_TQ_CONTINUATION_TRACE", "0") == "1"
 _TQ_FORCE_DECODE_SDPA_MAX_QK_CELLS = int(
     os.getenv("VLLM_TURBOQUANT_FORCE_DECODE_SDPA_MAX_QK_CELLS", "131072")
 )
@@ -2383,6 +2447,20 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     )
                     safe_block_table = block_table.clone()
                     safe_block_table[0, :pages_eff].clamp_(0, num_blocks - 1)
+            if _TQ_CONTINUATION_TRACE:
+                _tq_trace_pre_launch_continuation(
+                    layer=layer,
+                    cached_len=cached_len,
+                    seq_len=seq_len,
+                    q_len=q_len,
+                    pages=pages,
+                    alloc_len=alloc_len,
+                    block_size=block_size,
+                    block_table=safe_block_table,
+                    num_blocks=kv_cache.shape[0],
+                    required_bytes=(k_cached.numel() * k_cached.element_size())
+                    + (v_cached.numel() * v_cached.element_size()),
+                )
             _tq_full_dequant_kv[grid](
                 kv_cache,
                 safe_block_table,
@@ -2413,6 +2491,12 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 FP8_FORMAT=_fp8_format_code(device.index or 0),
                 num_warps=4,
             )
+            if _TQ_CONTINUATION_TRACE:
+                # Force the fault (if this launch is the one that faults) to
+                # surface here, attributed to this specific (layer, request)
+                # continuation-prefill dequant call, instead of at whatever
+                # unrelated .item()/.cpu() call happens to run next.
+                torch.cuda.synchronize()
 
             # Inverse-rotate MSE keys back to original space
             if not self.tq_config.key_fp8:

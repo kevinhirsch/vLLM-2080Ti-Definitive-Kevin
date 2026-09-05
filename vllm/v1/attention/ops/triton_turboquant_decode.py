@@ -14,11 +14,14 @@ from typing import Any
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.triton_decode_attention import (
     _fwd_kernel_stage2,
 )
+
+logger = init_logger(__name__)
 
 _FP8_FORMAT_CODE: dict[int, int] = {}
 _FP8_FORMAT_OVERRIDE = os.getenv(
@@ -29,6 +32,49 @@ if _FP8_FORMAT_OVERRIDE not in ("", "auto", "e4b15", "e4nv", "e5"):
     raise ValueError(
         "VLLM_TURBOQUANT_K8V4_FP8_FORMAT must be one of: "
         "auto, e4b15, e4nv, e5"
+    )
+
+# tq-crash lane (nightly torch.AcceleratorError in TurboQuant continuation
+# prefill; see /home/kevin/projects/lanes/tq-crash/{ANALYSIS,MECHANISMS}.md).
+# Same trace env as turboquant_attn.py's continuation-prefill instrument —
+# one flag drives diagnostics across both the decode-kernel family here and
+# the full-dequant kernel there, so a single repro run's log covers both.
+_TQ_DECODE_TRACE = os.getenv("VLLM_TQ_CONTINUATION_TRACE", "0") == "1"
+# Fix candidate (MECHANISMS.md Rank 1): unconditional, non-syncing clamp of
+# every block-table entry used by the decode-kernel family into
+# [0, num_blocks). Default OFF — see the call site below for why.
+_TQ_DECODE_BLOCK_TABLE_CLAMP = (
+    os.getenv("VLLM_TURBOQUANT_DECODE_BLOCK_TABLE_CLAMP", "0") == "1"
+)
+
+
+def _tq_decode_trace_pre_launch(
+    site: str,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_blocks: int,
+) -> None:
+    """VLLM_TQ_CONTINUATION_TRACE=1 diagnostic twin of
+    turboquant_attn._tq_trace_pre_launch_continuation, for the decode-kernel
+    family (`_tq_decode_stage1` / `_tq_decode_stage1_qtile`), which has no
+    equivalent bounds check at all today (ANALYSIS.md Section 3). Pays a
+    host sync to read bt_min/bt_max; diagnostic-only, gated off by default.
+    """
+    if block_table.numel() == 0:
+        return
+    bt_min = int(block_table.min().item())
+    bt_max = int(block_table.max().item())
+    seq_max = int(seq_lens.max().item()) if seq_lens.numel() else -1
+    logger.info(
+        "VLLM_TQ_CONTINUATION_TRACE decode-launch: site=%s bt_shape=%s "
+        "seq_len_max=%s num_blocks=%s bt_min=%s bt_max=%s bt_in_range=%s",
+        site,
+        tuple(block_table.shape),
+        seq_max,
+        num_blocks,
+        bt_min,
+        bt_max,
+        bool(0 <= bt_min and bt_max < num_blocks),
     )
 
 
@@ -1135,6 +1181,27 @@ def triton_turboquant_decode_attention(
     block_size = kv_cache.shape[1]
     kv_group_size = Hq // Hk
     device = query.device
+    num_blocks = kv_cache.shape[0]
+
+    # tq-crash lane fix candidate (MECHANISMS.md Rank 1): unlike the
+    # continuation-prefill dequant launch in turboquant_attn.py, neither
+    # `_tq_decode_stage1` nor `_tq_decode_stage1_qtile` validates
+    # `block_table` entries against `num_blocks` anywhere — every load
+    # derived from a block id is unmasked with respect to id validity (only
+    # masked against seq_len). Default OFF (untested on GPU, and this is
+    # the hottest path in the engine — every decode step, every layer,
+    # every sequence); clamp is unconditional and non-syncing when enabled,
+    # so it is cheap enough to consider for steady-state use once verified.
+    if _TQ_DECODE_BLOCK_TABLE_CLAMP:
+        block_table = block_table.clamp(0, max(num_blocks - 1, 0))
+
+    if _TQ_DECODE_TRACE:
+        _tq_decode_trace_pre_launch(
+            "qtile" if (_STAGE1_QTILE and qtile_same_seq and 1 < B <= 8) else "stage1",
+            block_table,
+            seq_lens,
+            num_blocks,
+        )
 
     cfg = _get_layout(D, mse_bits, value_quant_bits, key_packed_size)
 
@@ -1264,6 +1331,15 @@ def triton_turboquant_decode_attention(
             num_warps=1,
             num_stages=1,
         )
+
+    if _TQ_DECODE_TRACE:
+        # Force the fault (if this stage1 launch is the one that faults) to
+        # surface here, attributed to this decode-kernel call, instead of at
+        # whatever unrelated .item()/.cpu() call happens to run next (which
+        # is exactly what makes the continuation-prefill bounds check's
+        # crash line misleading when the real fault is upstream — see
+        # ANALYSIS.md Section 1.3 / MECHANISMS.md Rank 3).
+        torch.cuda.synchronize()
 
     # Stage 2: Reduce across KV splits
     # Output in query dtype — eliminates float16_copy kernel after stage2
