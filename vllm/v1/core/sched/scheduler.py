@@ -48,7 +48,7 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -252,6 +252,37 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        # [FORK] vllm-project/vllm#54076: the mamba "align" state grid is the
+        # mamba group's own block size, which the worker's `postprocess_mamba`
+        # checkpoints a state on (`mamba_spec.block_size` in mamba_utils.py).
+        # `self.cache_config.block_size` is the MINIMUM block size over every
+        # KV-cache group (set once in `vllm/v1/engine/core.py` from
+        # `min(g.kv_cache_spec.block_size for g in kv_cache_groups)`), and can
+        # be strictly finer than the mamba grid in a heterogeneous layout
+        # (page-size matching, an MTP/draft attention group, or an explicit
+        # --block-size). `_mamba_block_aligned_split` previously used
+        # `self.cache_config.block_size` directly (see the old assignment it
+        # replaces below): on a finer generic grid the scheduler's chunk stops
+        # never land on a real mamba-state boundary, so the group publishes no
+        # (or a misaligned) prefix hash and every hit falls back to an earlier
+        # checkpoint or misses outright. Computed once here, matching the
+        # coordinator's own single-mamba-block-size assumption elsewhere.
+        self.mamba_state_block_size: int | None = None
+        if self.need_mamba_block_aligned_split:
+            mamba_state_block_sizes = {
+                group.kv_cache_spec.block_size
+                for group in kv_cache_config.kv_cache_groups
+                if isinstance(group.kv_cache_spec, MambaSpec)
+            }
+            assert len(mamba_state_block_sizes) <= 1, (
+                "mamba align scheduling requires a single mamba state block "
+                f"size, got {sorted(mamba_state_block_sizes)}"
+            )
+            self.mamba_state_block_size = (
+                next(iter(mamba_state_block_sizes))
+                if mamba_state_block_sizes
+                else None
+            )
         self.retain_mamba_align_mtp_cache_block = (
             speculative_config is not None
             and speculative_config.method == "mtp"
@@ -298,7 +329,17 @@ class Scheduler(SchedulerInterface):
         # may remain unaligned because it is not reused as a boundary state.
         prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
         if num_computed_tokens < prefill_end:
-            block_size = self.cache_config.block_size
+            # [FORK] vllm-project/vllm#54076: split on the mamba group's own
+            # block size (`self.mamba_state_block_size`, derived in __init__
+            # from `MambaSpec.block_size`), not the generic cross-group
+            # minimum. `postprocess_mamba` (vllm/v1/worker/mamba_utils.py)
+            # only ever checkpoints a state where a chunk ends on the mamba
+            # grid; splitting on a finer generic grid (heterogeneous layouts:
+            # an MTP/drafter attention group, page-size matching, or an
+            # explicit --block-size) produces chunk ends that never coincide
+            # with a real state boundary, so the group publishes no (or a
+            # misaligned) prefix hash.
+            block_size = self.mamba_state_block_size or self.cache_config.block_size
 
             # EAGLE drops the last matched full-attention block. Keep the last
             # reusable Mamba boundary one block earlier so all hybrid groups
