@@ -2406,34 +2406,58 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     )
                 except Exception:
                     logger.exception("Gemma4 TQ continuation debug logging failed")
-            safe_block_table = block_table
-            if _TQ_CONTINUATION_BOUNDS_CHECK and cached_len > 0:
-                pages = math.ceil(cached_len / block_size)
-                num_blocks = kv_cache.shape[0]
-                width = block_table.shape[1]
-                if pages > width:
-                    # Belt-and-suspenders: the structural early-out above
-                    # already clamps cached_len so pages should never
-                    # exceed width here, but guard the slice anyway in
-                    # case a future caller reaches this point without
-                    # going through that clamp. Plain `[0, :pages]`
-                    # slicing silently truncates to `width` instead of
-                    # raising when pages > width, which would otherwise
-                    # hide this exact condition from the bt_min/bt_max
-                    # check below.
-                    logger.error(
-                        "TQ continuation pages>width: pages=%s width=%s "
-                        "cached_len=%s block_size=%s seq_len=%s q_len=%s "
-                        "layer=%s",
-                        pages,
-                        width,
-                        cached_len,
-                        block_size,
-                        seq_len,
-                        q_len,
-                        getattr(layer, "layer_name", None),
-                    )
-                pages_eff = min(pages, width)
+            # FIX (tq-crash lane; see ANALYSIS.md Section 1.3 and
+            # MECHANISMS.md Rank 1/3): unconditionally clamp the block ids
+            # this specific launch is about to use into [0, num_blocks).
+            #
+            # This used to be gated behind
+            # VLLM_TURBOQUANT_CONTINUATION_BOUNDS_CHECK and required a
+            # `.item()` host sync on *every* call (whether or not anything
+            # was ever out of range) to decide whether to clamp. That sync
+            # is exactly why a CUDA fault from an *earlier*, unrelated
+            # launch (a previous layer's kernel, or -- see MECHANISMS.md
+            # Rank 1 -- the completely unguarded decode-kernel family in
+            # triton_turboquant_decode.py, which runs first in a mixed
+            # batch) got attributed to this line instead of to whatever
+            # actually faulted: PyTorch raises torch.AcceleratorError at
+            # the first synchronization point after an async kernel fault,
+            # not at the launch that caused it.
+            #
+            # `_tq_clamp_block_table_pages` needs no host readback to decide
+            # whether to clamp -- clamping is safe regardless of whether it
+            # was necessary, and a no-op (bitwise identical output) whenever
+            # every entry is already valid, which is the overwhelmingly
+            # common case. That is what makes it safe to run unconditionally
+            # instead of only after an expensive detect-first check.
+            num_blocks = kv_cache.shape[0]
+            width = block_table.shape[1]
+            if pages > width:
+                # Belt-and-suspenders: the structural early-out above
+                # already clamps cached_len so pages should never exceed
+                # width here, but guard the slice anyway in case a future
+                # caller reaches this point without going through that
+                # clamp.
+                logger.error(
+                    "TQ continuation pages>width: pages=%s width=%s "
+                    "cached_len=%s block_size=%s seq_len=%s q_len=%s "
+                    "layer=%s",
+                    pages,
+                    width,
+                    cached_len,
+                    block_size,
+                    seq_len,
+                    q_len,
+                    getattr(layer, "layer_name", None),
+                )
+            pages_eff = min(pages, width)
+            safe_block_table = _tq_clamp_block_table_pages(
+                block_table, pages_eff, num_blocks
+            )
+            if _TQ_CONTINUATION_BOUNDS_CHECK and pages_eff > 0:
+                # Opt-in loud diagnostic for operators with existing
+                # alerting on this log line: still pays the .item() sync
+                # this flag has always paid, but purely for the log message
+                # now -- the clamp above no longer depends on it running.
                 bt_slice = block_table[0, :pages_eff]
                 bt_max = int(bt_slice.max().item())
                 bt_min = int(bt_slice.min().item())
@@ -2441,12 +2465,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     logger.error(
                         "TQ continuation dequant block_table OOB (pre-launch): layer=%s "
                         "cached_len=%s pages=%s block_size=%s num_blocks=%s bt_min=%s "
-                        "bt_max=%s q_len=%s seq_len=%s -- clamping to avoid MMU fault",
+                        "bt_max=%s q_len=%s seq_len=%s -- already clamped "
+                        "unconditionally before this diagnostic ran",
                         getattr(layer, "layer_name", None), cached_len, pages, block_size,
                         num_blocks, bt_min, bt_max, q_len, seq_len,
                     )
-                    safe_block_table = block_table.clone()
-                    safe_block_table[0, :pages_eff].clamp_(0, num_blocks - 1)
             if _TQ_CONTINUATION_TRACE:
                 _tq_trace_pre_launch_continuation(
                     layer=layer,
