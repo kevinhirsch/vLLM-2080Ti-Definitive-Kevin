@@ -321,18 +321,38 @@ class Scheduler(SchedulerInterface):
         if num_computed_tokens < prefill_end:
             block_size = self.cache_config.block_size
 
+            # [FORK] vllm-project/vllm#53802: a prefix-cache lookup is capped
+            # at `num_tokens - 1` at most (see
+            # `KVCacheManager.get_computed_blocks`'s
+            # `max_cache_hit_length = request.num_tokens - 1`), so the
+            # highest position any future lookup can register a hit at is
+            # `round_down(num_tokens - 1, block_size)`, not
+            # `round_down(num_tokens, block_size)`. On a block-aligned prompt
+            # the latter is a no-op and registers state one whole block above
+            # the highest position a lookup can ever reach, so a resubmit of
+            # that same prompt misses the true boundary and falls back to the
+            # previous (stale) retention checkpoint instead.
             # EAGLE drops the last matched full-attention block. Keep the last
             # reusable Mamba boundary one block earlier so all hybrid groups
             # describe the same prefix length.
-            last_cache_position = round_down(request.num_tokens, block_size)
+            last_cache_position = round_down(request.num_tokens - 1, block_size)
             # [FORK] MTP follows the EAGLE scheduler path, but an uncached
             # prompt tail still runs and produces the hidden states needed by
             # the proposer. In that case the final aligned Mamba state is valid
             # and retaining it avoids throwing away a full (often ~2K-token)
             # prefix block. Gated by VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK.
+            #
+            # NOTE (vllm-project/vllm#53802 interaction): this must detect
+            # "does the prompt have an unaligned tail past the last full
+            # block" directly (`num_tokens % block_size != 0`), not by
+            # comparing against `last_cache_position` -- now that the latter
+            # is floored from `num_tokens - 1` (the #53802 fix above), it is
+            # `< request.num_tokens` unconditionally, even for a block-aligned
+            # prompt, and would make this always-True and silently disable
+            # the eagle back-off below for every aligned prompt.
+            prompt_has_unaligned_tail = request.num_tokens % block_size != 0
             retain_final_mtp_block = (
-                self.retain_mamba_align_mtp_cache_block
-                and last_cache_position < request.num_tokens
+                self.retain_mamba_align_mtp_cache_block and prompt_has_unaligned_tail
             )
             if self.use_eagle and not retain_final_mtp_block:
                 last_cache_position = max(last_cache_position - block_size, 0)
