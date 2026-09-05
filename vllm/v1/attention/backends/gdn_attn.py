@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -21,6 +22,57 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
+
+
+def neutralize_stale_accept_rows(
+    num_accepted_tokens: torch.Tensor,
+    stale_rows: torch.Tensor,
+) -> torch.Tensor:
+    """Force ``stale_rows`` of ``num_accepted_tokens`` to 1 (this module's
+    existing "neutral"/no-op accepted count, also used by
+    ``mamba_utils.py``'s preprocess/postprocess boundary resets).
+
+    [FORK] Completes the port of vllm-project/vllm#51508 immediately above
+    this function's call site with the remaining fix from the closely
+    related vllm-project/vllm#50021 ("Bound accepted-token state lookups in
+    GDN/KDA spec decode").
+
+    The #51508 port nulls a stale row's own ``spec_state_indices_tensor``
+    entries (columns ``0..num_spec``) but leaves
+    ``num_accepted_tokens[row] == 0`` in place. That 0 still reaches
+    ``fused_recurrent_gated_delta_rule_fwd_kernel``,
+    ``fused_sigmoid_gating_delta_rule_update_kernel`` and the
+    ``causal_conv1d_update`` spec-decode path unmodified — all three
+    compute ``i_t = num_accepted_tokens[row] - 1`` *before* indexing
+    ``ssm_state_indices`` / ``conv_state_indices`` with it
+    (``fused_recurrent.py:113``, mirrored in ``fused_sigmoid_gating.py`` and
+    ``causal_conv1d.py:856``). For a stale row, ``i_t == -1``:
+    ``ssm_state_indices[row, -1]`` is not this (already-nulled) row's own
+    data, it is column ``num_spec`` (the last column) of row ``row - 1`` —
+    or genuinely out-of-bounds for ``row == 0`` — because these tensors are
+    plain row-major ``[batch, num_spec + 1]`` buffers
+    (``self.spec_state_indices_tensor = torch.empty((decode_cudagraph_max_bs,
+    self.num_spec + 1), ...)`` above). The existing ``state_idx <= 0`` /
+    null-block guards in those kernels check the value loaded from *that*
+    (wrong) address, not from this row's own nulled column 0 — so they only
+    catch this case when the previous row also happens to be null/invalid.
+
+    Forcing the count to 1 makes ``i_t == 0`` for stale rows instead, which
+    reads this row's *own* column 0 — already ``NULL_BLOCK_ID`` from the
+    #51508 null-write — so the kernels' existing guards correctly skip the
+    row in place, touching no other request's state.
+
+    Pure tensor op (``torch.where``), no kernel or launch-parameter changes;
+    safe to unit-test on CPU tensors with ``CUDA_VISIBLE_DEVICES=""`` (never
+    allocates GPU memory itself, and behaves identically on CPU and GPU
+    tensors). Gated behind ``VLLM_GDN_SPEC_ACCEPT_INDEX_CLAMP`` (default
+    off); unset, the caller is a no-op passthrough and behavior is
+    byte-identical to the tree before this port.
+    """
+    if not bool(stale_rows.any()):
+        return num_accepted_tokens
+    neutral = torch.ones_like(num_accepted_tokens)
+    return torch.where(stale_rows, neutral, num_accepted_tokens)
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -339,6 +391,16 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_state_indices_tensor[
                     stale_rows.to(spec_state_indices_tensor.device)
                 ] = NULL_BLOCK_ID
+                # [FORK] Port of vllm-project/vllm#50021 (Site 1), completing
+                # the #51508 port above: see neutralize_stale_accept_rows's
+                # docstring for why the null-write alone does not stop
+                # i_t=-1 from reading the *previous* row's data. Env-gated
+                # pending the GPU validation window (LANE/PORT.md); default
+                # off, so unset behavior is unchanged from the tree above.
+                if envs.VLLM_GDN_SPEC_ACCEPT_INDEX_CLAMP:
+                    num_accepted_tokens = neutralize_stale_accept_rows(
+                        num_accepted_tokens, stale_rows
+                    )
 
         chunk_indices: torch.Tensor | None = None
         chunk_offsets: torch.Tensor | None = None
