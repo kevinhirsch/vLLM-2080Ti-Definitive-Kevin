@@ -132,6 +132,72 @@ def _tq_continuation_prefix_combine_enabled(seq_len: int) -> bool:
     return False
 
 
+def _tq_chunked_prefix_plan(
+    cached_len: int, block_size: int, chunk_tokens: int
+) -> list[tuple[int, int, int, int, int]]:
+    """Pure arithmetic: partition ``[0, cached_len)`` into block-size-aligned
+    chunks of up to ``chunk_tokens`` tokens each.
+
+    Used by ``TurboQuantAttentionImpl._continuation_prefix_combine_chunked``
+    (RANK-4 backlog: chunked continuation-dequant) to decide the dequant/
+    attend range for each chunk. Kept as a standalone, side-effect-free
+    function -- no tensors, no CUDA, no logging -- so the chunk-range/pages/
+    alloc math can be unit-tested on CPU in isolation from triton/
+    flashinfer; see tests/turboquant/test_chunked_prefix_plan_math.py.
+
+    ``chunk_tokens`` is rounded down to the nearest multiple of
+    ``block_size`` (minimum one page) so every chunk boundary except
+    possibly the last falls exactly on a page boundary. That invariant
+    matters because the caller passes a page-offset *view* of the
+    block_table (``block_table[:, chunk_start_page:]``) into the unmodified
+    ``_tq_full_dequant_kv`` kernel rather than changing the kernel's
+    ``page_idx = pos // BLOCK_SIZE`` indexing -- ``pos = 0`` in the chunk-
+    local output buffer must land exactly on ``chunk_start_page`` in the
+    real table, which only holds when chunk_start_tok is page-aligned.
+
+    Returns a list of ``(chunk_start_tok, chunk_len, chunk_alloc_len,
+    chunk_start_page, pages_needed)`` tuples, one per chunk, covering
+    ``[0, cached_len)`` with no gaps or overlaps:
+
+    - ``chunk_start_tok``: absolute start offset into the cached prefix.
+    - ``chunk_len``: number of real (in-bounds) tokens in this chunk;
+      equal to the effective chunk size for every chunk except possibly
+      the last, which may be shorter.
+    - ``chunk_alloc_len``: ``chunk_len`` rounded up to a block_size
+      multiple -- the shape actually requested from the WorkspaceManager,
+      matching how the unchunked branch a few lines below sizes its single
+      whole-prefix buffer (``alloc_len = ceil(cached_len / block_size) *
+      block_size``).
+    - ``chunk_start_page`` / ``pages_needed``: the page range this chunk
+      reads from ``block_table``.
+    """
+    assert cached_len > 0, f"cached_len must be positive, got {cached_len}"
+    assert block_size > 0, f"block_size must be positive, got {block_size}"
+    assert chunk_tokens > 0, f"chunk_tokens must be positive, got {chunk_tokens}"
+    chunk_pages = max(1, chunk_tokens // block_size)
+    chunk_tokens_eff = chunk_pages * block_size
+    num_chunks = max(1, math.ceil(cached_len / chunk_tokens_eff))
+    plan: list[tuple[int, int, int, int, int]] = []
+    for i in range(num_chunks):
+        chunk_start_tok = i * chunk_tokens_eff
+        chunk_len = min(chunk_tokens_eff, cached_len - chunk_start_tok)
+        if chunk_len <= 0:
+            break
+        chunk_alloc_len = math.ceil(chunk_len / block_size) * block_size
+        chunk_start_page = chunk_start_tok // block_size
+        pages_needed = math.ceil(chunk_len / block_size)
+        plan.append(
+            (
+                chunk_start_tok,
+                chunk_len,
+                chunk_alloc_len,
+                chunk_start_page,
+                pages_needed,
+            )
+        )
+    return plan
+
+
 def _normalize_turboquant_flashinfer_backend(value: str) -> str:
     normalized = value.strip().lower()
     if normalized in ("1", "true", "yes", "on"):
@@ -210,6 +276,32 @@ _TQ_FI_PREFILL_CUDAGRAPH_SAFE = (
 )
 _TQ_CONTINUATION_WORKSPACE_RESERVE_TOKENS = int(
     os.getenv("VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS", "0")
+)
+# RANK-4 backlog item ("chunked continuation-dequant, +93K pool tokens"):
+# default 0 == disabled == byte-identical to the pre-existing whole-prefix
+# dequant behavior below. When set (e.g. 16384), _continuation_prefill's
+# prefix-combine branch dequantizes+attends over the cached TQ prefix in
+# bounded chunks instead of one single-shot buffer sized to the whole
+# cached_len, so the workspace reservation this enables
+# (_reserve_continuation_workspace) no longer needs to cover
+# max_model_len-class contexts. See DESIGN-IMPL.md in the
+# chunked-dequant lane for the full design and the numerical-equivalence
+# argument (chained log-sum-exp merge == single-shot softmax up to fp
+# rounding). Scope: only wired into the flashinfer-backed prefix-combine
+# path (prefix_combine_enabled); the non-prefix-combine concat+flash/SDPA
+# fallback is untouched and still dequants the whole prefix in one shot --
+# see the reserve-shrink caveat in gate-window.md before enabling this in
+# any deployment where that fallback can be hit with a long cached_len.
+_TQ_CONTINUATION_CHUNK_TOKENS = max(
+    0, int(os.getenv("VLLM_TURBOQUANT_CONTINUATION_CHUNK_TOKENS", "0"))
+)
+# Env-gated trace logging for the chunk loop (chunk index/range/pages/
+# workspace numel per launch). Default off, zero overhead when unset --
+# same convention as _GEMMA4_TQ4NC_DEBUG_CONTINUATION elsewhere in this
+# file. Useful for correlating with the tq-crash lane's illegal-memory-
+# access investigation in this same code path.
+_TQ_CHUNK_DEBUG = (
+    os.getenv("VLLM_TURBOQUANT_CONTINUATION_CHUNK_DEBUG", "0") == "1"
 )
 _TQ_CONTINUATION_SDPA_Q_CHUNK = int(
     os.getenv("VLLM_TURBOQUANT_CONTINUATION_SDPA_Q_CHUNK", "0")
@@ -879,6 +971,22 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             # of pre-carving max_model_len (≥1 GiB/rank at 512K-class
             # profiles, directly shrinking the KV pool).
             reserve_tokens = max(max_batched_tokens, configured_reserve)
+        elif _TQ_CONTINUATION_CHUNK_TOKENS > 0:
+            # Chunked continuation dequant (_continuation_prefix_combine_chunked)
+            # never asks this workspace for a per-chunk KV buffer bigger than
+            # one chunk, so reserving out to max_model_len buys nothing once
+            # chunking is on -- it would only subtract from the KV-cache pool
+            # for a buffer size the hot path can no longer request. Default
+            # the reserve down to the chunk size; an explicit
+            # VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS override
+            # (the branch above) still wins if an operator wants headroom
+            # above one chunk. NOTE: this does NOT cover the non-prefix-
+            # combine fallback path (still whole-prefix, see the module-level
+            # comment on _TQ_CONTINUATION_CHUNK_TOKENS) -- that path will
+            # raise WorkspaceManager's locked-growth AssertionError instead
+            # of silently under-allocating if it is ever reached with
+            # cached_len beyond this shrunk reserve.
+            reserve_tokens = max(max_batched_tokens, _TQ_CONTINUATION_CHUNK_TOKENS)
         else:
             reserve_tokens = max(max_batched_tokens, max_model_len)
         reserve_cached_len = math.ceil(reserve_tokens / block_size) * block_size
@@ -2079,6 +2187,23 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             and self._prefill_sliding_window <= 0
             and self._use_flashinfer_for_continuation(q_len)
         )
+        if prefix_combine_enabled and _TQ_CONTINUATION_CHUNK_TOKENS > 0:
+            # RANK-4: chunked continuation dequant. Only wired into this
+            # (flashinfer prefix-combine) branch -- see
+            # _continuation_prefix_combine_chunked docstring and
+            # DESIGN-IMPL.md. kv_cache.dim() != 5 and cached_len > 0 are
+            # already guaranteed by prefix_combine_enabled above.
+            return self._continuation_prefix_combine_chunked(
+                layer,
+                query,
+                key_chunk,
+                val_chunk,
+                kv_cache,
+                block_table,
+                cached_len,
+                seq_len,
+                centroids,
+            )
         if kv_cache.dim() == 5:
             triton_out = self._shared_fp16_decode_triton(
                 query,
@@ -2667,6 +2792,420 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 enable_gqa=(Hk < Hq),
             )  # (1, Hq, q_len, D)
             return out[0].transpose(0, 1)  # (q_len, Hq, D)
+
+    def _continuation_prefix_combine_chunked(
+        self,
+        layer: Any,
+        query: torch.Tensor,  # (q_len, Hq, D)
+        key_chunk: torch.Tensor,  # (q_len, Hk, D)
+        val_chunk: torch.Tensor,  # (q_len, Hk, D)
+        kv_cache: torch.Tensor,  # (num_blocks, block_size, Hk, slot_size)
+        block_table: torch.Tensor,  # (1, max_num_blocks)
+        cached_len: int,
+        seq_len: int,
+        centroids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Chunked variant of the flashinfer prefix-combine continuation path.
+
+        RANK-4 backlog ("chunked continuation-dequant, +93K pool tokens").
+        Only called from _continuation_prefill when prefix_combine_enabled
+        and VLLM_TURBOQUANT_CONTINUATION_CHUNK_TOKENS > 0; the caller has
+        already established kv_cache.dim() != 5 and cached_len > 0.
+
+        Instead of dequantizing the whole cached prefix into one
+        (1, Hk, alloc_len, D) workspace buffer (the unchunked branch earlier
+        in _continuation_prefill, above this method), this walks the prefix
+        in VLLM_TURBOQUANT_CONTINUATION_CHUNK_TOKENS-token, block-size-aligned
+        chunks. Each chunk is dequantized into a chunk-sized workspace
+        buffer and attended against the query (causal=False: every cached
+        position strictly precedes every new query position, exactly like
+        the single whole-prefix call it replaces), producing a partial
+        (output, LSE) pair. Partial pairs are folded together with the same
+        log-sum-exp combiner _continuation_prefill's unchunked branch already
+        uses to merge the (whole) prefix result with the current-chunk
+        result: merge_attn_states, dispatched at
+        vllm/v1/attention/ops/merge_attn_states.py:9 to the Triton kernel at
+        vllm/v1/attention/ops/triton_merge_attn_states.py:14-175 ("Implements
+        section 2.2 of https://www.arxiv.org/pdf/2501.01005"). LSE-based
+        softmax combination is associative/commutative over disjoint KV
+        partitions, so chaining N chunk merges reproduces the same
+        numerator/denominator split as one whole-prefix softmax, up to
+        floating-point summation-order rounding -- see
+        tests/turboquant/test_chunked_prefix_combine_math.py for the CPU
+        reference proof and DESIGN-IMPL.md for the argument in full.
+
+        The pages>width structural clamp and the per-launch block-table
+        bounds check below are deliberately duplicated from (not extracted
+        into a shared helper with) the unchunked branch: with
+        VLLM_TURBOQUANT_CONTINUATION_CHUNK_TOKENS unset (default) this
+        method is never called and the unchunked branch is completely
+        untouched, so the default path's behavior stays provably
+        byte-identical without needing GPU access to re-verify a shared-
+        helper refactor.
+        """
+        q_len, Hq, D = query.shape
+        Hk = key_chunk.shape[1]
+        device = query.device
+        block_size = kv_cache.shape[1]
+        num_blocks = kv_cache.shape[0]
+
+        # Structural guard (duplicated from _continuation_prefill's
+        # kv_cache.dim() != 5 branch): if the pages needed to cover
+        # cached_len exceed this row's block_table width, clamp cached_len
+        # (and seq_len, to preserve the seq_len == cached_len + q_len
+        # invariant the current-chunk attention call below relies on) down
+        # to what the table can actually address.
+        width = block_table.shape[1]
+        pages_total = math.ceil(cached_len / block_size)
+        if pages_total > width:
+            logger.error(
+                "TQ chunked continuation pages>width: pages=%s width=%s "
+                "cached_len=%s block_size=%s seq_len=%s q_len=%s layer=%s",
+                pages_total,
+                width,
+                cached_len,
+                block_size,
+                seq_len,
+                q_len,
+                getattr(layer, "layer_name", None),
+            )
+            cached_len = width * block_size
+            seq_len = cached_len + q_len
+            pages_total = width
+
+        plan = _tq_chunked_prefix_plan(
+            cached_len, block_size, _TQ_CONTINUATION_CHUNK_TOKENS
+        )
+        num_chunks = len(plan)
+
+        BLOCK_D = triton.next_power_of_2(D)
+        mse_bytes = self._mse_bytes
+        val_data_bytes = self._val_data_bytes
+
+        if self._fi_single_qo_indptr_cpu is None:
+            self._fi_single_qo_indptr_cpu = torch.empty(
+                2, dtype=torch.int32, pin_memory=True
+            )
+            self._fi_single_kv_indptr_cpu = torch.empty(
+                2, dtype=torch.int32, pin_memory=True
+            )
+        self._fi_single_qo_indptr_cpu[0] = 0
+        self._fi_single_qo_indptr_cpu[1] = q_len
+        seq_lens_q = q_len * torch.ones(1, dtype=torch.int32)
+
+        acc_out: torch.Tensor | None = None
+        acc_lse: torch.Tensor | None = None  # (Hq, q_len), contiguous
+
+        for i, (
+            chunk_start_tok,
+            chunk_len,
+            chunk_alloc_len,
+            chunk_start_page,
+            pages_needed,
+        ) in enumerate(plan):
+            chunk_block_table = block_table[:, chunk_start_page:]
+            safe_chunk_block_table = chunk_block_table
+
+            # Per-chunk bounds check (env-gated, mirrors the unchunked
+            # branch's pre-launch guard immediately below in this file and
+            # BlockTable._check_and_clamp_write_bounds in
+            # vllm/v1/worker/block_table.py -- same
+            # VLLM_TURBOQUANT_CONTINUATION_BOUNDS_CHECK flag, same
+            # clamp-and-log-loudly philosophy). This is the coordination
+            # point with the tq-crash lane's illegal-memory-access
+            # investigation in this code path: every chunk launch asserts/
+            # clamps its page range and workspace numel before the triton
+            # kernel touches it.
+            if _TQ_CONTINUATION_BOUNDS_CHECK:
+                avail_pages = chunk_block_table.shape[1]
+                if pages_needed > avail_pages:
+                    logger.error(
+                        "TQ chunked continuation dequant pages>avail: "
+                        "chunk=%s/%s pages_needed=%s avail_pages=%s "
+                        "chunk_start_page=%s width=%s cached_len=%s "
+                        "chunk_len=%s block_size=%s layer=%s -- clamping "
+                        "chunk_len",
+                        i,
+                        num_chunks,
+                        pages_needed,
+                        avail_pages,
+                        chunk_start_page,
+                        width,
+                        cached_len,
+                        chunk_len,
+                        block_size,
+                        getattr(layer, "layer_name", None),
+                    )
+                    pages_needed = avail_pages
+                    chunk_len = min(chunk_len, pages_needed * block_size)
+                    chunk_alloc_len = math.ceil(chunk_len / block_size) * block_size
+                if pages_needed > 0:
+                    bt_slice = chunk_block_table[0, :pages_needed]
+                    bt_min = int(bt_slice.min().item())
+                    bt_max = int(bt_slice.max().item())
+                    if bt_min < 0 or bt_max >= num_blocks:
+                        logger.error(
+                            "TQ chunked continuation block_table OOB "
+                            "(pre-launch): chunk=%s/%s layer=%s "
+                            "chunk_start_page=%s pages_needed=%s bt_min=%s "
+                            "bt_max=%s num_blocks=%s -- clamping to avoid "
+                            "MMU fault",
+                            i,
+                            num_chunks,
+                            getattr(layer, "layer_name", None),
+                            chunk_start_page,
+                            pages_needed,
+                            bt_min,
+                            bt_max,
+                            num_blocks,
+                        )
+                        safe_chunk_block_table = chunk_block_table.clone()
+                        safe_chunk_block_table[0, :pages_needed].clamp_(
+                            0, num_blocks - 1
+                        )
+            if chunk_len <= 0:
+                break
+
+            buf_shape = (1, Hk, chunk_alloc_len, D)
+            k_buf, v_buf = current_workspace_manager().get_simultaneous(
+                (buf_shape, torch.float16),
+                (buf_shape, torch.float16),
+            )
+            expected_numel = Hk * chunk_alloc_len * D
+            assert k_buf.numel() == expected_numel, (
+                f"chunked continuation dequant: k_buf numel mismatch "
+                f"chunk={i}/{num_chunks} expected={expected_numel} "
+                f"got={k_buf.numel()} chunk_alloc_len={chunk_alloc_len}"
+            )
+            assert v_buf.numel() == expected_numel, (
+                f"chunked continuation dequant: v_buf numel mismatch "
+                f"chunk={i}/{num_chunks} expected={expected_numel} "
+                f"got={v_buf.numel()} chunk_alloc_len={chunk_alloc_len}"
+            )
+            k_cached = k_buf[:, :, :chunk_alloc_len, :]
+            v_cached = v_buf[:, :, :chunk_alloc_len, :]
+
+            if _TQ_CHUNK_DEBUG:
+                logger.warning(
+                    "TQ chunk trace: chunk=%s/%s start_tok=%s chunk_len=%s "
+                    "alloc_len=%s start_page=%s pages_needed=%s bt_shape=%s "
+                    "k_buf_numel=%s cached_len=%s seq_len=%s q_len=%s "
+                    "layer=%s",
+                    i,
+                    num_chunks,
+                    chunk_start_tok,
+                    chunk_len,
+                    chunk_alloc_len,
+                    chunk_start_page,
+                    pages_needed,
+                    tuple(safe_chunk_block_table.shape),
+                    k_buf.numel(),
+                    cached_len,
+                    seq_len,
+                    q_len,
+                    getattr(layer, "layer_name", None),
+                )
+
+            grid = (chunk_alloc_len, 1 * Hk)
+            _tq_full_dequant_kv[grid](
+                kv_cache,
+                safe_chunk_block_table,
+                centroids,
+                k_cached,
+                v_cached,
+                k_cached.stride(0),
+                k_cached.stride(1),
+                k_cached.stride(2),
+                v_cached.stride(0),
+                v_cached.stride(1),
+                v_cached.stride(2),
+                kv_cache.stride(0),
+                kv_cache.stride(1),
+                kv_cache.stride(2),
+                safe_chunk_block_table.stride(0),
+                HEAD_DIM=D,
+                BLOCK_SIZE=block_size,
+                NUM_KV_HEADS=Hk,
+                MSE_BYTES=mse_bytes,
+                KPS=self.tq_config.key_packed_size,
+                VQB=self.tq_config.effective_value_quant_bits,
+                VAL_DATA_BYTES=val_data_bytes,
+                MSE_BITS=self.tq_config.key_mse_bits,
+                KEY_FP8=1 if self.tq_config.key_fp8 else 0,
+                BLOCK_D=BLOCK_D,
+                NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
+                FP8_FORMAT=_fp8_format_code(device.index or 0),
+                num_warps=4,
+            )
+
+            if not self.tq_config.key_fp8:
+                Pi_half = layer._tq_Pi_half
+                k_flat = k_cached[0, :, :chunk_len, :].reshape(-1, D)
+                k_flat = k_flat @ Pi_half
+                k_chunk_trim = k_flat.reshape(Hk, chunk_len, D).transpose(0, 1)
+            else:
+                k_chunk_trim = k_cached[0, :, :chunk_len, :].transpose(0, 1)
+            v_chunk_trim = v_cached[0, :, :chunk_len, :].transpose(0, 1)
+
+            cached_hk = k_chunk_trim.shape[1]
+            if cached_hk != Hk:
+                if cached_hk < Hk and Hk % cached_hk == 0:
+                    repeat = Hk // cached_hk
+                    k_chunk_trim = k_chunk_trim.repeat_interleave(repeat, dim=1)
+                    v_chunk_trim = v_chunk_trim.repeat_interleave(repeat, dim=1)
+                elif cached_hk > Hk and cached_hk % Hk == 0:
+                    group = cached_hk // Hk
+                    k_chunk_trim = k_chunk_trim.reshape(chunk_len, Hk, group, D)[
+                        :, :, 0, :
+                    ]
+                    v_chunk_trim = v_chunk_trim.reshape(chunk_len, Hk, group, D)[
+                        :, :, 0, :
+                    ]
+                else:
+                    raise RuntimeError(
+                        "Unsupported shared KV head mapping in chunked "
+                        f"continuation: cached_hk={cached_hk}, layer_hk={Hk}, "
+                        f"D={D}"
+                    )
+
+            self._fi_single_kv_indptr_cpu[0] = 0
+            self._fi_single_kv_indptr_cpu[1] = chunk_len
+            seq_lens_chunk = chunk_len * torch.ones(1, dtype=torch.int32)
+            chunk_plan_key = (
+                "continuation_prefix_combine_chunk",
+                Hq,
+                Hk,
+                D,
+                str(query.dtype),
+                str(k_chunk_trim.dtype),
+                q_len,
+                chunk_len,
+            )
+            chunk_wrapper = self._get_or_plan_flashinfer_prefill_wrapper(
+                device,
+                chunk_plan_key,
+                {
+                    "qo_indptr": self._flashinfer_indptr(
+                        self._fi_single_qo_indptr_cpu, Hq, D
+                    ),
+                    "kv_indptr": self._flashinfer_indptr(
+                        self._fi_single_kv_indptr_cpu, Hk, D
+                    ),
+                    "num_qo_heads": Hq,
+                    "num_kv_heads": Hk,
+                    "head_dim_qk": D,
+                    "causal": False,
+                    "window_left": -1,
+                    "sm_scale": self.scale,
+                    "pos_encoding_mode": "NONE",
+                    "q_data_type": query.dtype,
+                    "kv_data_type": k_chunk_trim.dtype,
+                    "seq_lens": seq_lens_chunk,
+                    "seq_lens_q": seq_lens_q,
+                    "max_token_per_sequence": q_len,
+                    "max_sequence_kv": chunk_len,
+                },
+            )
+            chunk_out = torch.empty_like(query)
+            chunk_lse = torch.empty((q_len, Hq), dtype=torch.float32, device=device)
+            chunk_out, chunk_lse = chunk_wrapper.run(
+                query,
+                k_chunk_trim,
+                v_chunk_trim,
+                out=chunk_out,
+                lse=chunk_lse,
+                return_lse=True,
+            )
+            chunk_lse_t = chunk_lse.transpose(0, 1).contiguous()  # (Hq, q_len)
+
+            if acc_out is None:
+                acc_out, acc_lse = chunk_out, chunk_lse_t
+            else:
+                merged_out = torch.empty_like(acc_out)
+                merged_lse = torch.empty_like(acc_lse)
+                merge_attn_states(
+                    merged_out,
+                    acc_out,
+                    acc_lse,
+                    chunk_out,
+                    chunk_lse_t,
+                    output_lse=merged_lse,
+                )
+                acc_out, acc_lse = merged_out, merged_lse
+
+        assert acc_out is not None and acc_lse is not None, (
+            "chunked continuation: no chunks processed for "
+            f"cached_len={cached_len} num_chunks={num_chunks} plan={plan}"
+        )
+
+        # Current (new-token) chunk attention + final merge: identical to
+        # _continuation_prefill's unchunked prefix-combine branch's tail
+        # (earlier in this file, above this method).
+        self._fi_single_kv_indptr_cpu[0] = 0
+        self._fi_single_kv_indptr_cpu[1] = q_len
+        seq_lens_current = q_len * torch.ones(1, dtype=torch.int32)
+        current_plan_key = (
+            "continuation_prefix_combine_current",
+            Hq,
+            Hk,
+            D,
+            str(query.dtype),
+            str(key_chunk.dtype),
+            q_len,
+        )
+        current_wrapper = self._get_or_plan_flashinfer_prefill_wrapper(
+            device,
+            current_plan_key,
+            {
+                "qo_indptr": self._flashinfer_indptr(
+                    self._fi_single_qo_indptr_cpu, Hq, D
+                ),
+                "kv_indptr": self._flashinfer_indptr(
+                    self._fi_single_kv_indptr_cpu, Hk, D
+                ),
+                "num_qo_heads": Hq,
+                "num_kv_heads": Hk,
+                "head_dim_qk": D,
+                "causal": True,
+                "window_left": self._prefill_sliding_window,
+                "sm_scale": self.scale,
+                "pos_encoding_mode": "NONE",
+                "q_data_type": query.dtype,
+                "kv_data_type": key_chunk.dtype,
+                "seq_lens": seq_lens_current,
+                "seq_lens_q": seq_lens_q,
+                "max_token_per_sequence": q_len,
+                "max_sequence_kv": q_len,
+            },
+        )
+        current_out = torch.empty_like(query)
+        current_lse = torch.empty((q_len, Hq), dtype=torch.float32, device=device)
+        current_out, current_lse = current_wrapper.run(
+            query,
+            key_chunk,
+            val_chunk,
+            out=current_out,
+            lse=current_lse,
+            return_lse=True,
+        )
+        current_lse_for_merge = current_lse.transpose(0, 1).contiguous()
+        merge_attn_states(
+            current_out,
+            acc_out,
+            acc_lse,
+            current_out,
+            current_lse_for_merge,
+        )
+        logger.info_once(
+            "TurboQuant chunked continuation prefix-combine path used: "
+            "chunk_tokens=%s num_chunks=%s seq_len=%s cached_len=%s q_len=%s",
+            _TQ_CONTINUATION_CHUNK_TOKENS,
+            num_chunks,
+            seq_len,
+            cached_len,
+            q_len,
+        )
+        return current_out
 
     # ------------------------------------------------------------------ #
     #  Decode: Triton TQ decode attention                                 #
