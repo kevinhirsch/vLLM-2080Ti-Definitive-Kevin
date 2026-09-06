@@ -4035,7 +4035,7 @@ class GPUModelRunner(
                 or force_disable_full_accept_boundary
             ),
         )
-        if f5_probe_trace.ENABLED:
+        if f5_probe_trace.ENABLED and not torch.cuda.is_current_stream_capturing():
             f5_probe_trace.log_dispatch(
                 cudagraph_mode=cudagraph_mode.name,
                 num_tokens=batch_descriptor.num_tokens,

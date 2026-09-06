@@ -1530,7 +1530,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             # see LANE/PROBE.md Hook C). No-op unless VLLM_F5_PROBE_TRACE=1;
             # the .tolist() calls are a real device sync, gated so they only
             # happen when the diagnostic is explicitly armed.
-            if f5_probe_trace.ENABLED:
+            if f5_probe_trace.ENABLED and not torch.cuda.is_current_stream_capturing():
                 f5_probe_trace.log_fanout(
                     num_accepted_tokens=num_accepted_tokens.tolist(),
                     state_indices=spec_state_indices_tensor.tolist(),

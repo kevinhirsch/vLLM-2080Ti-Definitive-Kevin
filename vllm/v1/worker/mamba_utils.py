@@ -298,7 +298,7 @@ def preprocess_mamba(
                 forward_context,
             )
             input_batch.num_accepted_tokens_cpu[i] = 1
-        if f5_probe_trace.ENABLED:
+        if f5_probe_trace.ENABLED and not torch.cuda.is_current_stream_capturing():
             f5_probe_trace.log_preprocess(
                 req_id=req_id,
                 prev_state_idx=prev_state_idx,
