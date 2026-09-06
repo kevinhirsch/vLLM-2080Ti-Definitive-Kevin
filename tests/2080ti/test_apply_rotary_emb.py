@@ -23,7 +23,6 @@ from vllm.config import (
     get_cached_compilation_config,
     set_current_vllm_config,
 )
-from vllm.platforms import current_platform
 
 CUDA_DEVICES = ["cuda:0"]
 
@@ -186,9 +185,12 @@ def run_dispatch_test(
             apply_rotary_emb.forward = original_forward
 
 
-@pytest.mark.skipif(
-    not current_platform.is_cuda_alike(), reason="Skipping CUDA/ROCm only tests."
-)
+# [FORK] Gate on device availability, not platform identity. On a CUDA box
+# with CUDA_VISIBLE_DEVICES="" current_platform.is_cuda_alike() is still True
+# (platform detection does not consult the visible-device mask), so the cuda:0
+# cases below would run and fail with "No CUDA GPUs are available" instead of
+# skipping. Same predicate as the fallback test at the bottom of this file.
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required.")
 @pytest.mark.parametrize("test_case", get_test_cases(), ids=lambda tc: tc.name)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 def test_rotary_embedding_dispatch(
