@@ -617,6 +617,7 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
+            temporarily_deferred: list[Request] = []
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
@@ -629,17 +630,37 @@ class Scheduler(SchedulerInterface):
                 request_id = request.request_id
 
                 # try to promote blocked statuses while traversing skipped queue.
-                if self._is_blocked_waiting_status(
-                    request.status
-                ) and not self._try_promote_blocked_waiting_request(request):
-                    if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
-                        logger.debug(
-                            "%s is still in WAITING_FOR_REMOTE_KVS state.",
-                            request_id,
-                        )
-                    request_queue.pop_request()
-                    step_skipped_waiting.prepend_request(request)
-                    continue
+                if self._is_blocked_waiting_status(request.status):
+                    if self._try_promote_blocked_waiting_request(request):
+                        # Reset blocked_since on successful promotion
+                        request.blocked_since = None
+                    else:
+                        # Exclude WAITING_FOR_STREAMING_REQ from timeout
+                        if request.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
+                            if request.blocked_since is None:
+                                request.blocked_since = time.time()
+                            elif (
+                                time.time() - request.blocked_since
+                                > self.scheduler_config.blocked_waiting_timeout_s
+                            ):
+                                self.finish_requests(
+                                    request_id, RequestStatus.FINISHED_ABORTED
+                                )
+                                continue
+                        else:
+                            # clear blocked_since for client-paced wait
+                            request.blocked_since = None
+
+                        if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                            logger.debug(
+                                "%s is still in WAITING_FOR_REMOTE_KVS state.",
+                                request_id,
+                            )
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
+                else:
+                    request.blocked_since = None
 
                 # Check that adding the request still respects the max_loras
                 # constraint.
@@ -758,7 +779,11 @@ class Scheduler(SchedulerInterface):
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
-                            break
+                            if self.running:
+                                break
+                            request_queue.pop_request()
+                            temporarily_deferred.append(request)
+                            continue
 
                 # External KV loads do not perform local work in this step.
                 if self.need_mamba_block_aligned_split and not load_kv_async:
@@ -769,7 +794,11 @@ class Scheduler(SchedulerInterface):
                         num_external_computed_tokens,
                     )
                     if num_new_tokens == 0:
-                        break
+                        if self.running:
+                            break
+                        request_queue.pop_request()
+                        temporarily_deferred.append(request)
+                        continue
 
                 # Handles an edge case when P/D Disaggregation
                 # is used with Spec Decoding where an
@@ -811,7 +840,11 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
-                    break
+                    if self.running:
+                        break
+                    request_queue.pop_request()
+                    temporarily_deferred.append(request)
+                    continue
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -895,6 +928,13 @@ class Scheduler(SchedulerInterface):
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
+
+            # Re-queue ordinary requests that were temporarily deferred due to
+            # resource exhaustion (not blocked-waiting status). These go back
+            # into self.waiting so they are reconsidered next step without
+            # polluting the skipped_waiting / deferred metrics.
+            for req in temporarily_deferred:
+                self.waiting.add_request(req)
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
