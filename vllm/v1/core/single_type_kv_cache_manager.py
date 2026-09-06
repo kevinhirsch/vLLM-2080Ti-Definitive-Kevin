@@ -922,6 +922,13 @@ class MambaManager(SingleTypeKVCacheManager):
             self.last_state_block_idx: dict[str, int] = {}
             # The set of the requests that have been allocated blocks
             self._allocated_block_reqs: set[str] = set()
+            # [FORK] Port of vllm-project/vllm#55450: high-water mark of the
+            # highest block index already retired by `_retire_align_blocks`,
+            # so a repeat call doesn't rescan the whole (potentially huge, on
+            # a long multi-turn conversation) skip range from scratch every
+            # step. See `_retire_align_blocks` for why the base class's
+            # stop-at-first-null scan is unsafe here.
+            self._num_retired_blocks: dict[str, int] = {}
 
     @classmethod
     def find_longest_cache_hit(
@@ -1000,8 +1007,12 @@ class MambaManager(SingleTypeKVCacheManager):
         # that we might actually need.
         num_computed_tokens = max(0, num_computed_tokens - self.num_speculative_blocks)
 
-        super().remove_skipped_blocks(request_id, num_computed_tokens)
         if self.mamba_cache_mode == "align":
+            # [FORK] Port of vllm-project/vllm#55450 (adapted -- see
+            # `_retire_align_blocks`): this fork has no `_remove_blocks_in_range`
+            # helper to override, so the whole gap-tolerant scan replaces the
+            # `super().remove_skipped_blocks()` call directly, align-mode only.
+            self._retire_align_blocks(request_id, num_computed_tokens)
             # `last_state_block_idx` refers to the block index allocated two steps ago.
             # The block allocated in the previous step is used to copy Mamba states
             # into the block allocated in the current step; the earlier block is
@@ -1019,6 +1030,54 @@ class MambaManager(SingleTypeKVCacheManager):
                 if blocks[last_state_block_idx] != self._null_block:
                     self.block_pool.free_blocks([blocks[last_state_block_idx]])
                     blocks[last_state_block_idx] = self._null_block
+        else:
+            super().remove_skipped_blocks(request_id, num_computed_tokens)
+
+    def _retire_align_blocks(self, request_id: str, num_computed_tokens: int) -> None:
+        """Align-mode block retirement, tolerant of null gaps.
+
+        [FORK] Adapted port of vllm-project/vllm#55450 ("retire Mamba states
+        across null gaps"). Upstream's V2 `MambaManager` overrides a shared
+        `_remove_blocks_in_range` helper; this fork's `SingleTypeKVCacheManager`
+        has no such helper; the equivalent scan is inlined directly in the base
+        class's `remove_skipped_blocks` (see there). That base scan walks the
+        skip range from the top down and BREAKS at the first null block, on the
+        assumption that every block below it must already be null too -- true
+        for every other manager type, where a block is only ever nulled by that
+        same top-down scan. It does not hold for Mamba align mode, which can
+        leave null gaps that are NOT the result of a previous retirement call:
+        - `find_longest_cache_hit` above inserts `i` leading dummy null blocks
+          before a resumed request's single real cache-hit block.
+        - Sparse retention (`reachable_block_mask`, VLLM_PREFIX_CACHE_RETENTION_INTERVAL,
+          the upstream vLLM#45845 port) deliberately keeps only a subset of
+          historical state blocks alive, nulling the rest at allocation time --
+          real, still-allocated blocks can sit BELOW a null one in the same
+          skip range.
+        In either case the base scan stops at the first (possibly spurious)
+        null and leaves every real block below it allocated forever: not a
+        crash, but a slow block-pool leak that eventually exhausts the pool on
+        a long-running, growing multi-turn conversation -- this fork's
+        production shape. Fix: skip over (don't stop at) a null block, and
+        remember the highest index already retired so a repeat call (this runs
+        every step) doesn't rescan the whole prefix each time.
+        """
+        num_skipped_tokens = self.get_num_skipped_tokens(num_computed_tokens)
+        if num_skipped_tokens <= 0:
+            return
+        blocks = self.req_to_blocks[request_id]
+        num_skipped_blocks = min(num_skipped_tokens // self.block_size, len(blocks))
+        first_block = self._num_retired_blocks.get(request_id, 0)
+        if first_block >= num_skipped_blocks:
+            return
+        removed_blocks: list[KVCacheBlock] = []
+        for i in range(num_skipped_blocks - 1, first_block - 1, -1):
+            if blocks[i] == self._null_block:
+                continue
+            removed_blocks.append(blocks[i])
+            blocks[i] = self._null_block
+        if removed_blocks:
+            self.block_pool.free_blocks(removed_blocks)
+        self._num_retired_blocks[request_id] = num_skipped_blocks
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """
@@ -1179,6 +1238,9 @@ class MambaManager(SingleTypeKVCacheManager):
         if self.mamba_cache_mode == "align":
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
+            # [FORK] Port of vllm-project/vllm#55450: drop the retirement
+            # high-water mark alongside the other per-request align-mode state.
+            self._num_retired_blocks.pop(request_id, None)
         super().free(request_id)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
