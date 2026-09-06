@@ -64,6 +64,21 @@ class GDNAttentionMetadata:
 
     num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
 
+    # [FORK] vllm-project/vllm#55504, `mamba_cache_mode != "align"` only (see
+    # GDNAttentionMetadataBuilder.build and its `_recover_spec_transition_state`
+    # gate): 1D source block-table columns to recover conv/ssm state from when
+    # a request transitions from speculative decoding to a regular decode in
+    # the same step (or a mixed batch has both kinds of request at once).
+    # Align mode performs the equivalent recovery earlier and generically, in
+    # mamba_utils.preprocess_mamba's host-orchestrated block relocation
+    # (accept_token_bias), and always resets num_accepted_tokens to 1 before
+    # this builder runs -- these stay None there, and align mode's block-table
+    # columns are per-checkpoint physical blocks, not the fixed
+    # draft-position slots this recovery assumes, so applying it there would
+    # copy the wrong block.
+    spec_decode_src_indices: torch.Tensor | None = None
+    non_spec_num_accepted: torch.Tensor | None = None
+
     # Pre-computed FLA chunk metadata (avoids GPU->CPU sync in prepare_chunk_indices)
     chunk_indices: torch.Tensor | None = None
     chunk_offsets: torch.Tensor | None = None
@@ -103,6 +118,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.num_spec = 0
         self.use_spec_decode: bool = self.num_spec > 0
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
+
+        # [FORK] vllm-project/vllm#55504 is scoped upstream to
+        # `mamba_cache_mode == "none"`. Align mode's mamba_utils.preprocess_mamba
+        # already performs the equivalent conv/ssm state recovery generically
+        # (via accept_token_bias) BEFORE this builder ever runs, by physically
+        # relocating the block and resetting num_accepted_tokens to 1; align
+        # mode's block-table columns are also separate per-checkpoint physical
+        # blocks rather than the fixed draft-position slots this recovery
+        # assumes, so running it there would copy state from the wrong block.
+        self._recover_spec_transition_state = (
+            vllm_config.cache_config.mamba_cache_mode != "align"
+        )
 
         self.use_full_cuda_graph: bool = (
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
@@ -204,6 +231,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     query_start_loc.device, non_blocking=True
                 )
 
+        # [FORK] vllm-project/vllm#55504, `mamba_cache_mode != "align"` only
+        # (see `_recover_spec_transition_state` in __init__): defaults for the
+        # two fields the recovery below fills in; both stay None for align
+        # mode and for any batch the guards below don't apply to.
+        spec_decode_src_indices = None
+        non_spec_num_accepted = None
+
         if spec_sequence_masks is None:
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
                 split_decodes_and_prefills(m, decode_threshold=1)
@@ -216,7 +250,39 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_query_start_loc = None
             non_spec_query_start_loc = query_start_loc
             non_spec_query_start_loc_cpu = query_start_loc_cpu
-            num_accepted_tokens = None
+            # [FORK] vllm-project/vllm#55504: a pure-decode batch (no row is
+            # CURRENTLY producing draft tokens) can still carry a meaningful
+            # per-row accepted count from a PREVIOUS step's speculative
+            # decode -- e.g. a request whose spec-decode got disabled, or
+            # that just finished verifying a draft, this step. Recover its
+            # true conv/ssm state source column before collapsing
+            # num_accepted_tokens to the neutral value the rest of this
+            # (non-align) path assumes.
+            if (
+                self._recover_spec_transition_state
+                and self.use_spec_decode
+                and num_accepted_tokens is not None
+                and num_decodes > 0
+            ):
+                col_indices = (num_accepted_tokens[:num_decodes] - 1).clamp(min=0)
+                spec_decode_src_indices = block_table_tensor[
+                    torch.arange(num_decodes, device=block_table_tensor.device),
+                    col_indices,
+                ]
+                num_accepted_tokens = num_accepted_tokens[:num_decodes]
+                if num_prefills > 0:
+                    num_accepted_tokens = torch.cat(
+                        [
+                            num_accepted_tokens,
+                            torch.ones(
+                                num_prefills,
+                                dtype=num_accepted_tokens.dtype,
+                                device=num_accepted_tokens.device,
+                            ),
+                        ]
+                    )
+            else:
+                num_accepted_tokens = None
         else:
             query_lens = query_start_loc[1:] - query_start_loc[:-1]
             assert spec_sequence_masks_cpu is not None
@@ -320,6 +386,25 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
 
             assert num_accepted_tokens is not None
+            if self._recover_spec_transition_state:
+                # [FORK] vllm-project/vllm#55504: preserve the non-spec
+                # partition's own accepted counts (and their conv/ssm state
+                # source columns) here, before they are overwritten below by
+                # the spec partition's counts -- a mixed batch's non-spec
+                # rows can carry a meaningful count > 1 from a previous
+                # speculative step, same as the pure-decode case above.
+                non_spec_num_accepted = num_accepted_tokens[
+                    non_spec_sequence_masks_cpu
+                ].clamp(min=1)
+                non_spec_block_rows = block_table_tensor[non_spec_sequence_masks_cpu]
+                source_columns = non_spec_num_accepted - 1
+                spec_decode_src_indices = non_spec_block_rows[
+                    torch.arange(
+                        non_spec_block_rows.size(0),
+                        device=block_table_tensor.device,
+                    ),
+                    source_columns,
+                ]
             num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
 
             # [FORK] Port of vllm-project/vllm#51508: a spec row whose async
@@ -500,6 +585,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,
             num_accepted_tokens=num_accepted_tokens,
+            spec_decode_src_indices=spec_decode_src_indices,
+            non_spec_num_accepted=non_spec_num_accepted,
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,

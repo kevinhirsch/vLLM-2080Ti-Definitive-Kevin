@@ -33,6 +33,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     block_idx_last_scheduled_token,  # (batch,)
     initial_state_idx,  # (batch,)
     num_computed_tokens,  # (batch,)
+    num_accepted_tokens_ptr,  # (batch,) or None -- [FORK] vllm-project/vllm#55504
     o_ptr,  # (dim, seqlen) - actually pointing to x_ptr
     # Matrix dimensions
     dim: tl.constexpr,
@@ -58,6 +59,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     KERNEL_WIDTH: tl.constexpr,
     SILU_ACTIVATION: tl.constexpr,
     IS_APC_ENABLED: tl.constexpr,
+    IS_SPEC_DECODING: tl.constexpr,  # [FORK] vllm-project/vllm#55504
     HAS_NULL_BLOCK: tl.constexpr,
     NP2_STATELEN: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -77,6 +79,22 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
 
     # single-sequence id
     idx_seq = tl.load(batch_ptr + tl.program_id(0)).to(tl.int64)
+
+    # [FORK] vllm-project/vllm#55504: when this sequence's true accepted
+    # count from a preceding speculative step is > 1, the "last accepted"
+    # token isn't at the state buffer's naive last position -- it's
+    # `accepted - 1` tokens further in. gdn_attn.py's
+    # `_recover_spec_transition_state` gate means num_accepted_tokens_ptr is
+    # only ever non-null for `mamba_cache_mode != "align"`; unexplored (no
+    # GPU window run) whether it can coincide with IS_APC_ENABLED, which
+    # this fork added independently for align-mode chunked prefill -- see
+    # LANE/REPORT.md in projects/lanes/align-prefix-fixes.
+    if IS_SPEC_DECODING:
+        conv_state_token_offset = (
+            tl.load(num_accepted_tokens_ptr + idx_seq).to(tl.int64) - 1
+        )
+    else:
+        conv_state_token_offset = 0
     chunk_offset = tl.load(token_chunk_offset_ptr + tl.program_id(0))
 
     # BLOCK_N elements along the feature-dimension (channel)
@@ -157,7 +175,10 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         load_init_state = tl.load(has_initial_states_ptr + idx_seq).to(tl.int1)
         if load_init_state:
             # load from conv_states
-            prior_tokens = conv_states_base + (state_len - 1) * stride_conv_state_tok
+            prior_tokens = (
+                conv_states_base
+                + (state_len - 1 + conv_state_token_offset) * stride_conv_state_tok
+            )
             mask_w = idx_feats < dim
             if KERNEL_WIDTH == 2:
                 conv_states_ptrs = prior_tokens  # [BLOCK_N]
@@ -247,7 +268,10 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                     conv_states_ptr
                     + (conv_states_input_coord * stride_conv_state_seq)
                     + (idx_feats * stride_conv_state_dim)[None, :]
-                    + ((idx_tokens_conv + seqlen) * stride_conv_state_tok)[:, None]
+                    + (
+                        (idx_tokens_conv + seqlen + conv_state_token_offset)
+                        * stride_conv_state_tok
+                    )[:, None]
                 )  # [BLOCK_M, BLOCK_N]
                 mask = (
                     (conv_states_input_coord < num_cache_lines)
@@ -480,6 +504,7 @@ def causal_conv1d_fn(
     activation: str | None = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
     null_block_id: int = NULL_BLOCK_ID,
+    num_accepted_tokens: torch.Tensor | None = None,  # [FORK] vllm-project/vllm#55504
     block_idx_first_scheduled_token: torch.Tensor | None = None,
     block_idx_last_scheduled_token: torch.Tensor | None = None,
     initial_state_idx: torch.Tensor | None = None,
@@ -715,6 +740,7 @@ def causal_conv1d_fn(
         block_idx_last_scheduled_token,
         initial_state_idx,
         num_computed_tokens,
+        num_accepted_tokens,  # [FORK] vllm-project/vllm#55504
         out,
         # Matrix dimensions
         dim,
@@ -740,6 +766,7 @@ def causal_conv1d_fn(
         KERNEL_WIDTH=width,
         SILU_ACTIVATION=activation in ["silu", "swish"],
         IS_APC_ENABLED=block_idx_last_scheduled_token is not None,
+        IS_SPEC_DECODING=num_accepted_tokens is not None,  # [FORK] vllm-project/vllm#55504
         HAS_NULL_BLOCK=null_block_id is not None,
         NP2_STATELEN=np2_statelen,
         # launch_cooperative_grid=True

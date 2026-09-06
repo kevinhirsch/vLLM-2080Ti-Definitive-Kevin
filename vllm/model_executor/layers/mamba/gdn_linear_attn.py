@@ -1383,6 +1383,21 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
+        # [FORK] vllm-project/vllm#55504, `mamba_cache_mode != "align"` only
+        # (see GDNAttentionMetadataBuilder._recover_spec_transition_state --
+        # this field stays None under align mode, making this whole block a
+        # no-op there): a request that just transitioned from speculative
+        # decoding to a regular (non-spec) decode this step has its true
+        # recurrent state sitting at `spec_decode_src_indices`, not yet at
+        # the canonical column `non_spec_state_indices_tensor` the rest of
+        # this function reads from -- copy it there before anything else
+        # runs.
+        spec_decode_src_indices = attn_metadata.spec_decode_src_indices
+        if spec_decode_src_indices is not None:
+            assert non_spec_state_indices_tensor is not None
+            num_corrected_states = spec_decode_src_indices.shape[0]
+            destination_indices = non_spec_state_indices_tensor[:num_corrected_states]
+            ssm_state[destination_indices] = ssm_state[spec_decode_src_indices]
 
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]
@@ -1432,6 +1447,17 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         if attn_metadata.num_prefills > 0:
             assert mixed_qkv_non_spec is not None
             mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
+            # [FORK] vllm-project/vllm#55504: a non-spec row reclassified
+            # into this prefill call (see gdn_attn.py's
+            # `num_decodes > 0 and num_spec_decodes > 0` merge) can carry a
+            # preserved accepted-count > 1 in `non_spec_num_accepted`
+            # (None, hence a no-op, under align mode -- see the
+            # `_forward_core` note above).
+            conv_num_accepted = (
+                attn_metadata.non_spec_num_accepted
+                if attn_metadata.non_spec_num_accepted is not None
+                else num_accepted_tokens
+            )
             # - "cache_indices" updates the conv_state cache in positions
             #   pointed to by "state_indices_tensor"
             mixed_qkv_non_spec = causal_conv1d_fn(
@@ -1443,11 +1469,20 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 has_initial_state=has_initial_state,
                 cache_indices=non_spec_state_indices_tensor,
                 query_start_loc=non_spec_query_start_loc,
+                num_accepted_tokens=conv_num_accepted,
                 null_block_id=PAD_SLOT_ID,
                 metadata=attn_metadata,
             ).transpose(0, 1)
         elif attn_metadata.num_decodes > 0:
             assert mixed_qkv_non_spec is not None
+            # [FORK] vllm-project/vllm#55504: only pass a (possibly > 1)
+            # accepted count through when the source-column recovery above
+            # actually ran (non-None `spec_decode_src_indices`) -- otherwise
+            # `num_accepted_tokens` may still hold stale per-spec-row values
+            # this call's rows don't correspond to.
+            conv_num_accepted = (
+                num_accepted_tokens if spec_decode_src_indices is not None else None
+            )
             mixed_qkv_non_spec = causal_conv1d_update(
                 mixed_qkv_non_spec,
                 conv_state,
@@ -1457,6 +1492,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 conv_state_indices=non_spec_state_indices_tensor[  # type: ignore[index]
                     : attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
                 ],
+                num_accepted_tokens=conv_num_accepted,
                 validate_data=True,
                 null_block_id=PAD_SLOT_ID,
             )
@@ -1792,6 +1828,17 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         )
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
+        # [FORK] vllm-project/vllm#55504, `mamba_cache_mode != "align"` only
+        # (see the matching note in `_forward_core`; None under align mode
+        # makes this a no-op there): recover a just-transitioned-to-decode
+        # row's true recurrent state before this packed fast path reads it.
+        num_accepted_tokens = attn_metadata.num_accepted_tokens
+        spec_decode_src_indices = attn_metadata.spec_decode_src_indices
+        if spec_decode_src_indices is not None:
+            assert non_spec_state_indices_tensor is not None
+            num_corrected_states = spec_decode_src_indices.shape[0]
+            destination_indices = non_spec_state_indices_tensor[:num_corrected_states]
+            ssm_state[destination_indices] = ssm_state[spec_decode_src_indices]
 
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]
@@ -1840,6 +1887,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 self.conv1d.bias,
                 self.activation,
                 conv_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
+                num_accepted_tokens=num_accepted_tokens,
                 validate_data=False,
                 null_block_id=PAD_SLOT_ID,
             )
