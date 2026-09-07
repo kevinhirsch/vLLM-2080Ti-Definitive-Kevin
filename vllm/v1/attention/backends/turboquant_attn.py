@@ -2481,6 +2481,32 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 )
 
         if prefix_combine_enabled:
+            # RCA fix (tq-prefix-combine-rca, Rank 1): make private, contiguous
+            # copies of the dequant output before handing it to a live
+            # FlashInfer kernel. k_cached_trim/v_cached_trim can alias
+            # WorkspaceManager's process-wide, single shared arena (k_buf/v_buf
+            # above, from current_workspace_manager().get_simultaneous() --
+            # see workspace.py:92-117: every call returns a view starting at
+            # byte offset 0 of one reused buffer, with no lifetime tracking).
+            # The non-combine path a few lines below never hits this because
+            # it copies these into a private k_full/v_full before running
+            # attention (the "Skip .contiguous() -- the copy into k_full/v_full
+            # handles layout" comment above is only true on that path); this
+            # branch skipped that copy and ran FlashInfer directly against the
+            # shared view. The very next get_simultaneous() call for this same
+            # buffer shape -- the next layer's continuation dequant, or the
+            # next request's (e.g. sibling thread C right after thread A) in
+            # _prefill_attention's per-request loop -- reuses the identical
+            # bytes. That reuse is only safe if every consumer of this view is
+            # provably ordered (same CUDA stream, strict FIFO) before the
+            # reuse; .contiguous() removes the aliasing regardless of whether
+            # that ordering assumption holds, and also gives FlashInfer a
+            # properly NHD-strided tensor instead of the transposed/strided
+            # view (real shape (cached_len, Hk, D), strides (D, alloc_len*D, 1)
+            # -- not the contiguous (Hk*D, D, 1) NHD strides the wrapper is
+            # constructed with). See RESULT.md Rank 1/Rank 3.
+            k_cached_trim = k_cached_trim.contiguous()
+            v_cached_trim = v_cached_trim.contiguous()
             if self._fi_single_qo_indptr_cpu is None:
                 self._fi_single_qo_indptr_cpu = torch.empty(
                     2, dtype=torch.int32, pin_memory=True
