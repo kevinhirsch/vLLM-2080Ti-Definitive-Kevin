@@ -274,6 +274,19 @@ _TQ_FI_PREFILL_PLAN_CACHE_MAXSIZE = max(
 _TQ_FI_PREFILL_CUDAGRAPH_SAFE = (
     os.getenv("VLLM_TURBOQUANT_FLASHINFER_PREFILL_CUDAGRAPH_SAFE", "0") == "1"
 )
+# RCA fix (tq-prefix-combine-rca, Rank 2): re-introduces the diagnostic/fix
+# from the unmerged tq-continuation-crash lane commit 1c9aba7f1 (branches
+# tq-continuation-crash / night-diag-0904, never merged to
+# frontier-pastnative-20260816). Default off: eviction only fires once the
+# plan-cache (maxsize 128 in prod, VLLM_TURBOQUANT_FLASHINFER_PREFILL_PLAN_CACHE_MAXSIZE)
+# is full, and the prefix-combine plan_key embeds cached_len (see
+# _get_or_plan_flashinfer_prefill_wrapper's caller in _continuation_prefill),
+# which is different on every chunk of a growing continuation -- so under the
+# tonight's two-growing-thread repro this cache churns and evicts repeatedly
+# within the 4-40 minute crash window. See RESULT.md Rank 2.
+_TQ_FI_PREFILL_SYNC_BEFORE_EVICT = (
+    os.getenv("VLLM_TURBOQUANT_FI_PREFILL_SYNC_BEFORE_EVICT", "0") == "1"
+)
 _TQ_CONTINUATION_WORKSPACE_RESERVE_TOKENS = int(
     os.getenv("VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS", "0")
 )
@@ -848,6 +861,18 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 # wrapper owns an auxiliary GPU workspace, so evicting after
                 # planning briefly requires maxsize + 1 workspaces and can
                 # OOM at the exact point this bound is meant to protect.
+                if _TQ_FI_PREFILL_SYNC_BEFORE_EVICT:
+                    # Evicting the oldest wrapper frees its private GPU
+                    # buffers with no synchronization anywhere nearby. If any
+                    # kernel launched by that wrapper's own plan()/run() is
+                    # still in flight on another stream relative to this one
+                    # (the single-stream FIFO assumption the rest of this
+                    # cache's design relies on -- see the CUDAGRAPH_SAFE
+                    # warning above), the freed memory can be reused by a
+                    # later-enqueued kernel before the evicted wrapper's own
+                    # kernels actually finish. This sync makes that ordering
+                    # true by construction instead of by assumption.
+                    torch.cuda.synchronize(device)
                 _TQ_FI_PREFILL_WRAPPERS.popitem(last=False)
 
             workspace = _get_shared_flashinfer_prefill_workspace(
@@ -2620,13 +2645,32 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             )
             prefix_lse_for_merge = prefix_lse.transpose(0, 1).contiguous()
             current_lse_for_merge = current_lse.transpose(0, 1).contiguous()
+            # RCA fix (tq-prefix-combine-rca, Rank 3): do not alias the merge
+            # kernel's `output` argument with its own `suffix_output` argument.
+            # The call below passed current_out for both, relying on
+            # vllm._custom_ops.merge_attn_states (dispatched to for this
+            # fp16/head_dim=256 config -- see
+            # vllm/v1/attention/ops/merge_attn_states.py:72-88) being safe for
+            # in-place output==suffix_output use, which this lane could not
+            # verify from Python-level source (the kernel is a C++/CUDA
+            # extension not vendored in this repo). The chunked variant of
+            # this same combine idea (_continuation_prefix_combine_chunked)
+            # is inconsistent about this: its per-chunk fold-in merges
+            # (further down in this file) use a separate merged_out/merged_lse
+            # rather than aliasing, only its own final merge aliases the same
+            # way this call does. Using a distinct destination costs one
+            # extra (q_len, Hq, D) allocation and copy per combine call but
+            # removes the aliasing question entirely regardless of which way
+            # the kernel actually behaves. See RESULT.md Rank 3.
+            merged_out = torch.empty_like(current_out)
             merge_attn_states(
-                current_out,
+                merged_out,
                 prefix_out,
                 prefix_lse_for_merge,
                 current_out,
                 current_lse_for_merge,
             )
+            current_out = merged_out
             del prefix_out, prefix_lse, current_lse
             del prefix_lse_for_merge, current_lse_for_merge
             logger.info_once(
