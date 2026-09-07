@@ -57,6 +57,11 @@ from vllm.v1.worker.workspace import (
     current_workspace_manager,
     is_workspace_manager_initialized,
 )
+# RCA diagnostic (tq-prefix-combine-rca-2, VLLM_TURBOQUANT_COMBINE_TRAP=1
+# only): round_up/dbo_current_ubatch_id are only used by
+# _combine_trap_check_workspace's best-effort arena-capacity check below.
+from vllm.utils.math_utils import round_up
+from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 from vllm.v1.attention.ops.triton_turboquant_decode import (
     _tq_full_dequant_kv,
     _fp8_format_code,
@@ -312,6 +317,15 @@ _TQ_CONTINUATION_SDPA_MAX_QK_CELLS = int(
 _TQ_CONTINUATION_BOUNDS_CHECK = (
     os.getenv("VLLM_TURBOQUANT_CONTINUATION_BOUNDS_CHECK", "0") == "1"
 )
+# RCA diagnostic (tq-prefix-combine-rca-2, patches/5-combine-trap.diff):
+# default-off, host-side invariant asserts + torch.cuda.synchronize() bracketing
+# around every kernel launch in the continuation prefix-combine branch of
+# _continuation_prefill. Converts an async Xid31/illegal-memory-access into a
+# synchronous RuntimeError naming the offending launch and its numbers, and
+# lets the crash-repro attribute a fault to the exact (layer, request, leg)
+# that caused it instead of wherever the next unrelated .item() happens to
+# sync. Zero effect on prod when unset -- see RESULT.md "What the trap covers".
+_TQ_COMBINE_TRAP = os.getenv("VLLM_TURBOQUANT_COMBINE_TRAP", "0") == "1"
 _TQ_FORCE_DECODE_SDPA_MAX_QK_CELLS = int(
     os.getenv("VLLM_TURBOQUANT_FORCE_DECODE_SDPA_MAX_QK_CELLS", "131072")
 )
@@ -481,6 +495,238 @@ def _get_shared_flashinfer_prefill_workspace(
         )
         _TQ_FI_PREFILL_WORKSPACES[key] = workspace
     return workspace
+
+
+# ---------------------------------------------------------------------------
+# RCA diagnostic (tq-prefix-combine-rca-2): VLLM_TURBOQUANT_COMBINE_TRAP=1
+#
+# Everything below is dead weight when the env var is unset (default) -- every
+# call site is guarded by `if _TQ_COMBINE_TRAP:` first, so the checks
+# themselves are never even evaluated in production. See RESULT.md
+# ("What the trap covers / does not cover") for the full rationale, the
+# specific mechanism each check targets, and the arm recipe.
+#
+# Design intent: turn the tonight-2026-09-07 failure signature (an async
+# Xid31/illegal-memory-access reported 1-3 unrelated .item() calls after the
+# kernel that actually corrupted memory, per the prior tq-prefix-combine-rca
+# lane's RESULT.md Section 4) into a synchronous Python RuntimeError, at a
+# known point, carrying the numbers that were live at that point. Two
+# independent techniques, both needed:
+#   1. torch.cuda.synchronize() calls bracketing the branch's own kernel
+#      launches (_combine_trap_sync below) -- this is what converts "async
+#      fault, misattributed" into "sync fault, correctly attributed to this
+#      request/layer/leg", REGARDLESS of which hypothesis in RESULT.md is
+#      right. It also independently answers whether this call is genuinely
+#      single-stream (see _combine_trap_check_stream).
+#   2. Host-side invariant asserts (_combine_trap_check_* below) -- these
+#      catch the subset of failure modes that are wrong *before* the kernel
+#      launch (bad block ids, shape/dtype drift, undersized buffers) and name
+#      them explicitly instead of waiting for the GPU to fault on them.
+# ---------------------------------------------------------------------------
+
+
+def _combine_trap_check_stream(tag: str, baseline):
+    """Return torch.cuda.current_stream() and, if `baseline` is not None,
+    raise if it differs -- direct evidence for/against the "compile
+    introduces additional streams around this custom op" hypothesis
+    (tq-prefix-combine-rca RESULT.md Section 3) versus the pure CPU/DMA-race
+    hypothesis this lane's RESULT.md Rank 1 argues does not need it. Cheap:
+    current_stream() is a host-side handle lookup, no sync.
+    """
+    current = torch.cuda.current_stream()
+    if baseline is not None and current.cuda_stream != baseline.cuda_stream:
+        raise RuntimeError(
+            f"[COMBINE_TRAP] stream changed within one combine call at "
+            f"'{tag}': baseline_stream=0x{baseline.cuda_stream:x} "
+            f"current_stream=0x{current.cuda_stream:x} -- this call is NOT "
+            f"single-stream; see RESULT.md Section 3 (multi-stream "
+            f"hypothesis) which this directly confirms."
+        )
+    return current
+
+
+def _combine_trap_check_block_table(
+    layer_name: Any,
+    block_table: torch.Tensor,
+    cached_len: int,
+    block_size: int,
+    num_blocks: int,
+    q_len: int,
+    seq_len: int,
+) -> None:
+    """Stricter, raising sibling of the env-gated VLLM_TURBOQUANT_CONTINUATION_
+    BOUNDS_CHECK clamp-and-log at turboquant_attn.py:2379-2418 (pinned
+    48093b360). That check is shared by both the combine and non-combine
+    arms and silently clamps+logs; this one is combine-only (called only
+    from inside `if prefix_combine_enabled:`), independent of whether
+    BOUNDS_CHECK is itself enabled, checks the RAW block_table (not
+    whatever BOUNDS_CHECK's own safe_block_table clamp already fixed up),
+    and raises instead of clamping so a genuinely out-of-range or
+    unexpectedly-shaped block table stops the request with numbers instead
+    of silently continuing on patched-up data.
+    """
+    pages = math.ceil(cached_len / block_size) if cached_len > 0 else 0
+    width = block_table.shape[1]
+    if pages > width:
+        raise RuntimeError(
+            f"[COMBINE_TRAP] pages>width feeding KERNEL1 dequant: pages={pages} "
+            f"width={width} cached_len={cached_len} block_size={block_size} "
+            f"seq_len={seq_len} q_len={q_len} layer={layer_name}"
+        )
+    if pages == 0:
+        return
+    bt_slice = block_table[0, :pages]
+    bt_max = int(bt_slice.max().item())
+    bt_min = int(bt_slice.min().item())
+    if bt_min < 0 or bt_max >= num_blocks:
+        raise RuntimeError(
+            f"[COMBINE_TRAP] block_table OOB feeding KERNEL1 dequant: "
+            f"bt_min={bt_min} bt_max={bt_max} num_blocks={num_blocks} "
+            f"pages={pages} cached_len={cached_len} q_len={q_len} "
+            f"seq_len={seq_len} layer={layer_name}"
+        )
+
+
+def _combine_trap_check_workspace(
+    layer_name: Any,
+    k_buf: torch.Tensor,
+    v_buf: torch.Tensor,
+    Hk: int,
+    alloc_len: int,
+    D: int,
+    cached_len: int,
+) -> None:
+    """cached_len vs alloc_len vs the WorkspaceManager arena's real capacity.
+    get_simultaneous() (workspace.py:92-117) already raises its own
+    AssertionError if the manager is locked and the request is undersized
+    (workspace.py:163-169), so k_buf/v_buf.numel() matching the requested
+    shape is close to tautological -- the one thing that check CANNOT see is
+    whether a *later* caller in the same step (next layer, or the sibling
+    thread's own dequant right after this one in _prefill_attention's
+    per-request loop) will reuse the identical bytes before this call's own
+    consumer (prefix_wrapper.run(), still to come) is done reading them; see
+    RESULT.md Rank 1(old)/Rank 2(old). This check only confirms the shapes
+    line up at this instant -- it cannot see the future reuse, only the
+    synchronize() calls around the run() calls make that race less likely
+    to land silently.
+    """
+    expected_numel = 1 * Hk * alloc_len * D
+    if k_buf.numel() != expected_numel or v_buf.numel() != expected_numel:
+        raise RuntimeError(
+            f"[COMBINE_TRAP] workspace buffer shape drift: k_buf.numel()="
+            f"{k_buf.numel()} v_buf.numel()={v_buf.numel()} expected="
+            f"{expected_numel} (Hk={Hk} alloc_len={alloc_len} D={D} "
+            f"cached_len={cached_len}) layer={layer_name}"
+        )
+    try:
+        mgr = current_workspace_manager()
+        ubatch_id = dbo_current_ubatch_id()
+        arena = mgr._current_workspaces[ubatch_id]  # noqa: SLF001 (diagnostic-only)
+        arena_bytes = arena.numel() * arena.element_size() if arena is not None else -1
+        needed_bytes = 2 * round_up(expected_numel * 2, 256)  # k+v, fp16, 256B-aligned
+        if arena_bytes >= 0 and needed_bytes > arena_bytes:
+            raise RuntimeError(
+                f"[COMBINE_TRAP] workspace arena undersized: arena_bytes="
+                f"{arena_bytes} needed_bytes={needed_bytes} alloc_len="
+                f"{alloc_len} Hk={Hk} D={D} cached_len={cached_len} "
+                f"layer={layer_name}"
+            )
+    except RuntimeError:
+        raise
+    except Exception as exc:  # noqa: BLE001 -- diagnostic best-effort only
+        logger.warning_once(
+            "[COMBINE_TRAP] workspace arena introspection failed (%s); "
+            "shape-only check above still applies", exc
+        )
+
+
+def _combine_trap_check_run_inputs(
+    leg: str,
+    layer_name: Any,
+    query: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    expected_kv_len: int,
+    Hq: int,
+    Hk: int,
+    D: int,
+    q_len: int,
+) -> None:
+    """Shapes/dtypes/devices of the tensors about to be hedged into
+    prefix_wrapper.run()/current_wrapper.run() against what plan() declared
+    for this exact wrapper (Hq, Hk, D, dtypes) and against this leg's own
+    expected KV length (cached_len for the prefix leg, q_len for the current
+    leg). Does NOT check strides against contiguous NHD -- tonight's arm Q
+    (dd2906ff6, .contiguous() on k/v_cached_trim) crashed *faster* than
+    unpatched prod with a different Xid fault type (VIRT_WRITE vs
+    VIRT_READ), so non-contiguity alone is not established as sufficient to
+    explain this crash and a hard stride assert here would likely just fire
+    on the always-non-contiguous v_cached_trim view every single combine
+    call in the unpatched configuration, i.e. constantly, telling us
+    nothing new. Stride is reported (not asserted) in the raised message
+    for whichever check does fire, since it's still relevant context.
+    """
+    if query.shape != (q_len, Hq, D):
+        raise RuntimeError(
+            f"[COMBINE_TRAP] {leg} query shape drift: got={tuple(query.shape)} "
+            f"expected=({q_len}, {Hq}, {D}) layer={layer_name}"
+        )
+    for name, t in (("k", k), ("v", v)):
+        if t.shape[0] != expected_kv_len or t.shape[1] != Hk or t.shape[2] != D:
+            raise RuntimeError(
+                f"[COMBINE_TRAP] {leg} {name} shape drift: got={tuple(t.shape)} "
+                f"expected=({expected_kv_len}, {Hk}, {D}) stride={tuple(t.stride())} "
+                f"q_len={q_len} layer={layer_name}"
+            )
+        if t.device != query.device:
+            raise RuntimeError(
+                f"[COMBINE_TRAP] {leg} {name} device drift: got={t.device} "
+                f"expected={query.device} layer={layer_name}"
+            )
+
+
+def _combine_trap_check_merge_inputs(
+    layer_name: Any,
+    current_out: torch.Tensor,
+    prefix_out: torch.Tensor,
+    prefix_lse: torch.Tensor,
+    current_lse: torch.Tensor,
+    q_len: int,
+    Hq: int,
+    D: int,
+) -> None:
+    """merge_attn_states' actual dispatch target (vllm._custom_ops ->
+    csrc/attention/merge_attn_states.cu, confirmed vendored and read in this
+    lane -- NOT true that it's an opaque, unauditable extension) indexes
+    output/prefix_output/suffix_output by (token_idx, head_idx, pack_idx)
+    computed from output.size(0)/(1)/(2) and prefix_output.stride(1) alone
+    (merge_attn_states_launcher, merge_attn_states.cu:253-268) -- it never
+    reads suffix_output's own shape/strides. A shape mismatch on
+    suffix_output (current_out, aliased as both output and suffix_output in
+    this call) would silently read/write past what its own storage holds
+    rather than raising, so this is asserted here rather than left to the
+    kernel.
+    """
+    if current_out.shape != (q_len, Hq, D) or prefix_out.shape != (q_len, Hq, D):
+        raise RuntimeError(
+            f"[COMBINE_TRAP] merge_attn_states output/prefix_output shape "
+            f"drift: current_out={tuple(current_out.shape)} "
+            f"prefix_out={tuple(prefix_out.shape)} expected=({q_len}, {Hq}, {D}) "
+            f"layer={layer_name}"
+        )
+    if prefix_lse.shape != (Hq, q_len) or current_lse.shape != (Hq, q_len):
+        raise RuntimeError(
+            f"[COMBINE_TRAP] merge_attn_states lse shape drift: "
+            f"prefix_lse={tuple(prefix_lse.shape)} "
+            f"current_lse={tuple(current_lse.shape)} expected=({Hq}, {q_len}) "
+            f"layer={layer_name}"
+        )
+    if current_out.dtype != prefix_out.dtype:
+        raise RuntimeError(
+            f"[COMBINE_TRAP] merge_attn_states dtype drift: "
+            f"current_out.dtype={current_out.dtype} "
+            f"prefix_out.dtype={prefix_out.dtype} layer={layer_name}"
+        )
 
 
 class TurboQuantAttentionBackend(AttentionBackend):
@@ -2328,6 +2574,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 (buf_shape, torch.float16),
                 (buf_shape, torch.float16),
             )
+            if _TQ_COMBINE_TRAP and prefix_combine_enabled:
+                _combine_trap_check_workspace(
+                    getattr(layer, "layer_name", None),
+                    k_buf, v_buf, Hk, alloc_len, D, cached_len,
+                )
             # Skip .zero_() — kernel writes all positions up to cached_len,
             # and we only read [:cached_len] afterwards.
             k_cached = k_buf[:, :, :alloc_len, :]
@@ -2416,6 +2667,12 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     )
                     safe_block_table = block_table.clone()
                     safe_block_table[0, :pages_eff].clamp_(0, num_blocks - 1)
+            if _TQ_COMBINE_TRAP and prefix_combine_enabled:
+                _combine_trap_check_block_table(
+                    getattr(layer, "layer_name", None),
+                    block_table, cached_len, block_size,
+                    kv_cache.shape[0], q_len, seq_len,
+                )
             _tq_full_dequant_kv[grid](
                 kv_cache,
                 safe_block_table,
@@ -2481,6 +2738,18 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 )
 
         if prefix_combine_enabled:
+            _combine_trap_stream0 = None
+            if _TQ_COMBINE_TRAP:
+                # Sync A: drain everything enqueued before this layer's own
+                # combine kernels (KERNEL1 dequant + K-rotation GEMM above,
+                # plus anything still in flight from earlier layers/requests
+                # on this stream). If the fault predates entry into this
+                # branch, it surfaces HERE instead of inside the window
+                # below, attributed to "before combine, layer=X req=Y".
+                torch.cuda.synchronize()
+                _combine_trap_stream0 = _combine_trap_check_stream(
+                    "combine-entry", None
+                )
             if self._fi_single_qo_indptr_cpu is None:
                 self._fi_single_qo_indptr_cpu = torch.empty(
                     2, dtype=torch.int32, pin_memory=True
@@ -2534,6 +2803,12 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             prefix_lse = torch.empty(
                 (q_len, Hq), dtype=torch.float32, device=device
             )
+            if _TQ_COMBINE_TRAP:
+                _combine_trap_check_run_inputs(
+                    "prefix", getattr(layer, "layer_name", None),
+                    query, k_cached_trim, v_cached_trim, cached_len,
+                    Hq, Hk, D, q_len,
+                )
             prefix_out, prefix_lse = prefix_wrapper.run(
                 query,
                 k_cached_trim,
@@ -2542,6 +2817,25 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 lse=prefix_lse,
                 return_lse=True,
             )
+            if _TQ_COMBINE_TRAP:
+                # Sync B -- THE race-closing sync (see RESULT.md Rank 1): this
+                # is the exact point between the prefix leg's plan()
+                # (enqueues a non_blocking=True host->device copy of
+                # _fi_single_kv_indptr_cpu, reading it for the value just set
+                # above, cached_len) and the next line, which overwrites that
+                # SAME pinned host buffer to q_len for the current leg's own
+                # plan(). Forcing a full device sync here makes the prefix
+                # leg's async copy (and its actual attention kernel) provably
+                # complete before the buffer can be reused, closing the race
+                # by construction rather than merely detecting it. If the
+                # crash disappears (or moves to a *different*, later combine
+                # call) specifically because of this one sync, that is strong
+                # evidence for Rank 1. If it still happens inside this exact
+                # bracket, Rank 1 is wrong or incomplete and the fault is
+                # inside prefix_wrapper.run()'s own kernel for a reason other
+                # than the indptr race.
+                torch.cuda.synchronize()
+                _combine_trap_check_stream("post-prefix-run", _combine_trap_stream0)
             del k_cached_trim, v_cached_trim, k_cached, v_cached, k_buf, v_buf
 
             self._fi_single_kv_indptr_cpu[1] = q_len
@@ -2584,6 +2878,12 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             current_lse = torch.empty(
                 (q_len, Hq), dtype=torch.float32, device=device
             )
+            if _TQ_COMBINE_TRAP:
+                _combine_trap_check_run_inputs(
+                    "current", getattr(layer, "layer_name", None),
+                    query, key_chunk, val_chunk, q_len,
+                    Hq, Hk, D, q_len,
+                )
             current_out, current_lse = current_wrapper.run(
                 query,
                 key_chunk,
@@ -2594,6 +2894,12 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             )
             prefix_lse_for_merge = prefix_lse.transpose(0, 1).contiguous()
             current_lse_for_merge = current_lse.transpose(0, 1).contiguous()
+            if _TQ_COMBINE_TRAP:
+                _combine_trap_check_merge_inputs(
+                    getattr(layer, "layer_name", None),
+                    current_out, prefix_out, prefix_lse_for_merge,
+                    current_lse_for_merge, q_len, Hq, D,
+                )
             merge_attn_states(
                 current_out,
                 prefix_out,
@@ -2601,6 +2907,20 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 current_out,
                 current_lse_for_merge,
             )
+            if _TQ_COMBINE_TRAP:
+                # Sync C: drains this layer's "current" attention kernel and
+                # the merge_attn_states kernel. If the fault is inside either
+                # of those (or the race from Sync B's comment reasserts
+                # itself on THIS leg's own indptr instead -- current_plan_key
+                # is not keyed by cached_len, so this wrapper is more often a
+                # cache-hit/no-replan than the prefix one, but is not
+                # replan-free on the first occurrence of a new q_len), it
+                # surfaces here, attributed to "after combine, layer=X
+                # req=Y" -- the last point inside this branch, before control
+                # returns to _prefill_attention's per-request loop and the
+                # NEXT request/layer's own combine call begins.
+                torch.cuda.synchronize()
+                _combine_trap_check_stream("post-merge", _combine_trap_stream0)
             del prefix_out, prefix_lse, current_lse
             del prefix_lse_for_merge, current_lse_for_merge
             logger.info_once(
