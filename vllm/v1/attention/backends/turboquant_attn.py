@@ -714,6 +714,12 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         self._fi_prefill_backend = _DEFAULT_TQ_FI_BACKEND
         self._fi_single_qo_indptr_cpu = None
         self._fi_single_kv_indptr_cpu = None
+        # RCA fix (tq-prefix-combine-rca-2, Rank 1): separate pinned
+        # kv_indptr buffer for the prefix-combine "current" leg. See the
+        # comment at its point of use in _continuation_prefill for why
+        # sharing _fi_single_kv_indptr_cpu between the "prefix" and
+        # "current" legs is unsafe.
+        self._fi_single_kv_indptr_cpu_current = None
         self._decode_workspace_reserved = False
         self._continuation_workspace_reserved = False
         self._shared_draft_sdpa_notice_logged = False
@@ -2488,6 +2494,35 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 self._fi_single_kv_indptr_cpu = torch.empty(
                     2, dtype=torch.int32, pin_memory=True
                 )
+            if self._fi_single_kv_indptr_cpu_current is None:
+                # RCA fix (tq-prefix-combine-rca-2, Rank 1): a SEPARATE pinned
+                # buffer for the "current" leg below, instead of reusing
+                # _fi_single_kv_indptr_cpu (which the prefix leg just wrote
+                # cached_len into). FlashInfer's BatchPrefillWithRaggedKVCache
+                # Wrapper.plan() copies its kv_indptr argument to the device
+                # with non_blocking=True (.venv/.../flashinfer/prefill.py:
+                # 2972-2973 for this install) -- a genuinely async DMA since
+                # the source is pin_memory=True. That copy reads the pinned
+                # buffer's CONTENTS at whatever moment the copy engine
+                # actually executes it, not at the moment plan() was called.
+                # The very next line after the prefix leg's prefix_wrapper.run()
+                # used to overwrite that SAME buffer to q_len for the current
+                # leg's own plan() -- if the prefix leg's async copy had not
+                # yet executed, it would read q_len instead of cached_len,
+                # silently mismatching the CPU-computed schedule (plan_info,
+                # correctly sized for cached_len) against the GPU-resident
+                # kv_indptr the actual FA2 kernel dispatch uses
+                # (self._kv_indptr_buf, consumed via run_args in
+                # prefill.py:3390-3439). Giving the current leg its own buffer
+                # means the prefix leg's buffer is only ever written once per
+                # call (matching the safe, idempotent-overwrite pattern the
+                # non-combine path at :2695ish already relies on -- see
+                # RESULT.md Rank 1 for the full mechanism and why the OLD
+                # Rank-1 fix, a .contiguous() copy of k/v_cached_trim, did NOT
+                # touch this and did not stop tonight's crash).
+                self._fi_single_kv_indptr_cpu_current = torch.empty(
+                    2, dtype=torch.int32, pin_memory=True
+                )
 
             self._fi_single_qo_indptr_cpu[0] = 0
             self._fi_single_qo_indptr_cpu[1] = q_len
@@ -2544,7 +2579,8 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             )
             del k_cached_trim, v_cached_trim, k_cached, v_cached, k_buf, v_buf
 
-            self._fi_single_kv_indptr_cpu[1] = q_len
+            self._fi_single_kv_indptr_cpu_current[0] = 0
+            self._fi_single_kv_indptr_cpu_current[1] = q_len
             seq_lens_current = q_len * torch.ones(1, dtype=torch.int32)
             current_plan_key = (
                 "continuation_prefix_combine_current",
@@ -2563,7 +2599,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         self._fi_single_qo_indptr_cpu, Hq, D
                     ),
                     "kv_indptr": self._flashinfer_indptr(
-                        self._fi_single_kv_indptr_cpu, Hk, D
+                        self._fi_single_kv_indptr_cpu_current, Hk, D
                     ),
                     "num_qo_heads": Hq,
                     "num_kv_heads": Hk,
