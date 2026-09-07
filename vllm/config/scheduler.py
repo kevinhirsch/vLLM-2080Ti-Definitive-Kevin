@@ -154,6 +154,27 @@ class SchedulerConfig:
     while a larger value (e.g., 10) reduces host overhead and may increase throughput
     by batching multiple tokens before sending."""
 
+    running_stall_timeout_s: float = Field(default=0.0, ge=0.0)
+    """[FORK] Timeout in seconds for a RUNNING request that makes no
+    observable forward progress (num_computed_tokens and output-token count
+    both unchanged since the last scheduler step that touched it). If a
+    running request is stalled for longer than this many seconds, it is
+    logged (a WARNING line prefixed "RUNNING-STALL") and aborted
+    (FINISHED_ERROR) via the same finish_requests() path used for client
+    cancellation/errors, so its KV cache blocks, encoder cache, and MTP
+    draft bookkeeping are freed/reset consistently.
+
+    This is a bound on per-request forward-progress liveness, not a general
+    engine-health check: it only fires while the scheduler's schedule()
+    method keeps being invoked. If the engine's main loop itself stops
+    calling schedule() (e.g. a process-wide deadlock rather than a stuck
+    model forward pass), this cannot act; an external process-level
+    watchdog is still required for that case.
+
+    0.0 (the default) disables the check entirely -- no per-request
+    bookkeeping overhead and no behavior change versus not having this
+    field at all."""
+
     @staticmethod
     def default_factory(**kwargs):
         """

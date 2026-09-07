@@ -429,8 +429,17 @@ class Scheduler(SchedulerInterface):
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
 
-        # For logging.
+        # For logging, and reused below as the "now" for the running-stall
+        # watchdog so the whole step is measured against one timestamp.
         scheduled_timestamp = time.monotonic()
+
+        # [FORK] Running-loop stall watchdog (SchedulerConfig.
+        # running_stall_timeout_s, default disabled). Abort any RUNNING
+        # request that has made no observable forward progress for too
+        # long *before* admitting/scheduling anything else this step, so
+        # a stalled request's KV blocks are freed in time to be reused by
+        # this same step's WAITING-queue admission below.
+        self._abort_stalled_running_requests(scheduled_timestamp)
 
         self.kv_cache_manager.new_step_starts()
 
@@ -876,6 +885,18 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                # [FORK] Running-loop stall watchdog: (re)start the
+                # progress clock on every admission/resumption into
+                # RUNNING. Covers both a fresh WAITING->RUNNING admission
+                # and a PREEMPTED->RUNNING resumption -- a resumed request
+                # must not inherit a stale clock from before it was
+                # preempted (its num_computed_tokens was reset to 0 by
+                # _preempt_request, so the snapshot must match).
+                request.last_progress_time = scheduled_timestamp
+                request.last_progress_num_computed_tokens = (
+                    request.num_computed_tokens
+                )
+                request.last_progress_num_output_tokens = request.num_output_tokens
                 # Encoder-related.
                 if encoder_inputs_to_schedule:
                     scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
@@ -1021,6 +1042,86 @@ class Scheduler(SchedulerInterface):
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
+
+    def _abort_stalled_running_requests(self, now: float) -> None:
+        """[FORK] Running-loop stall watchdog.
+
+        Context (2026-09-05 10:31 wedge): the engine can get into a state
+        where /health stays 200 and the scheduler keeps admitting new
+        requests into RUNNING, but generation throughput drops to 0 tok/s
+        for one or more already-RUNNING requests with no Xid and no
+        traceback. Upstream has no cross-rank/progress watchdog for this
+        (vLLM RFC #48720 is open, unimplemented); the #54348 blocked-
+        waiting-timeout port only covers requests parked in WAITING
+        sub-statuses (WAITING_FOR_REMOTE_KVS etc.), not RUNNING requests.
+
+        This bounds the failure instead of only detecting it from outside:
+        any RUNNING request whose last observed forward progress
+        (num_computed_tokens or num_output_tokens increasing -- see the
+        progress-stamp in update_from_output, and the clock-reset on
+        admission/resumption above) is older than
+        scheduler_config.running_stall_timeout_s gets logged and aborted
+        via the same finish_requests(..., FINISHED_ERROR) path used for
+        client cancellation/errors, so its KV cache blocks, encoder
+        cache, and MTP draft bookkeeping are freed/reset exactly as they
+        would be for any other abort.
+
+        Deliberately NOT triggered by:
+        - A long-running chunked prefill: num_computed_tokens advances
+          every step it is scheduled, so its clock keeps resetting.
+        - Async scheduling's one-step lag between a step being scheduled
+          and its progress being confirmed in update_from_output: the
+          clock is wall-clock seconds, not a step count, so a lag of a
+          fraction of a step is negligible against any sane timeout.
+        - A request merely waiting its turn for token budget while other
+          requests in the batch are healthy: as long as it eventually
+          gets scheduled and confirmed within the timeout window, its
+          clock advances normally.
+
+        Coverage limit (documented per the task, not glossed over): this
+        method only runs because schedule() is still being called. If the
+        whole engine is wedged such that the main loop stops calling
+        schedule() at all (as opposed to schedule() running fine while
+        update_from_output never confirms progress), this cannot act --
+        an external process-level watchdog restart is still required for
+        that failure mode.
+        """
+        timeout_s = self.scheduler_config.running_stall_timeout_s
+        if timeout_s <= 0.0 or not self.running:
+            # Disabled by default: zero bookkeeping cost, zero behavior
+            # change versus not having this feature at all.
+            return
+
+        stalled_ids: list[str] = []
+        num_running, num_waiting = self.get_request_counts()
+        for request in self.running:
+            last_progress = request.last_progress_time
+            if last_progress is None:
+                # Every request in self.running was admitted through the
+                # WAITING-loop code above, which always stamps
+                # last_progress_time. Defensive only: never let a missing
+                # stamp crash the scheduler.
+                continue
+            age = now - last_progress
+            if age <= timeout_s:
+                continue
+            stalled_ids.append(request.request_id)
+            # One line, machine-greppable.
+            logger.warning(
+                "RUNNING-STALL request_id=%s age_s=%.1f timeout_s=%.1f "
+                "num_computed_tokens=%d num_prompt_tokens=%d running=%d "
+                "waiting=%d",
+                request.request_id,
+                age,
+                timeout_s,
+                request.num_computed_tokens,
+                request.num_prompt_tokens,
+                num_running,
+                num_waiting,
+            )
+
+        if stalled_ids:
+            self.finish_requests(stalled_ids, RequestStatus.FINISHED_ERROR)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
@@ -1352,6 +1453,12 @@ class Scheduler(SchedulerInterface):
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
 
+        # [FORK] Running-loop stall watchdog: single "now" for this step's
+        # progress-confirmation stamps in the per-request loop below (see
+        # _abort_stalled_running_requests for the consumer).
+        running_stall_timeout_s = self.scheduler_config.running_stall_timeout_s
+        now = time.monotonic() if running_stall_timeout_s > 0.0 else 0.0
+
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
             perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)
@@ -1448,6 +1555,27 @@ class Scheduler(SchedulerInterface):
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
+
+            # [FORK] Running-loop stall watchdog: this request's step was
+            # just confirmed by a real ModelRunnerOutput -- unlike the
+            # speculative num_computed_tokens bump in _update_after_schedule
+            # (which happens before execution and confirms nothing), we
+            # know the model actually ran for this request this step.
+            # Refresh the progress clock only when num_computed_tokens or
+            # the output-token count actually grew since the last time we
+            # checked: covers chunked prefill (computed tokens grow, no
+            # sampled token yet) and decode (output tokens grow), while
+            # not resetting the clock on a step that touched the request
+            # but made no real progress.
+            if running_stall_timeout_s > 0.0 and (
+                request.num_computed_tokens > request.last_progress_num_computed_tokens
+                or request.num_output_tokens > request.last_progress_num_output_tokens
+            ):
+                request.last_progress_time = now
+                request.last_progress_num_computed_tokens = (
+                    request.num_computed_tokens
+                )
+                request.last_progress_num_output_tokens = request.num_output_tokens
 
             if new_token_ids and self.structured_output_manager.should_advance(request):
                 struct_output_request = request.structured_output_request

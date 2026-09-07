@@ -95,6 +95,18 @@ class Request:
         self.arrival_time = arrival_time if arrival_time is not None else time.time()
 
         self.status = RequestStatus.WAITING
+        # [FORK] Running-loop stall watchdog (SchedulerConfig.
+        # running_stall_timeout_s): monotonic timestamp of the last
+        # observed forward progress while this request has been RUNNING
+        # (num_computed_tokens or num_output_tokens increasing), or of
+        # (re)admission into RUNNING. None until first admitted; reset on
+        # every admission/resumption so a preempted-then-resumed request
+        # gets a fresh clock. See
+        # Scheduler._abort_stalled_running_requests and
+        # Scheduler.update_from_output.
+        self.last_progress_time: float | None = None
+        self.last_progress_num_computed_tokens: int = 0
+        self.last_progress_num_output_tokens: int = 0
         self.events: list[EngineCoreEvent] = []
         self.stop_reason: int | str | None = None
 
