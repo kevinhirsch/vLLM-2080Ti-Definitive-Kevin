@@ -168,6 +168,22 @@ class WorkspaceManager:
                     "Workspace growth is not allowed after locking."
                 )
 
+            # Xid31 combine-race fix (tq-combine-race-fix, see turboquant_attn.py's
+            # _TQ_COMBINE_ARENA_READ_EVENT and RESULT.md): this teardown frees
+            # the old arena and hands the reclaimed pages back to the CUDA
+            # driver (empty_cache() below) with no synchronization of any
+            # kind. In production this branch should be unreachable during
+            # serving -- lock_workspace() (called once after warmup) makes
+            # any post-lock growth raise the AssertionError above instead of
+            # reaching here -- but growth during the pre-lock warmup window,
+            # or after any future unlock_workspace() use, would otherwise be
+            # a genuine use-after-free if something is still reading through
+            # the old arena. This only runs on an actual size increase (the
+            # branch this file is already inside), never on the steady-state
+            # fast path, so paying one full-device sync here is free in the
+            # case that matters (serving) and cheap in the case it guards
+            # (warmup/rescale).
+            torch.accelerator.synchronize()
             # Only resize the requesting ubatch's workspace.  Other
             # ubatches resize lazily on their next get_simultaneous call.
             # Resizing all ubatches here would orphan the other ubatch's

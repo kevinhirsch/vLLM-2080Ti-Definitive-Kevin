@@ -53,6 +53,7 @@ from vllm.v1.attention.backends.fa_utils import (
     is_flash_attn_varlen_func_available,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
     is_workspace_manager_initialized,
@@ -363,6 +364,23 @@ _GEMMA4_TQ4NC_SHARED_FP16_TRITON = (
 )
 _TQ_FI_PREFILL_WORKSPACES: dict[tuple[str, str], torch.Tensor] = {}
 _TQ_FI_PREFILL_WRAPPERS: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
+# Xid31 combine-race fix (tq-combine-race-fix, see RESULT.md for the full
+# analysis). WorkspaceManager's per-ubatch dequant arena (workspace.py,
+# current_workspace_manager()._current_workspaces[ubatch_id]) is a single,
+# persistent buffer: every get_simultaneous() call, from any layer or any
+# request sharing this ubatch, returns a view starting at the same base
+# storage. The continuation prefix-combine branch below hands a live view of
+# that arena (v_cached_trim, and k_cached_trim too under a key_fp8=True TQ
+# preset) directly to an external FlashInfer kernel without waiting for it to
+# finish, so the very next caller's dequant-kernel WRITE into the same
+# storage can be enqueued before that read has completed. This is harmless
+# when both kernels land on the same CUDA stream (launch order == execution
+# order) and only unsafe if they don't -- which this file cannot rule out
+# under torch.compile (see RESULT.md Section 3 background). One CUDA event
+# per ubatch closes the gap: recorded right after the risky read is
+# enqueued, waited-on right before the arena is next touched. Keyed by
+# ubatch_id, mirroring WorkspaceManager's own _current_workspaces indexing.
+_TQ_COMBINE_ARENA_READ_EVENT: dict[int, torch.cuda.Event] = {}
 logger = init_logger(__name__)
 
 
@@ -2328,6 +2346,22 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 (buf_shape, torch.float16),
                 (buf_shape, torch.float16),
             )
+            # Xid31 combine-race fix: before this call's own dequant kernel
+            # (below) writes into the shared arena, make the GPU wait for
+            # whichever earlier call last handed a live view of it to
+            # FlashInfer (see _TQ_COMBINE_ARENA_READ_EVENT above). This is a
+            # stream-side wait, not a host sync: torch.cuda.Event.wait()
+            # defaults to blocking=False, so it costs one cheap GPU-side
+            # dependency check, not a CPU stall -- and when the previous
+            # reader already finished (the common, same-stream case, where
+            # CUDA's own FIFO ordering already made this a non-issue) the
+            # check is immediately satisfied. ubatch_id-keyed to match
+            # WorkspaceManager's own per-ubatch arena indexing.
+            _tq_prev_arena_read = _TQ_COMBINE_ARENA_READ_EVENT.get(
+                dbo_current_ubatch_id()
+            )
+            if _tq_prev_arena_read is not None:
+                _tq_prev_arena_read.wait()
             # Skip .zero_() — kernel writes all positions up to cached_len,
             # and we only read [:cached_len] afterwards.
             k_cached = k_buf[:, :, :alloc_len, :]
@@ -2542,6 +2576,29 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 lse=prefix_lse,
                 return_lse=True,
             )
+            # Xid31 combine-race fix: the read enqueued just above is the
+            # exposure this whole mechanism guards -- k_cached_trim (under
+            # key_fp8) and v_cached_trim (always) are live views into the
+            # shared WorkspaceManager arena, and prefix_wrapper.run() is an
+            # external (FlashInfer) call that does not block for its own
+            # kernel(s) to finish before returning. `del` two lines below
+            # only drops Python references; it does not wait for the GPU.
+            # Recording an event here (default blocking=False, and
+            # external=True so this is future-proofed if the combine branch
+            # ever becomes reachable from inside a captured CUDA graph --
+            # see RESULT.md's CUDA-graph honesty note; today it never is)
+            # costs one cheap async marker, paid on every combine call, in
+            # exchange for the next call's wait actually being able to close
+            # the race instead of just hoping launch order held.
+            _tq_arena_read_event = _TQ_COMBINE_ARENA_READ_EVENT.get(
+                dbo_current_ubatch_id()
+            )
+            if _tq_arena_read_event is None:
+                _tq_arena_read_event = torch.cuda.Event(external=True)
+                _TQ_COMBINE_ARENA_READ_EVENT[dbo_current_ubatch_id()] = (
+                    _tq_arena_read_event
+                )
+            _tq_arena_read_event.record()
             del k_cached_trim, v_cached_trim, k_cached, v_cached, k_buf, v_buf
 
             self._fi_single_kv_indptr_cpu[1] = q_len
