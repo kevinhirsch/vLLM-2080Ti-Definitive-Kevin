@@ -3843,192 +3843,675 @@ async def gateway_dashboard(request):
     return web.Response(text=DASHBOARD_HTML, content_type="text/html")
 
 DASHBOARD_HTML = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1"><title>vLLM Gateway Status</title>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>vLLM Gateway</title>
 <style>
 :root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--dim:#8b949e;--grn:#3fb950;--amb:#d29922;--red:#f85149;--blu:#58a6ff;--hover:#1c2129}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Helvetica,Arial,sans-serif}
-.mono,td.mono,.v{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
-.wrap{max-width:1080px;margin:0 auto;padding:0 18px 48px}
-.top{position:sticky;top:0;z-index:5;background:rgba(13,17,23,.92);backdrop-filter:blur(8px);border-bottom:1px solid var(--bd);margin:0 -18px 14px;padding:10px 18px;display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px}
-.top h1{font-size:15px;margin:0;font-weight:650;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.nav{display:flex;flex-wrap:wrap;gap:2px 4px;margin-left:auto}
-.nav a{color:var(--dim);text-decoration:none;font-size:12.5px;padding:4px 9px;border-radius:6px}.nav a:hover{color:var(--fg);background:var(--hover)}
-.sub{color:var(--dim);font-size:12.5px;margin-bottom:14px}
-.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;vertical-align:middle}
-.up{background:var(--grn);box-shadow:0 0 6px var(--grn)}.down{background:var(--red);box-shadow:0 0 6px var(--red)}
-.grid{display:grid;gap:10px}.g4{grid-template-columns:repeat(4,1fr)}.g2{grid-template-columns:repeat(2,1fr)}
-@media(max-width:720px){.g4{grid-template-columns:repeat(2,1fr)}.g2{grid-template-columns:1fr}.tmeta{display:none}}
-.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px 16px}
-.k{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.05em}.v{font-size:22px;font-weight:600;margin-top:2px}
-.v small{font-size:12px;color:var(--dim);font-weight:400}
-.bar{height:8px;border-radius:4px;background:#21262d;overflow:hidden;display:flex;margin-top:8px}
-.bar i{display:block;height:100%}.bl{background:var(--grn)}.br{background:var(--amb)}
-table{width:100%;border-collapse:collapse;font-size:12.5px}th{text-align:left;color:var(--dim);font-weight:500;padding:6px 8px;border-bottom:1px solid var(--bd)}
-td{padding:6px 8px;border-bottom:1px solid #21262d;white-space:nowrap}
-.tag{padding:1px 7px;border-radius:10px;font-size:11px;font-weight:600}
-.tl{background:rgba(63,185,80,.15);color:var(--grn)}.tr{background:rgba(210,153,34,.15);color:var(--amb)}
-.th{background:rgba(88,166,255,.15);color:var(--blu)}.tx{background:rgba(248,81,73,.15);color:var(--red)}
+html,body{margin:0}
+body{background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Helvetica,Arial,sans-serif}
+.mono,.v,td.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
+.wrap{max-width:1200px;margin:0 auto;padding:0 16px 32px}
 .rz{color:var(--dim)}
-h2{font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em;margin:22px 0 8px;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
-h2 .hint{text-transform:none;letter-spacing:0;font-weight:400;font-size:12.5px}
-.pill{display:inline-block;background:#21262d;border-radius:10px;padding:1px 8px;margin:0 4px 4px 0;font-size:12px}
-label{display:flex;flex-direction:column;gap:3px}input,select{background:#0d1117;border:1px solid var(--bd);color:var(--fg);border-radius:6px;padding:7px 9px;font-size:13px;font-family:inherit}
-input:focus,select:focus{outline:none;border-color:var(--blu)}
-button{background:var(--blu);color:#04101f;border:0;border-radius:6px;padding:7px 16px;font-weight:600;cursor:pointer;font-size:13px}button:hover{opacity:.9}
-button.ghost{background:transparent;color:var(--dim);border:1px solid var(--bd);font-weight:500;padding:4px 10px;font-size:12px}button.ghost:hover{color:var(--fg);opacity:1}
-/* background-task rows (little squares: flashing = working) */
+a{color:var(--blu);text-decoration:none}a:hover{opacity:.85}
+
+/* header */
+header.top{position:sticky;top:0;z-index:5;background:rgba(13,17,23,.94);backdrop-filter:blur(8px);border-bottom:1px solid var(--bd);margin:0 -16px 12px;padding:10px 16px;display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px}
+header h1{font-size:15px;margin:0;font-weight:650;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;vertical-align:middle}
+.dot.up{background:var(--grn);box-shadow:0 0 6px var(--grn)}
+.dot.down{background:var(--red);box-shadow:0 0 6px var(--red)}
+.dot.warn{background:var(--amb);box-shadow:0 0 6px var(--amb)}
+.stamp{font-size:11px;padding:2px 9px;border-radius:10px;font-weight:600}
+.stamp.local{background:rgba(63,185,80,.2);color:var(--grn)}
+.stamp.remote{background:rgba(210,153,34,.25);color:var(--amb)}
+button.ghost{background:transparent;color:var(--dim);border:1px solid var(--bd);font-weight:500;padding:4px 10px;font-size:12px;border-radius:6px;cursor:pointer}
+button.ghost:hover{color:var(--fg);background:var(--hover)}
+button.primary{background:var(--blu);color:#04101f;border:0;border-radius:6px;padding:7px 16px;font-weight:600;cursor:pointer;font-size:13px}
+button.primary:hover{opacity:.92}
+
+/* native tooltips on every metric label + knob */
+abbr[title]{text-decoration:none;border-bottom:1px dotted var(--dim);cursor:help}
+
+/* live-health strip */
+.strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-bottom:14px}
+.tile{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px 14px;min-width:0}
+.tile .k{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.05em}
+.tile .v{font-size:22px;font-weight:600;margin-top:2px;line-height:1.2}
+.tile .v small{font-size:12px;color:var(--dim);font-weight:400}
+.tile .sub{color:var(--dim);font-size:11.5px;margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* collapsible sections */
+details.sec{background:var(--card);border:1px solid var(--bd);border-radius:10px;margin:10px 0;overflow:hidden}
+details.sec>summary{list-style:none;padding:11px 14px;cursor:pointer;display:flex;align-items:center;gap:10px;font-size:14px;font-weight:600;color:var(--fg);user-select:none;flex-wrap:wrap}
+details.sec>summary::-webkit-details-marker{display:none}
+details.sec>summary::after{content:'\25B8';margin-left:auto;color:var(--dim);font-size:14px;transition:transform .12s}
+details.sec[open]>summary::after{transform:rotate(90deg)}
+details.sec>summary .sub{color:var(--dim);font-size:12px;font-weight:400}
+details.sec>.body{padding:0 14px 14px;border-top:1px solid var(--bd);padding-top:12px}
+
+/* meter/bar */
+.bar{height:8px;border-radius:4px;background:#21262d;overflow:hidden;display:flex;margin-top:8px}
+.bar i{display:block;height:100%}
+.bl{background:var(--grn)}.br{background:var(--amb)}.bblu{background:var(--blu)}
+
+/* tables */
+.tw{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{text-align:left;color:var(--dim);font-weight:500;padding:6px 8px;border-bottom:1px solid var(--bd);white-space:nowrap}
+td{padding:6px 8px;border-bottom:1px solid #21262d;white-space:nowrap}
+
+/* tags + badges */
+.tag{padding:1px 7px;border-radius:10px;font-size:11px;font-weight:600}
+.tag.local{background:rgba(63,185,80,.15);color:var(--grn)}
+.tag.remote{background:rgba(210,153,34,.15);color:var(--amb)}
+.tag.held{background:rgba(88,166,255,.15);color:var(--blu)}
+.tag.reject{background:rgba(248,81,73,.15);color:var(--red)}
+.badge{display:inline-block;font-size:11px;padding:0 6px;border-radius:8px;background:#21262d;color:var(--dim);margin-left:6px;vertical-align:1px;font-weight:500}
+.badge.ok{color:var(--grn);background:rgba(63,185,80,.12)}
+.badge.warn{color:var(--amb);background:rgba(210,153,34,.14)}
+.badge.run{color:var(--blu);background:rgba(88,166,255,.14)}
+.badge.err{color:var(--red);background:rgba(248,81,73,.14)}
+
+/* task rows */
 .tasks{display:flex;flex-direction:column}
-.task{display:grid;grid-template-columns:12px minmax(0,1fr) auto;gap:10px;align-items:start;padding:7px 8px;border-radius:6px;text-decoration:none;color:inherit}
+.task{display:grid;grid-template-columns:12px minmax(0,1fr) auto;gap:10px;align-items:start;padding:6px 8px;border-radius:6px;text-decoration:none;color:inherit}
 a.task:hover,.task.hov:hover{background:var(--hover)}
-.sq{width:9px;height:9px;border-radius:2px;margin-top:6px;background:#484f58;flex:none;display:inline-block}
-.sq{transition:opacity .22s ease-in-out}
+.sq{width:9px;height:9px;border-radius:2px;margin-top:6px;background:#484f58;display:inline-block;flex:none;transition:opacity .22s ease-in-out}
 .sq.run{background:var(--blu)}.bk .sq.run{opacity:.12}
-.sq.active{background:var(--blu);opacity:.55}
 .sq.done{background:var(--grn)}.sq.blocked{background:var(--red)}
 .sq.stale{background:var(--amb)}.bk .sq.stale{opacity:.3}
 .sq.queued{background:transparent;border:1.5px solid #8b949e}.sq.empty{background:#30363d}
-.tname{font-weight:600;line-height:1.35;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
-.tstat{color:var(--dim);font-size:12.5px;margin-top:2px;line-height:1.4;white-space:normal;word-break:break-word}
+.tname{font-weight:600;line-height:1.35;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;word-break:break-word}
+.tstat{color:var(--dim);font-size:12.5px;margin-top:2px;word-break:break-word;white-space:normal}
 .tmeta{color:var(--dim);font-size:12px;white-space:nowrap;text-align:right;line-height:1.35;padding-top:1px}
 .tmeta b{color:var(--fg);font-weight:600}
-.thead{display:flex;align-items:center;gap:8px;margin:10px 0 4px;color:var(--dim);font-size:12px;text-transform:uppercase;letter-spacing:.05em;flex-wrap:wrap}
+
+/* group headers inside a section */
+.thead{display:flex;align-items:center;gap:8px;margin:14px 0 4px;color:var(--dim);font-size:11.5px;text-transform:uppercase;letter-spacing:.05em;flex-wrap:wrap}
 .thead .n{background:#21262d;border-radius:9px;padding:0 7px;font-size:11px;color:var(--fg)}
 .thead .lg{text-transform:none;letter-spacing:0;font-weight:400}
-.empty{color:var(--dim);font-size:12.5px;padding:6px 8px}
-.tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:4px 0 6px}
-.tools input[type=text]{padding:5px 9px;font-size:12.5px;min-width:240px}
-details.tail summary{cursor:pointer;color:var(--dim);font-size:12px;list-style:none}details.tail summary::-webkit-details-marker{display:none}
-details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pre-wrap;background:#0d1117;border:1px solid var(--bd);border-radius:6px;padding:8px}
-.badge{display:inline-block;font-size:11px;padding:0 6px;border-radius:8px;background:#21262d;color:var(--dim);margin-left:6px;vertical-align:1px;font-weight:500}
-.badge.ok{color:var(--grn);background:rgba(63,185,80,.12)}.badge.warn{color:var(--amb);background:rgba(210,153,34,.14)}.badge.run{color:var(--blu);background:rgba(88,166,255,.14)}
-/* Telemetry section (added) -- new, isolated classes only; nothing above this line is touched */
+.empty{color:var(--dim);font-size:12.5px;padding:8px 4px}
+
+/* pagination */
+.pager{display:inline-flex;align-items:center;gap:6px;color:var(--dim);font-size:12px;margin-left:auto}
+.pager button{background:transparent;color:var(--dim);border:1px solid var(--bd);border-radius:6px;padding:2px 9px;font-size:12px;cursor:pointer;line-height:1.4}
+.pager button:hover:not(:disabled){color:var(--fg);background:var(--hover)}
+.pager button:disabled{opacity:.35;cursor:not-allowed}
+.pager .lbl{color:var(--dim);min-width:44px;text-align:center;font-variant-numeric:tabular-nums}
+
+/* tools row */
+.tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:4px 0 8px}
+.tools input[type=text]{background:#0d1117;border:1px solid var(--bd);color:var(--fg);border-radius:6px;padding:5px 9px;font-size:12.5px;min-width:180px}
+.tools label{display:flex;align-items:center;gap:6px;color:var(--dim);font-size:12px}
+.tools select{background:#0d1117;border:1px solid var(--bd);color:var(--fg);border-radius:6px;padding:3px 7px;font-size:12px}
+
+/* config form */
+form.cfg .row{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px 14px}
+form.cfg label{display:flex;flex-direction:column;gap:3px}
+form.cfg input,form.cfg select{background:#0d1117;border:1px solid var(--bd);color:var(--fg);border-radius:6px;padding:6px 9px;font-size:13px;font-family:inherit}
+form.cfg input:focus,form.cfg select:focus{outline:none;border-color:var(--blu)}
+form.cfg .k{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.05em}
+
+/* sparklines */
 .spark{width:100%;height:56px;display:block;overflow:visible}
 .spark polyline{fill:none;stroke-width:1.6;vector-effect:non-scaling-stroke}
-.spark .s1{stroke:var(--blu)}.spark .s2{stroke:var(--amb)}.spark .s3{stroke:var(--grn)}
-.telemwrap{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:2px}
-.telemwrap .legend{font-size:11px;color:var(--dim)}.telemwrap .legend b{font-weight:600}
-.legend .l1{color:var(--blu)}.legend .l2{color:var(--amb)}.legend .l3{color:var(--grn)}
-/* Windows section (added) -- new, isolated classes only; nothing above this line is touched */
-.wcard{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:10px 12px;margin-bottom:10px}
+.s1{stroke:var(--blu)}.s2{stroke:var(--amb)}.s3{stroke:var(--grn)}
+.spark-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px;margin-top:8px}
+.spark-cell{background:#0d1117;border:1px solid var(--bd);border-radius:8px;padding:10px 12px}
+.telemwrap{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:2px;gap:6px;flex-wrap:wrap}
+.telemwrap .legend{font-size:11px;color:var(--dim)}
+.l1{color:var(--blu)}.l2{color:var(--amb)}.l3{color:var(--grn)}
+
+/* details.tail (used inside task rows) */
+details.tail summary{cursor:pointer;color:var(--dim);font-size:12px;list-style:none}
+details.tail summary::-webkit-details-marker{display:none}
+details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pre-wrap;background:#0d1117;border:1px solid var(--bd);border-radius:6px;padding:8px}
+
+/* windows cards */
+.wcard{background:#0d1117;border:1px solid var(--bd);border-radius:8px;padding:10px 12px;margin-bottom:8px}
+.armwrap{overflow-x:auto}
 .armtbl{margin:6px 0 0;width:100%}
 .armtbl th,.armtbl td{padding:3px 6px;font-size:11.5px;white-space:nowrap}
-.armwrap{overflow-x:auto}
+
+/* mobile */
+@media(max-width:640px){
+  .wrap{padding:0 12px 32px}
+  header.top{margin:0 -12px 12px;padding:10px 12px}
+  header h1{font-size:14px}
+  details.sec>summary{padding:11px 12px;font-size:13.5px}
+  details.sec>.body{padding:0 12px 12px;padding-top:12px}
+  .tmeta{font-size:11.5px}
+  .tile .v{font-size:19px}
+  .strip{grid-template-columns:repeat(auto-fit,minmax(140px,1fr))}
+  .pager{margin-left:0;margin-top:4px}
+}
 </style></head><body><div class=wrap>
-<div class=top>
- <h1><span id=live></span>vLLM Gateway <span id=modebadge style='font-size:11px;padding:2px 9px;border-radius:10px;font-weight:600'></span> <button id=modebtn class=ghost></button></h1>
- <nav class=nav><a href=#s-tasks>Background tasks</a><a href=#s-windows>Windows</a><a href=#s-status>Status</a><a href=#s-routing>Routing</a><a href=#s-gpu>GPU</a><a href=#s-telemetry>Telemetry</a><a href=#s-requests>Requests</a><a href=#s-history>History</a><a href=#s-model>Model</a><a href=#s-settings>Settings</a></nav>
+
+<header class=top>
+ <h1>
+  <span id=live class="dot down" title="Overall gateway status. Green = live, red = last poll failed."></span>
+  vLLM Gateway
+  <span id=modebadge class=stamp title="Routing mode">...</span>
+  <button id=modebtn class=ghost>Toggle</button>
+ </h1>
+ <span class=rz id=updated style="margin-left:auto;font-size:12px">connecting...</span>
+ <span id=err class=rz style="color:var(--red);font-size:12px"></span>
+</header>
+
+<div class=rz style="font-size:12px;margin-bottom:12px">
+ <abbr title="This gateway listens on :8000 and forwards to the local vLLM engine on :8001. It queues, serialises, and (when local is full) overflows to a paid remote provider.">:8000 capacity-routing gateway</abbr>
+ &rarr; local engine :8001 &middot; overflow provider <b id=rm class=mono>--</b>
 </div>
-<div class=sub>:8000 capacity-routing gateway → local engine :8001 · overflow provider <span id=rm></span> · <span id=livedot class="sq run" style="margin:0 4px 0 4px;vertical-align:-1px"></span><span id=lastup class=mono>connecting…</span> <span id=err style="color:var(--red)"></span></div>
-<h2 id=s-tasks>Background tasks <span class=hint>everything the local model is doing right now — live requests from your agents, agent lanes, frontier-queue windows, deep-research jobs · refreshes every 2 s</span></h2>
-<div class=card>
+
+<!-- Live health strip -->
+<div class=strip id=strip></div>
+
+<!-- Research & lanes (open) -->
+<details class=sec id=sec-tasks open>
+ <summary>Research &amp; lanes <span class=sub>everything the local model is doing right now &middot; refreshes every 2 s</span></summary>
+ <div class=body>
   <div id=health_alert hidden style="margin:0 0 10px;padding:8px 12px;border-radius:8px;background:rgba(248,81,73,.12);border:1px solid rgba(248,81,73,.4);color:var(--fg);font-size:13px"></div>
-  <div class=thead>Health checks <span class=n id=n_health>…</span> <span class="lg rz" id=health_line>estate watchdog · every 5 min</span></div>
-  <div id=t_health style="display:flex;flex-wrap:wrap;gap:6px 14px;padding:4px 8px 10px;font-size:12.5px"><span class=empty>no watchdog state yet</span></div>
-  <div class=thead>Live requests on the local gateway <span class=n id=n_active>…</span> <span class="lg rz" id=lane_line></span></div>
-  <div class=tasks id=t_active><div class=empty>loading…</div></div>
-  <div class=thead>Agent lanes <span class=n id=n_lanes>…</span> <span class="lg rz">heartbeat files under lane roots · <span class="sq run" style="margin:0 4px 0 6px;vertical-align:-1px"></span>working <span class=sq style="background:var(--grn);margin:0 4px 0 10px;vertical-align:-1px"></span>done <span class=sq style="background:var(--red);margin:0 4px 0 10px;vertical-align:-1px"></span>blocked <span class=sq style="background:var(--amb);margin:0 4px 0 10px;vertical-align:-1px"></span>no heartbeat</span></div>
-  <div class=tasks id=t_lanes><div class=empty>loading…</div></div>
-  <div class=thead>Frontier queue <span class=n id=n_queue>…</span> <span id=q_paused></span> <span class="lg rz">engine benchmark windows — running, waiting, and the latest results</span></div>
-  <div class=tasks id=t_queue><div class=empty>loading…</div></div>
-  <div class=thead>Deep research <span class=n id=n_research>…</span> <span id=r_counts class=lg></span></div>
-  <div class=tools><input type=text id=r_filter placeholder="filter research by keyword…"> <button class=ghost id=r_more>show all</button> <label style="flex-direction:row;gap:6px;align-items:center;color:var(--dim);font-size:12px;cursor:pointer"><input type=checkbox id=r_hide0> hide jobs with 0 claims</label> <span class=rz style="font-size:12px">click a job to open its report</span></div>
-  <div class=tasks id=t_research><div class=empty>loading…</div></div>
+
+  <div class=thead>
+   <abbr title="Estate watchdog on 10.0.1.10, runs every 5 min. Each square is one check (green OK / amber WARN / red CRIT).">Health checks</abbr>
+   <span class=n id=n_health>...</span>
+   <span class="lg rz" id=health_line>loading...</span>
+  </div>
+  <div id=t_health style="display:flex;flex-wrap:wrap;gap:6px 14px;padding:4px 0 6px;font-size:12.5px"><span class=empty>loading...</span></div>
+
+  <div class=thead>
+   <abbr title="Requests currently being served or waiting on the local engine, one row per client.">Live requests</abbr>
+   <span class=n id=n_active>...</span>
+   <span class="lg rz" id=lane_line></span>
+   <span class=pager>
+    <button id=a_prev disabled>&lsaquo;</button>
+    <span class=lbl id=a_page>1/1</span>
+    <button id=a_next disabled>&rsaquo;</button>
+   </span>
+  </div>
+  <div class=tasks id=t_active><div class=empty>loading...</div></div>
+
+  <div class=thead>
+   <abbr title="Long-running background workers that heartbeat via STATUS files under a lane root (see lanes.dirs).">Agent lanes</abbr>
+   <span class=n id=n_lanes>...</span>
+   <span class="lg rz">
+    <span class="sq run" style="margin-right:4px;vertical-align:-1px"></span>working
+    <span class="sq" style="background:var(--grn);margin:0 4px 0 8px;vertical-align:-1px"></span>done
+    <span class="sq" style="background:var(--red);margin:0 4px 0 8px;vertical-align:-1px"></span>blocked
+    <span class="sq" style="background:var(--amb);margin:0 4px 0 8px;vertical-align:-1px"></span>stale
+   </span>
+   <span class=pager>
+    <button id=l_prev disabled>&lsaquo;</button>
+    <span class=lbl id=l_page>1/1</span>
+    <button id=l_next disabled>&rsaquo;</button>
+   </span>
+  </div>
+  <div class=tasks id=t_lanes><div class=empty>loading...</div></div>
+
+  <div class=thead>
+   <abbr title="Engine-benchmark windows queued by the frontier-queue runner. Running one blocks the local engine; the gateway serves via remote overflow meanwhile.">Frontier queue</abbr>
+   <span class=n id=n_queue>...</span>
+   <span id=q_paused></span>
+   <span class=pager>
+    <button id=q_prev disabled>&lsaquo;</button>
+    <span class=lbl id=q_page>1/1</span>
+    <button id=q_next disabled>&rsaquo;</button>
+   </span>
+  </div>
+  <div class=tasks id=t_queue><div class=empty>loading...</div></div>
+
+  <div class=thead>
+   <abbr title="Deep-research jobs on the research service (:8790). Each job runs a multi-agent chain; click a row for the report.">Deep research</abbr>
+   <span class=n id=n_research>...</span>
+   <span id=r_counts class=lg></span>
+  </div>
+  <div class=tools>
+   <input type=text id=r_filter placeholder="filter research by keyword...">
+   <label><input type=checkbox id=r_hide0> hide jobs with 0 claims</label>
+   <span class=rz style="font-size:12px">click a job to open its report</span>
+   <span class=pager>
+    <button id=r_prev disabled>&lsaquo;</button>
+    <span class=lbl id=r_page>1/1</span>
+    <button id=r_next disabled>&rsaquo;</button>
+   </span>
+  </div>
+  <div class=tasks id=t_research><div class=empty>loading...</div></div>
+
   <div id=t_err style="color:var(--red);font-size:12px;margin-top:6px"></div>
+ </div>
+</details>
+
+<!-- Frontier windows -->
+<details class=sec id=sec-windows>
+ <summary>Frontier windows <span class=sub>engine-benchmark windows: arms, evalkit, verdict &middot; refreshes every 10 s</span></summary>
+ <div class=body>
+  <div class=tools>
+   <span class="lg rz" id=win_summary>loading...</span>
+   <span class=pager>
+    <button id=w_prev disabled>&lsaquo;</button>
+    <span class=lbl id=w_page>1/1</span>
+    <button id=w_next disabled>&rsaquo;</button>
+   </span>
+  </div>
+  <div id=windows_list><div class=empty>loading...</div></div>
+  <div id=win_err style="color:var(--red);font-size:12px;margin-top:6px"></div>
+ </div>
+</details>
+
+<!-- Routing mix -->
+<details class=sec id=sec-routing>
+ <summary>Routing mix <span class=sub>traffic split between the local engine and the overflow provider</span></summary>
+ <div class=body>
+  <div class=bar id=lrbar></div>
+  <div id=lrtxt class=rz style="margin-top:8px;font-size:12.5px"></div>
+  <div id=reasons style="margin-top:6px"></div>
+ </div>
+</details>
+
+<!-- Telemetry -->
+<details class=sec id=sec-telem>
+ <summary>Telemetry <span class=sub>engine internals, GPU/host trends, per-client rollups &middot; refreshes every 2 s</span></summary>
+ <div class=body>
+  <div class=strip id=telem_tiles></div>
+  <div class=spark-grid>
+   <div class=spark-cell><div class=telemwrap><div class=k><abbr title="Prompt tokens/s (input) and generation tokens/s (output) as reported by the engine's Prometheus metrics.">Tokens/s (prompt / generation)</abbr></div><div class=legend><span class=l1>&#9632;</span> prompt <span class=l2>&#9632;</span> gen</div></div><svg class=spark id=sp_toks viewBox="0 0 300 56" preserveAspectRatio=none></svg></div>
+   <div class=spark-cell><div class=telemwrap><div class=k><abbr title="Time to first token, seconds. p50 = median wait before streaming starts; p95 = worst 5%.">TTFT p50 / p95 (s)</abbr></div><div class=legend><span class=l1>&#9632;</span> p50 <span class=l2>&#9632;</span> p95</div></div><svg class=spark id=sp_ttft viewBox="0 0 300 56" preserveAspectRatio=none></svg></div>
+   <div class=spark-cell><div class=telemwrap><div class=k><abbr title="Inter-token latency, seconds. Gap between consecutive output tokens after the first &mdash; streaming smoothness.">Inter-token latency (s)</abbr></div><div class=legend><span class=l1>&#9632;</span> p50 <span class=l2>&#9632;</span> p95</div></div><svg class=spark id=sp_tpot viewBox="0 0 300 56" preserveAspectRatio=none></svg></div>
+   <div class=spark-cell><div class=telemwrap><div class=k><abbr title="KV-cache utilisation % (engine) and gateway lanes currently in flight.">KV-cache % / lanes</abbr></div><div class=legend><span class=l1>&#9632;</span> KV% <span class=l2>&#9632;</span> lanes</div></div><svg class=spark id=sp_kv viewBox="0 0 300 56" preserveAspectRatio=none></svg></div>
+   <div class=spark-cell><div class=telemwrap><div class=k><abbr title="GPU 0 utilisation %, temperature C, and power draw as % of card cap.">GPU 0 &mdash; util / temp / power</abbr></div><div class=legend><span class=l1>&#9632;</span> util% <span class=l2>&#9632;</span> temp&deg;C <span class=l3>&#9632;</span> pwr%cap</div></div><svg class=spark id=sp_gpu0 viewBox="0 0 300 56" preserveAspectRatio=none></svg></div>
+   <div class=spark-cell><div class=telemwrap><div class=k><abbr title="GPU 1 utilisation %, temperature C, and power draw as % of card cap.">GPU 1 &mdash; util / temp / power</abbr></div><div class=legend><span class=l1>&#9632;</span> util% <span class=l2>&#9632;</span> temp&deg;C <span class=l3>&#9632;</span> pwr%cap</div></div><svg class=spark id=sp_gpu1 viewBox="0 0 300 56" preserveAspectRatio=none></svg></div>
+   <div class=spark-cell><div class=telemwrap><div class=k><abbr title="Percentage of recent requests routed to the paid overflow provider.">Remote-overflow share %</abbr></div><div class=legend></div></div><svg class=spark id=sp_remote viewBox="0 0 300 56" preserveAspectRatio=none></svg></div>
+   <div class=spark-cell><div class=k><abbr title="Whether the shim's periodic scrape of the engine's Prometheus /metrics is succeeding.">Engine metrics scrape</abbr></div><div class=v style="font-size:14px;margin-top:6px" id=telem_engok>...</div></div>
+  </div>
+
+  <div class=thead>
+   <abbr title="Per-client rollups since the gateway started. `client` is a friendly label inferred from IP + user-agent.">Per-client usage</abbr>
+   <span class=pager>
+    <button id=pc_prev disabled>&lsaquo;</button>
+    <span class=lbl id=pc_page>1/1</span>
+    <button id=pc_next disabled>&rsaquo;</button>
+   </span>
+  </div>
+  <div class=tw><table><thead><tr>
+   <th><abbr title="Client label &mdash; inferred from IP + user-agent.">client</abbr></th>
+   <th>requests</th><th>local</th><th>remote</th>
+   <th><abbr title="Total output tokens served (exact where the engine reported them; else lower-bound from chunk count, marked ~).">tokens out</abbr></th>
+   <th><abbr title="Average seconds spent waiting for a free lane before starting.">avg wait</abbr></th>
+   <th><abbr title="Average time to first token, seconds.">avg TTFT</abbr></th>
+   <th>errors</th>
+   <th><abbr title="Rough USD estimate for what the remote-overflow calls have cost this uptime.">est. remote cost</abbr></th>
+  </tr></thead><tbody id=telem_clients><tr><td colspan=9 class=empty>loading...</td></tr></tbody></table></div>
+
+  <div class=thead>
+   <abbr title="Failovers and non-2xx completions, newest first.">Error feed</abbr>
+   <span class=pager>
+    <button id=ef_prev disabled>&lsaquo;</button>
+    <span class=lbl id=ef_page>1/1</span>
+    <button id=ef_next disabled>&rsaquo;</button>
+   </span>
+  </div>
+  <div class=tw><table><thead><tr>
+   <th>time</th><th>client</th><th>endpoint</th>
+   <th><abbr title="Route the request took: local, remote (overflow), held, or rejected.">route</abbr></th>
+   <th>reason</th><th>status</th>
+  </tr></thead><tbody id=telem_errors><tr><td colspan=6 class=empty>loading...</td></tr></tbody></table></div>
+ </div>
+</details>
+
+<!-- Recent requests -->
+<details class=sec id=sec-req>
+ <summary>Recent requests <span class=sub>in-memory ring buffer &middot; newest first &middot; &#9889; = streamed</span></summary>
+ <div class=body>
+  <div class=tools>
+   <span class="lg rz" id=req_summary></span>
+   <span class=pager>
+    <button id=ev_prev disabled>&lsaquo;</button>
+    <span class=lbl id=ev_page>1/1</span>
+    <button id=ev_next disabled>&rsaquo;</button>
+   </span>
+  </div>
+  <div class=tw><table><thead><tr>
+   <th>time</th><th>endpoint</th><th>client</th>
+   <th><abbr title="Route the request took: local, remote overflow, held, or rejected.">route</abbr></th>
+   <th>reason</th>
+   <th><abbr title="Prompt tokens in &rarr; max output tokens requested. &#9889; = streamed.">size (in&rarr;out)</abbr></th>
+   <th><abbr title="Seconds waited for a free lane before starting.">waited</abbr></th>
+  </tr></thead><tbody id=ev><tr><td colspan=7 class=empty>loading...</td></tr></tbody></table></div>
+ </div>
+</details>
+
+<!-- History (server-side paginated) -->
+<details class=sec id=sec-hist>
+ <summary>History <span class=sub>on-disk request log (survives restarts) &middot; server-side paginated</span></summary>
+ <div class=body>
+  <div class=tools>
+   <input type=text id=h_client placeholder="filter by client...">
+   <input type=text id=h_route placeholder="filter by route/reason (local, remote, tiny...)">
+   <label>per page <select id=h_limit>
+    <option>10</option><option selected>25</option><option>50</option><option>100</option>
+   </select></label>
+   <span class=rz id=h_logstate></span>
+   <span class=pager>
+    <button id=h_prev disabled>&lsaquo;</button>
+    <span class=lbl id=h_page>1</span>
+    <button id=h_next disabled>&rsaquo;</button>
+   </span>
+  </div>
+  <div class=tw><table><thead><tr>
+   <th>time</th><th>client</th><th>route</th>
+   <th><abbr title="First few chars of the user prompt.">preview</abbr></th>
+   <th>in&rarr;out</th>
+   <th><abbr title="Time to first token, seconds.">TTFT</abbr></th>
+   <th>duration</th><th>status</th>
+  </tr></thead><tbody id=h_rows><tr><td colspan=8 class=empty>loading...</td></tr></tbody></table></div>
+
+  <div class=thead>Last 24 h summary <span class="lg rz">per-client rollup, same on-disk log</span></div>
+  <div class=strip id=h_tiles></div>
+  <div class=tw><table><thead><tr>
+   <th>client</th><th>requests</th><th>local</th><th>remote</th>
+   <th>tokens in</th><th>tokens out</th><th>errors</th>
+  </tr></thead><tbody id=h_clients><tr><td colspan=7 class=empty>loading...</td></tr></tbody></table></div>
+ </div>
+</details>
+
+<!-- Local model switcher -->
+<details class=sec id=sec-model>
+ <summary>Local model <span class=sub>switch the served checkpoint &middot; engine restarts &middot; overflow covers the gap</span></summary>
+ <div class=body>
+  <div class=rz style="font-size:12.5px">Scans <span id=mdir class=mono></span>. Any HF checkpoint works. Switching restarts the engine (~40 s warm / 4-5 min cold); traffic falls back to remote overflow until it is healthy. &#9888; no auth on this page.</div>
+  <div class=tw><table><thead><tr><th></th><th>model</th><th>size</th><th>format</th><th></th></tr></thead><tbody id=lm></tbody></table></div>
+  <div style="margin-top:8px"><span id=lmmsg class=rz></span></div>
+ </div>
+</details>
+
+<!-- Config -->
+<details class=sec id=sec-cfg>
+ <summary>Config <span class=sub>overflow provider + routing rules &middot; applied live, saved to shim.env &middot; &#9888; no auth</span></summary>
+ <div class=body>
+ <form class=cfg autocomplete=off>
+
+  <div class=thead>Provider</div>
+  <label class=k>Provider preset
+   <select id=f_preset>
+    <option value="">-- pick to autofill base + model --</option>
+    <option value="https://api.deepseek.com|deepseek-v4-flash">DeepSeek v4-flash</option>
+    <option value="https://api.deepseek.com|deepseek-v4-pro">DeepSeek v4-pro</option>
+    <option value="https://api.minimax.io/v1|MiniMax-M3">MiniMax M3</option>
+    <option value="https://dashscope-intl.aliyuncs.com/compatible-mode/v1|qwen3-coder-next">Qwen3-Coder-Next (DashScope intl)</option>
+    <option value="https://dashscope-intl.aliyuncs.com/compatible-mode/v1|qwen3.7-flash">qwen3.7-flash (DashScope intl)</option>
+    <option value="https://openrouter.ai/api/v1|minimax/minimax-m3">OpenRouter &rarr; MiniMax M3</option>
+   </select>
+  </label>
+  <div class=row>
+   <label class=k><abbr title="Base URL of the OpenAI-compatible overflow endpoint.">Remote base URL</abbr>
+    <input id=f_remote_base placeholder=https://api.minimax.io/v1></label>
+   <label class=k><abbr title="Model id the overflow provider expects on /v1/chat/completions. Verify with your provider.">Remote model</abbr>
+    <input id=f_remote_model placeholder=MiniMax-M3></label>
+   <label class=k><abbr title="Bearer key sent only in outbound requests to the overflow endpoint. Never returned.">Remote API key</abbr>
+    <span id=keystate class=rz></span>
+    <input id=f_remote_key type=password placeholder="leave blank to keep current"></label>
+   <label class=k><abbr title="1 = send every request straight to remote (engine bypass). 0 = local-first.">Force full-remote (0/1)</abbr>
+    <input id=f_force_remote type=number min=0 max=1></label>
+  </div>
+
+  <div class=thead>Local capacity</div>
+  <div class=row>
+   <label class=k><abbr title="Concurrent lanes on the local engine. 1 = strict serialisation.">Local budget (lanes)</abbr>
+    <input id=f_local_budget type=number min=1 max=8></label>
+   <label class=k><abbr title="Seconds an interactive request will wait for a lane before overflowing to remote.">Queue wait secs (interactive)</abbr>
+    <input id=f_local_wait_secs type=number min=0 step=1></label>
+   <label class=k><abbr title="Hard cap on total in-flight prompt tokens across all lanes. Prevents OOM.">Total in-flight ctx cap (tok)</abbr>
+    <input id=f_token_budget type=number min=0 step=50000></label>
+   <label class=k><abbr title="Seconds to hold traffic off the engine after an OOM before probing again.">OOM backoff (s)</abbr>
+    <input id=f_oom_backoff_secs type=number min=0 step=10></label>
+  </div>
+
+  <div class=thead>Routing guards &mdash; what goes remote</div>
+  <div class=row>
+   <label class=k><abbr title="If requested max output &ge; this, send remote. Bounds worst-case decode time on the local engine.">Big OUTPUT &ge; tok &rarr; remote</abbr>
+    <input id=f_big_output type=number min=0 step=1000></label>
+   <label class=k><abbr title="If the prompt &ge; this many tokens, send remote. 0 = off (crash-guard).">Big PROMPT &ge; tok &rarr; remote (0=off)</abbr>
+    <input id=f_big_prompt type=number min=0 step=1000></label>
+   <label class=k><abbr title="Single-request size cap (prompt + output). Requests above go remote.">Single-req size cap (tok)</abbr>
+    <input id=f_max_local_tokens type=number min=0 step=10000></label>
+   <label class=k><abbr title="Clamp any local request's max_tokens to this ceiling.">Local output clamp (tok)</abbr>
+    <input id=f_local_max_out type=number min=0 step=1024></label>
+   <label class=k><abbr title="A request larger than this claims the whole budget (serialise-solo).">Serialize-solo threshold (tok)</abbr>
+    <input id=f_big_tokens type=number min=0 step=1000></label>
+   <label class=k><abbr title="Upper bound on the first-token wait budget (seconds).">First-token deadline cap (s)</abbr>
+    <input id=f_first_token_max type=number min=5 step=5></label>
+   <label class=k><abbr title="Estimated prefill throughput (tok/s), used to size first-token deadlines.">Prefill rate est (tok/s)</abbr>
+    <input id=f_prefill_tps type=number min=100 step=100></label>
+  </div>
+
+  <div class=thead>Priority lanes &amp; behaviour</div>
+  <div class=row>
+   <label class=k><abbr title="Requests &le; this many tokens get a fast-lane and can exceed the normal budget.">Tiny fast-lane &le; tok</abbr>
+    <input id=f_tiny_tokens type=number min=0 step=100></label>
+   <label class=k><abbr title="Extra concurrent lanes reserved for tiny requests beyond the normal budget.">Tiny extra lanes</abbr>
+    <input id=f_tiny_extra_lanes type=number min=0 max=4></label>
+   <label class=k><abbr title="Lanes always reserved for interactive traffic; background never touches them.">Lanes reserved for interactive</abbr>
+    <input id=f_fg_reserved type=number min=0 max=4></label>
+   <label class=k><abbr title="Seconds a background request will wait for a lane before being held/rejected.">Background queue wait (s)</abbr>
+    <input id=f_bg_wait_secs type=number min=0 step=1></label>
+   <label class=k><abbr title="Pipe-separated substrings in the user-agent that classify a request as background.">Background markers (|-sep)</abbr>
+    <input id=f_bg_markers placeholder="scheduled cron job"></label>
+   <label class=k><abbr title="Comma ranges of UTC hours considered peak (e.g. 1-4,6-10).">Peak hours UTC</abbr>
+    <input id=f_peak_hours_utc></label>
+   <label class=k><abbr title="Disable /think for background traffic (0/1).">No-think for background (0/1)</abbr>
+    <input id=f_bg_no_think type=number min=0 max=1></label>
+   <label class=k><abbr title="Comma-separated client IPs whose requests get /think stripped.">No-think client IPs</abbr>
+    <input id=f_no_think_ips placeholder="10.0.1.10,10.0.1.250"></label>
+   <label class=k><abbr title="Enable per-request JSONL logging (0/1).">Per-request logging (0/1)</abbr>
+    <input id=f_log_requests type=number min=0 max=1></label>
+  </div>
+
+  <div style="margin-top:12px">
+   <button type=button id=save class=primary>Save settings</button>
+   <span id=savemsg class=rz></span>
+  </div>
+ </form>
+ </div>
+</details>
+
 </div>
 <script>
 (function(){
+  // ---- shared helpers ----
   const $=s=>document.querySelector(s);
+  const $$=s=>document.querySelectorAll(s);
   const esc=t=>String(t==null?'':t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-  const ago=s=>s<60?Math.round(s)+'s ago':s<5400?Math.round(s/60)+'m ago':s<172800?Math.round(s/3600)+'h ago':Math.round(s/86400)+'d ago';
-  const dur=s=>s==null?'':(s<90?Math.round(s)+'s':s<5400?Math.round(s/60)+'m':(s/3600).toFixed(1)+'h');
+  const ago=s=>s==null?'?':s<60?Math.round(s)+'s ago':s<5400?Math.round(s/60)+'m ago':s<172800?Math.round(s/3600)+'h ago':Math.round(s/86400)+'d ago';
+  const fmtAgo=t=>{const s=Math.max(0,Date.now()/1000-t);return s<60?s.toFixed(0)+'s':(s/60).toFixed(0)+'m';};
+  const dur=s=>s==null?'--':(s<90?Math.round(s)+'s':s<5400?Math.round(s/60)+'m':(s/3600).toFixed(1)+'h');
+  const fmtDur=s=>s==null?'--':(s<1?Math.round(s*1000)+'ms':s<90?s.toFixed(1)+'s':(s/60).toFixed(1)+'m');
   const when=t=>{if(!t)return'';let x=String(t).replace(' ','T');if(!/Z$|[+-]\d\d:\d\d$/.test(x))x+='Z';const d=new Date(x);if(isNaN(d))return esc(t);const s=(Date.now()-d.getTime())/1000;return s<86400?ago(s):d.toLocaleDateString(undefined,{month:'short',day:'numeric'})+' '+d.toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'});};
-  let showAll=false,data=null,lastOk=0;
-  // Global blink phase driven by JS (not CSS keyframes) so re-rendering rows never resets the flash
-  // and it works even where CSS animations are throttled/disabled.
+  const tile=(k,v,sub)=>`<div class=tile><div class=k>${k}</div><div class=v>${v}</div>${sub?`<div class=sub>${sub}</div>`:''}</div>`;
+  const routeTag=r=>r==='local'?'local':r==='held'?'held':r==='rejected-bg'?'reject':'remote';
+
+  // Global blink phase for the "run" squares so they visibly pulse without CSS keyframes.
   setInterval(()=>document.documentElement.classList.toggle('bk'),520);
-  setInterval(()=>{const s=lastOk?(Date.now()-lastOk)/1000:null;const lu=$('#lastup'),ld=$('#livedot');if(!lu)return;
-    if(s==null){lu.textContent='connecting…';return;}
-    lu.textContent='live · updated '+Math.round(s)+'s ago';ld.className='sq '+(s<8?'run':s<30?'stale':'blocked');},1000);
-  $('#r_more').addEventListener('click',()=>{showAll=!showAll;render();});
-  $('#r_filter').addEventListener('input',render);$('#r_hide0').addEventListener('change',render);
-  function row(cls,name,stat,meta,href,title){
+
+  // ---- admin-token fetch (for mutating endpoints) ----
+  function adminToken(){try{return localStorage.getItem('shim_admin_token')||'';}catch(e){return'';}}
+  async function adminFetch(url,opts){
+    opts=opts||{};opts.headers=Object.assign({'Content-Type':'application/json'},opts.headers||{});
+    const t=adminToken();if(t)opts.headers['X-Admin-Token']=t;
+    let r=await fetch(url,opts);
+    if(r.status===401){
+      const entered=prompt('Admin token required for this action (kept in this browser):');
+      if(entered){try{localStorage.setItem('shim_admin_token',entered);}catch(e){}opts.headers['X-Admin-Token']=entered;r=await fetch(url,opts);}
+    }
+    return r;
+  }
+
+  // ---- generic client-side pagination helper ----
+  const PAGE={active:1,lanes:1,queue:1,research:1,windows:1,ev:1,pc:1,ef:1};
+  function paginate(arr,key,per){
+    const total=arr.length,pages=Math.max(1,Math.ceil(total/per));
+    if(PAGE[key]>pages)PAGE[key]=pages;
+    const p=PAGE[key],from=(p-1)*per,to=Math.min(from+per,total);
+    return {slice:arr.slice(from,to),page:p,pages,total,from,to};
+  }
+  function wirePager(key,prevId,nextId,lblId,pages,onchange){
+    const prev=$(prevId),next=$(nextId),lbl=$(lblId);if(!prev||!next||!lbl)return;
+    prev.disabled=PAGE[key]<=1;next.disabled=PAGE[key]>=pages;
+    lbl.textContent=PAGE[key]+'/'+pages;
+    prev.onclick=()=>{if(PAGE[key]>1){PAGE[key]--;onchange();}};
+    next.onclick=()=>{if(PAGE[key]<pages){PAGE[key]++;onchange();}};
+  }
+
+  // ==================== TOP + STATS (uses /gateway/stats) ====================
+  let modelName='?', FR=0, lastOk=0;
+  async function loadModels(){try{const r=await fetch('/v1/models');const d=await r.json();modelName=(d.data&&d.data[0]&&d.data[0].id)||'?';}catch(e){}}
+  function renderMode(){
+    const b=$('#modebadge'),t=$('#modebtn');
+    if(FR){b.textContent='FULL REMOTE';b.className='stamp remote';t.textContent='Switch to LOCAL';}
+    else{b.textContent='LOCAL-FIRST';b.className='stamp local';t.textContent='Switch to FULL REMOTE';}
+  }
+  async function toggleMode(){FR=FR?0:1;await adminFetch('/gateway/config',{method:'POST',body:JSON.stringify({force_remote:FR})});renderMode();loadCfg();}
+  $('#modebtn').addEventListener('click',toggleMode);
+
+  // last-updated indicator (based on lastOk from the frequent tickers below)
+  setInterval(()=>{const s=lastOk?(Date.now()-lastOk)/1000:null;const lu=$('#updated'),ld=$('#live');if(!lu)return;
+    if(s==null){lu.textContent='connecting...';return;}
+    lu.textContent='live · updated '+Math.round(s)+'s ago';
+    ld.className='dot '+(s<8?'up':s<30?'warn':'down');
+  },1000);
+
+  let statsData=null,recentEvents=[];
+  async function tickStats(){
+    let s;try{const r=await fetch('/gateway/stats',{cache:'no-store'});s=await r.json();$('#err').textContent='';lastOk=Date.now();}
+    catch(e){$('#err').textContent='reconnecting... (showing last data)';return;}
+    statsData=s;$('#rm').textContent=s.remote_model||'--';
+    const uh=Math.floor(s.uptime/3600),um=Math.floor(s.uptime%3600/60);
+    // Top live-health strip
+    const gpuAvg=(s.gpu||[]).length?Math.round((s.gpu.reduce((a,g)=>a+(+g.util||0),0)/s.gpu.length)):null;
+    const modelShort=modelName.replace(/^.*\//,'').slice(0,26);
+    const bk=s.backoff>0?`<span class=sub style=color:var(--amb)>OOM backoff ${s.backoff}s</span>`:'';
+    $('#strip').innerHTML=[
+      `<div class=tile><div class=k><abbr title="Whether the local vLLM engine on :8001 is responding to /health.">Local engine</abbr></div><div class=v><span class="dot ${s.local_healthy?'up':'down'}"></span> ${s.local_healthy?'up':'DOWN'}</div><div class=sub title="${esc(modelName)}">${esc(modelShort||'--')}</div></div>`,
+      `<div class=tile><div class=k><abbr title="Concurrent lanes in use / total available. `+
+        `Waiting shown when requests are queued.">Lanes</abbr></div><div class=v class=mono>${s.inflight}<small>/${s.budget}</small>${s.waiting?` <span style=color:var(--amb)>+${s.waiting}</span>`:''}</div><div class=sub><abbr title="Rolling in-flight prompt tokens across all lanes / token-budget cap.">ctx ${((s.inflight_tokens||0)/1000).toFixed(0)}K/${((s.token_budget||0)/1000).toFixed(0)}K</abbr>${bk?' &middot; '+bk:''}</div></div>`,
+      `<div class=tile><div class=k><abbr title="Share of requests served by the local engine vs sent to the overflow provider.">Served local</abbr></div><div class=v class=mono style=color:var(--grn)>${s.local_pct}<small>%</small></div><div class=sub>overflow ${s.remote_pct}% &middot; avg wait ${s.avg_wait}s</div></div>`,
+      `<div class=tile><div class=k><abbr title="Live tokens/s from the engine's Prometheus metrics (prompt + generation combined). '--' if the engine is down or not yet scraped.">Tokens/s now</abbr></div><div class=v class=mono id=tps_now>--</div><div class=sub><abbr title="Time to first token &mdash; median (p50) then worst-5% (p95).">TTFT</abbr> <span id=ttft_line>--</span></div></div>`,
+      `<div class=tile><div class=k><abbr title="Average GPU utilisation across all cards, as reported by nvidia-smi.">GPU util avg</abbr></div><div class=v class=mono>${gpuAvg==null?'--':gpuAvg+'<small>%</small>'}</div><div class=sub>${(s.gpu||[]).map((g,i)=>'GPU'+i+' '+((g.util==null?'?':g.util)+'%')).join(' &middot; ')||'no GPU data'}</div></div>`,
+      `<div class=tile><div class=k><abbr title="Total requests since the gateway started, and current uptime.">Requests / uptime</abbr></div><div class=v class=mono>${s.total}</div><div class=sub>up ${uh}h${um}m &middot; peak lanes ${s.peak_inflight}</div></div>`,
+    ].join('');
+    // Routing mix section
+    const lp=s.local_pct,rp=s.remote_pct;
+    $('#lrbar').innerHTML=`<i class=bl style=width:${lp}%></i><i class=br style=width:${rp}%></i>`;
+    $('#lrtxt').innerHTML=`<span style=color:var(--grn)>&#9632;</span> local ${s.local} (${lp}%) &nbsp; <span style=color:var(--amb)>&#9632;</span> overflow ${s.remote} (${rp}%) &nbsp; peak lanes ${s.peak_inflight} &nbsp; uptime ${uh}h${um}m`;
+    $('#reasons').innerHTML=Object.keys(s.remote_reasons||{}).length?('overflow reasons: '+Object.entries(s.remote_reasons).map(([k,v])=>`<span class=badge>${esc(k)}: ${v}</span>`).join('')):'<span class=rz>no overflow yet</span>';
+    // Recent-requests table (paginated, 25/page)
+    recentEvents=(s.events||[]);
+    renderRecent();
+    // FR badge/mode (kept in sync; toggled by button)
+    // Note: also loaded via /gateway/config poll so the label is always accurate.
+  }
+
+  function renderRecent(){
+    const per=25,pg=paginate(recentEvents,'ev',per);
+    $('#req_summary').textContent=pg.total? (pg.total+' events buffered · showing '+(pg.from+1)+'-'+pg.to) : 'no events yet';
+    $('#ev').innerHTML=pg.slice.map(e=>`<tr><td class="rz mono">${fmtAgo(e.t)} ago</td><td>${esc(e.ep)}</td><td>${esc(e.client)}</td><td><span class="tag ${routeTag(e.d)}">${esc(e.d)}</span></td><td class=rz>${esc(e.r||'')}</td><td class=mono>${(e.ptok||0)}&rarr;${(e.maxtok||0)}${e.stream?' &#9889;':''}</td><td class=mono>${e.waited?e.waited+'s':''}</td></tr>`).join('')
+      || '<tr><td colspan=7 class=empty>no events yet</td></tr>';
+    wirePager('ev','#ev_prev','#ev_next','#ev_page',pg.pages,renderRecent);
+  }
+
+  // ==================== RESEARCH & LANES (uses /gateway/lanes) ====================
+  const TERMINAL=new Set(['done','failed','error','degraded','cancelled']);
+  const isRun=j=>!TERMINAL.has(j.status);
+  let lanesData=null;
+  function taskRow(cls,name,stat,meta,href,title){
     const inner='<span class="sq '+cls+'"></span><div><div class=tname'+(title?' title="'+esc(title)+'"':'')+'>'+name+'</div>'+(stat?'<div class=tstat>'+stat+'</div>':'')+'</div><div class=tmeta>'+(meta||'')+'</div>';
     return href?'<a class=task href="'+href+'" target=_blank rel=noopener>'+inner+'</a>':'<div class="task hov">'+inner+'</div>';
   }
-  const TERMINAL=new Set(['done','failed','error','degraded','cancelled']);const isRun=j=>!TERMINAL.has(j.status);
-  function render(){
-    if(!data)return;const d=data,q=d.queue||{};
-    const H=d.health||{};const HC=H.checks||[];
-    $('#n_health').textContent=H.present?HC.length:'–';
-    $('#health_line').innerHTML=H.present?('estate watchdog · overall <b style="color:'+(H.overall==='ok'?'var(--grn)':H.overall==='warn'?'var(--amb)':'var(--red)')+'">'+esc(H.overall||'?')+'</b> · last run '+(H.age_s!=null?ago(H.age_s):'?')+(H.paused?' · <span class="badge warn">PAUSED</span>':'')):'estate watchdog not installed yet';
+  function renderLanes(){
+    if(!lanesData)return;const d=lanesData,q=d.queue||{};
+    // Health checks
+    const H=d.health||{},HC=H.checks||[];
+    $('#n_health').textContent=H.present?HC.length:'-';
+    $('#health_line').innerHTML=H.present?('estate watchdog &middot; overall <b style="color:'+(H.overall==='ok'?'var(--grn)':H.overall==='warn'?'var(--amb)':'var(--red)')+'">'+esc(H.overall||'?')+'</b> &middot; last run '+(H.age_s!=null?ago(H.age_s):'?')+(H.paused?' &middot; <span class="badge warn">PAUSED</span>':'')):'estate watchdog not installed yet';
     $('#t_health').innerHTML=HC.map(c=>'<span title="'+esc(c.detail||'')+'"><span class="sq '+(c.status==='OK'?'done':c.status==='WARN'?'stale':c.status==='CRIT'?'blocked':'empty')+'" style="margin:0 5px 0 0;vertical-align:-1px"></span>'+esc(c.name)+' <span class=rz>'+esc((c.detail||'').slice(0,48))+'</span></span>').join('')||'<span class=empty>'+(H.present?'no checks reported':'no watchdog state yet')+'</span>';
     const ha=$('#health_alert');if(H.alert){ha.hidden=false;ha.textContent='ALERT · '+H.alert.slice(0,400);}else{ha.hidden=true;}
+    // Live requests
     const AC=d.active||[];$('#n_active').textContent=AC.length;
-    $('#lane_line').innerHTML='lanes <b>'+(d.inflight||0)+'</b>/'+(d.budget||0)+' in use · <b>'+(d.waiting||0)+'</b> waiting · '+
-      '<span class="sq run" style="margin:0 4px 0 6px;vertical-align:-1px"></span>generating on the local model '+
-      '<span class="sq stale" style="margin:0 4px 0 10px;vertical-align:-1px"></span>overflowed to the remote provider '+
-      '<span class="sq queued" style="margin:0 4px 0 10px;vertical-align:-1px"></span>waiting for a lane';
-    $('#t_active').innerHTML=AC.map(a=>{
+    $('#lane_line').innerHTML='lanes <b>'+(d.inflight||0)+'</b>/'+(d.budget||0)+' in use &middot; <b>'+(d.waiting||0)+'</b> waiting &middot; '+
+      '<span class="sq run" style="margin:0 4px 0 6px;vertical-align:-1px"></span>local '+
+      '<span class="sq stale" style="margin:0 4px 0 10px;vertical-align:-1px"></span>overflow '+
+      '<span class="sq queued" style="margin:0 4px 0 10px;vertical-align:-1px"></span>waiting';
+    const acPg=paginate(AC,'active',25);
+    $('#t_active').innerHTML=acPg.slice.map(a=>{
       const remote=a.route==='remote',queued=a.phase==='queued',held=a.phase==='held';
       const cls=queued?'queued':held?'queued':remote?'stale':'run';
-      const badge=queued?'<span class="badge warn">waiting for a lane</span>':held?'<span class="badge warn">holding for local (bg) · never sent remote</span>':remote?'<span class="badge warn">remote overflow · '+esc(a.reason||'')+'</span>':a.phase==='local'?'<span class="badge run">local model'+(a.waited?' · waited '+a.waited+'s':'')+'</span>':'<span class="badge run">routing</span>';
-      const who=esc(a.name)+(a.name!==a.ip?' <span class=rz>'+esc(a.ip)+'</span>':'')+(a.ua?' <span class=rz>· '+esc(a.ua)+'</span>':'');
-      const stat=(a.preview?'“'+esc(a.preview)+'”':'<span class=rz>(no text preview)</span>')+(a.bg?' · background':'')+(a.tiny?' · tiny':'')+(a.model?' · '+esc(a.model):'');
-      return row(cls,who+badge,stat,'<b>'+dur(a.elapsed_s)+'</b> elapsed<br>'+esc(a.ep)+(a.ptok?' · '+Math.round(a.ptok/1000)+'K in':'')+(a.maxtok?' · '+a.maxtok+' max out':'')+(a.stream?' · ⚡ stream':''),null,null);
-    }).join('')||'<div class=empty>Nothing running on the local model right now. Requests from pi, OpenCode, Agent Zero, Applicant, Hermes and the research service appear here the moment they arrive.</div>';
+      const badge=queued?'<span class="badge warn">waiting for a lane</span>':held?'<span class="badge warn">holding for local (bg) &middot; never sent remote</span>':remote?'<span class="badge warn">remote overflow &middot; '+esc(a.reason||'')+'</span>':a.phase==='local'?'<span class="badge run">local model'+(a.waited?' &middot; waited '+a.waited+'s':'')+'</span>':'<span class="badge run">routing</span>';
+      const who=esc(a.name)+(a.name!==a.ip?' <span class=rz>'+esc(a.ip)+'</span>':'')+(a.ua?' <span class=rz>&middot; '+esc(a.ua)+'</span>':'');
+      const stat=(a.preview?'"'+esc(a.preview)+'"':'<span class=rz>(no text preview)</span>')+(a.bg?' &middot; background':'')+(a.tiny?' &middot; tiny':'')+(a.model?' &middot; '+esc(a.model):'');
+      return taskRow(cls,who+badge,stat,'<b>'+dur(a.elapsed_s)+'</b> elapsed<br>'+esc(a.ep)+(a.ptok?' &middot; '+Math.round(a.ptok/1000)+'K in':'')+(a.maxtok?' &middot; '+a.maxtok+' max out':'')+(a.stream?' &middot; &#9889; stream':''),null,null);
+    }).join('')||'<div class=empty>Nothing running on the local model right now.</div>';
+    wirePager('active','#a_prev','#a_next','#a_page',acPg.pages,renderLanes);
+
+    // Agent lanes
     const L=d.lanes||[];$('#n_lanes').textContent=L.length;
-    $('#t_lanes').innerHTML=L.map(l=>{
+    const lPg=paginate(L,'lanes',25);
+    $('#t_lanes').innerHTML=lPg.slice.map(l=>{
       const st=l.status||'';const m=st.match(/^(RUNNING|DONE|BLOCKED)\s*\|\s*([^|]*)\|\s*(.*)$/);
       const state=m?m[1]:(st?'RUNNING':'UNKNOWN');const text=m?m[3].trim():(st||('newest file: '+l.newest));
       const stale=state==='RUNNING'&&l.age_s>900;
       const cls=state==='DONE'?'done':state==='BLOCKED'?'blocked':stale?'stale':state==='RUNNING'?'run':'empty';
       const label=state==='DONE'?'done':state==='BLOCKED'?'blocked':stale?'no heartbeat for '+dur(l.age_s):state==='RUNNING'?'working':'idle';
       const bcls=cls==='done'?'ok':cls==='run'?'run':cls==='empty'?'':'warn';
-      return row(cls,esc(l.lane)+'<span class="badge '+bcls+'">'+label+'</span>',esc(text),'updated <b>'+ago(l.age_s)+'</b><br>'+esc((l.root||'').replace(/^\/home\/kevin\//,'~/')),null,(l.root||'')+'/'+l.lane+' — newest file: '+l.newest);
-    }).join('')||'<div class=empty>No agent lanes right now. A lane appears as soon as a worker writes a STATUS file under a lane root (see lanes.dirs).</div>';
+      return taskRow(cls,esc(l.lane)+'<span class="badge '+bcls+'">'+label+'</span>',esc(text),'updated <b>'+ago(l.age_s)+'</b><br>'+esc((l.root||'').replace(/^\/home\/kevin\//,'~/')),null,(l.root||'')+'/'+l.lane+' -- newest file: '+l.newest);
+    }).join('')||'<div class=empty>No agent lanes right now.</div>';
+    wirePager('lanes','#l_prev','#l_next','#l_page',lPg.pages,renderLanes);
+
+    // Frontier queue
     const running=q.running||[],queued=q.queued||[],results=q.results||[];
+    const qAll=[].concat(
+      running.map(x=>({kind:'r',name:x.replace('.running','')})),
+      queued.map((x,i)=>({kind:'q',name:x,pos:i+1})),
+      results.map(r=>({kind:'d',r:r}))
+    );
     $('#n_queue').textContent=running.length+queued.length;
-    $('#q_paused').innerHTML=q.paused?'<span class="badge warn">PAUSED — kill switch is on</span>':'';
-    $('#t_queue').innerHTML=[].concat(
-      running.map(x=>row('run',esc(x.replace('.running',''))+'<span class="badge run">window running</span>','engine benchmark window in progress — the gateway serves via remote overflow meanwhile','')),
-      queued.map((x,i)=>row('queued',esc(x),'waiting · position '+(i+1)+' · the runner picks it up within 10 min once the engine is free','')),
-      results.map(r=>row('done',esc(r.file.replace(/\.txt$/,''))+'<span class="badge ok">result</span>','<details class=tail><summary>show last lines ▾</summary><pre>'+esc((r.tail||[]).join('\n'))+'</pre></details>','finished <b>'+ago(r.age_s)+'</b>'))
-    ).join('')||'<div class=empty>Queue idle — nothing running or waiting.</div>';
+    $('#q_paused').innerHTML=q.paused?'<span class="badge warn">PAUSED &mdash; kill switch is on</span>':'';
+    const qPg=paginate(qAll,'queue',25);
+    $('#t_queue').innerHTML=qPg.slice.map(item=>{
+      if(item.kind==='r')return taskRow('run',esc(item.name)+'<span class="badge run">window running</span>','engine benchmark in progress &mdash; the gateway serves via remote overflow meanwhile','');
+      if(item.kind==='q')return taskRow('queued',esc(item.name),'waiting &middot; position '+item.pos+' &middot; the runner picks it up within 10 min once the engine is free','');
+      const r=item.r;
+      return taskRow('done',esc(r.file.replace(/\.txt$/,''))+'<span class="badge ok">result</span>','<details class=tail><summary>show last lines &#9662;</summary><pre>'+esc((r.tail||[]).join('\n'))+'</pre></details>','finished <b>'+ago(r.age_s)+'</b>');
+    }).join('')||'<div class=empty>Queue idle &mdash; nothing running or waiting.</div>';
+    wirePager('queue','#q_prev','#q_next','#q_page',qPg.pages,renderLanes);
+
+    // Deep research
     const R=d.research||[];const f=($('#r_filter').value||'').toLowerCase();const hide0=$('#r_hide0').checked;
     const list=R.filter(j=>!f||(j.q||'').toLowerCase().includes(f)).filter(j=>!hide0||!/^0\//.test(j.claims||''));
     const nRun=R.filter(isRun).length,n0=R.filter(j=>/^0\//.test(j.claims||'')).length,nDone=(d.research_counts&&d.research_counts.done)||0;
     $('#n_research').textContent=R.length;
     $('#r_counts').innerHTML=(nRun?'<span class="badge run">'+nRun+' running</span>':'')+'<span class="badge ok">'+nDone+' done</span>'+(n0?'<span class="badge warn">'+n0+' produced no surviving claims</span>':'');
-    const shown=showAll?list:list.slice(0,8);
-    $('#r_more').textContent=showAll?'show fewer':'show all '+list.length;$('#r_more').style.display=list.length>8?'':'none';
-    $('#t_research').innerHTML=shown.map(j=>{
+    const rPg=paginate(list,'research',10);
+    $('#t_research').innerHTML=rPg.slice.map(j=>{
       const run=isRun(j),zero=/^0\//.test(j.claims||'');
       const cls=run?'run':(j.status==='failed'||j.status==='error')?'blocked':(j.status==='degraded'||zero)?'empty':'done';
-      const badge=run?'<span class="badge run">'+esc(j.phase||j.status)+(j.progress?' · '+esc(j.progress):'')+'</span>':j.status==='degraded'?'<span class="badge warn">degraded · no usable evidence</span>':zero?'<span class="badge warn">0 claims</span>':j.claims?'<span class="badge ok">'+esc(j.claims)+' claims</span>':'';
-      const stat=esc(j.depth)+(j.agents?' · '+esc(j.agents)+' agents':'')+(j.tokens?' · '+Math.round(j.tokens/1000)+'K tok':'')+(j.elapsed_s!=null?' · '+dur(j.elapsed_s):'')+(zero?' · <span style="color:var(--amb)">nothing survived verification — check research-service network health</span>':'');
-      return row(cls,esc(j.q)+badge,stat,'<b>'+when(j.submitted)+'</b><br><span class=mono>'+esc((j.id||'').slice(-6))+'</span>','/gateway/research/'+encodeURIComponent(j.id||''),j.q);
+      const badge=run?'<span class="badge run">'+esc(j.phase||j.status)+(j.progress?' &middot; '+esc(j.progress):'')+'</span>':j.status==='degraded'?'<span class="badge warn">degraded &middot; no usable evidence</span>':zero?'<span class="badge warn">0 claims</span>':j.claims?'<span class="badge ok">'+esc(j.claims)+' claims</span>':'';
+      const stat=esc(j.depth)+(j.agents?' &middot; '+esc(j.agents)+' agents':'')+(j.tokens?' &middot; '+Math.round(j.tokens/1000)+'K tok':'')+(j.elapsed_s!=null?' &middot; '+dur(j.elapsed_s):'')+(zero?' &middot; <span style="color:var(--amb)">nothing survived verification</span>':'');
+      return taskRow(cls,esc(j.q)+badge,stat,'<b>'+when(j.submitted)+'</b><br><span class=mono>'+esc((j.id||'').slice(-6))+'</span>','/gateway/research/'+encodeURIComponent(j.id||''),j.q);
     }).join('')||'<div class=empty>'+(R.length?'No jobs match the filter.':'No research jobs reported by the service.')+'</div>';
+    wirePager('research','#r_prev','#r_next','#r_page',rPg.pages,renderLanes);
+
     $('#t_err').textContent=(d.errors&&d.errors.length)?'partial data: '+d.errors.join(', '):'';
   }
-  let busy=false;
-  async function tick(){if(busy)return;busy=true;try{data=await(await fetch('/gateway/lanes',{cache:'no-store'})).json();lastOk=Date.now();render();$('#t_err').textContent=(data.errors&&data.errors.length)?'partial data: '+data.errors.join(', '):'';}catch(e){$('#t_err').textContent='background-task feed unreachable: '+e;}finally{busy=false;}}
-  tick();setInterval(tick,2000);
-})();
-</script>
-<h2 id=s-windows>Windows <span class=hint>frontier-queue engine-benchmark windows — full detail per window: arms, evalkit, pool, verdict · refreshes every 10 s</span></h2>
-<div class=card>
-  <div class=tools><span class="lg rz" id=win_summary>loading…</span> <button class=ghost id=win_more style="margin-left:auto;display:none"></button></div>
-  <div id=windows_list><div class=empty>loading…</div></div>
-  <div id=win_err style="color:var(--red);font-size:12px;margin-top:6px"></div>
-</div>
-<script>
-(function(){
-  const $=s=>document.querySelector(s);
-  const esc=t=>String(t==null?'':t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-  const ago=s=>s==null?'?':s<60?Math.round(s)+'s ago':s<5400?Math.round(s/60)+'m ago':s<172800?Math.round(s/3600)+'h ago':Math.round(s/86400)+'d ago';
-  const dur=s=>s==null?'–':(s<90?Math.round(s)+'s':s<5400?Math.round(s/60)+'m':(s/3600).toFixed(1)+'h');
-  let data=null,showAll=false;
+  let busyLanes=false;
+  async function tickLanes(){if(busyLanes)return;busyLanes=true;
+    try{lanesData=await(await fetch('/gateway/lanes',{cache:'no-store'})).json();lastOk=Date.now();renderLanes();}
+    catch(e){$('#t_err').textContent='background-task feed unreachable: '+e;}
+    finally{busyLanes=false;}
+  }
+  $('#r_filter').addEventListener('input',renderLanes);
+  $('#r_hide0').addEventListener('change',renderLanes);
+
+  // ==================== WINDOWS (uses /gateway/windows) ====================
+  let winData=null;
   function sqCls(w){return w.state==='queued'?'queued':w.failed?'blocked':w.state==='running'?'run':'done';}
   function armTable(w){
     const arms=Object.keys(w.arms||{});if(!arms.length)return'';
@@ -4036,314 +4519,228 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
     const rows=arms.map(a=>'<tr><td class=mono>'+esc(a)+'</td>'+keys.map(k=>'<td class=mono>'+(w.arms[a][k]!=null?esc(String(w.arms[a][k])):'')+'</td>').join('')+'</tr>').join('');
     return '<div class=armwrap><table class=armtbl><tr><th>arm</th>'+keys.map(k=>'<th>'+esc(k)+'</th>').join('')+'</tr>'+rows+'</table></div>';
   }
-  function badges(w){
+  function winBadges(w){
     let b='';
     Object.keys(w.evalkit||{}).forEach(a=>{
       const e=w.evalkit[a]||{};const scores=e.scores||[];const sc=scores.length?scores[scores.length-1]:null;
       const cls=sc==null?'':sc>=44?'ok':'warn';
-      b+='<span class="badge '+cls+'" title="'+esc(a+': '+(e.lines||[]).join(' · '))+'">'+esc(a)+' evalkit '+(sc!=null?sc+'/45':(e.lines||[]).length?'?':'')+'</span>';
+      b+='<span class="badge '+cls+'" title="'+esc(a+': '+(e.lines||[]).join(' | '))+'">'+esc(a)+' evalkit '+(sc!=null?sc+'/45':(e.lines||[]).length?'?':'')+'</span>';
     });
     Object.keys(w.pool||{}).forEach(a=>{b+='<span class=badge title="pool line, arm '+esc(a)+'">'+esc(a)+' pool '+esc(String(w.pool[a]))+'</span>';});
     return b;
   }
-  function card(w){
+  function winCard(w){
     const sq='<span class="sq '+sqCls(w)+'" style="margin-top:2px"></span>';
     const desc=esc(w.description||'(no header comment found)');
     const nowS=Date.now()/1000;
-    const meta=(w.state==='queued'?'queued · seen '+ago(nowS-(w.sort_ts||nowS))
+    const meta=(w.state==='queued'?'queued &middot; seen '+ago(nowS-(w.sort_ts||nowS))
                :w.duration_s!=null?'<b>'+dur(w.duration_s)+'</b>'+(w.state==='running'?' so far':'')
                :w.state)+
                (w.started_at?'<br><span class=rz>start '+esc(w.started_at)+'</span>':'')+
                (w.finished_at?'<br><span class=rz>end '+esc(w.finished_at)+'</span>':'');
-    const bd=badges(w);
+    const bd=winBadges(w);
     const stamps=(w.done_marker?'<span class="badge ok">'+esc(w.done_marker)+'</span>':'')+
-                 (w.failed?'<span class="badge warn" style="color:var(--red)">FAILED — no DONE marker</span>':'');
+                 (w.failed?'<span class="badge warn" style="color:var(--red)">FAILED &mdash; no DONE marker</span>':'');
     const badgeRow=(bd||stamps)?'<div style="margin-top:6px">'+bd+stamps+'</div>':'';
     const verdict=(w.verdict_lines||[]).length?'<div class=tstat style="margin-top:6px">'+w.verdict_lines.map(esc).join('<br>')+'</div>':'';
     const tbl=armTable(w);
-    const tail=(w.tail||[]).length?'<details class=tail style="margin-top:6px"><summary>show last '+w.tail.length+' lines ▾</summary><pre>'+esc(w.tail.join('\n'))+'</pre></details>':'';
-    const log=w.log_url?'<a href="'+w.log_url+'" target=_blank rel=noopener style="color:var(--blu);text-decoration:none;font-size:12px">full log →</a>':(w.result_file?'<span class=rz style="font-size:12px">'+esc(w.result_file)+' not written yet</span>':'');
+    const tail=(w.tail||[]).length?'<details class=tail style="margin-top:6px"><summary>show last '+w.tail.length+' lines &#9662;</summary><pre>'+esc(w.tail.join('\n'))+'</pre></details>':'';
+    const log=w.log_url?'<a href="'+w.log_url+'" target=_blank rel=noopener style="font-size:12px">full log &rarr;</a>':(w.result_file?'<span class=rz style="font-size:12px">'+esc(w.result_file)+' not written yet</span>':'');
     return '<div class=wcard><div style="display:grid;grid-template-columns:14px minmax(0,1fr) auto;gap:10px;align-items:start">'+
            sq+'<div><div class=tname>'+esc(w.name)+' <span class=badge>'+esc(w.state)+'</span></div>'+
            '<div class=tstat>'+desc+'</div>'+tbl+badgeRow+verdict+tail+
            (log?'<div style="margin-top:6px">'+log+'</div>':'')+
            '</div><div class=tmeta>'+meta+'</div></div></div>';
   }
-  function render(){
-    if(!data)return;
-    const W=data.windows||[];
+  function renderWindows(){
+    if(!winData)return;
+    const W=winData.windows||[];
     const nRun=W.filter(w=>w.state==='running').length,nQ=W.filter(w=>w.state==='queued').length;
     $('#win_summary').textContent=W.length+' windows · '+nRun+' running · '+nQ+' queued';
-    const more=$('#win_more');more.style.display=W.length>10?'':'none';more.textContent=showAll?'show fewer':'show all '+W.length;
-    const shown=showAll?W:W.slice(0,10);
-    $('#windows_list').innerHTML=shown.map(card).join('')||'<div class=empty>No frontier-queue windows found (queue/done both empty).</div>';
-    $('#win_err').textContent=(data.errors&&data.errors.length)?'partial data: '+data.errors.join(', '):'';
+    const per=25,pg=paginate(W,'windows',per);
+    $('#windows_list').innerHTML=pg.slice.map(winCard).join('')||'<div class=empty>No frontier-queue windows found (queue/done both empty).</div>';
+    wirePager('windows','#w_prev','#w_next','#w_page',pg.pages,renderWindows);
+    $('#win_err').textContent=(winData.errors&&winData.errors.length)?'partial data: '+winData.errors.join(', '):'';
   }
-  $('#win_more').addEventListener('click',()=>{showAll=!showAll;render();});
-  let busy=false;
-  async function tick(){if(busy)return;busy=true;try{data=await(await fetch('/gateway/windows',{cache:'no-store'})).json();render();}catch(e){$('#win_err').textContent='windows feed unreachable: '+e;}finally{busy=false;}}
-  tick();setInterval(tick,10000);
+  let busyWin=false;
+  async function tickWindows(){if(busyWin)return;busyWin=true;
+    try{winData=await(await fetch('/gateway/windows',{cache:'no-store'})).json();renderWindows();}
+    catch(e){$('#win_err').textContent='windows feed unreachable: '+e;}
+    finally{busyWin=false;}
+  }
+
+  // ==================== TELEMETRY (uses /gateway/telemetry) ====================
+  function sparkline(id,series){
+    const svg=document.getElementById(id);if(!svg)return;
+    const W=300,H=56,pad=3;
+    const lines=(series||[]).filter(s=>s&&s.length);
+    if(!lines.length){svg.innerHTML='';return;}
+    const n=Math.max(...lines.map(s=>s.length));
+    const all=[].concat(...lines).filter(v=>v!=null&&isFinite(v));
+    let lo=all.length?Math.min(...all):0, hi=all.length?Math.max(...all):1;
+    lo=Math.min(0,lo);if(hi<=lo)hi=lo+1;
+    const x=i=>pad+(W-2*pad)*(n<=1?0:i/(n-1));
+    const y=v=>H-pad-(H-2*pad)*((v-lo)/(hi-lo));
+    const cls=['s1','s2','s3'];
+    svg.innerHTML=lines.map((s,li)=>{
+      const pts=s.map((v,i)=>(v==null||!isFinite(v))?null:x(i).toFixed(1)+','+y(v).toFixed(1)).filter(Boolean).join(' ');
+      return pts?'<polyline class="'+cls[li%3]+'" points="'+pts+'"></polyline>':'';
+    }).join('');
+  }
+  function seriesOf(fast,path){return fast.map(s=>{let v=s;for(const k of path){v=v&&v[k];if(v==null)return null;}return v;});}
+  let telemData=null,perClientList=[],errorFeed=[];
+  function renderTelem(){
+    if(!telemData)return;
+    const t=telemData;
+    const fast=(t.series&&t.series.fast)||[];
+    const eng=(t.latest&&t.latest.engine)||{};
+    // Update top strip tokens/s + TTFT via the two special ids that live inside strip tiles
+    const tpsNow=$('#tps_now'),ttftLine=$('#ttft_line');
+    if(tpsNow){tpsNow.innerHTML=eng.ok&&(eng.prompt_tok_s!=null||eng.gen_tok_s!=null)?(((eng.prompt_tok_s||0)+(eng.gen_tok_s||0)).toFixed(0)):'--';}
+    if(ttftLine){ttftLine.innerHTML=eng.ok&&eng.ttft_p50!=null?(eng.ttft_p50.toFixed(2)+'s / '+(eng.ttft_p95||0).toFixed(2)+'s'):'--';}
+    $('#telem_engok').innerHTML=eng.ok?'<span class="dot up"></span> scraping OK':
+      ('<span class="dot down"></span> '+(eng.age_s!=null?('stale '+Math.round(eng.age_s)+'s ago ('+esc(eng.err||'')+')'):('never scraped yet ('+esc(eng.err||'engine down')+')')));
+    $('#telem_tiles').innerHTML=[
+      tile('<abbr title="Live combined prompt + generation tokens/s from the engine.">Tokens/s now</abbr>',eng.ok&&(eng.prompt_tok_s!=null||eng.gen_tok_s!=null)?(((eng.prompt_tok_s||0)+(eng.gen_tok_s||0)).toFixed(0)):'--'),
+      tile('<abbr title="Time to first token &mdash; median (p50) then worst 5% (p95).">TTFT p50 <small>/ p95</small></abbr>',eng.ok&&eng.ttft_p50!=null?(eng.ttft_p50.toFixed(2)+'s <small>/ '+(eng.ttft_p95||0).toFixed(2)+'s</small>'):'--'),
+      tile('<abbr title="KV-cache utilisation, percent of total.">KV-cache %</abbr>',eng.ok&&eng.kv_cache_pct!=null?(eng.kv_cache_pct.toFixed(0)+'<small>%</small>'):'--'),
+      tile('<abbr title="Engine-scheduled requests running now / waiting to run.">Engine running <small>/ waiting</small></abbr>',eng.ok?((eng.running==null?'--':eng.running)+' <small>/ '+(eng.waiting==null?'--':eng.waiting)+'</small>'):'--'),
+    ].join('');
+    sparkline('sp_toks',[seriesOf(fast,['engine','prompt_tok_s']),seriesOf(fast,['engine','gen_tok_s'])]);
+    sparkline('sp_ttft',[seriesOf(fast,['engine','ttft_p50']),seriesOf(fast,['engine','ttft_p95'])]);
+    sparkline('sp_tpot',[seriesOf(fast,['engine','tpot_p50']),seriesOf(fast,['engine','tpot_p95'])]);
+    sparkline('sp_kv',[seriesOf(fast,['engine','kv_cache_pct']),seriesOf(fast,['gateway','inflight'])]);
+    const pw=(gi)=>fast.map(s=>{const g=s.gpu&&s.gpu[gi];return(g&&g.power_w!=null&&g.power_limit_w)?100*g.power_w/g.power_limit_w:null;});
+    sparkline('sp_gpu0',[seriesOf(fast,['gpu',0,'util']),seriesOf(fast,['gpu',0,'temp_c']),pw(0)]);
+    sparkline('sp_gpu1',[seriesOf(fast,['gpu',1,'util']),seriesOf(fast,['gpu',1,'temp_c']),pw(1)]);
+    sparkline('sp_remote',[seriesOf(fast,['gateway','remote_share_pct'])]);
+    // per-client
+    const pc=t.per_client||{};
+    perClientList=Object.keys(pc).sort((a,b)=>pc[b].requests-pc[a].requests).map(n=>({n:n,c:pc[n]}));
+    renderPerClient();
+    // errors
+    errorFeed=t.errors||[];
+    renderErrorFeed();
+  }
+  function renderPerClient(){
+    const per=25,pg=paginate(perClientList,'pc',per);
+    $('#telem_clients').innerHTML=pg.slice.map(x=>{const n=x.n,c=x.c;
+      return '<tr><td>'+esc(n)+'</td><td class=mono>'+c.requests+'</td><td class=mono>'+c.local+'</td><td class=mono>'+c.remote+
+        '</td><td class=mono>'+c.tokens_out+(c.tokens_out_lb>0?' <span class=rz title="includes chunk-count lower bounds">(~)</span>':'')+
+        '</td><td class=mono>'+(c.wait_avg_s!=null?c.wait_avg_s+'s':'--')+'</td><td class=mono>'+(c.ttft_avg_s!=null?c.ttft_avg_s+'s':'--')+
+        '</td><td class=mono>'+c.errors+'</td><td class=mono>'+(c.cost_est_usd?'$'+c.cost_est_usd.toFixed(4):'--')+'</td></tr>';
+    }).join('')||'<tr><td colspan=9 class=empty>No completed requests yet.</td></tr>';
+    wirePager('pc','#pc_prev','#pc_next','#pc_page',pg.pages,renderPerClient);
+  }
+  function renderErrorFeed(){
+    const per=25,pg=paginate(errorFeed,'ef',per);
+    $('#telem_errors').innerHTML=pg.slice.map(e=>'<tr><td class="rz mono">'+fmtAgo(e.t)+' ago</td><td>'+esc(e.client)+'</td><td>'+esc(e.ep)+
+      '</td><td><span class="tag '+routeTag(e.route)+'">'+esc(e.route)+'</span></td><td class=rz>'+esc(e.reason)+
+      '</td><td class=mono>'+(e.status||'')+'</td></tr>').join('')||'<tr><td colspan=6 class=empty>No errors recorded.</td></tr>';
+    wirePager('ef','#ef_prev','#ef_next','#ef_page',pg.pages,renderErrorFeed);
+  }
+  async function tickTelemetry(){
+    try{telemData=await(await fetch('/gateway/telemetry',{cache:'no-store'})).json();renderTelem();}
+    catch(e){$('#telem_engok').textContent='telemetry feed unreachable: '+e;}
+  }
+
+  // ==================== HISTORY (server-side paginated /gateway/history) ====================
+  let hPage=1,hTimer=null;
+  function hLimit(){return parseInt($('#h_limit').value)||25;}
+  async function tickHistory(){
+    const cq=($('#h_client').value||'').trim(),rq=($('#h_route').value||'').trim();
+    const limit=hLimit();
+    const u='/gateway/history?limit='+limit+'&page='+hPage+(cq?'&client='+encodeURIComponent(cq):'')+(rq?'&route='+encodeURIComponent(rq):'');
+    let h;try{h=await(await fetch(u,{cache:'no-store'})).json();}
+    catch(e){$('#h_rows').innerHTML='<tr><td colspan=8 class=empty>history feed unreachable: '+esc(e)+'</td></tr>';return;}
+    const items=h.items||[];
+    $('#h_rows').innerHTML=items.map(r=>{
+      const badge='<span class="tag '+routeTag(r.route)+'">'+esc(r.route||'?')+'</span>'+(r.reason?' <span class=rz>'+esc(r.reason)+'</span>':'');
+      const out=r.outtok!=null?r.outtok:(r.outtok_lb!=null?'~'+r.outtok_lb:0);
+      return '<tr><td class="rz mono">'+fmtAgo(r.t)+' ago</td><td>'+esc(r.client)+'</td><td>'+badge+
+        '</td><td class=rz title="'+esc(r.preview||'')+'">'+esc((r.preview||'').slice(0,60))+
+        '</td><td class=mono>'+(r.ptok||0)+'&rarr;'+out+
+        '</td><td class=mono>'+(r.ttft!=null?r.ttft.toFixed(2)+'s':'--')+
+        '</td><td class=mono>'+fmtDur(r.duration)+'</td><td class=mono>'+(r.status||'')+'</td></tr>';
+    }).join('')||('<tr><td colspan=8 class=empty>No matching requests logged'+((cq||rq)?' for this filter.':' yet.')+'</td></tr>');
+    const lg=h.log||{};
+    $('#h_logstate').textContent='logged '+(lg.written||0)+' since restart'+(lg.dropped_cap?' · '+lg.dropped_cap+' dropped (daily cap)':'')+(lg.dropped_queue?' · '+lg.dropped_queue+' dropped (queue full)':'')+(lg.capped_today?' · TODAY LOG AT SIZE CAP':'');
+    // wire prev/next based on server-reported has_more
+    $('#h_page').textContent=hPage;
+    $('#h_prev').disabled=hPage<=1;
+    $('#h_next').disabled=!h.has_more;
+    // 24h summary
+    let s;try{s=await(await fetch('/gateway/history/summary?hours=24',{cache:'no-store'})).json();}catch(e){return;}
+    const pc=s.per_client||{};const names=Object.keys(pc).sort((a,b)=>pc[b].requests-pc[a].requests);
+    const errTotal=names.reduce((a,n)=>a+(pc[n].errors||0),0);
+    $('#h_tiles').innerHTML=[
+      tile('<abbr title="Total requests logged in the last 24 hours.">Requests (24h)</abbr>',s.requests||0),
+      tile('<abbr title="End-to-end request duration &mdash; median then worst 5%.">Duration p50 <small>/ p95</small></abbr>',fmtDur(s.duration_p50)+' <small>/ '+fmtDur(s.duration_p95)+'</small>'),
+      tile('<abbr title="Time to first token &mdash; median then worst 5%.">TTFT p50 <small>/ p95</small></abbr>',(s.ttft_p50!=null?s.ttft_p50.toFixed(2)+'s':'--')+' <small>/ '+(s.ttft_p95!=null?s.ttft_p95.toFixed(2)+'s':'--')+'</small>'),
+      tile('<abbr title="Non-2xx completions in the last 24 hours.">Errors (24h)</abbr>',errTotal),
+    ].join('');
+    $('#h_clients').innerHTML=names.map(n=>{const c=pc[n];
+      return '<tr><td>'+esc(n)+'</td><td class=mono>'+c.requests+'</td><td class=mono>'+c.local+'</td><td class=mono>'+c.remote+
+        '</td><td class=mono>'+c.tokens_in+'</td><td class=mono>'+c.tokens_out+'</td><td class=mono>'+c.errors+'</td></tr>';
+    }).join('')||'<tr><td colspan=7 class=empty>No requests logged in the last 24h.</td></tr>';
+  }
+  $('#h_client').addEventListener('input',()=>{clearTimeout(hTimer);hTimer=setTimeout(()=>{hPage=1;tickHistory();},300);});
+  $('#h_route').addEventListener('input',()=>{clearTimeout(hTimer);hTimer=setTimeout(()=>{hPage=1;tickHistory();},300);});
+  $('#h_limit').addEventListener('change',()=>{hPage=1;tickHistory();});
+  $('#h_prev').addEventListener('click',()=>{if(hPage>1){hPage--;tickHistory();}});
+  $('#h_next').addEventListener('click',()=>{hPage++;tickHistory();});
+
+  // ==================== LOCAL MODELS + CONFIG ====================
+  async function loadLocalModels(){
+    try{const d=await(await fetch('/gateway/models/local')).json();
+      $('#mdir').textContent=d.models_dir||'';
+      $('#lm').innerHTML=(d.models||[]).map(m=>{
+        const badge=m.live?'<span class="tag local">LIVE</span>':'';
+        const btn=m.servable&&!m.live?`<button class="ghost lmsw" data-p="${esc(m.path)}" style="font-size:11px;padding:3px 10px">Switch</button>`:
+                  (m.servable?'<span class=rz>current</span>':'<span class=rz style=color:var(--amb)>not servable</span>');
+        return `<tr><td>${badge}</td><td class=mono>${esc(m.name)}</td><td class=mono>${esc(m.gb)} GB</td><td class=rz>${esc(m.desc)}</td><td>${btn}</td></tr>`;
+      }).join('')||'<tr><td colspan=5 class=rz>no checkpoints found</td></tr>';
+      $$('.lmsw').forEach(b=>b.addEventListener('click',()=>switchLocal(b.dataset.p)));
+    }catch(e){}
+  }
+  async function switchLocal(p){
+    if(!confirm('Switch the local engine to:\n\n'+p+'\n\nThe engine restarts. Traffic falls back to remote overflow until it is healthy.'))return;
+    $('#lmmsg').textContent='switching... engine restarting';
+    try{const r=await adminFetch('/gateway/models/local',{method:'POST',body:JSON.stringify({path:p})});
+      const d=await r.json();
+      $('#lmmsg').textContent=d.error?('X '+d.error):('OK switching to '+d.switching_to+' ('+d.quant+') -- '+d.note);
+      setTimeout(loadLocalModels,15000);
+    }catch(e){$('#lmmsg').textContent='X '+e;}
+  }
+  async function loadCfg(){
+    try{const c=await(await fetch('/gateway/config')).json();
+      FR=c.force_remote?1:0;renderMode();
+      for(const [k,v] of Object.entries(c)){const el=document.getElementById('f_'+k);if(el&&el.type!=='password')el.value=v;}
+      $('#keystate').textContent=c.remote_key_display?(' · '+c.remote_key_display):' · not set';
+    }catch(e){}
+  }
+  async function saveCfg(){
+    const b={};
+    $$('input[id^=f_]').forEach(el=>{const k=el.id.slice(2);
+      if(el.type==='password'){if(el.value.trim())b[k]=el.value.trim();}
+      else if(el.value!=='')b[k]=el.value;
+    });
+    $('#savemsg').textContent='saving...';
+    try{const r=await adminFetch('/gateway/config',{method:'POST',body:JSON.stringify(b)});
+      const d=await r.json();$('#savemsg').textContent='OK saved: '+(d.changed||[]).join(', ');$('#f_remote_key').value='';loadCfg();}
+    catch(e){$('#savemsg').textContent='X '+e;}
+  }
+  $('#save').addEventListener('click',saveCfg);
+  $('#f_preset').addEventListener('change',e=>{const v=e.target.value;if(!v)return;const [b,m]=v.split('|');$('#f_remote_base').value=b;$('#f_remote_model').value=m;});
+
+  // ==================== BOOT ====================
+  loadModels();loadCfg();loadLocalModels();
+  tickStats();setInterval(tickStats,1500);setInterval(loadModels,15000);
+  tickLanes();setInterval(tickLanes,2000);
+  tickWindows();setInterval(tickWindows,10000);
+  tickTelemetry();setInterval(tickTelemetry,2000);
+  tickHistory();setInterval(tickHistory,10000);
 })();
-</script>
-<h2 id=s-status>Gateway status <span class=hint>engine health, lanes in use, traffic split</span></h2>
-<div class="grid g4" id=status></div>
-<h2 id=s-routing>Routing <span class=hint>how much traffic stayed on the local engine vs went to the overflow provider</span></h2><div class=card><div class=bar id=lrbar></div><div id=lrtxt class=sub style=margin-top:8px></div><div id=reasons></div></div>
-<h2 id=s-gpu>GPU <span class=hint>utilization and memory per card</span></h2><div class="grid g2" id=gpu></div>
-<h2 id=s-telemetry>Telemetry <span class=hint>engine internals, GPU/host trends, per-client usage, error feed · refreshes every 2 s</span></h2>
-<div class="grid g4" id=telem_tiles></div>
-<div class="grid g2" style="margin-top:10px">
-  <div class=card><div class=telemwrap><div class=k>Tokens/s (prompt / generation)</div><div class=legend><span class=l1>■</span> prompt <span class=l2>■</span> gen</div></div><svg class=spark id=sp_toks viewBox="0 0 300 56" preserveAspectRatio=none></svg></div>
-  <div class=card><div class=telemwrap><div class=k>TTFT p50 / p95 (s, windowed)</div><div class=legend><span class=l1>■</span> p50 <span class=l2>■</span> p95</div></div><svg class=spark id=sp_ttft viewBox="0 0 300 56" preserveAspectRatio=none></svg></div>
-  <div class=card><div class=telemwrap><div class=k>Inter-token latency p50 / p95 (s)</div><div class=legend><span class=l1>■</span> p50 <span class=l2>■</span> p95</div></div><svg class=spark id=sp_tpot viewBox="0 0 300 56" preserveAspectRatio=none></svg></div>
-  <div class=card><div class=telemwrap><div class=k>KV-cache % / lanes in use</div><div class=legend><span class=l1>■</span> KV% <span class=l2>■</span> lanes</div></div><svg class=spark id=sp_kv viewBox="0 0 300 56" preserveAspectRatio=none></svg></div>
-  <div class=card><div class=telemwrap><div class=k>GPU 0 — util / temp / power</div><div class=legend><span class=l1>■</span> util% <span class=l2>■</span> temp°C <span class=l3>■</span> power%cap</div></div><svg class=spark id=sp_gpu0 viewBox="0 0 300 56" preserveAspectRatio=none></svg></div>
-  <div class=card><div class=telemwrap><div class=k>GPU 1 — util / temp / power</div><div class=legend><span class=l1>■</span> util% <span class=l2>■</span> temp°C <span class=l3>■</span> power%cap</div></div><svg class=spark id=sp_gpu1 viewBox="0 0 300 56" preserveAspectRatio=none></svg></div>
-  <div class=card><div class=telemwrap><div class=k>Remote-overflow share %</div><div class=legend></div></div><svg class=spark id=sp_remote viewBox="0 0 300 56" preserveAspectRatio=none></svg></div>
-  <div class=card><div class=k>Engine metrics scrape</div><div class=v style="font-size:14px" id=telem_engok>…</div></div>
-</div>
-<h2 style=margin-top:22px>Per-client usage <span class=hint>rollups since gateway start</span></h2>
-<div class=card style=overflow-x:auto><table><thead><tr><th>client</th><th>requests</th><th>local</th><th>remote</th><th>tokens out</th><th>avg wait</th><th>avg TTFT</th><th>errors</th><th>est. remote cost</th></tr></thead><tbody id=telem_clients><tr><td colspan=9 class=empty>loading…</td></tr></tbody></table></div>
-<h2 style=margin-top:22px>Error feed <span class=hint>failovers &amp; non-2xx completions, newest first</span></h2>
-<div class=card style=overflow-x:auto><table><thead><tr><th>time</th><th>client</th><th>endpoint</th><th>route</th><th>reason</th><th>status</th></tr></thead><tbody id=telem_errors><tr><td colspan=6 class=empty>loading…</td></tr></tbody></table></div>
-<h2 id=s-requests>Recent requests <span class=hint>newest first · ⚡ = streamed</span></h2><div class=card style=overflow-x:auto><table><thead><tr><th>time</th><th>endpoint</th><th>client</th><th>route</th><th>reason</th><th>size (in→out)</th><th>waited</th></tr></thead><tbody id=ev></tbody></table></div>
-<h2 id=s-history>History <span class=hint>persisted request log (JSONL on disk, survives restarts) · filter + last 50 · refreshes every 10 s</span></h2>
-<div class=card>
-  <div class=tools><input type=text id=h_client placeholder="filter by client…"> <input type=text id=h_route placeholder="filter by route/reason (local, remote, tiny…)"> <span class=rz id=h_logstate></span></div>
-  <div style=overflow-x:auto><table><thead><tr><th>time</th><th>client</th><th>route</th><th>preview</th><th>in→out</th><th>TTFT</th><th>duration</th><th>status</th></tr></thead><tbody id=h_rows><tr><td colspan=8 class=empty>loading…</td></tr></tbody></table></div>
-</div>
-<div class=thead style=margin-top:14px>Last 24h <span class="lg rz">per-client summary, from the same on-disk log</span></div>
-<div class="grid g4" id=h_tiles></div>
-<div class=card style="overflow-x:auto;margin-top:10px"><table><thead><tr><th>client</th><th>requests</th><th>local</th><th>remote</th><th>tokens in</th><th>tokens out</th><th>errors</th></tr></thead><tbody id=h_clients><tr><td colspan=7 class=empty>loading…</td></tr></tbody></table></div>
-<h2 id=s-model>Local model <span class=hint>switch which checkpoint the engine serves</span></h2>
-<div class=card>
-<div class=sub>Scans <span id=mdir class=rz></span>. Any HF checkpoint works (not just Qwen). Switching restarts the engine (~40s warm / ~4-5 min cold); the gateway serves via remote overflow meanwhile. ⚠️ no auth on this page.</div>
-<table><thead><tr><th></th><th>model</th><th>size</th><th>format</th><th></th></tr></thead><tbody id=lm></tbody></table>
-<div style=margin-top:8px><span id=lmmsg class=rz></span></div>
-</div>
-<h2 id=s-settings>Settings <span class=hint>remote overflow provider &amp; routing rules</span></h2>
-<div class=card>
-<div class=sub>Applied live (no restart) and saved to shim.env. ⚠️ no auth — anyone on the LAN can change these.</div>
-<div class=k style=margin-bottom:6px>Provider preset <select id=f_preset style="background:#0d1117;border:1px solid var(--bd);color:var(--fg);border-radius:6px;padding:5px 8px">
- <option value="">— pick to autofill base+model —</option>
- <option value="https://api.deepseek.com|deepseek-v4-flash">DeepSeek v4-flash</option>
- <option value="https://api.deepseek.com|deepseek-v4-pro">DeepSeek v4-pro</option>
- <option value="https://api.minimax.io/v1|MiniMax-M3">MiniMax M3</option>
- <option value="https://dashscope-intl.aliyuncs.com/compatible-mode/v1|qwen3-coder-next">Qwen3-Coder-Next (DashScope intl)</option>
- <option value="https://dashscope-intl.aliyuncs.com/compatible-mode/v1|qwen3.7-flash">qwen3.7-flash (DashScope intl)</option>
- <option value="https://openrouter.ai/api/v1|minimax/minimax-m3">OpenRouter \u2192 MiniMax M3</option>
-</select> <span class=rz>verify exact model id with your provider</span></div>
-<div class="grid g2" style=gap:10px>
- <label class=k>Remote base URL<input id=f_remote_base placeholder=https://api.minimax.io/v1></label>
- <label class=k>Remote model<input id=f_remote_model placeholder=MiniMax-M3></label>
- <label class=k>Remote API key <span id=keystate class=rz></span><input id=f_remote_key type=password placeholder="leave blank to keep current"></label>
- <label class=k>Force full-remote (0/1)<input id=f_force_remote type=number min=0 max=1></label>
-</div>
-<h2 style=margin-top:16px>Local capacity</h2>
-<div class="grid g2" style=gap:10px>
- <label class=k>Local budget (lanes)<input id=f_local_budget type=number min=1 max=8></label>
- <label class=k>Queue wait secs (interactive)<input id=f_local_wait_secs type=number min=0 step=1></label>
- <label class=k>Total in-flight ctx cap (tok)<input id=f_token_budget type=number min=0 step=50000></label>
- <label class=k>OOM backoff secs<input id=f_oom_backoff_secs type=number min=0 step=10></label>
-</div>
-<h2 style=margin-top:16px>Routing guards \u2014 what goes remote</h2>
-<div class="grid g2" style=gap:10px>
- <label class=k>Big OUTPUT \u2265 tok \u2192 remote<input id=f_big_output type=number min=0 step=1000></label>
- <label class=k>Big PROMPT \u2265 tok \u2192 remote (0=off, crash guard)<input id=f_big_prompt type=number min=0 step=1000></label>
- <label class=k>Single-req size cap (tok)<input id=f_max_local_tokens type=number min=0 step=10000></label>
- <label class=k>Local output clamp (tok)<input id=f_local_max_out type=number min=0 step=1024></label>
- <label class=k>Serialize-solo threshold (big=full budget, tok)<input id=f_big_tokens type=number min=0 step=1000></label>
- <label class=k>First-token deadline cap (s)<input id=f_first_token_max type=number min=5 step=5></label>
- <label class=k>Prefill rate est (tok/s)<input id=f_prefill_tps type=number min=100 step=100></label>
-</div>
-<h2 style=margin-top:16px>Priority lanes &amp; behaviour</h2>
-<div class="grid g2" style=gap:10px>
- <label class=k>Tiny fast-lane \u2264 tok<input id=f_tiny_tokens type=number min=0 step=100></label>
- <label class=k>Tiny extra lanes (beyond budget)<input id=f_tiny_extra_lanes type=number min=0 max=4></label>
- <label class=k>Lanes reserved for interactive<input id=f_fg_reserved type=number min=0 max=4></label>
- <label class=k>Background queue wait (s)<input id=f_bg_wait_secs type=number min=0 step=1></label>
- <label class=k>Background markers (|-sep)<input id=f_bg_markers placeholder="scheduled cron job"></label>
- <label class=k>Peak hours UTC (e.g. 1-4,6-10)<input id=f_peak_hours_utc></label>
- <label class=k>No-think for background (0/1)<input id=f_bg_no_think type=number min=0 max=1></label>
- <label class=k>No-think client IPs (comma-sep)<input id=f_no_think_ips placeholder="10.0.1.10,10.0.1.250"></label>
- <label class=k>Per-request logging (0/1)<input id=f_log_requests type=number min=0 max=1></label>
-</div>
-<div style=margin-top:12px><button id=save>Save settings</button> <span id=savemsg class=rz></span></div>
-</div>
-</div><script>
-const $=s=>document.querySelector(s);let model="?";
-async function models(){try{const r=await fetch('/v1/models');const d=await r.json();model=(d.data&&d.data[0]&&d.data[0].id)||"?";}catch(e){}}
-function fmtAgo(t){const s=Math.max(0,Date.now()/1000-t);return s<60?s.toFixed(0)+'s':(s/60).toFixed(0)+'m';}
-function tile(k,v){return `<div class=card><div class=k>${k}</div><div class=v>${v}</div></div>`;}
-// route -> badge CSS class. "held"/"rejected-bg" are BG-LOCAL-ONLY additions (2026-09-06): a
-// background request that waited out / was refused during a local-availability event, and in
-// either case NEVER reached the paid remote provider -- so neither reuses the amber "remote" tag.
-function routeTag(r){return r==='local'?'tl':r==='held'?'th':r==='rejected-bg'?'tx':'tr';}
-async function tick(){
- let s;try{const r=await fetch('/gateway/stats');s=await r.json();$('#err').textContent='';}catch(e){$('#err').textContent='reconnecting… (showing last data)';$('#live').innerHTML='<span class="dot down"></span>';return;}
- $('#live').innerHTML=`<span class="dot up"></span>`;$('#rm').textContent=s.remote_model;
- const uh=Math.floor(s.uptime/3600),um=Math.floor(s.uptime%3600/60);
- const bk=s.backoff>0?`<div class=k style=color:var(--amb)>OOM backoff ${s.backoff}s</div>`:'';
- $('#status').innerHTML=[
-  `<div class=card><div class=k>Local engine</div><div class=v><span class="dot ${s.local_healthy?'up':'down'}"></span>${s.local_healthy?'up':'DOWN'}</div><div class=k style=margin-top:4px title="${model}">${model.slice(0,22)}</div></div>`,
-  `<div class=card><div class=k>Lanes / backlog</div><div class=v class=mono>${s.inflight}<small>/${s.budget}</small>${s.waiting?` <span style=color:var(--amb)>+${s.waiting} queued</span>`:''}</div><div class=bar><i class=bl style=width:${100*s.inflight/Math.max(1,s.budget)}%></i>${s.waiting?`<i class=br style=width:${Math.min(100,100*s.waiting/Math.max(1,s.budget))}%></i>`:''}</div><div class=k style=margin-top:4px>ctx in flight ${((s.inflight_tokens||0)/1000).toFixed(0)}K/${((s.token_budget||0)/1000).toFixed(0)}K · peak backlog ${s.peak_waiting} · overflowed ${s.overflowed_after_wait}</div>${bk}</div>`,
-  tile('Total requests',`<span class=mono>${s.total}</span>`),
-  `<div class=card><div class=k>Served local</div><div class=v class=mono style=color:var(--grn)>${s.local_pct}<small>%</small></div><div class=k style=margin-top:4px>overflow ${s.remote_pct}% · avg wait ${s.avg_wait}s</div></div>`,
-  tile('Held / rejected (bg)',`<span class=mono style=color:var(--blu)>${s.held||0}</span> <small style=color:var(--dim)>held</small> · <span class=mono style=color:var(--red)>${s.rejected_bg||0}</span> <small style=color:var(--dim)>rejected</small>`),
- ].join('');
- const lp=s.local_pct,rp=s.remote_pct;
- $('#lrbar').innerHTML=`<i class=bl style=width:${lp}%></i><i class=br style=width:${rp}%></i>`;
- $('#lrtxt').innerHTML=`<span style=color:var(--grn)>■</span> local ${s.local} (${lp}%) &nbsp; <span style=color:var(--amb)>■</span> overflow ${s.remote} (${rp}%) &nbsp; peak lanes ${s.peak_inflight} &nbsp; uptime ${uh}h${um}m`;
- $('#reasons').innerHTML=Object.keys(s.remote_reasons||{}).length?('overflow reasons: '+Object.entries(s.remote_reasons).map(([k,v])=>`<span class=pill>${k}: ${v}</span>`).join('')):'';
- $('#gpu').innerHTML=(s.gpu||[]).map((g,i)=>`<div class=card><div class=k>GPU ${i}</div><div class=v class=mono>${g.util}<small>% util</small></div><div class=bar><i class=bl style="width:${100*g.used/(g.used+g.free)}%;background:var(--blu)"></i></div><div class=k style=margin-top:4px>${(g.used/1024).toFixed(1)}G used · ${(g.free/1024).toFixed(1)}G free</div></div>`).join('')||'<div class=card><div class=k>no GPU data</div></div>';
- $('#ev').innerHTML=(s.events||[]).map(e=>`<tr><td class="rz mono">${fmtAgo(e.t)} ago</td><td>${e.ep}</td><td>${e.client}</td><td><span class="tag ${routeTag(e.d)}">${e.d}</span></td><td class=rz>${e.r}</td><td class=mono>${(e.ptok||0)}→${(e.maxtok||0)}${e.stream?' ⚡':''}</td><td class=mono>${e.waited?e.waited+'s':''}</td></tr>`).join('');
-}
-// SHIM_ADMIN_TOKEN (optional, default off): mutating endpoints 401 until this header is sent.
-// Asked for lazily on the first 401, never upfront -- most deployments never set the token,
-// so this must add zero friction until it is turned on.
-function adminToken(){return localStorage.getItem('shim_admin_token')||'';}
-async function adminFetch(url,opts){
- opts=opts||{};opts.headers=Object.assign({'Content-Type':'application/json'},opts.headers||{});
- const t=adminToken();if(t)opts.headers['X-Admin-Token']=t;
- let r=await fetch(url,opts);
- if(r.status===401){
-  const entered=prompt('Admin token required for this action (set once, kept in this browser):');
-  if(entered){localStorage.setItem('shim_admin_token',entered);opts.headers['X-Admin-Token']=entered;r=await fetch(url,opts);}
- }
- return r;
-}
-let FR=0;
-function renderMode(){const b=document.getElementById('modebadge'),t=document.getElementById('modebtn');
- if(FR){b.textContent='FULL REMOTE';b.style.background='rgba(210,153,34,.25)';b.style.color='var(--amb)';t.textContent='Switch to LOCAL';}
- else{b.textContent='LOCAL-FIRST';b.style.background='rgba(63,185,80,.2)';b.style.color='var(--grn)';t.textContent='Switch to FULL REMOTE';}}
-async function toggleMode(){FR=FR?0:1;await adminFetch('/gateway/config',{method:'POST',body:JSON.stringify({force_remote:FR})});renderMode();loadCfg();}
-document.getElementById('modebtn').addEventListener('click',toggleMode);
-document.getElementById('f_preset').addEventListener('change',e=>{const v=e.target.value;if(!v)return;const [b,m]=v.split('|');$('#f_remote_base').value=b;$('#f_remote_model').value=m;});
-async function loadLocalModels(){
- try{const d=await(await fetch('/gateway/models/local')).json();
-  $('#mdir').textContent=d.models_dir||'';
-  $('#lm').innerHTML=(d.models||[]).map(m=>{
-    const badge=m.live?'<span class="tag tl">LIVE</span>':'';
-    const btn=m.servable&&!m.live?`<button class=lmsw data-p="${m.path}" style="font-size:11px;padding:3px 10px">Switch</button>`:
-              (m.servable?'<span class=rz>current</span>':'<span class=rz style=color:var(--amb)>not servable</span>');
-    return `<tr><td>${badge}</td><td class=mono>${m.name}</td><td class=mono>${m.gb} GB</td><td class=rz>${m.desc}</td><td>${btn}</td></tr>`;}).join('')
-    ||'<tr><td colspan=5 class=rz>no checkpoints found</td></tr>';
-  document.querySelectorAll('.lmsw').forEach(b=>b.addEventListener('click',()=>switchLocal(b.dataset.p)));
- }catch(e){}}
-async function switchLocal(p){
- if(!confirm('Switch the local engine to:\n\n'+p+'\n\nThe engine restarts. Traffic falls back to remote overflow until it is healthy.'))return;
- $('#lmmsg').textContent='switching\u2026 engine restarting';
- try{const r=await adminFetch('/gateway/models/local',{method:'POST',body:JSON.stringify({path:p})});
-  const d=await r.json();
-  $('#lmmsg').textContent=d.error?('\u2717 '+d.error):('\u2713 switching to '+d.switching_to+' ('+d.quant+') \u2014 '+d.note);
-  setTimeout(loadLocalModels,15000);}catch(e){$('#lmmsg').textContent='\u2717 '+e;}}
-setInterval(loadLocalModels,20000);
-async function loadCfg(){try{const c=await(await fetch('/gateway/config')).json();
- FR=c.force_remote?1:0;renderMode();
- for(const [k,v] of Object.entries(c)){const el=document.getElementById('f_'+k);if(el&&el.type!=='password')el.value=v;}
- $('#keystate').textContent=c.remote_key_display?('\u00b7 '+c.remote_key_display):'\u00b7 not set';}catch(e){}}
-async function saveCfg(){const b={};
- document.querySelectorAll('input[id^=f_]').forEach(el=>{const k=el.id.slice(2);
-  if(el.type==='password'){if(el.value.trim())b[k]=el.value.trim();}
-  else if(el.value!=='')b[k]=el.value;});
- $('#savemsg').textContent='saving\u2026';
- try{const r=await adminFetch('/gateway/config',{method:'POST',body:JSON.stringify(b)});
-  const d=await r.json();$('#savemsg').textContent='\u2713 saved: '+(d.changed||[]).join(', ');$('#f_remote_key').value='';loadCfg();}
- catch(e){$('#savemsg').textContent='\u2717 '+e;}}
-document.getElementById('save').addEventListener('click',saveCfg);
-// ---- Telemetry (added). Self-contained: its own esc()/sparkline() helpers (the first script
-// block's esc() is private to its own IIFE and not reachable here); reuses fmtAgo()/tile()/$()
-// already defined above in this block. Touches nothing else in this file. ----
-function escT(t){return String(t==null?'':t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
-function sparkline(id,series){
- const svg=document.getElementById(id);if(!svg)return;
- const W=300,H=56,pad=3;
- const lines=(series||[]).filter(s=>s&&s.length);
- if(!lines.length){svg.innerHTML='';return;}
- const n=Math.max(...lines.map(s=>s.length));
- const all=[].concat(...lines).filter(v=>v!=null&&isFinite(v));
- let lo=all.length?Math.min(...all):0, hi=all.length?Math.max(...all):1;
- lo=Math.min(0,lo);if(hi<=lo)hi=lo+1;
- const x=i=>pad+(W-2*pad)*(n<=1?0:i/(n-1));
- const y=v=>H-pad-(H-2*pad)*((v-lo)/(hi-lo));
- const cls=['s1','s2','s3'];
- svg.innerHTML=lines.map((s,li)=>{
-   const pts=s.map((v,i)=>(v==null||!isFinite(v))?null:x(i).toFixed(1)+','+y(v).toFixed(1)).filter(Boolean).join(' ');
-   return pts?'<polyline class="'+cls[li%3]+'" points="'+pts+'"></polyline>':'';
- }).join('');
-}
-function seriesOf(fast,path){return fast.map(s=>{let v=s;for(const k of path){v=v&&v[k];if(v==null)return null;}return v;});}
-async function tickTelemetry(){
- let t;try{t=await(await fetch('/gateway/telemetry',{cache:'no-store'})).json();}catch(e){$('#telem_engok').textContent='telemetry feed unreachable: '+e;return;}
- const fast=(t.series&&t.series.fast)||[];
- const eng=(t.latest&&t.latest.engine)||{};
- $('#telem_engok').innerHTML=eng.ok?'<span class="dot up"></span>scraping OK':
-   ('<span class="dot down"></span>'+(eng.age_s!=null?('stale '+Math.round(eng.age_s)+'s ago ('+escT(eng.err||'')+')'):('never scraped yet ('+escT(eng.err||'engine down')+')')));
- $('#telem_tiles').innerHTML=[
-   tile('Tokens/s now',eng.ok&&(eng.prompt_tok_s!=null||eng.gen_tok_s!=null)?(((eng.prompt_tok_s||0)+(eng.gen_tok_s||0)).toFixed(0)):'—'),
-   tile('TTFT p50 <small>/ p95</small>',eng.ok&&eng.ttft_p50!=null?(eng.ttft_p50.toFixed(2)+'s <small>/ '+(eng.ttft_p95||0).toFixed(2)+'s</small>'):'—'),
-   tile('KV-cache %',eng.ok&&eng.kv_cache_pct!=null?(eng.kv_cache_pct.toFixed(0)+'<small>%</small>'):'—'),
-   tile('Engine running <small>/ waiting</small>',eng.ok?((eng.running==null?'—':eng.running)+' <small>/ '+(eng.waiting==null?'—':eng.waiting)+'</small>'):'—'),
- ].join('');
- sparkline('sp_toks',[seriesOf(fast,['engine','prompt_tok_s']),seriesOf(fast,['engine','gen_tok_s'])]);
- sparkline('sp_ttft',[seriesOf(fast,['engine','ttft_p50']),seriesOf(fast,['engine','ttft_p95'])]);
- sparkline('sp_tpot',[seriesOf(fast,['engine','tpot_p50']),seriesOf(fast,['engine','tpot_p95'])]);
- sparkline('sp_kv',[seriesOf(fast,['engine','kv_cache_pct']),seriesOf(fast,['gateway','inflight'])]);
- const pw=(gi)=>fast.map(s=>{const g=s.gpu&&s.gpu[gi];return(g&&g.power_w!=null&&g.power_limit_w)?100*g.power_w/g.power_limit_w:null;});
- sparkline('sp_gpu0',[seriesOf(fast,['gpu',0,'util']),seriesOf(fast,['gpu',0,'temp_c']),pw(0)]);
- sparkline('sp_gpu1',[seriesOf(fast,['gpu',1,'util']),seriesOf(fast,['gpu',1,'temp_c']),pw(1)]);
- sparkline('sp_remote',[seriesOf(fast,['gateway','remote_share_pct'])]);
- const pc=t.per_client||{};
- const names=Object.keys(pc).sort((a,b)=>pc[b].requests-pc[a].requests);
- $('#telem_clients').innerHTML=names.map(n=>{const c=pc[n];
-   return '<tr><td>'+escT(n)+'</td><td class=mono>'+c.requests+'</td><td class=mono>'+c.local+'</td><td class=mono>'+c.remote+
-     '</td><td class=mono>'+c.tokens_out+(c.tokens_out_lb>0?' <span class=rz title="includes chunk-count lower bounds">(~)</span>':'')+
-     '</td><td class=mono>'+(c.wait_avg_s!=null?c.wait_avg_s+'s':'—')+'</td><td class=mono>'+(c.ttft_avg_s!=null?c.ttft_avg_s+'s':'—')+
-     '</td><td class=mono>'+c.errors+'</td><td class=mono>'+(c.cost_est_usd?'$'+c.cost_est_usd.toFixed(4):'—')+'</td></tr>';
- }).join('')||'<tr><td colspan=9 class=empty>No completed requests yet.</td></tr>';
- const errs=t.errors||[];
- $('#telem_errors').innerHTML=errs.map(e=>'<tr><td class="rz mono">'+fmtAgo(e.t)+' ago</td><td>'+escT(e.client)+'</td><td>'+escT(e.ep)+
-   '</td><td><span class="tag '+routeTag(e.route)+'">'+escT(e.route)+'</span></td><td class=rz>'+escT(e.reason)+
-   '</td><td class=mono>'+(e.status||'')+'</td></tr>').join('')||'<tr><td colspan=6 class=empty>No errors recorded.</td></tr>';
-}
-// ---- History (added). Self-contained: its own fmtDur()/tickHistory(); reuses $()/escT()/
-// fmtAgo()/tile() already defined above in this same block. Touches nothing else in this file. ----
-function fmtDur(s){return s==null?'—':(s<1?Math.round(s*1000)+'ms':s<90?s.toFixed(1)+'s':(s/60).toFixed(1)+'m');}
-async function tickHistory(){
- const cq=($('#h_client').value||'').trim(),rq=($('#h_route').value||'').trim();
- let h;try{const u='/gateway/history?limit=50'+(cq?'&client='+encodeURIComponent(cq):'')+(rq?'&route='+encodeURIComponent(rq):'');
-   h=await(await fetch(u,{cache:'no-store'})).json();}catch(e){$('#h_rows').innerHTML='<tr><td colspan=8 class=empty>history feed unreachable: '+escT(e)+'</td></tr>';return;}
- const items=h.items||[];
- $('#h_rows').innerHTML=items.map(r=>{
-   const badge='<span class="tag '+routeTag(r.route)+'">'+escT(r.route||'?')+'</span>'+(r.reason?' <span class=rz>'+escT(r.reason)+'</span>':'');
-   const out=r.outtok!=null?r.outtok:(r.outtok_lb!=null?'~'+r.outtok_lb:0);
-   return '<tr><td class="rz mono">'+fmtAgo(r.t)+' ago</td><td>'+escT(r.client)+'</td><td>'+badge+
-     '</td><td class=rz title="'+escT(r.preview||'')+'">'+escT((r.preview||'').slice(0,60))+
-     '</td><td class=mono>'+(r.ptok||0)+'→'+out+
-     '</td><td class=mono>'+(r.ttft!=null?r.ttft.toFixed(2)+'s':'—')+
-     '</td><td class=mono>'+fmtDur(r.duration)+'</td><td class=mono>'+(r.status||'')+'</td></tr>';
- }).join('')||('<tr><td colspan=8 class=empty>No matching requests logged'+((cq||rq)?' for this filter.':' yet.')+'</td></tr>');
- const lg=h.log||{};
- $('#h_logstate').textContent='logged '+(lg.written||0)+' since restart'+(lg.dropped_cap?' · '+lg.dropped_cap+' dropped (daily cap)':'')+(lg.dropped_queue?' · '+lg.dropped_queue+' dropped (queue full)':'')+(lg.capped_today?' · TODAY’S LOG IS AT ITS SIZE CAP':'');
- let s;try{s=await(await fetch('/gateway/history/summary?hours=24',{cache:'no-store'})).json();}catch(e){return;}
- const pc=s.per_client||{};const names=Object.keys(pc).sort((a,b)=>pc[b].requests-pc[a].requests);
- const errTotal=names.reduce((a,n)=>a+(pc[n].errors||0),0);
- $('#h_tiles').innerHTML=[
-   tile('Requests (24h)',s.requests||0),
-   tile('Duration p50 <small>/ p95</small>',fmtDur(s.duration_p50)+' <small>/ '+fmtDur(s.duration_p95)+'</small>'),
-   tile('TTFT p50 <small>/ p95</small>',(s.ttft_p50!=null?s.ttft_p50.toFixed(2)+'s':'—')+' <small>/ '+(s.ttft_p95!=null?s.ttft_p95.toFixed(2)+'s':'—')+'</small>'),
-   tile('Errors (24h)',errTotal),
- ].join('');
- $('#h_clients').innerHTML=names.map(n=>{const c=pc[n];
-   return '<tr><td>'+escT(n)+'</td><td class=mono>'+c.requests+'</td><td class=mono>'+c.local+'</td><td class=mono>'+c.remote+
-     '</td><td class=mono>'+c.tokens_in+'</td><td class=mono>'+c.tokens_out+'</td><td class=mono>'+c.errors+'</td></tr>';
- }).join('')||'<tr><td colspan=7 class=empty>No requests logged in the last 24h.</td></tr>';
-}
-let hTimer=null;
-$('#h_client').addEventListener('input',()=>{clearTimeout(hTimer);hTimer=setTimeout(tickHistory,300);});
-$('#h_route').addEventListener('input',()=>{clearTimeout(hTimer);hTimer=setTimeout(tickHistory,300);});
-models();loadCfg();loadLocalModels();tick();setInterval(tick,1500);setInterval(models,15000);
-tickTelemetry();setInterval(tickTelemetry,2000);
-tickHistory();setInterval(tickHistory,10000);
 </script></body></html>"""
 
 async def _on_startup(app):
