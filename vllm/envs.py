@@ -883,10 +883,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     .strip()
     .lower(),
     "VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE_MIN_TOKENS": lambda: int(
-        os.getenv("VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE_MIN_TOKENS", "20480")
+        os.getenv("VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE_MIN_TOKENS") or "20480"
     ),
     "VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS": lambda: int(
-        os.getenv("VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS", "0")
+        os.getenv("VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS") or "0"
     ),
     "VLLM_TURBOQUANT_FLASHINFER_PREFILL_PLAN_CACHE_MAXSIZE": lambda: int(
         os.getenv("VLLM_TURBOQUANT_FLASHINFER_PREFILL_PLAN_CACHE_MAXSIZE", "16")
@@ -898,7 +898,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Set to 0 to restore the legacy behaviour (KV cache sized ignoring the
     # workspace, which can crash with an illegal memory access at deep prefill).
     "VLLM_TQ_RESERVE_PREFILL_WORKSPACE": lambda: bool(
-        int(os.getenv("VLLM_TQ_RESERVE_PREFILL_WORKSPACE", "1"))
+        int(os.getenv("VLLM_TQ_RESERVE_PREFILL_WORKSPACE") or "1")
     ),
     # EXP-045b: arm Xid31 instrumentation (buffer registry + int32/2GiB offset
     # projection + CUDA memory-history snapshot on fault). Default OFF; negligible
@@ -925,19 +925,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_SPEC_VERIFY_OVERSHOOT_MULT", "24")
     ),
     "VLLM_TURBOQUANT_CONTINUATION_SDPA_Q_CHUNK": lambda: int(
-        os.getenv("VLLM_TURBOQUANT_CONTINUATION_SDPA_Q_CHUNK", "0")
+        os.getenv("VLLM_TURBOQUANT_CONTINUATION_SDPA_Q_CHUNK") or "0"
     ),
     "VLLM_TURBOQUANT_CONTINUATION_SDPA_MAX_QK_CELLS": lambda: int(
-        os.getenv("VLLM_TURBOQUANT_CONTINUATION_SDPA_MAX_QK_CELLS", "0")
+        os.getenv("VLLM_TURBOQUANT_CONTINUATION_SDPA_MAX_QK_CELLS") or "0"
     ),
     "VLLM_TURBOQUANT_FORCE_DECODE_SDPA": lambda: bool(
-        int(os.getenv("VLLM_TURBOQUANT_FORCE_DECODE_SDPA", "0"))
+        int(os.getenv("VLLM_TURBOQUANT_FORCE_DECODE_SDPA") or "0")
     ),
     "VLLM_TURBOQUANT_FORCE_CONTINUATION_SDPA": lambda: bool(
-        int(os.getenv("VLLM_TURBOQUANT_FORCE_CONTINUATION_SDPA", "0"))
+        int(os.getenv("VLLM_TURBOQUANT_FORCE_CONTINUATION_SDPA") or "0")
     ),
     "VLLM_TURBOQUANT_FORCE_DECODE_SDPA_MAX_QK_CELLS": lambda: int(
-        os.getenv("VLLM_TURBOQUANT_FORCE_DECODE_SDPA_MAX_QK_CELLS", "131072")
+        os.getenv("VLLM_TURBOQUANT_FORCE_DECODE_SDPA_MAX_QK_CELLS") or "131072"
     ),
     "VLLM_TURBOQUANT_MAX_KV_SPLITS": lambda: (
         int(value)
@@ -945,16 +945,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         else None
     ),
     "VLLM_TURBOQUANT_DECODE_BLOCK_KV": lambda: int(
-        os.getenv("VLLM_TURBOQUANT_DECODE_BLOCK_KV", "2")
+        os.getenv("VLLM_TURBOQUANT_DECODE_BLOCK_KV") or "2"
     ),
     "VLLM_TURBOQUANT_K8V4_FP8_FORMAT": lambda: os.getenv(
         "VLLM_TURBOQUANT_K8V4_FP8_FORMAT", "auto"
     ),
     "VLLM_TURBOQUANT_CUDAGRAPH_SPEC_DECODE_SAFE": lambda: bool(
-        int(os.getenv("VLLM_TURBOQUANT_CUDAGRAPH_SPEC_DECODE_SAFE", "0"))
+        int(os.getenv("VLLM_TURBOQUANT_CUDAGRAPH_SPEC_DECODE_SAFE") or "0")
     ),
     "VLLM_TURBOQUANT_SKIP_PREFILL_STORE": lambda: bool(
-        int(os.getenv("VLLM_TURBOQUANT_SKIP_PREFILL_STORE", "0"))
+        int(os.getenv("VLLM_TURBOQUANT_SKIP_PREFILL_STORE") or "0")
     ),
     # EXP-038 GDN snapshot/park/fork PoC. OFF by default; only enable on a
     # throwaway engine, never on the production :8001 serve.
