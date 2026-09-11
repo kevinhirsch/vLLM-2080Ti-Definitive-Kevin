@@ -219,6 +219,17 @@ FG_RESERVED = int(os.environ.get("SHIM_FG_RESERVED", "2"))
 # is completely idle (nothing in flight, nobody queued) a big background request may take the
 # whole budget, exactly like a big foreground one does. Set 0 to restore the old always-remote rule.
 BG_BIG_LOCAL_WHEN_IDLE = int(os.environ.get("SHIM_BG_BIG_LOCAL_WHEN_IDLE", "1"))
+# 2026-09-11 (Kevin: "the uncensored local model IS the point of the estate"; measured: his
+# interactive pi session was served locally only 7% of the time, 448/482 requests overflowed
+# to paid DeepSeek in 2 days). gw-interactive-never-overflows: an INTERACTIVE (non-background)
+# request that is merely WAITING for a lane -- local is healthy, just busy -- no longer times
+# out into an overflow. It keeps waiting for a local lane instead (same 1e9 sentinel already
+# used when no remote is configured at all). This does NOT touch the local-DOWN path above
+# (a genuinely dead/unhealthy engine still overflows interactive immediately, same as before --
+# waiting for a lane that will never open is not "the point"), and does not touch background,
+# which still yields and overflows on its own short timer. Default on; set 0 to restore the
+# previous LOCAL_WAIT-then-overflow behaviour for interactive traffic.
+INTERACTIVE_NEVER_OVERFLOW = int(os.environ.get("SHIM_INTERACTIVE_NEVER_OVERFLOW", "1"))
 # 2026-09-11 (Kevin: "response time... is unbearably slow"; gw-admission-proportional-units).
 # estimate_units() used to charge ANY request >= BIG_TOKENS the WHOLE current budget, on the
 # theory that a big prefill "runs alone." Measured effect: one of Kevin's own 111K-token pi
@@ -350,6 +361,7 @@ _CFG = {
     "SHIM_FG_RESERVED":      ("FG_RESERVED",      int),
     "SHIM_BG_BIG_LOCAL_WHEN_IDLE": ("BG_BIG_LOCAL_WHEN_IDLE", int),
     "SHIM_TOKENS_PER_UNIT":  ("TOKENS_PER_UNIT", int),
+    "SHIM_INTERACTIVE_NEVER_OVERFLOW": ("INTERACTIVE_NEVER_OVERFLOW", int),
     "SHIM_BG_XCLIENTS":      ("BG_XCLIENTS", lambda v: [m.lower() for m in _parse_seq(v, _CFG_SEP["SHIM_BG_XCLIENTS"])]),
     "SHIM_POOL_TOKENS":      ("POOL_TOKENS",      int),
     "SHIM_BG_WAIT_SECS":     ("BG_WAIT",          float),
@@ -1759,6 +1771,42 @@ def _local_model_name():
     return os.environ.get("SHIM_LOCAL_MODEL_NAME", "qwen-local")
 
 
+# Sentinel meaning "never time out and overflow" -- the same value the code already relied on
+# for "no remote configured at all" long before this file added a second reason to want it.
+NO_OVERFLOW_SECONDS = 1e9
+
+
+def admission_lane_limit(background, budget, fg_reserved):
+    """How many of `budget` lanes THIS class may fill. Background may only use lanes beyond
+    fg_reserved (kept free for interactive); interactive may use the whole budget."""
+    return max(1, budget - fg_reserved) if background else budget
+
+
+def admission_wait_seconds(background, remote_available, peak, local_wait, bg_wait,
+                            interactive_never_overflow):
+    """How long a queued request waits for a local lane before the caller overflows it to
+    remote. Pulled out of _route_completions as a pure function so the policy is testable
+    without an event loop (gw-interactive-never-overflows, 2026-09-11).
+
+    - No remote configured at all: nobody can overflow -- wait forever, for any class
+      (unchanged, pre-existing behaviour).
+    - Background: unchanged -- BG_WAIT normally, biased up to LOCAL_WAIT during peak hours
+      (peak-hours DeepSeek pricing makes queueing locally cheaper than robot busywork on the
+      2x-priced remote).
+    - Interactive, with the policy on (default): NEVER overflow on a timeout. Local merely
+      being busy is not local being unavailable, and "the uncensored local model is the point"
+      (Kevin, 2026-09-11) -- so it keeps waiting for a lane instead of paying for remote. This
+      does not touch the SEPARATE local-DOWN check earlier in _route_completions, which still
+      overflows interactive immediately on a genuinely dead engine.
+    - Interactive, with the policy off: the previous behaviour (LOCAL_WAIT then overflow).
+    """
+    if not remote_available:
+        return NO_OVERFLOW_SECONDS
+    if background:
+        return local_wait if peak else bg_wait
+    return NO_OVERFLOW_SECONDS if interactive_never_overflow else local_wait
+
+
 def _desired_units(body):
     """The size-implied unit cost with NO ceiling applied -- how many lanes this request would
     take if it could have as many as it wants. Used two ways: estimate_units() clamps it to
@@ -2752,18 +2800,15 @@ async def _route_completions(request):
             return await _forward_remote(request, path, body, streaming)
         # no remote configured -> fall through to the normal local wait loop
 
-    # local UP: claim a slot, WAITING up to LOCAL_WAIT for capacity instead of instant-overflow.
+    # local UP: claim a slot, WAITING for capacity instead of instant-overflow.
     # PRIORITY LANES: background (cron/batch) may only fill lanes beyond FG_RESERVED — those
     # stay free so an interactive turn NEVER queues behind robot busywork — and background
-    # waits only BG_WAIT before overflowing to the cheap remote.
+    # waits only BG_WAIT before overflowing to the cheap remote. Interactive traffic, by
+    # policy (2026-09-11), does not overflow on a mere timeout at all -- see admission_wait().
     # The check-and-increment is done with no await in between, so it's race-free under asyncio.
-    if background:
-        lane_limit = max(1, effective_budget() - FG_RESERVED)
-        _bgw = LOCAL_WAIT if is_peak() else BG_WAIT   # peak: bias bg toward local queueing
-        deadline = time.time() + (_bgw if remote_ok() else 1e9)
-    else:
-        lane_limit = effective_budget()
-        deadline = time.time() + (LOCAL_WAIT if remote_ok() else 1e9)
+    lane_limit = admission_lane_limit(background, effective_budget(), FG_RESERVED)
+    deadline = time.time() + admission_wait_seconds(
+        background, remote_ok(), is_peak(), LOCAL_WAIT, BG_WAIT, INTERACTIVE_NEVER_OVERFLOW)
     admitted = False
     _local_reason = "-"      # "bg-big-idle" when the idle-engine rule admitted a big background request
     admitted_conc = 1        # local concurrency at admission -> scales the first-token deadline
