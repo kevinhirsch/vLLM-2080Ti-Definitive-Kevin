@@ -471,6 +471,13 @@ def _admin_ok(request):
 _inflight = 0            # local capacity units currently in flight
 _inflight_tokens = 0    # sum of est prompt tokens of in-flight local requests (size-aware cap)
 _waiting  = 0           # requests currently blocked in the queue-first wait loop (backlog)
+# 2026-09-11 (gw-queue-position-header): per-class split of the SAME count above. Kevin's
+# dashboard showed one aggregate "waiting" number with no way to tell "am I, personally,
+# waiting" from "a cron job is waiting" -- exactly the ambiguity behind his "response time...
+# is unbearably slow" complaint, since a page full of background waiters looks identical to
+# one interactive waiter. Mutated at the SAME two sites as _waiting, by construction (see the
+# comment there): never drifts from it because it is updated in the same breath.
+_waiting_by_class = {"interactive": 0, "background": 0}
 _backoff_until = 0.0
 _health = {"ok": False, "at": 0.0}
 REMOTE_ENABLED = bool(REMOTE_BASE and REMOTE_KEY)
@@ -2845,8 +2852,10 @@ async def _route_completions(request):
                 break
             if not queued:                       # first time we couldn't get a slot -> we're backlogged
                 queued = True
-                _active_set(request, phase="queued")
+                _active_set(request, phase="queued",
+                            queue_position=_waiting_by_class["background" if background else "interactive"] + 1)
                 _waiting += 1
+                _waiting_by_class["background" if background else "interactive"] += 1
                 _stats["peak_waiting"] = max(_stats["peak_waiting"], _waiting)
             await asyncio.sleep(SLOT_POLL)
             waited += SLOT_POLL
@@ -2854,6 +2863,7 @@ async def _route_completions(request):
     finally:
         if queued:
             _waiting -= 1
+            _waiting_by_class["background" if background else "interactive"] -= 1
 
     if not admitted:
         # distinguish WHY we couldn't admit: lane-count vs total-context (size-aware) cap
@@ -2992,6 +3002,13 @@ async def gateway_stats(request):
         "budget": effective_budget(), "configured_budget": BUDGET,
         "inflight": _inflight, "peak_inflight": _stats["peak_inflight"],
         "waiting": _waiting, "peak_waiting": _stats["peak_waiting"],
+        # gw-queue-position-header (2026-09-11): per-class queue depth, so "am I personally
+        # waiting" is answerable at a glance instead of one aggregate number that background
+        # traffic can dominate. Deliberately NOT paired with a fake per-class wait estimate --
+        # avg_wait below stays a single honest aggregate rather than two numbers dressed up as
+        # a per-class split that record_event() does not actually track. See
+        # gw-ttft-decomposition-telemetry for the real per-class latency breakdown this wants.
+        "waiting_by_class": dict(_waiting_by_class),
         "overflowed_after_wait": _stats["overflowed_after_wait"],
         "inflight_tokens": _inflight_tokens, "token_budget": TOKEN_BUDGET,
         "backoff": max(0, int(_backoff_until - time.time())),
