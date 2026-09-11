@@ -4709,8 +4709,10 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
   <div class=row>
    <label><span class=k>How many requests can run locally at once?</span><span class=hint>concurrent lanes &middot; 1 = strictly one at a time</span>
     <input id=f_local_budget type=number min=1 max=8></label>
-   <label><span class=k>How long should an interactive request wait for a free lane?</span><span class=hint>seconds, before overflowing to the paid provider</span>
+   <label><span class=k>How long should a request wait for a free lane?</span><span class=hint>seconds &middot; used for background during peak hours, and for interactive only if "never overflow" below is off</span>
     <input id=f_local_wait_secs type=number min=0 step=1></label>
+   <label><span class=k>Should interactive traffic ever overflow while waiting?</span><span class=hint>0 = never, it queues until a lane is free (default) &middot; 1 = restores the wait-above-then-overflow behaviour</span>
+    <input id=f_interactive_never_overflow type=number min=0 max=1></label>
    <label><span class=k>Total context all lanes together may hold</span><span class=hint>tokens &middot; prevents an out-of-memory crash</span>
     <input id=f_token_budget type=number min=0 step=50000></label>
    <label><span class=k>After an out-of-memory crash, how long to back off?</span><span class=hint>seconds before probing the local engine again</span>
@@ -4727,8 +4729,10 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
     <input id=f_max_local_tokens type=number min=0 step=10000></label>
    <label><span class=k>Clamp any local request's output to at most&hellip;</span><span class=hint>tokens</span>
     <input id=f_local_max_out type=number min=0 step=1024></label>
-   <label><span class=k>A request this big claims the whole budget alone</span><span class=hint>tokens (serialize-solo)</span>
+   <label><span class=k>Above this size, a request's lane cost scales with its size</span><span class=hint>tokens &middot; below this, every request costs exactly 1 lane</span>
     <input id=f_big_tokens type=number min=0 step=1000></label>
+   <label><span class=k>How many tokens equal one lane, for a big request?</span><span class=hint>tokens/unit &middot; e.g. a 100K-token request costs ceil(100000&divide;this) lanes, capped by the budget</span>
+    <input id=f_tokens_per_unit type=number min=1000 step=1000></label>
    <label><span class=k>Treat this much in-flight context as "a monster is running"</span><span class=hint>tokens &middot; caused reason "monster"</span>
     <input id=f_monster_inflight type=number min=0 step=10000></label>
    <label><span class=k>Upper bound on the first-token wait budget</span><span class=hint>seconds</span>
@@ -4957,7 +4961,7 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
     setBanner('oom', s.backoff>0?('Local engine is in OOM backoff for another '+s.backoff+'s -- new requests overflow to the paid provider until it clears.'):null, 'warn');
     $('#strip').innerHTML=[
       `<div class=tile><div class=k><abbr title="Whether the local vLLM engine on :8001 is responding to /health.">Local engine</abbr></div><div class=v><span class="dot ${s.local_healthy?'up':'down'}"></span> ${s.local_healthy?'up':'DOWN'}</div><div class=sub title="${esc(modelName)}">${esc(modelShort||'--')}</div></div>`,
-      `<div class=tile><div class=k><abbr title="Concurrent request slots (lanes) in use / total available. Waiting shown when requests are queued for one.">Lanes</abbr></div><div class=v class=mono>${s.inflight}<small>/${s.budget}</small>${s.waiting?` <span style=color:var(--amb)>+${s.waiting} waiting</span>`:''}</div><div class=sub><abbr title="Rolling in-flight prompt tokens across all lanes / token-budget cap.">context in use ${((s.inflight_tokens||0)/1000).toFixed(0)}K / ${((s.token_budget||0)/1000).toFixed(0)}K cap</abbr>${bk?' &middot; '+bk:''}</div></div>`,
+      `<div class=tile><div class=k><abbr title="Concurrent request slots (lanes) in use / total available. Waiting shown when requests are queued for one, broken out by class.">Lanes</abbr></div><div class=v class=mono>${s.inflight}<small>/${s.budget}</small>${s.waiting?` <span style=color:var(--amb)>+${s.waiting} waiting${s.waiting_by_class?` (${s.waiting_by_class.interactive||0} interactive, ${s.waiting_by_class.background||0} bg)`:''}</span>`:''}</div><div class=sub><abbr title="Rolling in-flight prompt tokens across all lanes / token-budget cap.">context in use ${((s.inflight_tokens||0)/1000).toFixed(0)}K / ${((s.token_budget||0)/1000).toFixed(0)}K cap</abbr>${bk?' &middot; '+bk:''}</div></div>`,
       `<div class=tile><div class=k><abbr title="Share of requests served by the local engine vs sent to the overflow provider.">Served local</abbr></div><div class=v class=mono style=color:var(--grn)>${s.local_pct}<small>%</small></div><div class=sub>overflow ${s.remote_pct}% &middot; avg wait ${s.avg_wait}s</div></div>`,
       `<div class=tile><div class=k><abbr title="Live tokens/s from the engine's Prometheus metrics (prompt + generation combined). '--' if the engine is down or not yet scraped.">Tokens/s now</abbr></div><div class=v class=mono id=tps_now>--</div><div class=sub>time to first token <span id=ttft_line>--</span></div></div>`,
       `<div class=tile><div class=k><abbr title="Average GPU utilisation across all cards, as reported by nvidia-smi.">GPU util avg</abbr></div><div class=v class=mono>${gpuAvg==null?'--':gpuAvg+'<small>%</small>'}</div><div class=sub>${(s.gpu||[]).map((g,i)=>'GPU'+i+' '+((g.util==null?'?':g.util)+'%')).join(' &middot; ')||'no GPU data'}</div></div>`,
@@ -5038,13 +5042,14 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
       // deadline estimate (item 7): how much of the configured wait is left before this
       // would overflow, computed client-side from the live config -- no backend change needed.
       let deadline=null;
-      if(queued&&CFG){
+      const guaranteedLocal=queued&&!a.bg&&CFG&&Number(CFG.interactive_never_overflow)===1;
+      if(queued&&CFG&&!guaranteedLocal){
         const waitS=(a.bg?CFG.bg_wait_secs:CFG.local_wait_secs);
         if(waitS!=null)deadline=Math.max(0,Number(waitS)-(a.waited||0));
       }
       rows.push({kind:'request',who:clientDisplay(a.name,a.ip,a.ua),
         what:(a.preview?'"'+esc(a.preview)+'"':'<span class=rz>(no text preview)</span>')+(a.bg?' &middot; background':'')+(a.tiny?' &middot; tiny':'')+(a.model?' &middot; '+esc(a.model):''),
-        state, badgeText: queued?'waiting for a lane'+(deadline!=null?' \u00b7 overflows in ~'+Math.round(deadline)+'s':''):held?'holding for local (background) -- never billed':remote?'remote overflow \u00b7 '+esc(a.reason||''):a.phase==='local'?'local model'+(a.waited?' \u00b7 waited '+a.waited+'s':''):'routing',
+        state, badgeText: queued?'waiting for a lane'+(deadline!=null?' \u00b7 overflows in ~'+Math.round(deadline)+'s':(guaranteedLocal?' \u00b7 guaranteed local (never overflows)':'')):held?'holding for local (background) -- never billed':remote?'remote overflow \u00b7 '+esc(a.reason||''):a.phase==='local'?'local model'+(a.waited?' \u00b7 waited '+a.waited+'s':''):'routing',
         age:a.elapsed_s||0, meta:esc(a.ep)+(a.ptok?' \u00b7 '+Math.round(a.ptok/1000)+'K in':'')+(a.maxtok?' \u00b7 '+a.maxtok+' max out':'')+(a.stream?' \u00b7 \u26a1 stream':''),
         sortkey:(a.name||'')+' '+(a.preview||'')});
     });
