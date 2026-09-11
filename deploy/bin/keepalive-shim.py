@@ -26,6 +26,93 @@ import urllib.request
 import aiohttp
 from aiohttp import web
 
+# -------- config sequences: ONE separator per field, on both the read and the write --------
+# 2026-09-09 RCA. NO_THINK_IPS was dead for ~3 weeks and said nothing about it. h_chat gates
+# the no-think policy on `request.remote in NO_THINK_IPS`; the set held exactly one member --
+# this entire run of garbage -- so neither 10.0.1.10 (Hermes) nor 10.0.1.250 (the scheduler
+# peer) could ever match it:
+#     {{'''"{'10.0.1.10'"}'}'}'''}'}'}|{'{'{'''{'{'{"'10.0.1.250'}"'''}'}'''
+#
+# This file corrupted its own config. No shell was involved. Two halves of THIS module
+# disagreed: the readers below split on "," while _persist_config joined on "|", so the first
+# dashboard save of ANY field rewrote a good value into one the reader could not parse. An
+# older _persist_config was worse -- it wrote str(g[gname]) for every type, so a set reached
+# disk as its Python repr, braces and quotes included, and each save then re-serialised the
+# previous parse of the previous repr. The punctuation COMPOUNDED. The shim.env backups in
+# this directory are that ratchet, one doubling per save:
+#     08-14  {'10.0.1.10', '10.0.1.250'}                     <- str(set) written
+#     08-16  {"'10.0.1.250'}", "{'10.0.1.10'"}               <- comma-split of that
+#     08-24  {'{\'\'\'"{\'10.0.1.10\'"}\'}\'}\'', ...        <- and again
+#     09-05  {{'''"{'10.0.1.10'"}...}|{'{'{...               <- the "|" join froze it there
+# It has the shape the vault files under [[Workflow Interpolation Footgun]], reached with no
+# shell at all. SHIM_BG_XCLIENTS was dead the same way, from the same asymmetry.
+#
+# The fix is both halves, because a tolerant parser alone would just let the writer lay down
+# the next bad value. _CFG_SEP pins the canonical separator per field -- the one that field's
+# reader has always used -- and BOTH writers (_persist_config to shim.env, current_config to
+# the dashboard form) now use it, so the round trip is lossless. _parse_seq additionally
+# accepts the other separator and strips repr punctuation, so a value already corrupt on disk
+# self-heals on the next read instead of staying dead until a human happens to notice.
+# Covered by test_no_think_ips.py beside this file.
+_CFG_SEP = {
+    "SHIM_NO_THINK_IPS": ",",
+    "SHIM_BG_XCLIENTS":  ",",
+    "SHIM_BG_MARKERS":   "|",   # free-text phrases: a marker may itself contain a comma
+}
+_CFG_SEP_DEFAULT = "|"
+# Punctuation a Python container repr leaves around a member. Stripped from the ENDS only,
+# never from the middle, so a legitimate value keeps its interior characters.
+_REPR_JUNK = " \t\r\n{}[]()'\""
+
+
+def _parse_seq(value, sep=",", heal=True):
+    """Split a persisted config scalar into its member tokens.
+
+    sep  -- the field's canonical separator, from _CFG_SEP.
+    heal -- also accept the OTHER separator and strip container-repr punctuation, so a value
+            written by the old broken writer comes back to life. Turn this OFF for free-text
+            fields (BG_MARKERS), where a quote or a comma may be part of the value itself.
+
+    Returns a list: order preserved, duplicates dropped, empties dropped. Callers that want a
+    set wrap it, so this one function serves both shapes.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (set, frozenset, list, tuple)):
+        # A caster can be handed a real container (a dashboard POST, or a re-cast of a value
+        # already parsed). Flatten it through the same path, so a member that is itself a
+        # corrupt joined string still splits.
+        items = sorted(value) if isinstance(value, (set, frozenset)) else list(value)
+        out = []
+        for item in items:
+            out.extend(_parse_seq(item, sep, heal))
+    else:
+        s = str(value)
+        if heal and sep != _CFG_SEP_DEFAULT:
+            s = s.replace(_CFG_SEP_DEFAULT, sep)
+        out = []
+        for tok in s.split(sep):
+            tok = tok.strip(_REPR_JUNK) if heal else tok.strip()
+            if tok:
+                out.append(tok)
+    seen, uniq = set(), []
+    for tok in out:
+        if tok not in seen:
+            seen.add(tok)
+            uniq.append(tok)
+    return uniq
+
+
+def _fmt_seq(value, sep):
+    """Serialise a config sequence with the separator its own reader expects.
+
+    Sets are sorted so a save is deterministic -- otherwise shim.env churns on every write and
+    a diff can never tell you whether the value actually changed.
+    """
+    items = sorted(value) if isinstance(value, (set, frozenset)) else list(value)
+    return sep.join(str(x) for x in items)
+
+
 PORT         = int(os.environ.get("SHIM_PORT", "8000"))
 LOCAL        = os.environ.get("SHIM_UPSTREAM", "http://127.0.0.1:8001").rstrip("/")
 # where live config edits (via the dashboard) are persisted so they survive a restart
@@ -132,8 +219,9 @@ BG_BIG_LOCAL_WHEN_IDLE = int(os.environ.get("SHIM_BG_BIG_LOCAL_WHEN_IDLE", "1"))
 # local digester all ran as FOREGROUND and could fill every lane, queueing genuinely interactive
 # turns behind robot busywork -- the exact thing FG_RESERVED exists to prevent. Substrings (case-
 # insensitive) that mark an X-Client as background; hot-reloadable via /gateway/config.
-BG_XCLIENTS = [m.strip().lower() for m in os.environ.get(
-    "SHIM_BG_XCLIENTS", "cron,batch,workflow-bg,research-feeder,digester").split(",") if m.strip()]
+BG_XCLIENTS = [m.lower() for m in _parse_seq(
+    os.environ.get("SHIM_BG_XCLIENTS", "cron,batch,workflow-bg,research-feeder,digester"),
+    _CFG_SEP["SHIM_BG_XCLIENTS"])]
 BG_WAIT     = float(os.environ.get("SHIM_BG_WAIT_SECS", "5"))
 # 2026-09-06 (background-remote-cost incident): an engine fault/restart used to fail EVERY
 # in-flight request over to the paid remote provider the instant local_healthy() went False --
@@ -183,6 +271,13 @@ NONTHINK_TOP_K   = int(os.environ.get("SHIM_NONTHINK_TOP_K", "20"))
 # MASTER SWITCH: 1 = FULL REMOTE (every completion -> DeepSeek; local engine untouched —
 # for maintenance/repro/debugging), 0 = normal local-first. Toggle live from the dashboard.
 FORCE_REMOTE = 1 if os.environ.get("SHIM_FORCE_REMOTE", "0").lower() in ("1", "true", "on") else 0
+# The third mode (Kevin 2026-09-10: "LOCAL FIRST // FULL REMOTE // FULL LOCAL"):
+# 1 = FULL LOCAL — never overflow to the paid remote for ANY request; when every local lane is
+# busy a request QUEUES for a lane instead of spending money ($0 guaranteed, latency unbounded).
+# Better than unsetting the remote credentials because it is reversible from the dashboard and
+# leaves the remote configured for the moment it is wanted again. It OUTRANKS FORCE_REMOTE: if
+# both are somehow set, local wins, because the mode that cannot spend money is the safe one.
+LOCAL_ONLY = 1 if os.environ.get("SHIM_LOCAL_ONLY", "0").lower() in ("1", "true", "on") else 0
 # PEAK-AWARE overflow bias (2026-08-13, DeepSeek peak/off-peak pricing eff. Aug 16):
 # during remote-provider PEAK hours (UTC ranges like "1-4,6-10"), BACKGROUND requests
 # wait the full LOCAL_WAIT for a local lane instead of fast-overflowing at BG_WAIT —
@@ -201,7 +296,7 @@ def is_peak():
     return False
 # Also strip thinking for LOCAL requests from these client IPs (comma-separated; e.g. the
 # Hermes boxes, whose 1-3K-token chain-of-thought per turn is the user-felt latency).
-NO_THINK_IPS = {ip.strip() for ip in os.environ.get("SHIM_NO_THINK_IPS", "").split(",") if ip.strip()}
+NO_THINK_IPS = set(_parse_seq(os.environ.get("SHIM_NO_THINK_IPS", ""), _CFG_SEP["SHIM_NO_THINK_IPS"]))
 
 
 # ---------------- live config (editable from the dashboard, no restart) ----------------
@@ -212,6 +307,7 @@ _CFG = {
     "SHIM_REMOTE_KEY":       ("REMOTE_KEY",   str),
     "SHIM_REMOTE_MODEL":     ("REMOTE_MODEL", str),
     "SHIM_FORCE_REMOTE":     ("FORCE_REMOTE", lambda v: 1 if str(v).lower() in ("1","true","on") else 0),
+    "SHIM_LOCAL_ONLY":       ("LOCAL_ONLY",   lambda v: 1 if str(v).lower() in ("1","true","on") else 0),
     # local capacity
     "SHIM_LOCAL_BUDGET":     ("BUDGET",       int),
     "SHIM_LOCAL_WAIT_SECS":  ("LOCAL_WAIT",   float),
@@ -231,7 +327,7 @@ _CFG = {
     "SHIM_TINY_EXTRA_LANES": ("TINY_EXTRA_LANES", int),
     "SHIM_FG_RESERVED":      ("FG_RESERVED",      int),
     "SHIM_BG_BIG_LOCAL_WHEN_IDLE": ("BG_BIG_LOCAL_WHEN_IDLE", int),
-    "SHIM_BG_XCLIENTS":      ("BG_XCLIENTS", lambda v: [m.strip().lower() for m in str(v).split(",") if m.strip()]),
+    "SHIM_BG_XCLIENTS":      ("BG_XCLIENTS", lambda v: [m.lower() for m in _parse_seq(v, _CFG_SEP["SHIM_BG_XCLIENTS"])]),
     "SHIM_POOL_TOKENS":      ("POOL_TOKENS",      int),
     "SHIM_BG_WAIT_SECS":     ("BG_WAIT",          float),
     "SHIM_BG_MARKERS":       ("BG_MARKERS", lambda v: [m for m in str(v).split("|") if m]),
@@ -252,7 +348,7 @@ _CFG = {
     "SHIM_THINK_BUDGET_MAX": ("THINK_BUDGET_MAX", int),
     "SHIM_THINK_OFF_UNDER":  ("THINK_OFF_UNDER", int),
     "SHIM_THINK_LOW_UNDER":  ("THINK_LOW_UNDER", int),
-    "SHIM_NO_THINK_IPS":     ("NO_THINK_IPS", lambda v: {i.strip() for i in str(v).split(",") if i.strip()}),
+    "SHIM_NO_THINK_IPS":     ("NO_THINK_IPS", lambda v: set(_parse_seq(v, _CFG_SEP["SHIM_NO_THINK_IPS"]))),
     "SHIM_LOG_REQUESTS":     ("LOG_REQUESTS", lambda v: str(v).lower() not in ("0","false","")),
     # non-thinking sampling profile (EXP-026)
     "SHIM_NONTHINK_PROFILE": ("NONTHINK_PROFILE", lambda v: str(v).lower() not in ("0","false","")),
@@ -343,6 +439,30 @@ _waiting  = 0           # requests currently blocked in the queue-first wait loo
 _backoff_until = 0.0
 _health = {"ok": False, "at": 0.0}
 REMOTE_ENABLED = bool(REMOTE_BASE and REMOTE_KEY)
+
+
+def remote_ok():
+    """May this request overflow to the PAID remote at all?
+
+    One question, one place. FULL LOCAL (Kevin 2026-09-10) is exactly "the answer is no,
+    for every request" -- so every routing decision asks this rather than reading
+    REMOTE_ENABLED itself, and a request that would have overflowed waits for a local lane
+    instead (the queue-first wait loop already treats "no remote" as an unbounded deadline).
+    Reading the globals live is deliberate: both flags are hot-reloadable from the dashboard,
+    so the mode changes without a restart and without dropping in-flight work."""
+    return bool(REMOTE_ENABLED) and not LOCAL_ONLY
+
+
+def routing_mode():
+    """The dashboard's three states, derived from the same two flags the router uses so the
+    badge can never disagree with the behaviour."""
+    if LOCAL_ONLY:
+        return "full_local"
+    if REMOTE_ENABLED and FORCE_REMOTE:
+        return "full_remote"
+    return "local_first"
+
+
 STATS_FILE = os.environ.get("SHIM_STATS_FILE", "/home/kevin/.local/share/vllm-qwen27b/gateway-stats.json")
 
 # ---------------- live metrics (for the /gateway/dashboard status page) ----------------
@@ -1368,14 +1488,20 @@ def current_config(masked=True):
     for env, (gname, _) in _CFG.items():
         field = env.lower().replace("shim_", "")
         v = g[gname]
-        if isinstance(v, (set, list)):
-            v = ",".join(sorted(v)) if isinstance(v, set) else "|".join(v)
+        if isinstance(v, (set, frozenset, list, tuple)):
+            # Same separator table the env-file writer uses. This value is rendered straight
+            # into the dashboard form, which POSTs it back into apply_config -- so if the two
+            # ever disagree again, merely opening the page and pressing Save re-corrupts the
+            # field. That is precisely how no_think_ips died.
+            v = _fmt_seq(v, _CFG_SEP.get(env, _CFG_SEP_DEFAULT))
         elif isinstance(v, bool):
             v = 1 if v else 0
         out[field] = v
     k = g["REMOTE_KEY"]
     out["remote_key_display"] = ("set (" + k[:5] + "\u2026" + k[-4:] + ")") if (masked and k and len(k) > 12) else ("set" if k else "")
     out["remote_key_set"] = bool(k)
+    out["admin_token_set"] = bool(SHIM_ADMIN_TOKEN)  # dashboard auth-state badge (never the value itself)
+    out["mode"] = routing_mode()  # the three-way badge reads this, never its own guess
     if masked:
         out.pop("remote_key", None)
     return out
@@ -1396,14 +1522,51 @@ def apply_config(fields):
         except Exception as e:
             log.warning("config: bad value for %s: %r (%s)", fk, val, e)
     g["REMOTE_ENABLED"] = bool(g["REMOTE_BASE"] and g["REMOTE_KEY"])
-    if changed:
+    if changed and _config_owner():
         _persist_config()
     return changed
+
+def _config_owner():
+    """May THIS process rewrite SHIM_ENV_FILE?
+
+    Learned the hard way 2026-09-10: a second shim started for a smoke test on another port
+    inherited none of the production env, so its globals were library DEFAULTS -- and its first
+    dashboard POST called _persist_config(), which rewrites the WHOLE file from those globals.
+    It silently replaced the tuned production values (lane budget 14 -> 2) and emptied the
+    remote base+key; the next restart of the real service loaded them.
+
+    Ownership test: a process that actually loaded this env file agrees with most of what is in
+    it. A foreign process does not. Refusing to write is always safe (the operator's live change
+    still applies in memory, it just does not outlive a restart), while writing when we are not
+    the owner destroys a hand-tuned production config."""
+    path = SHIM_ENV_FILE
+    try:
+        with open(path) as fh:
+            rows = [l.strip().split("=", 1) for l in fh if l.strip() and not l.startswith("#") and "=" in l]
+    except OSError:
+        return True                      # no file yet -> we are creating it
+    tunable = [(k, v) for k, v in rows if k in _CFG]
+    if not tunable:
+        return True
+    agree = sum(1 for k, v in tunable if str(os.environ.get(k, "\0")) == v)
+    ok = agree >= max(1, int(0.6 * len(tunable)))
+    if not ok:
+        log.error("_persist_config REFUSED: this process matches only %d/%d tunables in %s, so it did "
+                  "not load that file and must not rewrite it (a foreign instance once clobbered the "
+                  "production gateway config this way). Live change applied in memory only.",
+                  agree, len(tunable), path)
+    return ok
+
 
 def _persist_config():
     """Rewrite SHIM_ENV_FILE with current tunable values (atomic, mode 600)."""
     g = globals()
-    vals = {env: ("|".join(str(x) for x in g[gname]) if isinstance(g[gname], (list, tuple, set)) else str(g[gname]))
+    # Each sequence field is written with ITS OWN separator (_CFG_SEP), not a single global
+    # one. The old unconditional "|".join is what killed NO_THINK_IPS and BG_XCLIENTS: both
+    # are read back with a comma split, so every save handed the reader one unsplittable
+    # token and the policy silently stopped matching anything.
+    vals = {env: (_fmt_seq(g[gname], _CFG_SEP.get(env, _CFG_SEP_DEFAULT))
+                  if isinstance(g[gname], (list, tuple, set, frozenset)) else str(g[gname]))
             for env, (gname, _) in _CFG.items()}
     try:
         lines, seen = [], set()
@@ -1660,6 +1823,41 @@ def strip_thinking(body):
     ctk["enable_thinking"] = False
     j["chat_template_kwargs"] = ctk
     return json.dumps(j).encode()
+
+
+def _no_think_policy(request, background):
+    """Should chain-of-thought be stripped for this LOCAL request?
+
+    Two triggers, unchanged: a background request when BG_NO_THINK is on, or a client IP in
+    NO_THINK_IPS. Extracted 2026-09-09 only so both local lanes ask the SAME question -- see
+    _prepare_local_body.
+    """
+    return bool((background and BG_NO_THINK)
+                or (getattr(request, "remote", None) in NO_THINK_IPS))
+
+
+def _prepare_local_body(request, body, background):
+    """The one and only body transform for a request being sent to the LOCAL engine.
+
+    2026-09-09. This chain used to be written out twice -- once on the main admission path and
+    once in the TINY fast-lane -- and the two copies drifted: the tiny copy applied
+    bound_local_output/thinking_budget_guard/nonthinking_sampling_profile/repetition_guard but
+    never strip_thinking. So the entire no-think policy (NO_THINK_IPS *and* the background
+    trigger) was silently skipped for every call small enough to take the fast lane, which is
+    most of the traffic the policy exists for: the listed hosts are precisely the ones firing
+    short status turns under TINY_TOKENS.
+
+    Measured on the live gateway before this fix, same prompt, same minute:
+        main lane, from 10.0.1.10  -> reasoning_content None      (policy applied)
+        TINY lane, from 10.0.1.10  -> reasoning_content 114 chars (policy skipped)
+
+    Duplication was the mechanism, so the fix is one function rather than a corrected copy.
+    test_no_think_ips.py asserts the chain appears exactly once in this file.
+    """
+    prepared = repetition_guard(nonthinking_sampling_profile(thinking_budget_guard(bound_local_output(body))))
+    if _no_think_policy(request, background):
+        prepared = strip_thinking(prepared)
+    return prepared
 
 
 def _is_empty_thinking_response(resp):
@@ -2274,7 +2472,7 @@ async def _note_remote_response(request, payload, body):
 
 
 async def _forward_remote(request, path, body, streaming):
-    if not REMOTE_ENABLED:
+    if not remote_ok():
         return web.json_response(
             {"error": {"message": "local unavailable and no remote overflow configured"}}, status=503)
     kind, payload = await _relay(request, REMOTE_BASE, path, remap_for_remote(body), REMOTE_KEY, streaming)
@@ -2390,7 +2588,7 @@ async def _route_completions(request):
                  model_req, ptok, maxtok, streaming, tiny, background, _preview(body))
 
     # MASTER SWITCH: full-remote mode (maintenance/debug) — everything -> DeepSeek
-    if REMOTE_ENABLED and FORCE_REMOTE:
+    if remote_ok() and FORCE_REMOTE:
         # BG-LOCAL-ONLY: a maintenance window is a deliberate, operator-chosen full-remote
         # mode -- not a transient outage worth waiting out -- so background traffic is
         # REJECTED immediately (no wait, no paid remote) rather than held or forwarded.
@@ -2409,21 +2607,21 @@ async def _route_completions(request):
     local_pin = "local-pin" in (request.headers.get("X-Client") or "").lower()
 
     # size cap: too-big-for-this-box requests OOM local even at budget=1 -> send straight to remote
-    if REMOTE_ENABLED and not local_pin and over_local_cap(body):
+    if remote_ok() and not local_pin and over_local_cap(body):
         log.info("route %s est prompt+max > %d -> remote(size)", path, MAX_LOCAL_TOKENS)
         record_event("remote", "size", request, units, 0, **ev)
         return await _forward_remote(request, path, body, streaming)
 
     # big-OUTPUT requests (e.g. Hermes max_tokens=65536): long generations that saturate this slow
     # box and hang interactive clients -> straight to remote (DeepSeek serves them far faster).
-    if REMOTE_ENABLED and not local_pin and BIG_OUTPUT > 0 and maxtok >= BIG_OUTPUT:
+    if remote_ok() and not local_pin and BIG_OUTPUT > 0 and maxtok >= BIG_OUTPUT:
         log.info("route %s maxtok=%d >= %d -> remote(big-out)", path, maxtok, BIG_OUTPUT)
         record_event("remote", "big-out", request, units, 0, **ev)
         return await _forward_remote(request, path, body, streaming)
 
     # big-PROMPT requests (e.g. a pi session whose context has grown huge): can't prefill within the
     # first-token cap on this slow box and would saturate/OOM local -> straight to remote up front.
-    if REMOTE_ENABLED and not local_pin and BIG_PROMPT > 0 and ptok >= BIG_PROMPT:
+    if remote_ok() and not local_pin and BIG_PROMPT > 0 and ptok >= BIG_PROMPT:
         log.info("route %s ptok=%d >= %d -> remote(big-prompt)", path, ptok, BIG_PROMPT)
         record_event("remote", "big-prompt", request, units, 0, **ev)
         return await _forward_remote(request, path, body, streaming)
@@ -2432,7 +2630,7 @@ async def _route_completions(request):
     # UNLESS this is background traffic under BG_LOCAL_ONLY: hold it and poll for recovery
     # instead (background can wait; it must never pay for remote to cover an engine restart).
     if not await local_healthy():
-        if background and BG_LOCAL_ONLY and REMOTE_ENABLED:
+        if background and BG_LOCAL_ONLY and remote_ok():
             _active_set(request, phase="held")
             held_deadline = time.time() + BG_WAIT_LOCAL
             held_waited = 0.0
@@ -2451,7 +2649,7 @@ async def _route_completions(request):
             # FALL THROUGH: local is healthy again, so every check below (monster bypass, tiny
             # fast-lane, admission wait, relay) runs exactly as it would have if
             # local_healthy() had returned True on the very first check above.
-        elif REMOTE_ENABLED:
+        elif remote_ok():
             log.info("route %s local unhealthy -> remote(local-down)", path)
             record_event("remote", "local-down", request, units, 0, **ev)
             return await _forward_remote(request, path, body, streaming)
@@ -2460,7 +2658,7 @@ async def _route_completions(request):
     # now would crawl (~1 tok per chunk-step). Route new arrivals remote until it drains.
     _foreign = _health.get("foreign", 0) if FOREIGN_LOAD_GUARD else 0
     _foreign_heavy = bool(_health.get("foreign_heavy", False)) if FOREIGN_LOAD_GUARD else False
-    if REMOTE_ENABLED and not local_pin and (
+    if remote_ok() and not local_pin and (
         (MONSTER_INFLIGHT > 0 and _inflight_tokens >= MONSTER_INFLIGHT)
         or _foreign_heavy
     ):
@@ -2481,10 +2679,13 @@ async def _route_completions(request):
                      path, units, _inflight, effective_budget(), TINY_EXTRA_LANES)
             _active_set(request, phase="local", route="local")
             try:
-                # tiny fast-lane needs the same thinking guard as the main path: these are
-                # exactly the small-max_tokens calls that get starved to an empty response.
+                # tiny fast-lane needs the same body preparation as the main path: these are
+                # exactly the small-max_tokens calls that get starved to an empty response,
+                # AND (2026-09-09) they are most of the traffic NO_THINK_IPS is meant to
+                # cover. It used to inline its own copy of the chain and omitted
+                # strip_thinking, so the no-think policy was dead on this lane specifically.
                 kind, payload = await _relay(request, LOCAL, path,
-                                             repetition_guard(nonthinking_sampling_profile(thinking_budget_guard(bound_local_output(body)))),
+                                             _prepare_local_body(request, body, background),
                                              None, streaming, concurrency=1)
                 if kind == "ok":
                     _note_payload_outcome(request, payload, streaming)   # TELEMETRY
@@ -2500,7 +2701,7 @@ async def _route_completions(request):
             finally:
                 _inflight -= units
                 _inflight_tokens -= ptok
-        elif REMOTE_ENABLED:
+        elif remote_ok():
             log.info("route %s TINY inflight=%d/%d(+%d) full -> remote(tiny-fast)",
                      path, _inflight, effective_budget(), TINY_EXTRA_LANES)
             record_event("remote", "tiny-fast", request, units, 0, **ev)
@@ -2515,10 +2716,10 @@ async def _route_completions(request):
     if background:
         lane_limit = max(1, effective_budget() - FG_RESERVED)
         _bgw = LOCAL_WAIT if is_peak() else BG_WAIT   # peak: bias bg toward local queueing
-        deadline = time.time() + (_bgw if REMOTE_ENABLED else 1e9)
+        deadline = time.time() + (_bgw if remote_ok() else 1e9)
     else:
         lane_limit = effective_budget()
-        deadline = time.time() + (LOCAL_WAIT if REMOTE_ENABLED else 1e9)
+        deadline = time.time() + (LOCAL_WAIT if remote_ok() else 1e9)
     admitted = False
     _local_reason = "-"      # "bg-big-idle" when the idle-engine rule admitted a big background request
     admitted_conc = 1        # local concurrency at admission -> scales the first-token deadline
@@ -2562,7 +2763,7 @@ async def _route_completions(request):
             reason = "bg-yield"      # lanes exist but are reserved for interactive
         else:
             reason = "cap"
-        where = f"remote({reason})" if REMOTE_ENABLED else "remote(none)"
+        where = f"remote({reason})" if remote_ok() else "remote(none)"
         log.info("route %s units=%d inflight=%d/%d tok=%d/%d waited=%.1fs -> %s",
                  path, units, _inflight, effective_budget(), _inflight_tokens, TOKEN_BUDGET, waited, where)
         if queued:
@@ -2586,9 +2787,7 @@ async def _route_completions(request):
         except Exception as e:
             log.warning("flightrec: %s", e)
     try:
-        _lb = repetition_guard(nonthinking_sampling_profile(thinking_budget_guard(bound_local_output(body))))
-        if (background and BG_NO_THINK) or (getattr(request, "remote", None) in NO_THINK_IPS):
-            _lb = strip_thinking(_lb)
+        _lb = _prepare_local_body(request, body, background)
         kind, payload = await _relay(request, LOCAL, path, _lb, None, streaming, concurrency=admitted_conc)
         if kind == "ok":
             _note_payload_outcome(request, payload, streaming)   # TELEMETRY (see DESIGN.md (c))
@@ -2667,7 +2866,7 @@ async def h_health(request):
     strict behaviour."""
     if await local_healthy():
         return web.Response(text="OK")
-    if REMOTE_ENABLED and REMOTE_BASE:
+    if remote_ok() and REMOTE_BASE:
         return web.Response(text="DEGRADED: local down, serving via remote")
     return web.Response(status=503, text="local down, no remote configured")
 
@@ -2697,6 +2896,7 @@ async def gateway_stats(request):
         "inflight_tokens": _inflight_tokens, "token_budget": TOKEN_BUDGET,
         "backoff": max(0, int(_backoff_until - time.time())),
         "remote_model": REMOTE_MODEL, "remote_enabled": REMOTE_ENABLED,
+        "local_only": bool(LOCAL_ONLY), "mode": routing_mode(),
         "local_wait": LOCAL_WAIT,
         "monster_inflight": MONSTER_INFLIGHT,
         "total": _stats["total"], "local": _stats["local"], "remote": _stats["remote"],
@@ -3845,17 +4045,23 @@ async def gateway_dashboard(request):
 DASHBOARD_HTML = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><title>vLLM Gateway</title>
 <style>
-:root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--dim:#8b949e;--grn:#3fb950;--amb:#d29922;--red:#f85149;--blu:#58a6ff;--hover:#1c2129}
+:root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--dim:#8b949e;--grn:#3fb950;--amb:#d29922;--red:#f85149;--blu:#58a6ff;--acc:#a371f7;--hover:#1c2129}
+@media (prefers-color-scheme:light){
+ :root{--bg:#f6f8fa;--card:#ffffff;--bd:#d0d7de;--fg:#1f2328;--dim:#57606a;--grn:#1a7f37;--amb:#9a6700;--red:#cf222e;--blu:#0969da;--acc:#8250df;--hover:#eef1f4}
+}
 *{box-sizing:border-box}
 html,body{margin:0}
 body{background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Helvetica,Arial,sans-serif}
 .mono,.v,td.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
-.wrap{max-width:1200px;margin:0 auto;padding:0 16px 32px}
+.wrap{max-width:1280px;margin:0 auto;padding:0 16px 40px}
 .rz{color:var(--dim)}
 a{color:var(--blu);text-decoration:none}a:hover{opacity:.85}
+:focus-visible{outline:2px solid var(--blu);outline-offset:2px;border-radius:3px}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.001ms!important;transition-duration:.001ms!important}}
 
 /* header */
-header.top{position:sticky;top:0;z-index:5;background:rgba(13,17,23,.94);backdrop-filter:blur(8px);border-bottom:1px solid var(--bd);margin:0 -16px 12px;padding:10px 16px;display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px}
+header.top{position:sticky;top:0;z-index:6;background:rgba(13,17,23,.94);backdrop-filter:blur(8px);border-bottom:1px solid var(--bd);margin:0 -16px 0;padding:10px 16px;display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px}
+@media (prefers-color-scheme:light){header.top{background:rgba(246,248,250,.94)}}
 header h1{font-size:15px;margin:0;font-weight:650;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .dot{display:inline-block;width:9px;height:9px;border-radius:50%;vertical-align:middle}
 .dot.up{background:var(--grn);box-shadow:0 0 6px var(--grn)}
@@ -3864,12 +4070,60 @@ header h1{font-size:15px;margin:0;font-weight:650;display:flex;align-items:cente
 .stamp{font-size:11px;padding:2px 9px;border-radius:10px;font-weight:600}
 .stamp.local{background:rgba(63,185,80,.2);color:var(--grn)}
 .stamp.remote{background:rgba(210,153,34,.25);color:var(--amb)}
+.stamp.locked{background:rgba(88,166,255,.22);color:var(--acc)}
+.seg{display:inline-flex;gap:0;border:1px solid var(--bd);border-radius:8px;overflow:hidden;margin-left:4px}
+.segbtn{background:transparent;border:0;border-right:1px solid var(--bd);color:var(--dim);font:inherit;font-size:11px;
+ font-weight:600;letter-spacing:.02em;padding:3px 10px;cursor:pointer}
+.segbtn:last-child{border-right:0}
+.segbtn:hover{background:var(--hover)}
+.segbtn.on{background:rgba(63,185,80,.22);color:var(--grn)}
+.segbtn.on[data-mode=full_remote]{background:rgba(210,153,34,.25);color:var(--amb)}
+.segbtn.on[data-mode=full_local]{background:rgba(88,166,255,.22);color:var(--acc)}
 button.ghost{background:transparent;color:var(--dim);border:1px solid var(--bd);font-weight:500;padding:4px 10px;font-size:12px;border-radius:6px;cursor:pointer}
 button.ghost:hover{color:var(--fg);background:var(--hover)}
+button.ghost.on{color:var(--blu);border-color:var(--blu)}
 button.primary{background:var(--blu);color:#04101f;border:0;border-radius:6px;padding:7px 16px;font-weight:600;cursor:pointer;font-size:13px}
 button.primary:hover{opacity:.92}
+.consequence{width:100%;font-size:11.5px;color:var(--dim);padding:2px 0 0}
 
-/* native tooltips on every metric label + knob */
+/* auth badge */
+.authbadge{font-size:11px;padding:2px 8px;border-radius:10px;font-weight:600;cursor:default}
+.authbadge.on{background:rgba(63,185,80,.15);color:var(--grn)}
+.authbadge.off{background:rgba(248,81,73,.15);color:var(--red)}
+
+/* sub-header row: subtitle + glossary toggle */
+.subrow{display:flex;flex-wrap:wrap;align-items:baseline;gap:10px;font-size:12px;margin:10px 0 12px}
+
+/* glossary */
+#glossary{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:10px 14px;margin-bottom:12px;font-size:12.5px}
+#glossary dl{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:6px 18px;margin:6px 0 0}
+#glossary dt{color:var(--fg);font-weight:600;display:inline}
+#glossary dd{color:var(--dim);display:inline;margin:0 0 0 4px}
+#glossary .row{margin:0}
+
+/* global banner (errors + backoff + estate alert, consolidated) */
+#banner{display:flex;flex-direction:column;gap:6px;margin:10px 0}
+.bnln{padding:8px 12px;border-radius:8px;font-size:12.5px;display:flex;gap:8px;align-items:baseline}
+.bnln.err{background:rgba(248,81,73,.12);border:1px solid rgba(248,81,73,.4)}
+.bnln.warn{background:rgba(210,153,34,.12);border:1px solid rgba(210,153,34,.4)}
+.bnln b.src{font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;color:var(--dim);flex:none}
+
+/* right-now summary strip */
+#now_summary{display:flex;flex-wrap:wrap;gap:14px 22px;align-items:baseline;background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:10px 16px;margin:12px 0;font-size:13px}
+#now_summary b{font-size:17px;font-variant-numeric:tabular-nums}
+#now_summary .lbl{color:var(--dim);font-size:11.5px;text-transform:uppercase;letter-spacing:.04em;margin-left:4px}
+#longest{font-size:12px;color:var(--amb);margin-top:2px}
+
+/* tab bar */
+.tabbar{display:flex;gap:4px;border-bottom:1px solid var(--bd);margin:6px 0 14px;flex-wrap:wrap}
+.tabbtn{background:transparent;border:0;border-bottom:2px solid transparent;color:var(--dim);font:inherit;font-size:13.5px;font-weight:600;padding:8px 14px 9px;cursor:pointer;margin-bottom:-1px}
+.tabbtn:hover{color:var(--fg)}
+.tabbtn.on{color:var(--fg);border-bottom-color:var(--blu)}
+.tabbtn .n{background:#21262d;border-radius:9px;padding:0 6px;font-size:10.5px;margin-left:6px;color:var(--dim)}
+.tabpane{display:none}
+.tabpane.on{display:block}
+
+/* native tooltips on every metric label + knob (secondary reinforcement; text is never hover-only) */
 abbr[title]{text-decoration:none;border-bottom:1px dotted var(--dim);cursor:help}
 
 /* live-health strip */
@@ -3880,7 +4134,7 @@ abbr[title]{text-decoration:none;border-bottom:1px dotted var(--dim);cursor:help
 .tile .v small{font-size:12px;color:var(--dim);font-weight:400}
 .tile .sub{color:var(--dim);font-size:11.5px;margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
-/* collapsible sections */
+/* collapsible sections (still used inside tabs for optional/secondary content) */
 details.sec{background:var(--card);border:1px solid var(--bd);border-radius:10px;margin:10px 0;overflow:hidden}
 details.sec>summary{list-style:none;padding:11px 14px;cursor:pointer;display:flex;align-items:center;gap:10px;font-size:14px;font-weight:600;color:var(--fg);user-select:none;flex-wrap:wrap}
 details.sec>summary::-webkit-details-marker{display:none}
@@ -3888,6 +4142,9 @@ details.sec>summary::after{content:'\25B8';margin-left:auto;color:var(--dim);fon
 details.sec[open]>summary::after{transform:rotate(90deg)}
 details.sec>summary .sub{color:var(--dim);font-size:12px;font-weight:400}
 details.sec>.body{padding:0 14px 14px;border-top:1px solid var(--bd);padding-top:12px}
+h2.h{font-size:14px;font-weight:600;margin:18px 0 8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+h2.h .sub{color:var(--dim);font-size:12px;font-weight:400}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px 14px;margin:10px 0}
 
 /* meter/bar */
 .bar{height:8px;border-radius:4px;background:#21262d;overflow:hidden;display:flex;margin-top:8px}
@@ -3898,7 +4155,11 @@ details.sec>.body{padding:0 14px 14px;border-top:1px solid var(--bd);padding-top
 .tw{overflow-x:auto}
 table{width:100%;border-collapse:collapse;font-size:12.5px}
 th{text-align:left;color:var(--dim);font-weight:500;padding:6px 8px;border-bottom:1px solid var(--bd);white-space:nowrap}
+th.sortable{cursor:pointer;user-select:none}
+th.sortable:hover{color:var(--fg)}
+th.sortable .arrow{display:inline-block;width:9px;color:var(--blu);font-size:10px}
 td{padding:6px 8px;border-bottom:1px solid #21262d;white-space:nowrap}
+@media (prefers-color-scheme:light){td{border-bottom-color:#e7ebee}}
 
 /* tags + badges */
 .tag{padding:1px 7px;border-radius:10px;font-size:11px;font-weight:600}
@@ -3911,20 +4172,24 @@ td{padding:6px 8px;border-bottom:1px solid #21262d;white-space:nowrap}
 .badge.warn{color:var(--amb);background:rgba(210,153,34,.14)}
 .badge.run{color:var(--blu);background:rgba(88,166,255,.14)}
 .badge.err{color:var(--red);background:rgba(248,81,73,.14)}
+.badge.kind{color:var(--acc);background:rgba(163,113,247,.15);text-transform:uppercase;font-size:9.5px;letter-spacing:.03em}
 
 /* task rows */
 .tasks{display:flex;flex-direction:column}
 .task{display:grid;grid-template-columns:12px minmax(0,1fr) auto;gap:10px;align-items:start;padding:6px 8px;border-radius:6px;text-decoration:none;color:inherit}
 a.task:hover,.task.hov:hover{background:var(--hover)}
-.sq{width:9px;height:9px;border-radius:2px;margin-top:6px;background:#484f58;display:inline-block;flex:none;transition:opacity .22s ease-in-out}
-.sq.run{background:var(--blu)}.bk .sq.run{opacity:.12}
+.sq{width:9px;height:9px;border-radius:2px;margin-top:6px;background:#484f58;display:inline-block;flex:none}
+.sq.run{background:var(--blu);animation:sqpulse 1.3s ease-in-out infinite}
+@keyframes sqpulse{0%,100%{opacity:1}50%{opacity:.25}}
 .sq.done{background:var(--grn)}.sq.blocked{background:var(--red)}
-.sq.stale{background:var(--amb)}.bk .sq.stale{opacity:.3}
-.sq.queued{background:transparent;border:1.5px solid #8b949e}.sq.empty{background:#30363d}
+.sq.stale{background:var(--amb)}
+.sq.queued{background:transparent;border:1.5px solid var(--dim)}.sq.empty{background:#30363d}
 .tname{font-weight:600;line-height:1.35;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;word-break:break-word}
 .tstat{color:var(--dim);font-size:12.5px;margin-top:2px;word-break:break-word;white-space:normal}
 .tmeta{color:var(--dim);font-size:12px;white-space:nowrap;text-align:right;line-height:1.35;padding-top:1px}
 .tmeta b{color:var(--fg);font-weight:600}
+.role{color:var(--fg)}
+.rawid{color:var(--dim);font-size:11px}
 
 /* group headers inside a section */
 .thead{display:flex;align-items:center;gap:8px;margin:14px 0 4px;color:var(--dim);font-size:11.5px;text-transform:uppercase;letter-spacing:.05em;flex-wrap:wrap}
@@ -3941,42 +4206,61 @@ a.task:hover,.task.hov:hover{background:var(--hover)}
 
 /* tools row */
 .tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:4px 0 8px}
-.tools input[type=text]{background:#0d1117;border:1px solid var(--bd);color:var(--fg);border-radius:6px;padding:5px 9px;font-size:12.5px;min-width:180px}
+.tools input[type=text]{background:var(--bg);border:1px solid var(--bd);color:var(--fg);border-radius:6px;padding:5px 9px;font-size:12.5px;min-width:180px}
 .tools label{display:flex;align-items:center;gap:6px;color:var(--dim);font-size:12px}
-.tools select{background:#0d1117;border:1px solid var(--bd);color:var(--fg);border-radius:6px;padding:3px 7px;font-size:12px}
+.tools select{background:var(--bg);border:1px solid var(--bd);color:var(--fg);border-radius:6px;padding:3px 7px;font-size:12px}
+.chip{background:transparent;border:1px solid var(--bd);color:var(--dim);border-radius:14px;padding:3px 11px;font-size:12px;cursor:pointer;font-weight:600}
+.chip:hover{color:var(--fg);background:var(--hover)}
+.chip.on{background:rgba(88,166,255,.16);color:var(--blu);border-color:var(--blu)}
 
 /* config form */
-form.cfg .row{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px 14px}
+form.cfg .row{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px 14px}
 form.cfg label{display:flex;flex-direction:column;gap:3px}
-form.cfg input,form.cfg select{background:#0d1117;border:1px solid var(--bd);color:var(--fg);border-radius:6px;padding:6px 9px;font-size:13px;font-family:inherit}
+form.cfg input,form.cfg select{background:var(--bg);border:1px solid var(--bd);color:var(--fg);border-radius:6px;padding:6px 9px;font-size:13px;font-family:inherit}
 form.cfg input:focus,form.cfg select:focus{outline:none;border-color:var(--blu)}
-form.cfg .k{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.05em}
+form.cfg .k{color:var(--fg);font-size:12.5px;font-weight:500}
+form.cfg .hint{color:var(--dim);font-size:11px;font-weight:400}
+.fieldflash{animation:flash 1.6s ease-out}
+@keyframes flash{0%{background:rgba(88,166,255,.25)}100%{background:transparent}}
 
 /* sparklines */
 .spark{width:100%;height:56px;display:block;overflow:visible}
 .spark polyline{fill:none;stroke-width:1.6;vector-effect:non-scaling-stroke}
 .s1{stroke:var(--blu)}.s2{stroke:var(--amb)}.s3{stroke:var(--grn)}
 .spark-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px;margin-top:8px}
-.spark-cell{background:#0d1117;border:1px solid var(--bd);border-radius:8px;padding:10px 12px}
+.spark-cell{background:var(--bg);border:1px solid var(--bd);border-radius:8px;padding:10px 12px}
 .telemwrap{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:2px;gap:6px;flex-wrap:wrap}
 .telemwrap .legend{font-size:11px;color:var(--dim)}
 .l1{color:var(--blu)}.l2{color:var(--amb)}.l3{color:var(--grn)}
+.sparkfoot{font-size:11px;color:var(--dim);margin-top:3px}
 
 /* details.tail (used inside task rows) */
 details.tail summary{cursor:pointer;color:var(--dim);font-size:12px;list-style:none}
 details.tail summary::-webkit-details-marker{display:none}
-details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pre-wrap;background:#0d1117;border:1px solid var(--bd);border-radius:6px;padding:8px}
+details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pre-wrap;background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:8px}
 
 /* windows cards */
-.wcard{background:#0d1117;border:1px solid var(--bd);border-radius:8px;padding:10px 12px;margin-bottom:8px}
+.wcard{background:var(--bg);border:1px solid var(--bd);border-radius:8px;padding:10px 12px;margin-bottom:8px}
 .armwrap{overflow-x:auto}
 .armtbl{margin:6px 0 0;width:100%}
 .armtbl th,.armtbl td{padding:3px 6px;font-size:11.5px;white-space:nowrap}
 
+/* reason -> knob explainer rows */
+.reasonrow{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:baseline;padding:8px 0;border-bottom:1px solid #21262d}
+@media (prefers-color-scheme:light){.reasonrow{border-bottom-color:#e7ebee}}
+.reasonrow:last-child{border-bottom:0}
+.reasonrow .rtitle{font-weight:600}
+.reasonrow .rwhy{color:var(--dim);font-size:12.5px;margin-top:2px}
+.reasonrow .rfix{color:var(--acc);font-size:12px;margin-top:3px}
+.reasonrow .rcount{text-align:right;white-space:nowrap}
+.reasonrow .rcount b{font-size:16px}
+.rbar{height:5px;border-radius:3px;background:#21262d;margin-top:6px;overflow:hidden}
+.rbar i{display:block;height:100%;background:var(--amb)}
+
 /* mobile */
 @media(max-width:640px){
   .wrap{padding:0 12px 32px}
-  header.top{margin:0 -12px 12px;padding:10px 12px}
+  header.top{margin:0 -12px;padding:10px 12px}
   header h1{font-size:14px}
   details.sec>summary{padding:11px 12px;font-size:13.5px}
   details.sec>.body{padding:0 12px 12px;padding-top:12px}
@@ -3984,6 +4268,8 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
   .tile .v{font-size:19px}
   .strip{grid-template-columns:repeat(auto-fit,minmax(140px,1fr))}
   .pager{margin-left:0;margin-top:4px}
+  .reasonrow{grid-template-columns:1fr}
+  .reasonrow .rcount{text-align:left}
 }
 </style></head><body><div class=wrap>
 
@@ -3992,140 +4278,146 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
   <span id=live class="dot down" title="Overall gateway status. Green = live, red = last poll failed."></span>
   vLLM Gateway
   <span id=modebadge class=stamp title="Routing mode">...</span>
-  <button id=modebtn class=ghost>Toggle</button>
+  <span id=modeseg class=seg>
+   <button class=segbtn data-mode=local_first>LOCAL FIRST</button>
+   <button class=segbtn data-mode=full_remote>FULL REMOTE</button>
+   <button class=segbtn data-mode=full_local>FULL LOCAL</button>
+  </span>
+  <span id=authbadge class=authbadge title="Whether POST /gateway/config and POST /gateway/models/local require the X-Admin-Token header.">...</span>
  </h1>
  <span class=rz id=updated style="margin-left:auto;font-size:12px">connecting...</span>
- <span id=err class=rz style="color:var(--red);font-size:12px"></span>
+ <div class=consequence id=modeconsequence></div>
 </header>
 
-<div class=rz style="font-size:12px;margin-bottom:12px">
- <abbr title="This gateway listens on :8000 and forwards to the local vLLM engine on :8001. It queues, serialises, and (when local is full) overflows to a paid remote provider.">:8000 capacity-routing gateway</abbr>
- &rarr; local engine :8001 &middot; overflow provider <b id=rm class=mono>--</b>
+<div class=subrow>
+ <span class=rz><abbr title="This gateway listens on :8000 and forwards to the local vLLM engine on :8001. It queues, serialises, and (when local is full) overflows to a paid remote provider.">:8000 capacity-routing gateway</abbr> &rarr; local engine :8001 &middot; overflow provider <b id=rm class=mono>--</b></span>
+ <button class=chip id=glossary_btn type=button>? Glossary</button>
 </div>
 
-<!-- Live health strip -->
+<div id=glossary hidden>
+ <b>Glossary</b> &mdash; every term used on this page, in one place (not hover-only).
+ <dl>
+  <div class=row><dt>Lane</dt><dd>one concurrent request slot on the local engine. "Budget" = how many lanes exist.</dd></div>
+  <div class=row><dt>TTFT</dt><dd>time to first token &mdash; how long before streaming starts.</dd></div>
+  <div class=row><dt>TPOT / inter-token latency</dt><dd>seconds between output tokens once streaming has started.</dd></div>
+  <div class=row><dt>KV-cache %</dt><dd>how full the engine's attention-cache memory is.</dd></div>
+  <div class=row><dt>ctx</dt><dd>context &mdash; total prompt+output tokens a request occupies while in flight.</dd></div>
+  <div class=row><dt>prefill</dt><dd>the engine reading your prompt, before it can generate the first token.</dd></div>
+  <div class=row><dt>OOM backoff</dt><dd>the local engine ran out of memory; the gateway holds off sending it new work for a bit.</dd></div>
+  <div class=row><dt>Serialize-solo</dt><dd>a request big enough that it claims the *entire* lane budget alone.</dd></div>
+  <div class=row><dt>Tiny fast-lane</dt><dd>very small requests get their own reserved headroom so they never queue behind big ones.</dd></div>
+  <div class=row><dt>Background</dt><dd>a request tagged (by user-agent or IP) as non-interactive &mdash; cron/batch traffic that waits less patiently and never blocks a human's turn.</dd></div>
+  <div class=row><dt>FULL REMOTE / FULL LOCAL</dt><dd>routing modes &mdash; see the tooltip on the mode buttons above.</dd></div>
+  <div class=row><dt>p50 / p95</dt><dd>median, then the worst 5% &mdash; a shorthand for "typical" vs "bad case".</dd></div>
+  <div class=row><dt>Evalkit score</dt><dd>an automated quality check on an engine-benchmark window's output, out of 45.</dd></div>
+  <div class=row><dt>Arm</dt><dd>one configuration variant being A/B-tested in a frontier-queue benchmark window.</dd></div>
+  <div class=row><dt>Pool</dt><dd>the KV-cache block pool size an arm was tested with.</dd></div>
+  <div class=row><dt>MTP</dt><dd>multi-token prediction &mdash; the engine's speculative-decoding scheme.</dd></div>
+  <div class=row><dt>Claims</dt><dd>research-job output: how many extracted claims survived verification, out of how many drafted.</dd></div>
+  <div class=row><dt>Degraded</dt><dd>a research job finished without enough usable evidence to trust.</dd></div>
+ </dl>
+</div>
+
+<div id=banner></div>
+
+<!-- Live health strip: always visible, whichever tab is open -->
 <div class=strip id=strip></div>
 
-<!-- Research & lanes (open) -->
-<details class=sec id=sec-tasks open>
- <summary>Research &amp; lanes <span class=sub>everything the local model is doing right now &middot; refreshes every 2 s</span></summary>
- <div class=body>
-  <div id=health_alert hidden style="margin:0 0 10px;padding:8px 12px;border-radius:8px;background:rgba(248,81,73,.12);border:1px solid rgba(248,81,73,.4);color:var(--fg);font-size:13px"></div>
+<div class=tabbar id=tabbar>
+ <button class="tabbtn on" data-tab=now>Now <span class=n id=tab_n_now>&middot;</span></button>
+ <button class=tabbtn data-tab=traffic>Traffic <span class=n id=tab_n_traffic>&middot;</span></button>
+ <button class=tabbtn data-tab=settings>Settings</button>
+</div>
 
-  <div class=thead>
-   <abbr title="Estate watchdog on 10.0.1.10, runs every 5 min. Each square is one check (green OK / amber WARN / red CRIT).">Health checks</abbr>
-   <span class=n id=n_health>...</span>
-   <span class="lg rz" id=health_line>loading...</span>
-  </div>
-  <div id=t_health style="display:flex;flex-wrap:wrap;gap:6px 14px;padding:4px 0 6px;font-size:12.5px"><span class=empty>loading...</span></div>
+<!-- ================= NOW ================= -->
+<div class="tabpane on" id=pane-now>
 
-  <div class=thead>
-   <abbr title="Requests currently being served or waiting on the local engine, one row per client.">Live requests</abbr>
-   <span class=n id=n_active>...</span>
-   <span class="lg rz" id=lane_line></span>
-   <span class=pager>
-    <button id=a_prev disabled>&lsaquo;</button>
-    <span class=lbl id=a_page>1/1</span>
-    <button id=a_next disabled>&rsaquo;</button>
-   </span>
-  </div>
-  <div class=tasks id=t_active><div class=empty>loading...</div></div>
+ <div id=now_summary>loading&hellip;</div>
+ <div id=longest hidden></div>
 
-  <div class=thead>
-   <abbr title="Long-running background workers that heartbeat via STATUS files under a lane root (see lanes.dirs).">Agent lanes</abbr>
-   <span class=n id=n_lanes>...</span>
-   <span class="lg rz">
-    <span class="sq run" style="margin-right:4px;vertical-align:-1px"></span>working
-    <span class="sq" style="background:var(--grn);margin:0 4px 0 8px;vertical-align:-1px"></span>done
-    <span class="sq" style="background:var(--red);margin:0 4px 0 8px;vertical-align:-1px"></span>blocked
-    <span class="sq" style="background:var(--amb);margin:0 4px 0 8px;vertical-align:-1px"></span>stale
-   </span>
-   <span class=pager>
-    <button id=l_prev disabled>&lsaquo;</button>
-    <span class=lbl id=l_page>1/1</span>
-    <button id=l_next disabled>&rsaquo;</button>
-   </span>
-  </div>
-  <div class=tasks id=t_lanes><div class=empty>loading...</div></div>
-
-  <div class=thead>
-   <abbr title="Engine-benchmark windows queued by the frontier-queue runner. Running one blocks the local engine; the gateway serves via remote overflow meanwhile.">Frontier queue</abbr>
-   <span class=n id=n_queue>...</span>
-   <span id=q_paused></span>
-   <span class=pager>
-    <button id=q_prev disabled>&lsaquo;</button>
-    <span class=lbl id=q_page>1/1</span>
-    <button id=q_next disabled>&rsaquo;</button>
-   </span>
-  </div>
-  <div class=tasks id=t_queue><div class=empty>loading...</div></div>
-
-  <div class=thead>
-   <abbr title="Deep-research jobs on the research service (:8790). Each job runs a multi-agent chain; click a row for the report.">Deep research</abbr>
-   <span class=n id=n_research>...</span>
-   <span id=r_counts class=lg></span>
-  </div>
-  <div class=tools>
-   <input type=text id=r_filter placeholder="filter research by keyword...">
-   <label><input type=checkbox id=r_hide0> hide jobs with 0 claims</label>
-   <span class=rz style="font-size:12px">click a job to open its report</span>
-   <span class=pager>
-    <button id=r_prev disabled>&lsaquo;</button>
-    <span class=lbl id=r_page>1/1</span>
-    <button id=r_next disabled>&rsaquo;</button>
-   </span>
-  </div>
-  <div class=tasks id=t_research><div class=empty>loading...</div></div>
-
-  <div id=t_err style="color:var(--red);font-size:12px;margin-top:6px"></div>
+ <div class=tools>
+  <span class=chip id=k_all data-k="" style="border-color:var(--blu);color:var(--blu)">All</span>
+  <span class=chip data-k=request>Requests</span>
+  <span class=chip data-k=lane>Agent lanes</span>
+  <span class=chip data-k=window>Windows</span>
+  <span class=chip data-k=research>Research</span>
+  <label><input type=checkbox id=n_showdone> include finished</label>
+  <span class=rz style="font-size:11.5px" id=n_state_legend></span>
+  <span class=pager>
+   <button id=n_prev disabled>&lsaquo;</button>
+   <span class=lbl id=n_page>1/1</span>
+   <button id=n_next disabled>&rsaquo;</button>
+  </span>
  </div>
-</details>
-
-<!-- Frontier windows -->
-<details class=sec id=sec-windows>
- <summary>Frontier windows <span class=sub>engine-benchmark windows: arms, evalkit, verdict &middot; refreshes every 10 s</span></summary>
- <div class=body>
-  <div class=tools>
-   <span class="lg rz" id=win_summary>loading...</span>
-   <span class=pager>
-    <button id=w_prev disabled>&lsaquo;</button>
-    <span class=lbl id=w_page>1/1</span>
-    <button id=w_next disabled>&rsaquo;</button>
-   </span>
-  </div>
-  <div id=windows_list><div class=empty>loading...</div></div>
-  <div id=win_err style="color:var(--red);font-size:12px;margin-top:6px"></div>
+ <div class=tw>
+  <table id=n_table>
+   <thead><tr>
+    <th></th>
+    <th class=sortable data-sort=kind>kind<span class=arrow></span></th>
+    <th class=sortable data-sort=who>who / what<span class=arrow></span></th>
+    <th>status</th>
+    <th class=sortable data-sort=age>age<span class=arrow></span></th>
+    <th></th>
+   </tr></thead>
+   <tbody id=n_rows><tr><td colspan=6 class=empty>loading...</td></tr></tbody>
+  </table>
  </div>
-</details>
+ <div id=n_err style="color:var(--red);font-size:12px;margin-top:6px"></div>
+ <div style="margin-top:6px"><button class="ghost" id=n_csv type=button>Export CSV</button></div>
 
-<!-- Routing mix -->
-<details class=sec id=sec-routing>
- <summary>Routing mix <span class=sub>traffic split between the local engine and the overflow provider</span></summary>
- <div class=body>
+ <details class=sec id=sec-health>
+  <summary>Estate watchdog <span class=sub>separate service on 10.0.1.10 &middot; not part of this gateway &middot; refreshes every 2 s</span></summary>
+  <div class=body>
+   <div id=health_alert hidden style="margin:0 0 10px;padding:8px 12px;border-radius:8px;background:rgba(248,81,73,.12);border:1px solid rgba(248,81,73,.4);color:var(--fg);font-size:13px"></div>
+   <div class=thead>Checks <span class=n id=n_health>...</span><span class="lg rz" id=health_line>loading...</span></div>
+   <div id=t_health style="display:flex;flex-wrap:wrap;gap:6px 14px;padding:4px 0 6px;font-size:12.5px"><span class=empty>loading...</span></div>
+  </div>
+ </details>
+
+</div>
+
+<!-- ================= TRAFFIC ================= -->
+<div class=tabpane id=pane-traffic>
+
+ <h2 class=h>Routing mix <span class=sub>local vs. paid overflow, and exactly why each overflow happened</span></h2>
+ <div class=card>
   <div class=bar id=lrbar></div>
   <div id=lrtxt class=rz style="margin-top:8px;font-size:12.5px"></div>
-  <div id=reasons style="margin-top:6px"></div>
  </div>
-</details>
 
-<!-- Telemetry -->
-<details class=sec id=sec-telem>
- <summary>Telemetry <span class=sub>engine internals, GPU/host trends, per-client rollups &middot; refreshes every 2 s</span></summary>
- <div class=body>
+ <div class=card>
+  <div class=thead>Why requests went to the paid provider <span class="lg rz">ranked by how often &middot; each links to the setting that causes it</span></div>
+  <div id=reasons><span class=empty>loading...</span></div>
+  <div class=thead style="margin-top:14px">Outcome legend</div>
+  <div class="lg rz" style="font-size:12px;line-height:2">
+   <span class="tag local">local</span> served by the local engine &nbsp;&middot;&nbsp;
+   <span class="tag remote">remote</span> sent to the paid overflow provider &nbsp;&middot;&nbsp;
+   <span class="tag held">held</span> background traffic paused, waiting for local to recover (never billed) &nbsp;&middot;&nbsp;
+   <span class="tag reject">rejected</span> background traffic refused outright (a deliberate maintenance window, no wait, no bill)
+  </div>
+ </div>
+
+ <h2 class=h>Telemetry <span class=sub>engine internals, GPU/host trends, per-client rollups &middot; live, refreshes every 2 s</span></h2>
+ <div class=card>
   <div class=strip id=telem_tiles></div>
   <div class=spark-grid>
-   <div class=spark-cell><div class=telemwrap><div class=k><abbr title="Prompt tokens/s (input) and generation tokens/s (output) as reported by the engine's Prometheus metrics.">Tokens/s (prompt / generation)</abbr></div><div class=legend><span class=l1>&#9632;</span> prompt <span class=l2>&#9632;</span> gen</div></div><svg class=spark id=sp_toks viewBox="0 0 300 56" preserveAspectRatio=none></svg></div>
-   <div class=spark-cell><div class=telemwrap><div class=k><abbr title="Time to first token, seconds. p50 = median wait before streaming starts; p95 = worst 5%.">TTFT p50 / p95 (s)</abbr></div><div class=legend><span class=l1>&#9632;</span> p50 <span class=l2>&#9632;</span> p95</div></div><svg class=spark id=sp_ttft viewBox="0 0 300 56" preserveAspectRatio=none></svg></div>
-   <div class=spark-cell><div class=telemwrap><div class=k><abbr title="Inter-token latency, seconds. Gap between consecutive output tokens after the first &mdash; streaming smoothness.">Inter-token latency (s)</abbr></div><div class=legend><span class=l1>&#9632;</span> p50 <span class=l2>&#9632;</span> p95</div></div><svg class=spark id=sp_tpot viewBox="0 0 300 56" preserveAspectRatio=none></svg></div>
-   <div class=spark-cell><div class=telemwrap><div class=k><abbr title="KV-cache utilisation % (engine) and gateway lanes currently in flight.">KV-cache % / lanes</abbr></div><div class=legend><span class=l1>&#9632;</span> KV% <span class=l2>&#9632;</span> lanes</div></div><svg class=spark id=sp_kv viewBox="0 0 300 56" preserveAspectRatio=none></svg></div>
-   <div class=spark-cell><div class=telemwrap><div class=k><abbr title="GPU 0 utilisation %, temperature C, and power draw as % of card cap.">GPU 0 &mdash; util / temp / power</abbr></div><div class=legend><span class=l1>&#9632;</span> util% <span class=l2>&#9632;</span> temp&deg;C <span class=l3>&#9632;</span> pwr%cap</div></div><svg class=spark id=sp_gpu0 viewBox="0 0 300 56" preserveAspectRatio=none></svg></div>
-   <div class=spark-cell><div class=telemwrap><div class=k><abbr title="GPU 1 utilisation %, temperature C, and power draw as % of card cap.">GPU 1 &mdash; util / temp / power</abbr></div><div class=legend><span class=l1>&#9632;</span> util% <span class=l2>&#9632;</span> temp&deg;C <span class=l3>&#9632;</span> pwr%cap</div></div><svg class=spark id=sp_gpu1 viewBox="0 0 300 56" preserveAspectRatio=none></svg></div>
-   <div class=spark-cell><div class=telemwrap><div class=k><abbr title="Percentage of recent requests routed to the paid overflow provider.">Remote-overflow share %</abbr></div><div class=legend></div></div><svg class=spark id=sp_remote viewBox="0 0 300 56" preserveAspectRatio=none></svg></div>
+   <div class=spark-cell><div class=telemwrap><div class=k><abbr title="Prompt tokens/s (input) and generation tokens/s (output) as reported by the engine's Prometheus metrics.">Tokens/s (prompt / generation)</abbr></div><div class=legend><span class=l1>&#9632;</span> prompt <span class=l2>&#9632;</span> gen</div></div><svg class=spark id=sp_toks viewBox="0 0 300 56" preserveAspectRatio=none></svg><div class=sparkfoot id=sf_toks></div></div>
+   <div class=spark-cell><div class=telemwrap><div class=k><abbr title="Time to first token, seconds. p50 = median wait before streaming starts; p95 = worst 5%.">TTFT p50 / p95 (s)</abbr></div><div class=legend><span class=l1>&#9632;</span> p50 <span class=l2>&#9632;</span> p95</div></div><svg class=spark id=sp_ttft viewBox="0 0 300 56" preserveAspectRatio=none></svg><div class=sparkfoot id=sf_ttft></div></div>
+   <div class=spark-cell><div class=telemwrap><div class=k><abbr title="Inter-token latency, seconds. Gap between consecutive output tokens after the first -- streaming smoothness.">Inter-token latency (s)</abbr></div><div class=legend><span class=l1>&#9632;</span> p50 <span class=l2>&#9632;</span> p95</div></div><svg class=spark id=sp_tpot viewBox="0 0 300 56" preserveAspectRatio=none></svg><div class=sparkfoot id=sf_tpot></div></div>
+   <div class=spark-cell><div class=telemwrap><div class=k><abbr title="KV-cache utilisation % (engine) and gateway lanes currently in flight.">KV-cache % / lanes</abbr></div><div class=legend><span class=l1>&#9632;</span> KV% <span class=l2>&#9632;</span> lanes</div></div><svg class=spark id=sp_kv viewBox="0 0 300 56" preserveAspectRatio=none></svg><div class=sparkfoot id=sf_kv></div></div>
+   <div class=spark-cell><div class=telemwrap><div class=k><abbr title="GPU 0 utilisation %, temperature C, and power draw as % of card cap.">GPU 0 &mdash; util / temp / power</abbr></div><div class=legend><span class=l1>&#9632;</span> util% <span class=l2>&#9632;</span> temp&deg;C <span class=l3>&#9632;</span> pwr%cap</div></div><svg class=spark id=sp_gpu0 viewBox="0 0 300 56" preserveAspectRatio=none></svg><div class=sparkfoot id=sf_gpu0></div></div>
+   <div class=spark-cell><div class=telemwrap><div class=k><abbr title="GPU 1 utilisation %, temperature C, and power draw as % of card cap.">GPU 1 &mdash; util / temp / power</abbr></div><div class=legend><span class=l1>&#9632;</span> util% <span class=l2>&#9632;</span> temp&deg;C <span class=l3>&#9632;</span> pwr%cap</div></div><svg class=spark id=sp_gpu1 viewBox="0 0 300 56" preserveAspectRatio=none></svg><div class=sparkfoot id=sf_gpu1></div></div>
+   <div class=spark-cell><div class=telemwrap><div class=k><abbr title="Percentage of recent requests routed to the paid overflow provider.">Remote-overflow share %</abbr></div><div class=legend></div></div><svg class=spark id=sp_remote viewBox="0 0 300 56" preserveAspectRatio=none></svg><div class=sparkfoot id=sf_remote></div></div>
    <div class=spark-cell><div class=k><abbr title="Whether the shim's periodic scrape of the engine's Prometheus /metrics is succeeding.">Engine metrics scrape</abbr></div><div class=v style="font-size:14px;margin-top:6px" id=telem_engok>...</div></div>
   </div>
+ </div>
 
-  <div class=thead>
-   <abbr title="Per-client rollups since the gateway started. `client` is a friendly label inferred from IP + user-agent.">Per-client usage</abbr>
+ <h2 class=h>Per-client usage <span class=sub>who is calling this gateway, and how much</span></h2>
+ <div class=card>
+  <div class=tools>
+   <span class=rz style="font-size:12px">host key: <span id=hostkey></span></span>
+   <label>window <select id=pc_window><option value=uptime selected>since gateway start</option><option value=day>last 24h</option></select></label>
+   <span class=rz style="font-size:11.5px" id=pc_filtered_note></span>
    <span class=pager>
     <button id=pc_prev disabled>&lsaquo;</button>
     <span class=lbl id=pc_page>1/1</span>
@@ -4133,22 +4425,22 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
    </span>
   </div>
   <div class=tw><table><thead><tr>
-   <th><abbr title="Client label &mdash; inferred from IP + user-agent.">client</abbr></th>
-   <th>requests</th><th>local</th><th>remote</th>
+   <th class=sortable data-sort=client>client<span class=arrow></span></th>
+   <th class=sortable data-sort=requests>requests<span class=arrow></span></th><th>local</th><th>remote</th>
    <th><abbr title="Total output tokens served (exact where the engine reported them; else lower-bound from chunk count, marked ~).">tokens out</abbr></th>
    <th><abbr title="Average seconds spent waiting for a free lane before starting.">avg wait</abbr></th>
    <th><abbr title="Average time to first token, seconds.">avg TTFT</abbr></th>
    <th>errors</th>
-   <th><abbr title="Rough USD estimate for what the remote-overflow calls have cost this uptime.">est. remote cost</abbr></th>
+   <th class=sortable data-sort=cost><abbr title="Rough USD estimate for what the remote-overflow calls have cost (uptime window only).">est. cost</abbr><span class=arrow></span></th>
   </tr></thead><tbody id=telem_clients><tr><td colspan=9 class=empty>loading...</td></tr></tbody></table></div>
+ </div>
 
-  <div class=thead>
-   <abbr title="Failovers and non-2xx completions, newest first.">Error feed</abbr>
-   <span class=pager>
-    <button id=ef_prev disabled>&lsaquo;</button>
-    <span class=lbl id=ef_page>1/1</span>
-    <button id=ef_next disabled>&rsaquo;</button>
-   </span>
+ <h2 class=h>Error feed <span class=sub>failovers and non-2xx completions, newest first</span></h2>
+ <div class=card>
+  <div class=pager style="margin-bottom:6px">
+   <button id=ef_prev disabled>&lsaquo;</button>
+   <span class=lbl id=ef_page>1/1</span>
+   <button id=ef_next disabled>&rsaquo;</button>
   </div>
   <div class=tw><table><thead><tr>
    <th>time</th><th>client</th><th>endpoint</th>
@@ -4156,34 +4448,9 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
    <th>reason</th><th>status</th>
   </tr></thead><tbody id=telem_errors><tr><td colspan=6 class=empty>loading...</td></tr></tbody></table></div>
  </div>
-</details>
 
-<!-- Recent requests -->
-<details class=sec id=sec-req>
- <summary>Recent requests <span class=sub>in-memory ring buffer &middot; newest first &middot; &#9889; = streamed</span></summary>
- <div class=body>
-  <div class=tools>
-   <span class="lg rz" id=req_summary></span>
-   <span class=pager>
-    <button id=ev_prev disabled>&lsaquo;</button>
-    <span class=lbl id=ev_page>1/1</span>
-    <button id=ev_next disabled>&rsaquo;</button>
-   </span>
-  </div>
-  <div class=tw><table><thead><tr>
-   <th>time</th><th>endpoint</th><th>client</th>
-   <th><abbr title="Route the request took: local, remote overflow, held, or rejected.">route</abbr></th>
-   <th>reason</th>
-   <th><abbr title="Prompt tokens in &rarr; max output tokens requested. &#9889; = streamed.">size (in&rarr;out)</abbr></th>
-   <th><abbr title="Seconds waited for a free lane before starting.">waited</abbr></th>
-  </tr></thead><tbody id=ev><tr><td colspan=7 class=empty>loading...</td></tr></tbody></table></div>
- </div>
-</details>
-
-<!-- History (server-side paginated) -->
-<details class=sec id=sec-hist>
- <summary>History <span class=sub>on-disk request log (survives restarts) &middot; server-side paginated</span></summary>
- <div class=body>
+ <h2 class=h>Request history <span class=sub>on-disk log, survives restarts &middot; server-side paginated</span></h2>
+ <div class=card>
   <div class=tools>
    <input type=text id=h_client placeholder="filter by client...">
    <input type=text id=h_route placeholder="filter by route/reason (local, remote, tiny...)">
@@ -4204,33 +4471,48 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
    <th><abbr title="Time to first token, seconds.">TTFT</abbr></th>
    <th>duration</th><th>status</th>
   </tr></thead><tbody id=h_rows><tr><td colspan=8 class=empty>loading...</td></tr></tbody></table></div>
-
-  <div class=thead>Last 24 h summary <span class="lg rz">per-client rollup, same on-disk log</span></div>
-  <div class=strip id=h_tiles></div>
-  <div class=tw><table><thead><tr>
-   <th>client</th><th>requests</th><th>local</th><th>remote</th>
-   <th>tokens in</th><th>tokens out</th><th>errors</th>
-  </tr></thead><tbody id=h_clients><tr><td colspan=7 class=empty>loading...</td></tr></tbody></table></div>
  </div>
-</details>
 
-<!-- Local model switcher -->
-<details class=sec id=sec-model>
- <summary>Local model <span class=sub>switch the served checkpoint &middot; engine restarts &middot; overflow covers the gap</span></summary>
- <div class=body>
-  <div class=rz style="font-size:12.5px">Scans <span id=mdir class=mono></span>. Any HF checkpoint works. Switching restarts the engine (~40 s warm / 4-5 min cold); traffic falls back to remote overflow until it is healthy. &#9888; no auth on this page.</div>
+ <h2 class=h>Recent requests <span class=sub>in-memory ring buffer, this process's uptime only &middot; &#9889; = streamed</span></h2>
+ <div class=card>
+  <div class=tools><span class="lg rz" id=req_summary></span>
+   <span class=pager>
+    <button id=ev_prev disabled>&lsaquo;</button>
+    <span class=lbl id=ev_page>1/1</span>
+    <button id=ev_next disabled>&rsaquo;</button>
+   </span>
+  </div>
+  <div class=tw><table><thead><tr>
+   <th>time</th><th>endpoint</th><th>client</th>
+   <th>route</th><th>reason</th>
+   <th><abbr title="Prompt tokens in -> max output tokens requested. streamed = lightning icon.">size (in&rarr;out)</abbr></th>
+   <th>waited</th>
+  </tr></thead><tbody id=ev><tr><td colspan=7 class=empty>loading...</td></tr></tbody></table></div>
+ </div>
+
+</div>
+
+<!-- ================= SETTINGS ================= -->
+<div class=tabpane id=pane-settings>
+
+ <h2 class=h>Local model <span class=sub>switch the served checkpoint &middot; engine restarts &middot; overflow covers the gap</span></h2>
+ <div class=card>
+  <div class=rz style="font-size:12.5px">Scans <span id=mdir class=mono></span>. Any HF checkpoint works. Switching restarts the engine (~40 s warm / 4-5 min cold); traffic falls back to remote overflow until it is healthy.</div>
   <div class=tw><table><thead><tr><th></th><th>model</th><th>size</th><th>format</th><th></th></tr></thead><tbody id=lm></tbody></table></div>
   <div style="margin-top:8px"><span id=lmmsg class=rz></span></div>
  </div>
-</details>
 
-<!-- Config -->
-<details class=sec id=sec-cfg>
- <summary>Config <span class=sub>overflow provider + routing rules &middot; applied live, saved to shim.env &middot; &#9888; no auth</span></summary>
- <div class=body>
+ <h2 class=h>Admin access <span class=sub>who can change settings below</span></h2>
+ <div class=card id=authcard>
+  <div id=authtext class=rz style="font-size:12.5px"></div>
+  <div style="margin-top:8px"><button class=ghost id=forget_token type=button>Forget saved admin token in this browser</button></div>
+ </div>
+
+ <h2 class=h>Provider &amp; routing settings <span class=sub>applied live, saved to shim.env</span></h2>
+ <div class=card>
  <form class=cfg autocomplete=off>
 
-  <div class=thead>Provider</div>
+  <div class=thead>Overflow provider &mdash; where paid requests go</div>
   <label class=k>Provider preset
    <select id=f_preset>
     <option value="">-- pick to autofill base + model --</option>
@@ -4243,66 +4525,67 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
    </select>
   </label>
   <div class=row>
-   <label class=k><abbr title="Base URL of the OpenAI-compatible overflow endpoint.">Remote base URL</abbr>
+   <label><span class=k>Overflow provider URL</span><span class=hint>base URL of the OpenAI-compatible endpoint</span>
     <input id=f_remote_base placeholder=https://api.minimax.io/v1></label>
-   <label class=k><abbr title="Model id the overflow provider expects on /v1/chat/completions. Verify with your provider.">Remote model</abbr>
+   <label><span class=k>Overflow model name</span><span class=hint>model id that provider expects on /v1/chat/completions</span>
     <input id=f_remote_model placeholder=MiniMax-M3></label>
-   <label class=k><abbr title="Bearer key sent only in outbound requests to the overflow endpoint. Never returned.">Remote API key</abbr>
-    <span id=keystate class=rz></span>
+   <label><span class=k>Overflow API key</span><span class=hint id=keystate>&nbsp;</span>
     <input id=f_remote_key type=password placeholder="leave blank to keep current"></label>
-   <label class=k><abbr title="1 = send every request straight to remote (engine bypass). 0 = local-first.">Force full-remote (0/1)</abbr>
+   <label><span class=k>Send everything to the overflow provider?</span><span class=hint>1 = yes, bypass the local engine entirely &middot; 0 = local-first (normal)</span>
     <input id=f_force_remote type=number min=0 max=1></label>
   </div>
 
-  <div class=thead>Local capacity</div>
+  <div class=thead>Local capacity &mdash; how much the local engine can take at once</div>
   <div class=row>
-   <label class=k><abbr title="Concurrent lanes on the local engine. 1 = strict serialisation.">Local budget (lanes)</abbr>
+   <label><span class=k>How many requests can run locally at once?</span><span class=hint>concurrent lanes &middot; 1 = strictly one at a time</span>
     <input id=f_local_budget type=number min=1 max=8></label>
-   <label class=k><abbr title="Seconds an interactive request will wait for a lane before overflowing to remote.">Queue wait secs (interactive)</abbr>
+   <label><span class=k>How long should an interactive request wait for a free lane?</span><span class=hint>seconds, before overflowing to the paid provider</span>
     <input id=f_local_wait_secs type=number min=0 step=1></label>
-   <label class=k><abbr title="Hard cap on total in-flight prompt tokens across all lanes. Prevents OOM.">Total in-flight ctx cap (tok)</abbr>
+   <label><span class=k>Total context all lanes together may hold</span><span class=hint>tokens &middot; prevents an out-of-memory crash</span>
     <input id=f_token_budget type=number min=0 step=50000></label>
-   <label class=k><abbr title="Seconds to hold traffic off the engine after an OOM before probing again.">OOM backoff (s)</abbr>
+   <label><span class=k>After an out-of-memory crash, how long to back off?</span><span class=hint>seconds before probing the local engine again</span>
     <input id=f_oom_backoff_secs type=number min=0 step=10></label>
   </div>
 
-  <div class=thead>Routing guards &mdash; what goes remote</div>
+  <div class=thead>Routing guards &mdash; when a request skips the local engine</div>
   <div class=row>
-   <label class=k><abbr title="If requested max output &ge; this, send remote. Bounds worst-case decode time on the local engine.">Big OUTPUT &ge; tok &rarr; remote</abbr>
+   <label><span class=k>Send to overflow if requested output is at least&hellip;</span><span class=hint>tokens &middot; caused reason "big-out"</span>
     <input id=f_big_output type=number min=0 step=1000></label>
-   <label class=k><abbr title="If the prompt &ge; this many tokens, send remote. 0 = off (crash-guard).">Big PROMPT &ge; tok &rarr; remote (0=off)</abbr>
+   <label><span class=k>Send to overflow if the prompt is at least&hellip;</span><span class=hint>tokens, 0 = off &middot; caused reason "big-prompt"</span>
     <input id=f_big_prompt type=number min=0 step=1000></label>
-   <label class=k><abbr title="Single-request size cap (prompt + output). Requests above go remote.">Single-req size cap (tok)</abbr>
+   <label><span class=k>Hard size cap: prompt + output above this always goes to overflow</span><span class=hint>tokens &middot; caused reason "size"</span>
     <input id=f_max_local_tokens type=number min=0 step=10000></label>
-   <label class=k><abbr title="Clamp any local request's max_tokens to this ceiling.">Local output clamp (tok)</abbr>
+   <label><span class=k>Clamp any local request's output to at most&hellip;</span><span class=hint>tokens</span>
     <input id=f_local_max_out type=number min=0 step=1024></label>
-   <label class=k><abbr title="A request larger than this claims the whole budget (serialise-solo).">Serialize-solo threshold (tok)</abbr>
+   <label><span class=k>A request this big claims the whole budget alone</span><span class=hint>tokens (serialize-solo)</span>
     <input id=f_big_tokens type=number min=0 step=1000></label>
-   <label class=k><abbr title="Upper bound on the first-token wait budget (seconds).">First-token deadline cap (s)</abbr>
+   <label><span class=k>Treat this much in-flight context as "a monster is running"</span><span class=hint>tokens &middot; caused reason "monster"</span>
+    <input id=f_monster_inflight type=number min=0 step=10000></label>
+   <label><span class=k>Upper bound on the first-token wait budget</span><span class=hint>seconds</span>
     <input id=f_first_token_max type=number min=5 step=5></label>
-   <label class=k><abbr title="Estimated prefill throughput (tok/s), used to size first-token deadlines.">Prefill rate est (tok/s)</abbr>
+   <label><span class=k>Estimated prefill speed</span><span class=hint>tokens/s, used to size first-token deadlines</span>
     <input id=f_prefill_tps type=number min=100 step=100></label>
   </div>
 
   <div class=thead>Priority lanes &amp; behaviour</div>
   <div class=row>
-   <label class=k><abbr title="Requests &le; this many tokens get a fast-lane and can exceed the normal budget.">Tiny fast-lane &le; tok</abbr>
+   <label><span class=k>Treat requests this small as "tiny"</span><span class=hint>tokens &middot; tiny requests get their own fast lane</span>
     <input id=f_tiny_tokens type=number min=0 step=100></label>
-   <label class=k><abbr title="Extra concurrent lanes reserved for tiny requests beyond the normal budget.">Tiny extra lanes</abbr>
+   <label><span class=k>Extra lanes reserved just for tiny requests</span><span class=hint>beyond the normal budget &middot; caused reason "tiny-fast" when full</span>
     <input id=f_tiny_extra_lanes type=number min=0 max=4></label>
-   <label class=k><abbr title="Lanes always reserved for interactive traffic; background never touches them.">Lanes reserved for interactive</abbr>
+   <label><span class=k>Lanes always kept free for interactive (non-background) traffic</span><span class=hint>caused reason "bg-yield"</span>
     <input id=f_fg_reserved type=number min=0 max=4></label>
-   <label class=k><abbr title="Seconds a background request will wait for a lane before being held/rejected.">Background queue wait (s)</abbr>
+   <label><span class=k>How long background traffic waits for a lane</span><span class=hint>seconds, before overflowing</span>
     <input id=f_bg_wait_secs type=number min=0 step=1></label>
-   <label class=k><abbr title="Pipe-separated substrings in the user-agent that classify a request as background.">Background markers (|-sep)</abbr>
+   <label><span class=k>User-agent substrings that mark a request "background"</span><span class=hint>pipe-separated, e.g. scheduled|cron|job</span>
     <input id=f_bg_markers placeholder="scheduled cron job"></label>
-   <label class=k><abbr title="Comma ranges of UTC hours considered peak (e.g. 1-4,6-10).">Peak hours UTC</abbr>
+   <label><span class=k>Peak hours (UTC) &mdash; bias background traffic to wait for local</span><span class=hint>comma ranges, e.g. 1-4,6-10</span>
     <input id=f_peak_hours_utc></label>
-   <label class=k><abbr title="Disable /think for background traffic (0/1).">No-think for background (0/1)</abbr>
+   <label><span class=k>Strip /think for background traffic?</span><span class=hint>0/1</span>
     <input id=f_bg_no_think type=number min=0 max=1></label>
-   <label class=k><abbr title="Comma-separated client IPs whose requests get /think stripped.">No-think client IPs</abbr>
+   <label><span class=k>Client IPs that always get /think stripped</span><span class=hint>comma-separated</span>
     <input id=f_no_think_ips placeholder="10.0.1.10,10.0.1.250"></label>
-   <label class=k><abbr title="Enable per-request JSONL logging (0/1).">Per-request logging (0/1)</abbr>
+   <label><span class=k>Log every request body to disk?</span><span class=hint>0/1 &middot; needed for the History tab</span>
     <input id=f_log_requests type=number min=0 max=1></label>
   </div>
 
@@ -4312,7 +4595,8 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
   </div>
  </form>
  </div>
-</details>
+
+</div>
 
 </div>
 <script>
@@ -4321,16 +4605,27 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
   const $=s=>document.querySelector(s);
   const $$=s=>document.querySelectorAll(s);
   const esc=t=>String(t==null?'':t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  // ONE family of time formatters, consistently suffixed, so the page never mixes "14s elapsed" /
+  // "0s ago" / "48m ago" / "up 719h25m" styles for the same underlying quantity again.
   const ago=s=>s==null?'?':s<60?Math.round(s)+'s ago':s<5400?Math.round(s/60)+'m ago':s<172800?Math.round(s/3600)+'h ago':Math.round(s/86400)+'d ago';
-  const fmtAgo=t=>{const s=Math.max(0,Date.now()/1000-t);return s<60?s.toFixed(0)+'s':(s/60).toFixed(0)+'m';};
+  const fmtAgo=t=>{const s=Math.max(0,Date.now()/1000-t);return s<60?s.toFixed(0)+'s ago':(s/60).toFixed(0)+'m ago';};
   const dur=s=>s==null?'--':(s<90?Math.round(s)+'s':s<5400?Math.round(s/60)+'m':(s/3600).toFixed(1)+'h');
   const fmtDur=s=>s==null?'--':(s<1?Math.round(s*1000)+'ms':s<90?s.toFixed(1)+'s':(s/60).toFixed(1)+'m');
   const when=t=>{if(!t)return'';let x=String(t).replace(' ','T');if(!/Z$|[+-]\d\d:\d\d$/.test(x))x+='Z';const d=new Date(x);if(isNaN(d))return esc(t);const s=(Date.now()-d.getTime())/1000;return s<86400?ago(s):d.toLocaleDateString(undefined,{month:'short',day:'numeric'})+' '+d.toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'});};
   const tile=(k,v,sub)=>`<div class=tile><div class=k>${k}</div><div class=v>${v}</div>${sub?`<div class=sub>${sub}</div>`:''}</div>`;
   const routeTag=r=>r==='local'?'local':r==='held'?'held':r==='rejected-bg'?'reject':'remote';
 
-  // Global blink phase for the "run" squares so they visibly pulse without CSS keyframes.
-  setInterval(()=>document.documentElement.classList.toggle('bk'),520);
+  // ---- host -> role map (item 42/43): who is actually calling this gateway ----
+  const HOSTS={'10.0.1.10':'agents-prod / Hermes','10.0.1.11':'Applicant','10.0.1.12':'ubuntuide01 / pi',
+               '10.0.1.225':'this box (local)','10.0.1.250':'Hermes scheduler','127.0.0.1':'this box (local)'};
+  function hostRole(ip){for(const k in HOSTS){if(ip&&ip.indexOf(k)===0)return HOSTS[k];}return null;}
+  function clientDisplay(name,ip,ua){
+    const role=hostRole(ip||name);
+    const primary=role?role:esc(name||ip||'?');
+    const secondary=[ip&&ip!==primary?esc(ip):null, ua?esc(ua):null].filter(Boolean).join(' &middot; ');
+    return '<span class=role>'+primary+'</span>'+(secondary?' <span class=rawid>'+secondary+'</span>':'');
+  }
+  $('#hostkey').innerHTML=Object.entries(HOSTS).map(([ip,r])=>'<span class=mono>'+ip+'</span>='+esc(r)).join(' &middot; ');
 
   // ---- admin-token fetch (for mutating endpoints) ----
   function adminToken(){try{return localStorage.getItem('shim_admin_token')||'';}catch(e){return'';}}
@@ -4339,14 +4634,36 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
     const t=adminToken();if(t)opts.headers['X-Admin-Token']=t;
     let r=await fetch(url,opts);
     if(r.status===401){
-      const entered=prompt('Admin token required for this action (kept in this browser):');
+      const entered=prompt('Admin token required for this action (kept in this browser only):');
       if(entered){try{localStorage.setItem('shim_admin_token',entered);}catch(e){}opts.headers['X-Admin-Token']=entered;r=await fetch(url,opts);}
     }
     return r;
   }
+  $('#forget_token').addEventListener('click',()=>{try{localStorage.removeItem('shim_admin_token');}catch(e){}$('#forget_token').textContent='forgotten -- next save will re-prompt';});
 
-  // ---- generic client-side pagination helper ----
-  const PAGE={active:1,lanes:1,queue:1,research:1,windows:1,ev:1,pc:1,ef:1};
+  // ---- global error/alert banner (item 63): every subsystem writes ONE line here instead of
+  // scattering #err/#t_err/#win_err/#telem_engok/#health_alert around the page. ----
+  const BANNER={};   // key -> {text, level}
+  function setBanner(key,text,level){ // level 'err'|'warn'|null(clear)
+    if(!text){delete BANNER[key];}else{BANNER[key]={text,level:level||'err'};}
+    renderBanner();
+  }
+  function renderBanner(){
+    const keys=Object.keys(BANNER);
+    $('#banner').innerHTML=keys.map(k=>{const b=BANNER[k];
+      return '<div class="bnln '+b.level+'"><b class=src>'+esc(k)+'</b><span>'+esc(b.text)+'</span></div>';
+    }).join('');
+  }
+
+  // ---- generic client-side pagination + sort helper ----
+  const PAGE={now:1,pc:1,ef:1,ev:1};
+  const SORT={now:{key:null,dir:1},pc:{key:null,dir:-1}};
+  function sortArr(arr,key,dir){
+    if(!key)return arr;
+    return arr.slice().sort((a,b)=>{const av=a[key],bv=b[key];
+      if(typeof av==='number'||typeof bv==='number')return((av||0)-(bv||0))*dir;
+      return String(av||'').localeCompare(String(bv||''))*dir;});
+  }
   function paginate(arr,key,per){
     const total=arr.length,pages=Math.max(1,Math.ceil(total/per));
     if(PAGE[key]>pages)PAGE[key]=pages;
@@ -4360,212 +4677,299 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
     prev.onclick=()=>{if(PAGE[key]>1){PAGE[key]--;onchange();}};
     next.onclick=()=>{if(PAGE[key]<pages){PAGE[key]++;onchange();}};
   }
+  function wireSort(tableSel,sortKey,onchange){
+    $$(tableSel+' th.sortable').forEach(th=>{
+      th.addEventListener('click',()=>{
+        const k=th.dataset.sort,s=SORT[sortKey];
+        s.dir=(s.key===k)?-s.dir:1;s.key=k;
+        $$(tableSel+' th.sortable .arrow').forEach(a=>a.textContent='');
+        th.querySelector('.arrow').textContent=s.dir>0?'\u25B2':'\u25BC';
+        onchange();
+      });
+    });
+  }
+  function csvDownload(filename,rows){
+    const esc2=v=>{v=String(v==null?'':v);return /[",\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v;};
+    const csv=rows.map(r=>r.map(esc2).join(',')).join('\n');
+    const blob=new Blob([csv],{type:'text/csv'});
+    const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=filename;
+    document.body.appendChild(a);a.click();a.remove();
+    setTimeout(()=>URL.revokeObjectURL(a.href),4000);
+  }
+
+  // change-detection: skip a full innerHTML re-render when the underlying data hasn't
+  // changed (item 58) -- cheap JSON-string compare, keyed per render target.
+  const _lastRender={};
+  function renderIfChanged(key,data,fn){
+    const sig=JSON.stringify(data);
+    if(_lastRender[key]===sig)return false;
+    _lastRender[key]=sig;fn();return true;
+  }
+
+  // Global blink phase kept only as a fallback flag; the actual pulse is a CSS animation now
+  // (item 57) so it costs no forced layout, and prefers-reduced-motion turns it off for free.
+
+  // ==================== TAB BAR (items 34/35/50/53/54) ====================
+  let TAB='now';
+  function applyTab(t,push){
+    TAB=t;
+    $$('.tabbtn').forEach(b=>b.classList.toggle('on',b.dataset.tab===t));
+    $$('.tabpane').forEach(p=>p.classList.toggle('on',p.id==='pane-'+t));
+    try{localStorage.setItem('shim_tab',t);}catch(e){}
+    if(push)history.replaceState(null,'','#'+t);
+  }
+  $$('.tabbtn').forEach(b=>b.addEventListener('click',()=>applyTab(b.dataset.tab,true)));
+  (function initTab(){
+    let t=(location.hash||'').replace('#','');
+    if(!['now','traffic','settings'].includes(t)){try{t=localStorage.getItem('shim_tab')||'now';}catch(e){t='now';}}
+    applyTab(t,false);
+  })();
+  function goToSetting(fieldId){
+    applyTab('settings',true);
+    const el=document.getElementById(fieldId);
+    if(el){el.scrollIntoView({block:'center'});el.focus();
+      const label=el.closest('label');(label||el).classList.add('fieldflash');
+      setTimeout(()=>(label||el).classList.remove('fieldflash'),1700);}
+  }
+
+  // ---- glossary (item 24): a real panel, not a hover-only tooltip ----
+  $('#glossary_btn').addEventListener('click',()=>{
+    const g=$('#glossary');g.hidden=!g.hidden;
+    $('#glossary_btn').classList.toggle('on',!g.hidden);
+    try{localStorage.setItem('shim_glossary',g.hidden?'0':'1');}catch(e){}
+  });
+  try{if(localStorage.getItem('shim_glossary')==='1'){$('#glossary').hidden=false;$('#glossary_btn').classList.add('on');}}catch(e){}
 
   // ==================== TOP + STATS (uses /gateway/stats) ====================
-  let modelName='?', FR=0, lastOk=0;
+  let modelName='?', FR=0, MODE='local_first', lastOk=0, CFG={};
   async function loadModels(){try{const r=await fetch('/v1/models');const d=await r.json();modelName=(d.data&&d.data[0]&&d.data[0].id)||'?';}catch(e){}}
+  const MODE_LABEL={local_first:'LOCAL-FIRST',full_remote:'FULL REMOTE',full_local:'FULL LOCAL (queue, $0)'};
+  const MODE_CLASS={local_first:'stamp local',full_remote:'stamp remote',full_local:'stamp locked'};
+  const MODE_CONSEQUENCE={local_first:'Requests use the local engine first; only overflow to the paid provider when every lane is busy or a guard fires.',
+                          full_remote:'Every completion goes straight to the paid overflow provider -- the local engine sits idle.',
+                          full_local:'Never spends money: a request with no free local lane QUEUES for one instead of overflowing.'};
+  const MODE_BODY={local_first:{local_only:0,force_remote:0},
+                   full_remote:{local_only:0,force_remote:1},
+                   full_local:{local_only:1,force_remote:0}};
   function renderMode(){
-    const b=$('#modebadge'),t=$('#modebtn');
-    if(FR){b.textContent='FULL REMOTE';b.className='stamp remote';t.textContent='Switch to LOCAL';}
-    else{b.textContent='LOCAL-FIRST';b.className='stamp local';t.textContent='Switch to FULL REMOTE';}
+    const b=$('#modebadge');
+    if(b){b.textContent=MODE_LABEL[MODE]||MODE;b.className=MODE_CLASS[MODE]||'stamp';}
+    $$('#modeseg .segbtn').forEach(x=>x.classList.toggle('on',x.dataset.mode===MODE));
+    $('#modeconsequence').textContent=MODE_CONSEQUENCE[MODE]||'';
   }
-  async function toggleMode(){FR=FR?0:1;await adminFetch('/gateway/config',{method:'POST',body:JSON.stringify({force_remote:FR})});renderMode();loadCfg();}
-  $('#modebtn').addEventListener('click',toggleMode);
+  async function setMode(m){
+    if(!MODE_BODY[m])return;
+    const prev=MODE;
+    try{
+      const r=await adminFetch('/gateway/config',{method:'POST',body:JSON.stringify(MODE_BODY[m])});
+      const d=await r.json();
+      MODE=(d.config&&d.config.mode)||m;
+    }catch(e){MODE=prev;setBanner('mode','mode change failed: '+e,'err');}
+    FR=(MODE==='full_remote')?1:0;renderMode();loadCfg();
+  }
+  $$('#modeseg .segbtn').forEach(x=>x.addEventListener('click',()=>setMode(x.dataset.mode)));
 
-  // last-updated indicator (based on lastOk from the frequent tickers below)
   setInterval(()=>{const s=lastOk?(Date.now()-lastOk)/1000:null;const lu=$('#updated'),ld=$('#live');if(!lu)return;
     if(s==null){lu.textContent='connecting...';return;}
-    lu.textContent='live · updated '+Math.round(s)+'s ago';
+    lu.textContent='live \u00b7 updated '+Math.round(s)+'s ago';
     ld.className='dot '+(s<8?'up':s<30?'warn':'down');
   },1000);
 
   let statsData=null,recentEvents=[];
   async function tickStats(){
-    let s;try{const r=await fetch('/gateway/stats',{cache:'no-store'});s=await r.json();$('#err').textContent='';lastOk=Date.now();}
-    catch(e){$('#err').textContent='reconnecting... (showing last data)';return;}
+    let s;try{const r=await fetch('/gateway/stats',{cache:'no-store'});s=await r.json();setBanner('stats',null);lastOk=Date.now();}
+    catch(e){setBanner('stats','reconnecting... (showing last data)','warn');return;}
     statsData=s;$('#rm').textContent=s.remote_model||'--';
     const uh=Math.floor(s.uptime/3600),um=Math.floor(s.uptime%3600/60);
-    // Top live-health strip
     const gpuAvg=(s.gpu||[]).length?Math.round((s.gpu.reduce((a,g)=>a+(+g.util||0),0)/s.gpu.length)):null;
     const modelShort=modelName.replace(/^.*\//,'').slice(0,26);
     const bk=s.backoff>0?`<span class=sub style=color:var(--amb)>OOM backoff ${s.backoff}s</span>`:'';
+    setBanner('oom', s.backoff>0?('Local engine is in OOM backoff for another '+s.backoff+'s -- new requests overflow to the paid provider until it clears.'):null, 'warn');
     $('#strip').innerHTML=[
       `<div class=tile><div class=k><abbr title="Whether the local vLLM engine on :8001 is responding to /health.">Local engine</abbr></div><div class=v><span class="dot ${s.local_healthy?'up':'down'}"></span> ${s.local_healthy?'up':'DOWN'}</div><div class=sub title="${esc(modelName)}">${esc(modelShort||'--')}</div></div>`,
-      `<div class=tile><div class=k><abbr title="Concurrent lanes in use / total available. `+
-        `Waiting shown when requests are queued.">Lanes</abbr></div><div class=v class=mono>${s.inflight}<small>/${s.budget}</small>${s.waiting?` <span style=color:var(--amb)>+${s.waiting}</span>`:''}</div><div class=sub><abbr title="Rolling in-flight prompt tokens across all lanes / token-budget cap.">ctx ${((s.inflight_tokens||0)/1000).toFixed(0)}K/${((s.token_budget||0)/1000).toFixed(0)}K</abbr>${bk?' &middot; '+bk:''}</div></div>`,
+      `<div class=tile><div class=k><abbr title="Concurrent request slots (lanes) in use / total available. Waiting shown when requests are queued for one.">Lanes</abbr></div><div class=v class=mono>${s.inflight}<small>/${s.budget}</small>${s.waiting?` <span style=color:var(--amb)>+${s.waiting} waiting</span>`:''}</div><div class=sub><abbr title="Rolling in-flight prompt tokens across all lanes / token-budget cap.">context in use ${((s.inflight_tokens||0)/1000).toFixed(0)}K / ${((s.token_budget||0)/1000).toFixed(0)}K cap</abbr>${bk?' &middot; '+bk:''}</div></div>`,
       `<div class=tile><div class=k><abbr title="Share of requests served by the local engine vs sent to the overflow provider.">Served local</abbr></div><div class=v class=mono style=color:var(--grn)>${s.local_pct}<small>%</small></div><div class=sub>overflow ${s.remote_pct}% &middot; avg wait ${s.avg_wait}s</div></div>`,
-      `<div class=tile><div class=k><abbr title="Live tokens/s from the engine's Prometheus metrics (prompt + generation combined). '--' if the engine is down or not yet scraped.">Tokens/s now</abbr></div><div class=v class=mono id=tps_now>--</div><div class=sub><abbr title="Time to first token &mdash; median (p50) then worst-5% (p95).">TTFT</abbr> <span id=ttft_line>--</span></div></div>`,
+      `<div class=tile><div class=k><abbr title="Live tokens/s from the engine's Prometheus metrics (prompt + generation combined). '--' if the engine is down or not yet scraped.">Tokens/s now</abbr></div><div class=v class=mono id=tps_now>--</div><div class=sub>time to first token <span id=ttft_line>--</span></div></div>`,
       `<div class=tile><div class=k><abbr title="Average GPU utilisation across all cards, as reported by nvidia-smi.">GPU util avg</abbr></div><div class=v class=mono>${gpuAvg==null?'--':gpuAvg+'<small>%</small>'}</div><div class=sub>${(s.gpu||[]).map((g,i)=>'GPU'+i+' '+((g.util==null?'?':g.util)+'%')).join(' &middot; ')||'no GPU data'}</div></div>`,
       `<div class=tile><div class=k><abbr title="Total requests since the gateway started, and current uptime.">Requests / uptime</abbr></div><div class=v class=mono>${s.total}</div><div class=sub>up ${uh}h${um}m &middot; peak lanes ${s.peak_inflight}</div></div>`,
     ].join('');
-    // Routing mix section
+    // Routing mix
     const lp=s.local_pct,rp=s.remote_pct;
     $('#lrbar').innerHTML=`<i class=bl style=width:${lp}%></i><i class=br style=width:${rp}%></i>`;
     $('#lrtxt').innerHTML=`<span style=color:var(--grn)>&#9632;</span> local ${s.local} (${lp}%) &nbsp; <span style=color:var(--amb)>&#9632;</span> overflow ${s.remote} (${rp}%) &nbsp; peak lanes ${s.peak_inflight} &nbsp; uptime ${uh}h${um}m`;
-    $('#reasons').innerHTML=Object.keys(s.remote_reasons||{}).length?('overflow reasons: '+Object.entries(s.remote_reasons).map(([k,v])=>`<span class=badge>${esc(k)}: ${v}</span>`).join('')):'<span class=rz>no overflow yet</span>';
-    // Recent-requests table (paginated, 25/page)
+    renderReasons(s.remote_reasons||{},s.remote||1);
     recentEvents=(s.events||[]);
     renderRecent();
-    // FR badge/mode (kept in sync; toggled by button)
-    // Note: also loaded via /gateway/config poll so the label is always accurate.
+    $('#tab_n_traffic').textContent=(s.remote||0)+' overflow';
   }
+
+  // ---- WHY OVERFLOW: every reason gets a plain sentence + the live value of the setting
+  // that causes it + a jump-to-setting link (items 11-20). Built from the exact strings
+  // record_event() uses server-side -- see _route_completions() in keepalive-shim.py. ----
+  const REASON_INFO={
+    forced:      {why:'Full-remote mode is switched on -- every request goes straight to the paid provider.', field:'f_force_remote', label:v=>'force-remote = '+v, fix:'Switch the mode badge back to LOCAL FIRST.'},
+    size:        {why:'Prompt + requested output was bigger than the single-request size cap.', field:'f_max_local_tokens', label:v=>'cap = '+Number(v).toLocaleString()+' tok', fix:'Raise the size cap in Settings if this box can actually hold it.'},
+    'big-out':   {why:'Requested output tokens was at or above the big-output threshold.', field:'f_big_output', label:v=>'threshold = '+Number(v).toLocaleString()+' tok', fix:'Raise the big-output threshold if these should stay local.'},
+    'big-prompt':{why:'The prompt was at or above the big-prompt threshold.', field:'f_big_prompt', label:v=>v>0?('threshold = '+Number(v).toLocaleString()+' tok'):'currently off (0)', fix:'Raise (or set) the big-prompt threshold.'},
+    'local-down':{why:'The local engine was unhealthy when this request arrived.', field:'f_oom_backoff_secs', label:v=>'backoff = '+v+'s', fix:'Check the Local engine tile above and the engine logs.'},
+    monster:     {why:'A huge prefill was already monopolizing the engine -- new arrivals overflow until it drains.', field:'f_monster_inflight', label:v=>'threshold = '+Number(v).toLocaleString()+' tok in flight', fix:'Raise the monster-inflight threshold, or expect this while a big job runs.'},
+    'tiny-fast': {why:'This was a tiny/fast-lane request, but even the reserved tiny headroom was full.', field:'f_tiny_extra_lanes', label:v=>'extra tiny lanes = '+v, fix:'Add more tiny extra lanes.'},
+    tokens:      {why:'A lane was free, but serving this would have exceeded the total in-flight context budget.', field:'f_token_budget', label:v=>'budget = '+Number(v).toLocaleString()+' tok', fix:'Raise the total in-flight context cap.'},
+    'bg-yield':  {why:'Lanes existed, but they are reserved for interactive traffic -- this request was background.', field:'f_fg_reserved', label:v=>'reserved for interactive = '+v, fix:'Lower the reserved-for-interactive count, or accept background waits longer.'},
+    cap:         {why:'All lanes were busy and this request waited past its queue timeout.', field:'f_local_budget', label:v=>'budget = '+v+' lane(s)', fix:'Raise Local budget (lanes), or raise the queue-wait timeout.'},
+    failover:    {why:'Local accepted the request but errored or ran out of memory mid-flight, so it fell back to remote.', field:'f_oom_backoff_secs', label:v=>'backoff = '+v+'s', fix:'Check engine logs for the underlying crash.'},
+    'force-remote':{why:'A deliberate full-remote maintenance window -- background traffic was rejected outright rather than billed.', field:'f_force_remote', label:v=>'force-remote = '+v, fix:'Turn off full-remote mode when the window ends.'},
+  };
+  function renderReasons(reasons,totalRemote){
+    const entries=Object.entries(reasons).sort((a,b)=>b[1]-a[1]);
+    if(!entries.length){$('#reasons').innerHTML='<span class=empty>No overflow yet -- everything has been served locally.</span>';return;}
+    const max=entries[0][1];
+    $('#reasons').innerHTML=entries.map(([key,n])=>{
+      const info=REASON_INFO[key]||{why:'(undocumented reason: '+esc(key)+')',field:null,label:()=>'',fix:''};
+      const val=info.field?CFG[info.field.slice(2)]:null;
+      const pct=totalRemote?Math.round(100*n/totalRemote):0;
+      const jump=info.field?`<a href="#" class=rz onclick="event.preventDefault();window.__gotoSetting('${info.field}')">${esc(info.field?info.label(val):'')} &rarr;</a>`:'';
+      return '<div class=reasonrow><div><div class=rtitle>'+esc(key)+'</div><div class=rwhy>'+esc(info.why)+'</div>'+
+        (info.fix?'<div class=rfix>&#128161; '+esc(info.fix)+'</div>':'')+
+        '<div class=rbar><i style=width:'+Math.round(100*n/max)+'%></i></div></div>'+
+        '<div class=rcount><b>'+n+'</b><div class=rz>'+pct+'% of overflow</div>'+(jump?'<div style="margin-top:3px">'+jump+'</div>':'')+'</div></div>';
+    }).join('');
+  }
+  window.__gotoSetting=goToSetting;   // reasonrow links are built via innerHTML, so this needs a stable global
 
   function renderRecent(){
     const per=25,pg=paginate(recentEvents,'ev',per);
-    $('#req_summary').textContent=pg.total? (pg.total+' events buffered · showing '+(pg.from+1)+'-'+pg.to) : 'no events yet';
-    $('#ev').innerHTML=pg.slice.map(e=>`<tr><td class="rz mono">${fmtAgo(e.t)} ago</td><td>${esc(e.ep)}</td><td>${esc(e.client)}</td><td><span class="tag ${routeTag(e.d)}">${esc(e.d)}</span></td><td class=rz>${esc(e.r||'')}</td><td class=mono>${(e.ptok||0)}&rarr;${(e.maxtok||0)}${e.stream?' &#9889;':''}</td><td class=mono>${e.waited?e.waited+'s':''}</td></tr>`).join('')
-      || '<tr><td colspan=7 class=empty>no events yet</td></tr>';
+    $('#req_summary').textContent=pg.total? (pg.total+' events buffered (this process only) \u00b7 showing '+(pg.from+1)+'-'+pg.to) : 'No requests yet this uptime.';
+    $('#ev').innerHTML=pg.slice.map(e=>`<tr><td class="rz mono">${fmtAgo(e.t)}</td><td>${esc(e.ep)}</td><td>${clientDisplay(e.client)}</td><td><span class="tag ${routeTag(e.d)}">${esc(e.d)}</span></td><td class=rz>${esc(e.r||'')}</td><td class=mono>${(e.ptok||0)}&rarr;${(e.maxtok||0)}${e.stream?' &#9889;':''}</td><td class=mono>${e.waited?e.waited+'s':''}</td></tr>`).join('')
+      || '<tr><td colspan=7 class=empty>No requests logged yet this uptime.</td></tr>';
     wirePager('ev','#ev_prev','#ev_next','#ev_page',pg.pages,renderRecent);
   }
 
-  // ==================== RESEARCH & LANES (uses /gateway/lanes) ====================
+  // ==================== UNIFIED "NOW" LIST (items 1-10, 50-55) ====================
+  // One list, one Kind column, one pager, one empty state -- instead of four hand-rolled
+  // lists (live requests / agent lanes / frontier queue+windows / research) each with its
+  // own pager and its own definition of "still running".
   const TERMINAL=new Set(['done','failed','error','degraded','cancelled']);
-  const isRun=j=>!TERMINAL.has(j.status);
-  let lanesData=null;
-  function taskRow(cls,name,stat,meta,href,title){
-    const inner='<span class="sq '+cls+'"></span><div><div class=tname'+(title?' title="'+esc(title)+'"':'')+'>'+name+'</div>'+(stat?'<div class=tstat>'+stat+'</div>':'')+'</div><div class=tmeta>'+(meta||'')+'</div>';
-    return href?'<a class=task href="'+href+'" target=_blank rel=noopener>'+inner+'</a>':'<div class="task hov">'+inner+'</div>';
-  }
-  function renderLanes(){
-    if(!lanesData)return;const d=lanesData,q=d.queue||{};
-    // Health checks
-    const H=d.health||{},HC=H.checks||[];
-    $('#n_health').textContent=H.present?HC.length:'-';
-    $('#health_line').innerHTML=H.present?('estate watchdog &middot; overall <b style="color:'+(H.overall==='ok'?'var(--grn)':H.overall==='warn'?'var(--amb)':'var(--red)')+'">'+esc(H.overall||'?')+'</b> &middot; last run '+(H.age_s!=null?ago(H.age_s):'?')+(H.paused?' &middot; <span class="badge warn">PAUSED</span>':'')):'estate watchdog not installed yet';
-    $('#t_health').innerHTML=HC.map(c=>'<span title="'+esc(c.detail||'')+'"><span class="sq '+(c.status==='OK'?'done':c.status==='WARN'?'stale':c.status==='CRIT'?'blocked':'empty')+'" style="margin:0 5px 0 0;vertical-align:-1px"></span>'+esc(c.name)+' <span class=rz>'+esc((c.detail||'').slice(0,48))+'</span></span>').join('')||'<span class=empty>'+(H.present?'no checks reported':'no watchdog state yet')+'</span>';
-    const ha=$('#health_alert');if(H.alert){ha.hidden=false;ha.textContent='ALERT · '+H.alert.slice(0,400);}else{ha.hidden=true;}
-    // Live requests
-    const AC=d.active||[];$('#n_active').textContent=AC.length;
-    $('#lane_line').innerHTML='lanes <b>'+(d.inflight||0)+'</b>/'+(d.budget||0)+' in use &middot; <b>'+(d.waiting||0)+'</b> waiting &middot; '+
-      '<span class="sq run" style="margin:0 4px 0 6px;vertical-align:-1px"></span>local '+
-      '<span class="sq stale" style="margin:0 4px 0 10px;vertical-align:-1px"></span>overflow '+
-      '<span class="sq queued" style="margin:0 4px 0 10px;vertical-align:-1px"></span>waiting';
-    const acPg=paginate(AC,'active',25);
-    $('#t_active').innerHTML=acPg.slice.map(a=>{
+  let lanesData=null, winData=null, nFilter='';
+  const N_STATE_LEGEND='<span class="sq run" style="vertical-align:-1px"></span> working &nbsp;'+
+    '<span class="sq queued" style="vertical-align:-1px"></span> queued &nbsp;'+
+    '<span class="sq stale" style="vertical-align:-1px"></span> stale (no heartbeat) &nbsp;'+
+    '<span class="sq done" style="vertical-align:-1px"></span> done &nbsp;'+
+    '<span class="sq blocked" style="vertical-align:-1px"></span> blocked';
+  $('#n_state_legend').innerHTML=N_STATE_LEGEND;
+
+  function buildUnified(){
+    const rows=[];
+    const L=lanesData||{};
+    // requests (kind=request) -- in-flight HTTP calls, from /gateway/lanes .active
+    (L.active||[]).forEach(a=>{
       const remote=a.route==='remote',queued=a.phase==='queued',held=a.phase==='held';
-      const cls=queued?'queued':held?'queued':remote?'stale':'run';
-      const badge=queued?'<span class="badge warn">waiting for a lane</span>':held?'<span class="badge warn">holding for local (bg) &middot; never sent remote</span>':remote?'<span class="badge warn">remote overflow &middot; '+esc(a.reason||'')+'</span>':a.phase==='local'?'<span class="badge run">local model'+(a.waited?' &middot; waited '+a.waited+'s':'')+'</span>':'<span class="badge run">routing</span>';
-      const who=esc(a.name)+(a.name!==a.ip?' <span class=rz>'+esc(a.ip)+'</span>':'')+(a.ua?' <span class=rz>&middot; '+esc(a.ua)+'</span>':'');
-      const stat=(a.preview?'"'+esc(a.preview)+'"':'<span class=rz>(no text preview)</span>')+(a.bg?' &middot; background':'')+(a.tiny?' &middot; tiny':'')+(a.model?' &middot; '+esc(a.model):'');
-      return taskRow(cls,who+badge,stat,'<b>'+dur(a.elapsed_s)+'</b> elapsed<br>'+esc(a.ep)+(a.ptok?' &middot; '+Math.round(a.ptok/1000)+'K in':'')+(a.maxtok?' &middot; '+a.maxtok+' max out':'')+(a.stream?' &middot; &#9889; stream':''),null,null);
-    }).join('')||'<div class=empty>Nothing running on the local model right now.</div>';
-    wirePager('active','#a_prev','#a_next','#a_page',acPg.pages,renderLanes);
-
-    // Agent lanes
-    const L=d.lanes||[];$('#n_lanes').textContent=L.length;
-    const lPg=paginate(L,'lanes',25);
-    $('#t_lanes').innerHTML=lPg.slice.map(l=>{
+      const state=queued?'queued':held?'queued':remote?'stale':'run';
+      // deadline estimate (item 7): how much of the configured wait is left before this
+      // would overflow, computed client-side from the live config -- no backend change needed.
+      let deadline=null;
+      if(queued&&CFG){
+        const waitS=(a.bg?CFG.bg_wait_secs:CFG.local_wait_secs);
+        if(waitS!=null)deadline=Math.max(0,Number(waitS)-(a.waited||0));
+      }
+      rows.push({kind:'request',who:clientDisplay(a.name,a.ip,a.ua),
+        what:(a.preview?'"'+esc(a.preview)+'"':'<span class=rz>(no text preview)</span>')+(a.bg?' &middot; background':'')+(a.tiny?' &middot; tiny':'')+(a.model?' &middot; '+esc(a.model):''),
+        state, badgeText: queued?'waiting for a lane'+(deadline!=null?' \u00b7 overflows in ~'+Math.round(deadline)+'s':''):held?'holding for local (background) -- never billed':remote?'remote overflow \u00b7 '+esc(a.reason||''):a.phase==='local'?'local model'+(a.waited?' \u00b7 waited '+a.waited+'s':''):'routing',
+        age:a.elapsed_s||0, meta:esc(a.ep)+(a.ptok?' \u00b7 '+Math.round(a.ptok/1000)+'K in':'')+(a.maxtok?' \u00b7 '+a.maxtok+' max out':'')+(a.stream?' \u00b7 \u26a1 stream':''),
+        sortkey:(a.name||'')+' '+(a.preview||'')});
+    });
+    // agent lanes (kind=lane) -- long-running background workers (STATUS-file heartbeat)
+    (L.lanes||[]).forEach(l=>{
       const st=l.status||'';const m=st.match(/^(RUNNING|DONE|BLOCKED)\s*\|\s*([^|]*)\|\s*(.*)$/);
-      const state=m?m[1]:(st?'RUNNING':'UNKNOWN');const text=m?m[3].trim():(st||('newest file: '+l.newest));
-      const stale=state==='RUNNING'&&l.age_s>900;
-      const cls=state==='DONE'?'done':state==='BLOCKED'?'blocked':stale?'stale':state==='RUNNING'?'run':'empty';
-      const label=state==='DONE'?'done':state==='BLOCKED'?'blocked':stale?'no heartbeat for '+dur(l.age_s):state==='RUNNING'?'working':'idle';
-      const bcls=cls==='done'?'ok':cls==='run'?'run':cls==='empty'?'':'warn';
-      return taskRow(cls,esc(l.lane)+'<span class="badge '+bcls+'">'+label+'</span>',esc(text),'updated <b>'+ago(l.age_s)+'</b><br>'+esc((l.root||'').replace(/^\/home\/kevin\//,'~/')),null,(l.root||'')+'/'+l.lane+' -- newest file: '+l.newest);
-    }).join('')||'<div class=empty>No agent lanes right now.</div>';
-    wirePager('lanes','#l_prev','#l_next','#l_page',lPg.pages,renderLanes);
-
-    // Frontier queue
-    const running=q.running||[],queued=q.queued||[],results=q.results||[];
-    const qAll=[].concat(
-      running.map(x=>({kind:'r',name:x.replace('.running','')})),
-      queued.map((x,i)=>({kind:'q',name:x,pos:i+1})),
-      results.map(r=>({kind:'d',r:r}))
-    );
-    $('#n_queue').textContent=running.length+queued.length;
-    $('#q_paused').innerHTML=q.paused?'<span class="badge warn">PAUSED &mdash; kill switch is on</span>':'';
-    const qPg=paginate(qAll,'queue',25);
-    $('#t_queue').innerHTML=qPg.slice.map(item=>{
-      if(item.kind==='r')return taskRow('run',esc(item.name)+'<span class="badge run">window running</span>','engine benchmark in progress &mdash; the gateway serves via remote overflow meanwhile','');
-      if(item.kind==='q')return taskRow('queued',esc(item.name),'waiting &middot; position '+item.pos+' &middot; the runner picks it up within 10 min once the engine is free','');
-      const r=item.r;
-      return taskRow('done',esc(r.file.replace(/\.txt$/,''))+'<span class="badge ok">result</span>','<details class=tail><summary>show last lines &#9662;</summary><pre>'+esc((r.tail||[]).join('\n'))+'</pre></details>','finished <b>'+ago(r.age_s)+'</b>');
-    }).join('')||'<div class=empty>Queue idle &mdash; nothing running or waiting.</div>';
-    wirePager('queue','#q_prev','#q_next','#q_page',qPg.pages,renderLanes);
-
-    // Deep research
-    const R=d.research||[];const f=($('#r_filter').value||'').toLowerCase();const hide0=$('#r_hide0').checked;
-    const list=R.filter(j=>!f||(j.q||'').toLowerCase().includes(f)).filter(j=>!hide0||!/^0\//.test(j.claims||''));
-    const nRun=R.filter(isRun).length,n0=R.filter(j=>/^0\//.test(j.claims||'')).length,nDone=(d.research_counts&&d.research_counts.done)||0;
-    $('#n_research').textContent=R.length;
-    $('#r_counts').innerHTML=(nRun?'<span class="badge run">'+nRun+' running</span>':'')+'<span class="badge ok">'+nDone+' done</span>'+(n0?'<span class="badge warn">'+n0+' produced no surviving claims</span>':'');
-    const rPg=paginate(list,'research',10);
-    $('#t_research').innerHTML=rPg.slice.map(j=>{
-      const run=isRun(j),zero=/^0\//.test(j.claims||'');
-      const cls=run?'run':(j.status==='failed'||j.status==='error')?'blocked':(j.status==='degraded'||zero)?'empty':'done';
-      const badge=run?'<span class="badge run">'+esc(j.phase||j.status)+(j.progress?' &middot; '+esc(j.progress):'')+'</span>':j.status==='degraded'?'<span class="badge warn">degraded &middot; no usable evidence</span>':zero?'<span class="badge warn">0 claims</span>':j.claims?'<span class="badge ok">'+esc(j.claims)+' claims</span>':'';
-      const stat=esc(j.depth)+(j.agents?' &middot; '+esc(j.agents)+' agents':'')+(j.tokens?' &middot; '+Math.round(j.tokens/1000)+'K tok':'')+(j.elapsed_s!=null?' &middot; '+dur(j.elapsed_s):'')+(zero?' &middot; <span style="color:var(--amb)">nothing survived verification</span>':'');
-      return taskRow(cls,esc(j.q)+badge,stat,'<b>'+when(j.submitted)+'</b><br><span class=mono>'+esc((j.id||'').slice(-6))+'</span>','/gateway/research/'+encodeURIComponent(j.id||''),j.q);
-    }).join('')||'<div class=empty>'+(R.length?'No jobs match the filter.':'No research jobs reported by the service.')+'</div>';
-    wirePager('research','#r_prev','#r_next','#r_page',rPg.pages,renderLanes);
-
-    $('#t_err').textContent=(d.errors&&d.errors.length)?'partial data: '+d.errors.join(', '):'';
+      const stg=m?m[1]:(st?'RUNNING':'UNKNOWN');const text=m?m[3].trim():(st||('newest file: '+l.newest));
+      const stale=stg==='RUNNING'&&l.age_s>900;
+      const state=stg==='DONE'?'done':stg==='BLOCKED'?'blocked':stale?'stale':stg==='RUNNING'?'run':'empty';
+      rows.push({kind:'lane',who:'<span class=role>'+esc(l.lane)+'</span>',what:esc(text),state,
+        badgeText: state==='done'?'done':state==='blocked'?'blocked':state==='stale'?'no heartbeat for '+dur(l.age_s):state==='run'?'working':'idle',
+        age:l.age_s||0, meta:esc((l.root||'').replace(/^\/home\/kevin\//,'~/')), sortkey:l.lane||''});
+    });
+    // research jobs (kind=research)
+    (L.research||[]).forEach(j=>{
+      const running=!TERMINAL.has(j.status),zero=/^0\//.test(j.claims||'');
+      const state=running?'run':(j.status==='failed'||j.status==='error')?'blocked':(j.status==='degraded'||zero)?'stale':'done';
+      rows.push({kind:'research',who:'<span class=rawid>'+esc((j.id||'').slice(-6))+'</span>',what:esc(j.q)+' &middot; '+esc(j.depth)+(j.agents?' \u00b7 '+esc(j.agents)+' agents':'')+(j.tokens?' \u00b7 '+Math.round(j.tokens/1000)+'K tok':''),state,
+        badgeText: running?esc(j.phase||j.status)+(j.progress?' \u00b7 '+esc(j.progress):''):j.status==='degraded'?'degraded -- no usable evidence':zero?'0 claims survived':j.claims?esc(j.claims)+' claims':'',
+        age:j.elapsed_s||0, meta:'<a href="/gateway/research/'+encodeURIComponent(j.id||'')+'" target=_blank rel=noopener>report &rarr;</a>', sortkey:j.q||'',
+        href:'/gateway/research/'+encodeURIComponent(j.id||'')});
+    });
+    // frontier windows (kind=window) -- this now covers what used to be a SEPARATE "frontier
+    // queue" list too (item 51): queued/running/done are all just window states.
+    ((winData&&winData.windows)||[]).forEach(w=>{
+      const state=w.state==='queued'?'queued':w.failed?'blocked':w.state==='running'?'run':'done';
+      rows.push({kind:'window',who:'<span class=role>'+esc(w.name)+'</span>',what:esc(w.description||'(no header comment found)'),state,
+        badgeText: w.state==='queued'?'queued':w.duration_s!=null?dur(w.duration_s)+(w.state==='running'?' so far':''):w.state,
+        age:w.duration_s||0, meta:w.log_url?'<a href="'+w.log_url+'" target=_blank rel=noopener>log &rarr;</a>':'', sortkey:w.name||''});
+    });
+    return rows;
   }
+  function kindLabel(k){return {request:'request',lane:'agent lane',window:'window',research:'research'}[k]||k;}
+  function renderNow(){
+    const all=buildUnified();
+    const summary={request:0,lane:0,window:0,research:0};
+    let longest=null;
+    all.forEach(r=>{if(r.state==='run'){summary[r.kind]=(summary[r.kind]||0)+1;if(!longest||r.age>longest.age)longest=r;}});
+    $('#now_summary').innerHTML=
+      '<span><b>'+summary.request+'</b><span class=lbl>requests in flight</span></span>'+
+      '<span><b>'+summary.lane+'</b><span class=lbl>agent lanes working</span></span>'+
+      '<span><b>'+summary.window+'</b><span class=lbl>windows running</span></span>'+
+      '<span><b>'+summary.research+'</b><span class=lbl>research running</span></span>';
+    const longestEl=$('#longest');
+    if(longest&&longest.age>180){longestEl.hidden=false;longestEl.innerHTML='\u23f1 longest still running: <b>'+kindLabel(longest.kind)+'</b> '+longest.who+' &mdash; '+dur(longest.age);}
+    else longestEl.hidden=true;
+    $('#tab_n_now').textContent=(summary.request+summary.lane+summary.window+summary.research)+' active';
+
+    const showDone=$('#n_showdone').checked;
+    let rows=all.filter(r=>(!nFilter||r.kind===nFilter)&&(showDone||!TERMINAL.has(r.state)&&r.state!=='done'));
+    const s=SORT.now;
+    if(s.key==='kind')rows=sortArr(rows,'kind',s.dir);
+    else if(s.key==='who')rows=sortArr(rows,'sortkey',s.dir);
+    else if(s.key==='age')rows=sortArr(rows,'age',s.dir);
+    else rows=rows.slice().sort((a,b)=>(b.state==='run')-(a.state==='run')||b.age-a.age); // default: working-first, then oldest
+
+    const per=25,pg=paginate(rows,'now',per);
+    $('#n_rows').innerHTML=pg.slice.map(r=>{
+      const inner='<span class="sq '+r.state+'"></span>';
+      const body='<div class=tname>'+r.who+'</div><div class=tstat>'+r.what+'</div>';
+      const badge='<span class="badge '+(r.state==='run'?'run':r.state==='done'?'ok':r.state==='blocked'?'err':'warn')+'">'+esc(r.badgeText)+'</span>';
+      return '<tr><td>'+inner+'</td><td><span class="badge kind">'+kindLabel(r.kind)+'</span></td><td>'+body+'</td><td>'+badge+'</td><td class=mono>'+dur(r.age)+'</td><td class=tmeta>'+(r.meta||'')+'</td></tr>';
+    }).join('')||('<tr><td colspan=6 class=empty>'+(all.length?'Nothing matches this filter right now.':'Nothing in flight -- gateway is idle. That is normal, not a problem.')+'</td></tr>');
+    wirePager('now','#n_prev','#n_next','#n_page',pg.pages,renderNow);
+    $('#n_err').textContent=[(lanesData&&lanesData.errors)||[],(winData&&winData.errors)||[]].flat().join(', ');
+    // health checks (estate watchdog -- kept, but visually a separate box now, not the top of the page)
+    const H=(lanesData&&lanesData.health)||{},HC=H.checks||[];
+    $('#n_health').textContent=H.present?HC.length:'-';
+    $('#health_line').innerHTML=H.present?('overall <b style="color:'+(H.overall==='ok'?'var(--grn)':H.overall==='warn'?'var(--amb)':'var(--red)')+'">'+esc(H.overall||'?')+'</b> \u00b7 last run '+(H.age_s!=null?ago(H.age_s):'?')+(H.paused?' \u00b7 <span class="badge warn">PAUSED</span>':'')):'estate watchdog not installed yet';
+    $('#t_health').innerHTML=HC.map(c=>'<span title="'+esc(c.detail||'')+'"><span class="sq '+(c.status==='OK'?'done':c.status==='WARN'?'stale':c.status==='CRIT'?'blocked':'empty')+'" style="margin:0 5px 0 0;vertical-align:-1px"></span>'+esc(c.name)+' <span class=rz>'+esc((c.detail||'').slice(0,48))+'</span></span>').join('')||'<span class=empty>'+(H.present?'no checks reported':'no watchdog state yet')+'</span>';
+    const ha=$('#health_alert');if(H.alert){ha.hidden=false;ha.textContent='ALERT \u00b7 '+H.alert.slice(0,400);}else{ha.hidden=true;}
+  }
+  $$('.chip[data-k]').forEach(c=>c.addEventListener('click',()=>{
+    nFilter=c.dataset.k;PAGE.now=1;
+    $$('.chip[data-k]').forEach(x=>x.classList.toggle('on',x===c));
+    renderNow();
+  }));
+  $('#k_all').classList.add('on');
+  $('#n_showdone').addEventListener('change',()=>{PAGE.now=1;renderNow();});
+  wireSort('#n_table','now',renderNow);
+  $('#n_csv').addEventListener('click',()=>{
+    const rows=buildUnified().filter(r=>!nFilter||r.kind===nFilter);
+    csvDownload('gateway-now.csv',[['kind','who','status','age_s'],...rows.map(r=>[r.kind,r.who.replace(/<[^>]+>/g,''),r.badgeText,Math.round(r.age)])]);
+  });
+
   let busyLanes=false;
   async function tickLanes(){if(busyLanes)return;busyLanes=true;
-    try{lanesData=await(await fetch('/gateway/lanes',{cache:'no-store'})).json();lastOk=Date.now();renderLanes();}
-    catch(e){$('#t_err').textContent='background-task feed unreachable: '+e;}
+    try{lanesData=await(await fetch('/gateway/lanes',{cache:'no-store'})).json();lastOk=Date.now();renderNow();}
+    catch(e){setBanner('lanes','background-task feed unreachable: '+e,'err');}
     finally{busyLanes=false;}
-  }
-  $('#r_filter').addEventListener('input',renderLanes);
-  $('#r_hide0').addEventListener('change',renderLanes);
-
-  // ==================== WINDOWS (uses /gateway/windows) ====================
-  let winData=null;
-  function sqCls(w){return w.state==='queued'?'queued':w.failed?'blocked':w.state==='running'?'run':'done';}
-  function armTable(w){
-    const arms=Object.keys(w.arms||{});if(!arms.length)return'';
-    const keys=[];arms.forEach(a=>Object.keys(w.arms[a]).forEach(k=>{if(!keys.includes(k))keys.push(k);}));
-    const rows=arms.map(a=>'<tr><td class=mono>'+esc(a)+'</td>'+keys.map(k=>'<td class=mono>'+(w.arms[a][k]!=null?esc(String(w.arms[a][k])):'')+'</td>').join('')+'</tr>').join('');
-    return '<div class=armwrap><table class=armtbl><tr><th>arm</th>'+keys.map(k=>'<th>'+esc(k)+'</th>').join('')+'</tr>'+rows+'</table></div>';
-  }
-  function winBadges(w){
-    let b='';
-    Object.keys(w.evalkit||{}).forEach(a=>{
-      const e=w.evalkit[a]||{};const scores=e.scores||[];const sc=scores.length?scores[scores.length-1]:null;
-      const cls=sc==null?'':sc>=44?'ok':'warn';
-      b+='<span class="badge '+cls+'" title="'+esc(a+': '+(e.lines||[]).join(' | '))+'">'+esc(a)+' evalkit '+(sc!=null?sc+'/45':(e.lines||[]).length?'?':'')+'</span>';
-    });
-    Object.keys(w.pool||{}).forEach(a=>{b+='<span class=badge title="pool line, arm '+esc(a)+'">'+esc(a)+' pool '+esc(String(w.pool[a]))+'</span>';});
-    return b;
-  }
-  function winCard(w){
-    const sq='<span class="sq '+sqCls(w)+'" style="margin-top:2px"></span>';
-    const desc=esc(w.description||'(no header comment found)');
-    const nowS=Date.now()/1000;
-    const meta=(w.state==='queued'?'queued &middot; seen '+ago(nowS-(w.sort_ts||nowS))
-               :w.duration_s!=null?'<b>'+dur(w.duration_s)+'</b>'+(w.state==='running'?' so far':'')
-               :w.state)+
-               (w.started_at?'<br><span class=rz>start '+esc(w.started_at)+'</span>':'')+
-               (w.finished_at?'<br><span class=rz>end '+esc(w.finished_at)+'</span>':'');
-    const bd=winBadges(w);
-    const stamps=(w.done_marker?'<span class="badge ok">'+esc(w.done_marker)+'</span>':'')+
-                 (w.failed?'<span class="badge warn" style="color:var(--red)">FAILED &mdash; no DONE marker</span>':'');
-    const badgeRow=(bd||stamps)?'<div style="margin-top:6px">'+bd+stamps+'</div>':'';
-    const verdict=(w.verdict_lines||[]).length?'<div class=tstat style="margin-top:6px">'+w.verdict_lines.map(esc).join('<br>')+'</div>':'';
-    const tbl=armTable(w);
-    const tail=(w.tail||[]).length?'<details class=tail style="margin-top:6px"><summary>show last '+w.tail.length+' lines &#9662;</summary><pre>'+esc(w.tail.join('\n'))+'</pre></details>':'';
-    const log=w.log_url?'<a href="'+w.log_url+'" target=_blank rel=noopener style="font-size:12px">full log &rarr;</a>':(w.result_file?'<span class=rz style="font-size:12px">'+esc(w.result_file)+' not written yet</span>':'');
-    return '<div class=wcard><div style="display:grid;grid-template-columns:14px minmax(0,1fr) auto;gap:10px;align-items:start">'+
-           sq+'<div><div class=tname>'+esc(w.name)+' <span class=badge>'+esc(w.state)+'</span></div>'+
-           '<div class=tstat>'+desc+'</div>'+tbl+badgeRow+verdict+tail+
-           (log?'<div style="margin-top:6px">'+log+'</div>':'')+
-           '</div><div class=tmeta>'+meta+'</div></div></div>';
-  }
-  function renderWindows(){
-    if(!winData)return;
-    const W=winData.windows||[];
-    const nRun=W.filter(w=>w.state==='running').length,nQ=W.filter(w=>w.state==='queued').length;
-    $('#win_summary').textContent=W.length+' windows · '+nRun+' running · '+nQ+' queued';
-    const per=25,pg=paginate(W,'windows',per);
-    $('#windows_list').innerHTML=pg.slice.map(winCard).join('')||'<div class=empty>No frontier-queue windows found (queue/done both empty).</div>';
-    wirePager('windows','#w_prev','#w_next','#w_page',pg.pages,renderWindows);
-    $('#win_err').textContent=(winData.errors&&winData.errors.length)?'partial data: '+winData.errors.join(', '):'';
   }
   let busyWin=false;
   async function tickWindows(){if(busyWin)return;busyWin=true;
-    try{winData=await(await fetch('/gateway/windows',{cache:'no-store'})).json();renderWindows();}
-    catch(e){$('#win_err').textContent='windows feed unreachable: '+e;}
+    try{winData=await(await fetch('/gateway/windows',{cache:'no-store'})).json();renderNow();}
+    catch(e){setBanner('windows','windows feed unreachable: '+e,'err');}
     finally{busyWin=false;}
   }
 
@@ -4586,62 +4990,82 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
       const pts=s.map((v,i)=>(v==null||!isFinite(v))?null:x(i).toFixed(1)+','+y(v).toFixed(1)).filter(Boolean).join(' ');
       return pts?'<polyline class="'+cls[li%3]+'" points="'+pts+'"></polyline>':'';
     }).join('');
+    return {n,lo,hi};
+  }
+  // sample cadence is fixed server-side at 2s (TELEM_SAMPLE_SECS) -- used only to label the
+  // window ("last ~Nm"), never to compute anything routing-relevant.
+  const TELEM_SAMPLE_SECS=2;
+  function sparkFoot(id,n,cur){
+    const el=document.getElementById(id);if(!el)return;
+    const win=n?dur(n*TELEM_SAMPLE_SECS):'--';
+    el.textContent='last ~'+win+(cur!=null?' \u00b7 now '+cur:'');
   }
   function seriesOf(fast,path){return fast.map(s=>{let v=s;for(const k of path){v=v&&v[k];if(v==null)return null;}return v;});}
-  let telemData=null,perClientList=[],errorFeed=[];
+  let telemData=null,perClientList=[],errorFeed=[],pcWindow='uptime';
   function renderTelem(){
     if(!telemData)return;
     const t=telemData;
     const fast=(t.series&&t.series.fast)||[];
     const eng=(t.latest&&t.latest.engine)||{};
-    // Update top strip tokens/s + TTFT via the two special ids that live inside strip tiles
     const tpsNow=$('#tps_now'),ttftLine=$('#ttft_line');
     if(tpsNow){tpsNow.innerHTML=eng.ok&&(eng.prompt_tok_s!=null||eng.gen_tok_s!=null)?(((eng.prompt_tok_s||0)+(eng.gen_tok_s||0)).toFixed(0)):'--';}
     if(ttftLine){ttftLine.innerHTML=eng.ok&&eng.ttft_p50!=null?(eng.ttft_p50.toFixed(2)+'s / '+(eng.ttft_p95||0).toFixed(2)+'s'):'--';}
     $('#telem_engok').innerHTML=eng.ok?'<span class="dot up"></span> scraping OK':
       ('<span class="dot down"></span> '+(eng.age_s!=null?('stale '+Math.round(eng.age_s)+'s ago ('+esc(eng.err||'')+')'):('never scraped yet ('+esc(eng.err||'engine down')+')')));
+    setBanner('engine', eng.ok?null:'Engine Prometheus scrape is failing -- telemetry sparklines are stale.', 'warn');
     $('#telem_tiles').innerHTML=[
-      tile('<abbr title="Live combined prompt + generation tokens/s from the engine.">Tokens/s now</abbr>',eng.ok&&(eng.prompt_tok_s!=null||eng.gen_tok_s!=null)?(((eng.prompt_tok_s||0)+(eng.gen_tok_s||0)).toFixed(0)):'--'),
-      tile('<abbr title="Time to first token &mdash; median (p50) then worst 5% (p95).">TTFT p50 <small>/ p95</small></abbr>',eng.ok&&eng.ttft_p50!=null?(eng.ttft_p50.toFixed(2)+'s <small>/ '+(eng.ttft_p95||0).toFixed(2)+'s</small>'):'--'),
-      tile('<abbr title="KV-cache utilisation, percent of total.">KV-cache %</abbr>',eng.ok&&eng.kv_cache_pct!=null?(eng.kv_cache_pct.toFixed(0)+'<small>%</small>'):'--'),
-      tile('<abbr title="Engine-scheduled requests running now / waiting to run.">Engine running <small>/ waiting</small></abbr>',eng.ok?((eng.running==null?'--':eng.running)+' <small>/ '+(eng.waiting==null?'--':eng.waiting)+'</small>'):'--'),
+      tile('Tokens/s now',eng.ok&&(eng.prompt_tok_s!=null||eng.gen_tok_s!=null)?(((eng.prompt_tok_s||0)+(eng.gen_tok_s||0)).toFixed(0)):'--'),
+      tile('TTFT (time to first token) p50 <small>/ p95</small>',eng.ok&&eng.ttft_p50!=null?(eng.ttft_p50.toFixed(2)+'s <small>/ '+(eng.ttft_p95||0).toFixed(2)+'s</small>'):'--'),
+      tile('KV-cache % (attention-cache memory used)',eng.ok&&eng.kv_cache_pct!=null?(eng.kv_cache_pct.toFixed(0)+'<small>%</small>'):'--'),
+      tile('Engine running <small>/ waiting</small>',eng.ok?((eng.running==null?'--':eng.running)+' <small>/ '+(eng.waiting==null?'--':eng.waiting)+'</small>'):'--'),
     ].join('');
-    sparkline('sp_toks',[seriesOf(fast,['engine','prompt_tok_s']),seriesOf(fast,['engine','gen_tok_s'])]);
-    sparkline('sp_ttft',[seriesOf(fast,['engine','ttft_p50']),seriesOf(fast,['engine','ttft_p95'])]);
-    sparkline('sp_tpot',[seriesOf(fast,['engine','tpot_p50']),seriesOf(fast,['engine','tpot_p95'])]);
-    sparkline('sp_kv',[seriesOf(fast,['engine','kv_cache_pct']),seriesOf(fast,['gateway','inflight'])]);
+    let m;
+    m=sparkline('sp_toks',[seriesOf(fast,['engine','prompt_tok_s']),seriesOf(fast,['engine','gen_tok_s'])]);sparkFoot('sf_toks',fast.length,eng.ok?((eng.prompt_tok_s||0).toFixed(0)+'p/'+(eng.gen_tok_s||0).toFixed(0)+'g tok/s'):null);
+    m=sparkline('sp_ttft',[seriesOf(fast,['engine','ttft_p50']),seriesOf(fast,['engine','ttft_p95'])]);sparkFoot('sf_ttft',fast.length,eng.ttft_p50!=null?eng.ttft_p50.toFixed(2)+'s':null);
+    m=sparkline('sp_tpot',[seriesOf(fast,['engine','tpot_p50']),seriesOf(fast,['engine','tpot_p95'])]);sparkFoot('sf_tpot',fast.length,eng.tpot_p50!=null?eng.tpot_p50.toFixed(2)+'s':null);
+    m=sparkline('sp_kv',[seriesOf(fast,['engine','kv_cache_pct']),seriesOf(fast,['gateway','inflight'])]);sparkFoot('sf_kv',fast.length,eng.kv_cache_pct!=null?eng.kv_cache_pct.toFixed(0)+'%':null);
     const pw=(gi)=>fast.map(s=>{const g=s.gpu&&s.gpu[gi];return(g&&g.power_w!=null&&g.power_limit_w)?100*g.power_w/g.power_limit_w:null;});
-    sparkline('sp_gpu0',[seriesOf(fast,['gpu',0,'util']),seriesOf(fast,['gpu',0,'temp_c']),pw(0)]);
-    sparkline('sp_gpu1',[seriesOf(fast,['gpu',1,'util']),seriesOf(fast,['gpu',1,'temp_c']),pw(1)]);
-    sparkline('sp_remote',[seriesOf(fast,['gateway','remote_share_pct'])]);
-    // per-client
+    m=sparkline('sp_gpu0',[seriesOf(fast,['gpu',0,'util']),seriesOf(fast,['gpu',0,'temp_c']),pw(0)]);sparkFoot('sf_gpu0',fast.length,null);
+    m=sparkline('sp_gpu1',[seriesOf(fast,['gpu',1,'util']),seriesOf(fast,['gpu',1,'temp_c']),pw(1)]);sparkFoot('sf_gpu1',fast.length,null);
+    m=sparkline('sp_remote',[seriesOf(fast,['gateway','remote_share_pct'])]);sparkFoot('sf_remote',fast.length,null);
     const pc=t.per_client||{};
     perClientList=Object.keys(pc).sort((a,b)=>pc[b].requests-pc[a].requests).map(n=>({n:n,c:pc[n]}));
     renderPerClient();
-    // errors
     errorFeed=t.errors||[];
     renderErrorFeed();
   }
   function renderPerClient(){
     const per=25,pg=paginate(perClientList,'pc',per);
+    $('#pc_filtered_note').textContent='uptime-scoped rollup (switch the window selector for a 24h view backed by the on-disk log)';
     $('#telem_clients').innerHTML=pg.slice.map(x=>{const n=x.n,c=x.c;
-      return '<tr><td>'+esc(n)+'</td><td class=mono>'+c.requests+'</td><td class=mono>'+c.local+'</td><td class=mono>'+c.remote+
+      return '<tr><td><a href="#" onclick="event.preventDefault();window.__filterHistory(\''+esc(n).replace(/'/g,"\\'")+'\')">'+clientDisplay(n)+'</a></td><td class=mono>'+c.requests+'</td><td class=mono>'+c.local+'</td><td class=mono>'+c.remote+
         '</td><td class=mono>'+c.tokens_out+(c.tokens_out_lb>0?' <span class=rz title="includes chunk-count lower bounds">(~)</span>':'')+
         '</td><td class=mono>'+(c.wait_avg_s!=null?c.wait_avg_s+'s':'--')+'</td><td class=mono>'+(c.ttft_avg_s!=null?c.ttft_avg_s+'s':'--')+
         '</td><td class=mono>'+c.errors+'</td><td class=mono>'+(c.cost_est_usd?'$'+c.cost_est_usd.toFixed(4):'--')+'</td></tr>';
-    }).join('')||'<tr><td colspan=9 class=empty>No completed requests yet.</td></tr>';
+    }).join('')||'<tr><td colspan=9 class=empty>No completed requests yet this uptime.</td></tr>';
     wirePager('pc','#pc_prev','#pc_next','#pc_page',pg.pages,renderPerClient);
   }
+  window.__filterHistory=function(name){$('#h_client').value=name;hPage=1;tickHistory();applyTab('traffic',true);$('#h_client').scrollIntoView({block:'center'});};
+  $('#pc_window').addEventListener('change',async e=>{
+    pcWindow=e.target.value;
+    if(pcWindow==='uptime'){renderPerClient();return;}
+    try{const s=await(await fetch('/gateway/history/summary?hours=24',{cache:'no-store'})).json();
+      const pc=s.per_client||{};
+      perClientList=Object.keys(pc).sort((a,b)=>pc[b].requests-pc[a].requests).map(n=>({n:n,c:{requests:pc[n].requests,local:pc[n].local,remote:pc[n].remote,tokens_out:pc[n].tokens_out,errors:pc[n].errors,wait_avg_s:null,ttft_avg_s:null,cost_est_usd:null}}));
+      $('#pc_filtered_note').textContent='last 24h, from the on-disk log';
+      renderPerClient();
+    }catch(e2){setBanner('history','24h summary unreachable: '+e2,'err');}
+  });
   function renderErrorFeed(){
     const per=25,pg=paginate(errorFeed,'ef',per);
-    $('#telem_errors').innerHTML=pg.slice.map(e=>'<tr><td class="rz mono">'+fmtAgo(e.t)+' ago</td><td>'+esc(e.client)+'</td><td>'+esc(e.ep)+
+    $('#telem_errors').innerHTML=pg.slice.map(e=>'<tr><td class="rz mono">'+fmtAgo(e.t)+'</td><td>'+clientDisplay(e.client)+'</td><td>'+esc(e.ep)+
       '</td><td><span class="tag '+routeTag(e.route)+'">'+esc(e.route)+'</span></td><td class=rz>'+esc(e.reason)+
-      '</td><td class=mono>'+(e.status||'')+'</td></tr>').join('')||'<tr><td colspan=6 class=empty>No errors recorded.</td></tr>';
+      '</td><td class=mono>'+(e.status||'')+'</td></tr>').join('')||'<tr><td colspan=6 class=empty>No errors recorded this uptime.</td></tr>';
     wirePager('ef','#ef_prev','#ef_next','#ef_page',pg.pages,renderErrorFeed);
   }
   async function tickTelemetry(){
     try{telemData=await(await fetch('/gateway/telemetry',{cache:'no-store'})).json();renderTelem();}
-    catch(e){$('#telem_engok').textContent='telemetry feed unreachable: '+e;}
+    catch(e){setBanner('telemetry','telemetry feed unreachable: '+e,'err');}
   }
 
   // ==================== HISTORY (server-side paginated /gateway/history) ====================
@@ -4657,32 +5081,17 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
     $('#h_rows').innerHTML=items.map(r=>{
       const badge='<span class="tag '+routeTag(r.route)+'">'+esc(r.route||'?')+'</span>'+(r.reason?' <span class=rz>'+esc(r.reason)+'</span>':'');
       const out=r.outtok!=null?r.outtok:(r.outtok_lb!=null?'~'+r.outtok_lb:0);
-      return '<tr><td class="rz mono">'+fmtAgo(r.t)+' ago</td><td>'+esc(r.client)+'</td><td>'+badge+
+      return '<tr><td class="rz mono">'+fmtAgo(r.t)+'</td><td>'+clientDisplay(r.client)+'</td><td>'+badge+
         '</td><td class=rz title="'+esc(r.preview||'')+'">'+esc((r.preview||'').slice(0,60))+
         '</td><td class=mono>'+(r.ptok||0)+'&rarr;'+out+
         '</td><td class=mono>'+(r.ttft!=null?r.ttft.toFixed(2)+'s':'--')+
         '</td><td class=mono>'+fmtDur(r.duration)+'</td><td class=mono>'+(r.status||'')+'</td></tr>';
     }).join('')||('<tr><td colspan=8 class=empty>No matching requests logged'+((cq||rq)?' for this filter.':' yet.')+'</td></tr>');
     const lg=h.log||{};
-    $('#h_logstate').textContent='logged '+(lg.written||0)+' since restart'+(lg.dropped_cap?' · '+lg.dropped_cap+' dropped (daily cap)':'')+(lg.dropped_queue?' · '+lg.dropped_queue+' dropped (queue full)':'')+(lg.capped_today?' · TODAY LOG AT SIZE CAP':'');
-    // wire prev/next based on server-reported has_more
+    $('#h_logstate').textContent='logged '+(lg.written||0)+' since restart'+(lg.dropped_cap?' \u00b7 '+lg.dropped_cap+' dropped (daily cap)':'')+(lg.dropped_queue?' \u00b7 '+lg.dropped_queue+' dropped (queue full)':'')+(lg.capped_today?' \u00b7 TODAY LOG AT SIZE CAP':'');
     $('#h_page').textContent=hPage;
     $('#h_prev').disabled=hPage<=1;
     $('#h_next').disabled=!h.has_more;
-    // 24h summary
-    let s;try{s=await(await fetch('/gateway/history/summary?hours=24',{cache:'no-store'})).json();}catch(e){return;}
-    const pc=s.per_client||{};const names=Object.keys(pc).sort((a,b)=>pc[b].requests-pc[a].requests);
-    const errTotal=names.reduce((a,n)=>a+(pc[n].errors||0),0);
-    $('#h_tiles').innerHTML=[
-      tile('<abbr title="Total requests logged in the last 24 hours.">Requests (24h)</abbr>',s.requests||0),
-      tile('<abbr title="End-to-end request duration &mdash; median then worst 5%.">Duration p50 <small>/ p95</small></abbr>',fmtDur(s.duration_p50)+' <small>/ '+fmtDur(s.duration_p95)+'</small>'),
-      tile('<abbr title="Time to first token &mdash; median then worst 5%.">TTFT p50 <small>/ p95</small></abbr>',(s.ttft_p50!=null?s.ttft_p50.toFixed(2)+'s':'--')+' <small>/ '+(s.ttft_p95!=null?s.ttft_p95.toFixed(2)+'s':'--')+'</small>'),
-      tile('<abbr title="Non-2xx completions in the last 24 hours.">Errors (24h)</abbr>',errTotal),
-    ].join('');
-    $('#h_clients').innerHTML=names.map(n=>{const c=pc[n];
-      return '<tr><td>'+esc(n)+'</td><td class=mono>'+c.requests+'</td><td class=mono>'+c.local+'</td><td class=mono>'+c.remote+
-        '</td><td class=mono>'+c.tokens_in+'</td><td class=mono>'+c.tokens_out+'</td><td class=mono>'+c.errors+'</td></tr>';
-    }).join('')||'<tr><td colspan=7 class=empty>No requests logged in the last 24h.</td></tr>';
   }
   $('#h_client').addEventListener('input',()=>{clearTimeout(hTimer);hTimer=setTimeout(()=>{hPage=1;tickHistory();},300);});
   $('#h_route').addEventListener('input',()=>{clearTimeout(hTimer);hTimer=setTimeout(()=>{hPage=1;tickHistory();},300);});
@@ -4714,9 +5123,16 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
   }
   async function loadCfg(){
     try{const c=await(await fetch('/gateway/config')).json();
-      FR=c.force_remote?1:0;renderMode();
+      CFG=c;
+      FR=c.force_remote?1:0;
+      MODE=c.mode||(c.local_only?'full_local':(c.force_remote?'full_remote':'local_first'));renderMode();
       for(const [k,v] of Object.entries(c)){const el=document.getElementById('f_'+k);if(el&&el.type!=='password')el.value=v;}
-      $('#keystate').textContent=c.remote_key_display?(' · '+c.remote_key_display):' · not set';
+      $('#keystate').textContent=c.remote_key_display?('current: '+c.remote_key_display):'not set';
+      const ab=$('#authbadge'),at=$('#authtext');
+      if(c.admin_token_set){ab.textContent='admin-gated';ab.className='authbadge on';
+        at.innerHTML='An admin token IS set. Saving settings or switching the local model from this page requires it -- you will be prompted once per browser and it is then remembered in this browser only (localStorage).';}
+      else{ab.textContent='\u26a0 open (no admin token)';ab.className='authbadge off';
+        at.innerHTML='<b style=color:var(--amb)>No admin token is set.</b> Anyone on the LAN who can reach this page can change settings or switch the local model with no login. Set <span class=mono>SHIM_ADMIN_TOKEN_FILE</span> (or <span class=mono>SHIM_ADMIN_TOKEN</span>) and restart the service to close this.';}
     }catch(e){}
   }
   async function saveCfg(){
@@ -4733,13 +5149,27 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
   $('#save').addEventListener('click',saveCfg);
   $('#f_preset').addEventListener('change',e=>{const v=e.target.value;if(!v)return;const [b,m]=v.split('|');$('#f_remote_base').value=b;$('#f_remote_model').value=m;});
 
+  // ==================== SHARED CLOCK (item 56): one setInterval instead of five, and
+  // everything pauses while the tab is hidden instead of repainting invisibly forever. ====================
+  const TASKS=[
+    {every:1500, fn:tickStats, due:0},
+    {every:2000, fn:tickLanes, due:0},
+    {every:10000, fn:tickWindows, due:0},
+    {every:2000, fn:tickTelemetry, due:0},
+    {every:10000, fn:tickHistory, due:0},
+    {every:15000, fn:loadModels, due:0},
+  ];
+  function clockTick(){
+    if(document.hidden)return;
+    const now=Date.now();
+    TASKS.forEach(t=>{if(now>=t.due){t.due=now+t.every;t.fn();}});
+  }
+  setInterval(clockTick,500);
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden){TASKS.forEach(t=>t.due=0);clockTick();}});
+
   // ==================== BOOT ====================
   loadModels();loadCfg();loadLocalModels();
-  tickStats();setInterval(tickStats,1500);setInterval(loadModels,15000);
-  tickLanes();setInterval(tickLanes,2000);
-  tickWindows();setInterval(tickWindows,10000);
-  tickTelemetry();setInterval(tickTelemetry,2000);
-  tickHistory();setInterval(tickHistory,10000);
+  tickStats();tickLanes();tickWindows();tickTelemetry();tickHistory();
 })();
 </script></body></html>"""
 
