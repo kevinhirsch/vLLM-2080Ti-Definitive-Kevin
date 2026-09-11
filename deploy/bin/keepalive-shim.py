@@ -1080,16 +1080,18 @@ def _telemetry_note_request(info, resp=None):
             "waited": round(waited, 3) if waited else 0.0,
             "ttft": ttft, "ptok": info.get("ptok"), "maxtok": info.get("maxtok"),
             "outtok": outtok, "outtok_lb": outtok_lb,
-            # RESPONSE-SHAPE fields (shim-remote-observability lane, 2026-09-05). Populated
-            # today for route=="remote" non-streaming responses only (_forward_remote ->
-            # _note_remote_response -> classify_remote_response; see REPORT.md) -- always None
-            # for route=="local" (out of scope for this lane: the local path already has its
-            # own real-time empty-response check, _is_empty_thinking_response()/EMPTY_RETRY, it
-            # just never persisted the verdict here) and for content_len/content_empty/
-            # has_tool_calls on ANY streaming response (not reconstructable from a chunked
-            # stream without reassembling every delta -- documented limitation, see REPORT.md).
-            # finish_reason is the one exception that CAN show up on a streaming remote
-            # response too: _relay()'s _scan_usage best-effort-scans the SSE trailer for it.
+            # RESPONSE-SHAPE fields. content_empty/has_tool_calls/finish_reason:
+            #   - non-streaming remote: _forward_remote -> _note_remote_response ->
+            #     classify_remote_response (shim-remote-observability lane, 2026-09-05).
+            #   - ANY streaming response, local or remote (gw-streaming-content-classifier,
+            #     2026-09-11): _relay()'s _sse_content_shape() scans every delta for
+            #     non-whitespace content / tool_calls WITHOUT reassembling the full message --
+            #     content_len is the one field that stays None for streaming (a running char
+            #     count was judged not worth the extra per-chunk work; content_empty already
+            #     answers the question content_len existed to answer).
+            #   - non-streaming local: still None -- the local path already has its own
+            #     real-time empty-response check (_is_empty_thinking_response()/EMPTY_RETRY),
+            #     it just never persisted the verdict here; out of THIS lane's scope.
             "finish_reason": info.get("finish_reason"),
             "content_len": info.get("content_len"),
             "content_empty": info.get("content_empty"),
@@ -2233,6 +2235,35 @@ def _looks_meaningful(text):
     return False
 
 
+def _sse_content_shape(data, saw_content, saw_tool_call):
+    """Update (saw_content, saw_tool_call) from one chunk of raw SSE bytes -- possibly several
+    'data: {...}' lines, possibly a partial line at either end (like every other scanner in
+    _relay, it is fed overlapping/repeated chunks and is safe to call on the same bytes more
+    than once: OR-ing booleans is idempotent). Never raises; an unparseable line is skipped,
+    not fatal, exactly like _scan_usage's existing tolerance for the same input shape.
+
+    2026-09-11 (gw-streaming-content-classifier): pulled out of _relay's closure so the
+    content-shape LOGIC is testable without mocking the aiohttp streaming machinery around it.
+    """
+    try:
+        for ln in bytes(data).split(b"\n"):
+            ln = ln.strip()
+            if not ln.startswith(b"data:"):
+                continue
+            raw = ln[5:].strip()
+            if raw in (b"", b"[DONE]"):
+                continue
+            delta = ((json.loads(raw).get("choices") or [{}])[0].get("delta") or {})
+            c = delta.get("content")
+            if c and str(c).strip():
+                saw_content = True
+            if delta.get("tool_calls"):
+                saw_tool_call = True
+    except Exception:
+        pass
+    return saw_content, saw_tool_call
+
+
 async def _relay(request, base, path, body, key, streaming, concurrency=1):
     """
     Forward to (base) and relay the response to the client.
@@ -2364,6 +2395,24 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1):
         except Exception:
             pass
 
+    # TELEMETRY (gw-streaming-content-classifier, 2026-09-11): content_empty/has_tool_calls
+    # for STREAMING responses. Kevin's coding runner (pi/OpenCode/OpenHands) streams 100% of
+    # its traffic, so the empty-content-on-200 case reproduced live in the gateway black-box
+    # audit (forced thinking + a max_tokens too small for the reasoning trace to finish, which
+    # leaves `content` empty while `reasoning_content` is populated) was structurally invisible
+    # for exactly the client it hurts -- classify_remote_response() only ever ran on the
+    # non-streaming path. _sse_content_shape() (module-level, unit-tested independently of this
+    # closure -- see test_streaming_content_classifier.py) does NOT reassemble the full message
+    # (the 2026-09-05 comment above is right that doing so would be real surgery); it keeps only
+    # two cheap running facts across every delta: whether ANY non-whitespace content character
+    # has been seen, and whether ANY tool_call has been seen -- exactly what content_empty/
+    # has_tool_calls reduce to.
+    _saw_content = [False]
+    _saw_tool_call = [False]
+
+    def _scan_content_shape(data):
+        _saw_content[0], _saw_tool_call[0] = _sse_content_shape(data, _saw_content[0], _saw_tool_call[0])
+
     async def _read_until_commit():
         async for chunk in up.content.iter_any():
             buf.extend(chunk)
@@ -2394,6 +2443,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1):
         _active_set(request, ttft=round(_t_first[0] - t_relay_start, 3))
     _scan_usage(buf)   # TELEMETRY: covers the (common, for short responses) case where the whole
                         # stream -- usage trailer included -- already arrived within the gate
+    _scan_content_shape(buf)
 
     if phase == "clean_end":
         # upstream finished before any 'meaningful' chunk — deliver as-is (short/empty response),
@@ -2402,7 +2452,8 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1):
         if buf:
             await resp.write(bytes(buf))
         await resp.write_eof(); await session.close()
-        _outkw = {"outtok_lb": _chunk_ct[0]}
+        _outkw = {"outtok_lb": _chunk_ct[0],
+                  "content_empty": not _saw_content[0], "has_tool_calls": _saw_tool_call[0]}
         if _exact_outtok[0] is not None:
             _outkw["outtok"] = _exact_outtok[0]
         if _is_remote_relay and _exact_finish[0] is not None:
@@ -2422,13 +2473,15 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1):
             await resp.write(chunk)
             _chunk_ct[0] += 1
             _scan_usage(chunk)
+            _scan_content_shape(chunk)
     except Exception as e:
         try:
             await resp.write(f'data: {{"error":{{"message":"stream interrupted: {e}"}}}}\n\n'.encode())
         except Exception:
             pass
     await resp.write_eof(); await session.close()
-    _outkw = {"outtok_lb": _chunk_ct[0]}
+    _outkw = {"outtok_lb": _chunk_ct[0],
+              "content_empty": not _saw_content[0], "has_tool_calls": _saw_tool_call[0]}
     if _exact_outtok[0] is not None:
         _outkw["outtok"] = _exact_outtok[0]
     if _is_remote_relay and _exact_finish[0] is not None:
