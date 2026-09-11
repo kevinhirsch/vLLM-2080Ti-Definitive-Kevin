@@ -26,7 +26,7 @@ Cost-first: a single request is always local (free); only real overflow costs mo
 
 NEVER manages the vLLM process (that's vllm-qwen27b.service + its watchdog).
 """
-import asyncio, os, sys, json, time, logging, collections, subprocess, re, hmac, math
+import asyncio, os, sys, json, time, logging, collections, subprocess, re, hmac, math, hashlib
 import urllib.request
 import aiohttp
 from aiohttp import web
@@ -247,6 +247,24 @@ INTERACTIVE_NEVER_OVERFLOW = int(os.environ.get("SHIM_INTERACTIVE_NEVER_OVERFLOW
 # /gateway/config so the ratio can be tuned from the bake-off without a restart. This does NOT
 # relax the TOKEN_BUDGET check, which remains the real KV-safety gate.
 TOKENS_PER_UNIT = int(os.environ.get("SHIM_TOKENS_PER_UNIT", "12000"))
+# 2026-09-11 (gw-admission-computed-token-cost). estimate_units() charges a big request by its
+# PROMPT LENGTH, but prefix caching means a growing multi-turn conversation (pi's own pattern --
+# each turn resends the whole history plus one new message) only actually costs the engine the
+# NEW suffix, not the whole resent prefix: a 111K-token turn that is 98% cached is ~2K tokens of
+# real prefill work. predict_computed_tokens() tracks a one-deep per-client prefix hash and
+# predicts "only the delta since last turn" on a hit, full cost on any miss (new client, first
+# turn, edited/branched history). PREFIX_HIT_MARGIN_TOKENS pads that delta for tokenizer/
+# block-alignment slop at the cache boundary. USE_COMPUTED_COST is a KILL SWITCH, default OFF:
+# est_computed/computed_actual are measured and logged from the moment this deploys (so the
+# card's own 200-live-turn accuracy gate has something to grade), but admission cost keeps using
+# the existing raw-token math until that gate is actually checked against real telemetry --
+# shipping the measurement ahead of the behaviour change on a brand-new heuristic that touches
+# live admission, not after it, per Kevin's own benchmark-rigor standard. Flipping it to 1 does
+# NOT relax TOKEN_BUDGET (unchanged, still raw-prompt-token-based, still the real KV-safety net)
+# -- it only changes how many LANES a correctly-predicted-cheap request is charged.
+PREFIX_HIT_MARGIN_TOKENS = int(os.environ.get("SHIM_PREFIX_HIT_MARGIN_TOKENS", "512"))
+USE_COMPUTED_COST = int(os.environ.get("SHIM_USE_COMPUTED_COST", "0"))
+PREFIX_CACHE_MAX_CLIENTS = 200   # bound on _prefix_seen's size; not a tuning knob, not hot-reloadable
 # 2026-09-05 (evalkit run-2 forensics): background classification by X-Client only matched the
 # substrings "cron"/"batch", so the research service ("workflow-bg"), the research feeder and the
 # local digester all ran as FOREGROUND and could fill every lane, queueing genuinely interactive
@@ -362,6 +380,8 @@ _CFG = {
     "SHIM_BG_BIG_LOCAL_WHEN_IDLE": ("BG_BIG_LOCAL_WHEN_IDLE", int),
     "SHIM_TOKENS_PER_UNIT":  ("TOKENS_PER_UNIT", int),
     "SHIM_INTERACTIVE_NEVER_OVERFLOW": ("INTERACTIVE_NEVER_OVERFLOW", int),
+    "SHIM_PREFIX_HIT_MARGIN_TOKENS": ("PREFIX_HIT_MARGIN_TOKENS", int),
+    "SHIM_USE_COMPUTED_COST": ("USE_COMPUTED_COST", int),
     "SHIM_BG_XCLIENTS":      ("BG_XCLIENTS", lambda v: [m.lower() for m in _parse_seq(v, _CFG_SEP["SHIM_BG_XCLIENTS"])]),
     "SHIM_POOL_TOKENS":      ("POOL_TOKENS",      int),
     "SHIM_BG_WAIT_SECS":     ("BG_WAIT",          float),
@@ -478,6 +498,15 @@ _waiting  = 0           # requests currently blocked in the queue-first wait loo
 # one interactive waiter. Mutated at the SAME two sites as _waiting, by construction (see the
 # comment there): never drifts from it because it is updated in the same breath.
 _waiting_by_class = {"interactive": 0, "background": 0}
+# gw-admission-computed-token-cost: client name -> {"hashes": per-message sha256 list of that
+# client's last request, "prompt_tokens": that request's estimated prompt tokens, "ts":
+# time.time()}. One entry per client (not per request) -- a one-deep prefix-cache model, matching
+# the shape of a growing multi-turn conversation where each new turn's messages list starts with
+# ALL of the previous turn's messages (see _is_prefix_of() -- a real conversation typically grows
+# by 2+ messages per turn, since the client echoes the assistant's own reply back alongside the
+# next user message, not by exactly 1). Bounded by PREFIX_CACHE_MAX_CLIENTS (FIFO eviction) so an
+# attacker or a runaway number of distinct X-Client values can't grow this without bound.
+_prefix_seen = {}
 _backoff_until = 0.0
 _health = {"ok": False, "at": 0.0}
 REMOTE_ENABLED = bool(REMOTE_BASE and REMOTE_KEY)
@@ -646,6 +675,10 @@ _PER_CLIENT = collections.defaultdict(lambda: {
     "tokens_out_lb": 0, "wait_sum": 0.0, "wait_n": 0, "ttft_sum": 0.0, "ttft_n": 0,
     "errors": 0, "cost_est_usd": 0.0})
 _ERROR_FEED = collections.deque(maxlen=200)
+# gw-admission-computed-token-cost safety AC: a request whose actual computed tokens exceed
+# what predict_computed_tokens() would have charged it by > 2x, regardless of whether
+# USE_COMPUTED_COST is even on -- this must be visible BEFORE the switch is flipped, not after.
+_MISESTIMATE_FEED = collections.deque(maxlen=200)
 _cpu_prev = {"t": 0.0, "total": 0, "idle": 0}
 _telem_lr_prev = {"local": None, "remote": None}   # previous tick's cumulative local/remote counts
 
@@ -1068,6 +1101,13 @@ def _telemetry_note_request(info, resp=None):
             _ERROR_FEED.appendleft({"t": round(now, 1), "client": name, "ep": info.get("ep"),
                                     "route": route, "reason": reason, "status": status,
                                     "preview": info.get("preview")})
+        est_computed = info.get("est_computed")
+        computed_actual = info.get("computed_actual")
+        if est_computed is not None and computed_actual is not None and computed_actual > 2 * est_computed:
+            log.warning("mis-estimate: client=%s est_computed=%d computed_actual=%d (%.1fx)",
+                        name, est_computed, computed_actual, computed_actual / max(1, est_computed))
+            _MISESTIMATE_FEED.appendleft({"t": round(now, 1), "client": name,
+                                          "est_computed": est_computed, "computed_actual": computed_actual})
         # (e) append-only JSONL request log -- see DESIGN.md (e) / REPORT.md. Never write on the
         # request path: this only appends a small dict to a bounded in-memory list;
         # _jsonl_flusher() (sibling to _stats_saver()) does the actual blocking file I/O off the
@@ -1107,6 +1147,13 @@ def _telemetry_note_request(info, resp=None):
             # table; decode_time is new (see decompose_timing()'s docstring for why engine_queue
             # and prefill_time aren't split out here).
             **decompose_timing(waited, ttft, duration),
+            # gw-admission-computed-token-cost: est_tokens/est_computed set unconditionally in
+            # _route_completions (regardless of USE_COMPUTED_COST); computed_actual only when
+            # the engine's usage trailer carried prompt_tokens (local only -- see _relay()).
+            # None (not 0) whenever the engine side isn't known, same "missing != zero" rule as
+            # decompose_timing() -- a null here must never be mistaken for "0 tokens computed".
+            "est_tokens": info.get("est_tokens"), "est_computed": info.get("est_computed"),
+            "computed_actual": info.get("computed_actual"),
         })
     except Exception as e:
         log.warning("telemetry note_request: %s", e)
@@ -1877,17 +1924,92 @@ def admission_wait_seconds(background, remote_available, peak, local_wait, bg_wa
     return NO_OVERFLOW_SECONDS if interactive_never_overflow else local_wait
 
 
-def _desired_units(body):
+def _parse_messages(body):
+    try:
+        return json.loads(body).get("messages") or []
+    except Exception:
+        return []
+
+
+def _message_hashes(msgs):
+    """Per-message content hash -- one sha256 per message, not one hash of the whole list.
+    This is what makes "is request N a prefix of request N+1" a cheap elementwise comparison
+    (see _is_prefix_of) instead of needing to store or re-hash raw conversation text, which for
+    a 100K-token pi turn would mean holding that much text in memory per tracked client. None
+    for an unhashable message -- treated as a guaranteed non-match, never a crash."""
+    out = []
+    for m in msgs:
+        try:
+            out.append(hashlib.sha256(json.dumps(m, sort_keys=True, default=str)
+                                       .encode("utf-8", "replace")).hexdigest())
+        except Exception:
+            out.append(None)
+    return out
+
+
+def _is_prefix_of(prev_hashes, this_hashes):
+    """True iff prev_hashes is a non-empty, strictly-shorter, elementwise-equal prefix of
+    this_hashes. A real multi-turn conversation grows by MORE than one message per turn (the
+    client echoes back the assistant's own reply alongside the next user message), so this
+    checks list-prefix containment at any growth amount, not "exactly one message longer"."""
+    if not prev_hashes or len(prev_hashes) >= len(this_hashes):
+        return False
+    return all(a is not None and a == b for a, b in zip(prev_hashes, this_hashes))
+
+
+def predict_computed_tokens(client, body, est_tokens):
+    """Predict how many tokens the engine will actually have to compute fresh for THIS request,
+    using the previous request from the SAME client as a one-deep prefix-cache model
+    (gw-admission-computed-token-cost). Falls back to full cost (est_tokens) whenever there is
+    nothing to predict FROM: no prior request for this client, fewer than 2 messages (nothing
+    could be a carried-over prefix), or -- the common non-hit case -- the previous request's
+    messages aren't a prefix of this one (first turn, edited/branched history, a different
+    conversation entirely). Never returns less than 1."""
+    msgs = _parse_messages(body)
+    if len(msgs) < 2:
+        return max(1, est_tokens)
+    prev = _prefix_seen.get(client)
+    if prev is None or not _is_prefix_of(prev.get("hashes"), _message_hashes(msgs)):
+        return max(1, est_tokens)
+    delta = max(0, est_tokens - prev.get("prompt_tokens", 0))
+    return max(1, delta + PREFIX_HIT_MARGIN_TOKENS)
+
+
+def _prefix_cache_observe(client, body, prompt_tokens):
+    """Record this request's per-message hashes + size so the NEXT turn from the same client can
+    predict against it. Called once per request, regardless of hit/miss/route -- observation is
+    unconditional so a miss this turn can still become a hit next turn."""
+    msgs = _parse_messages(body)
+    if not msgs:
+        return
+    if len(_prefix_seen) >= PREFIX_CACHE_MAX_CLIENTS and client not in _prefix_seen:
+        _prefix_seen.pop(next(iter(_prefix_seen)), None)   # oldest-inserted, dict preserves order
+    _prefix_seen[client] = {"hashes": _message_hashes(msgs), "prompt_tokens": prompt_tokens,
+                             "ts": time.time()}
+
+
+def _desired_units(body, client=None):
     """The size-implied unit cost with NO ceiling applied -- how many lanes this request would
     take if it could have as many as it wants. Used two ways: estimate_units() clamps it to
     the normal reserved cap; the bg-idle-bypass below reads it directly to decide whether a
     truly enormous background job should be allowed MORE than that cap when nothing else is
-    running (see BG_BIG_LOCAL_WHEN_IDLE)."""
+    running (see BG_BIG_LOCAL_WHEN_IDLE).
+
+    `client` is optional and, while USE_COMPUTED_COST stays at its default (0), unused --
+    existing callers/tests that don't pass it see byte-identical behaviour. When flipped on,
+    a request at or above BIG_TOKENS is costed by its PREDICTED computed tokens instead of its
+    raw size (see predict_computed_tokens())."""
     tokens = _est_tokens(body)
-    return 1 if tokens < BIG_TOKENS else max(1, math.ceil(tokens / max(1, TOKENS_PER_UNIT)))
+    if tokens < BIG_TOKENS:
+        return 1
+    if USE_COMPUTED_COST and client is not None:
+        tokens = predict_computed_tokens(client, body, tokens)
+        if tokens < BIG_TOKENS:
+            return 1
+    return max(1, math.ceil(tokens / max(1, TOKENS_PER_UNIT)))
 
 
-def estimate_units(body, budget=None, allow_full_budget=False):
+def estimate_units(body, budget=None, allow_full_budget=False, client=None):
     """How many of the `budget` lane-slots this request should claim.
 
     2026-09-11 (gw-admission-proportional-units): proportional to estimated size, not
@@ -1903,7 +2025,7 @@ def estimate_units(body, budget=None, allow_full_budget=False):
     """
     budget = effective_budget() if budget is None else budget
     ceiling = max(1, budget if allow_full_budget else budget - FG_RESERVED)
-    return min(ceiling, _desired_units(body))
+    return min(ceiling, _desired_units(body, client))
 
 
 def first_token_timeout(body, concurrency=1):
@@ -2414,6 +2536,14 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1):
     # forwards chunks), so recovering a full message here would need materially more surgery
     # than this lane's scope -- documented limitation, see REPORT.md.
     _exact_finish = [None]
+    # gw-admission-computed-token-cost: prompt_tokens + prefix-cache hit, from the SAME usage
+    # trailer _exact_outtok already scans (live-measured: 96% of streaming rows already carry
+    # it -- pi/OpenCode/OpenHands request stream_options.include_usage today, no shim-side
+    # injection needed). cached_tokens is only ever present (per vLLM's chat_completion/
+    # serving.py) when it is truthy, i.e. a genuine cache hit -- a miss or a non-hit prompt
+    # leaves this None, which computed_actual below must NOT treat as "0 cached" by accident.
+    _exact_ptok = [None]
+    _exact_cached = [None]
     _is_remote_relay = (base == REMOTE_BASE)
 
     def _scan_usage(data):
@@ -2446,6 +2576,11 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1):
                     uu = (json.loads(raw).get("usage") or {})
                     if "completion_tokens" in uu:
                         _exact_outtok[0] = int(uu["completion_tokens"])
+                    if "prompt_tokens" in uu:
+                        _exact_ptok[0] = int(uu["prompt_tokens"])
+                    ptd = uu.get("prompt_tokens_details")
+                    if ptd and "cached_tokens" in ptd:
+                        _exact_cached[0] = int(ptd["cached_tokens"])
                 if _exact_finish[0] is None and b'"finish_reason"' in ln:
                     ch = (json.loads(raw).get("choices") or [{}])[0]
                     fr = ch.get("finish_reason")
@@ -2519,6 +2654,10 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1):
             _outkw["outtok"] = _exact_outtok[0]
         if _is_remote_relay and _exact_finish[0] is not None:
             _outkw["finish_reason"] = _exact_finish[0]
+        # gw-admission-computed-token-cost: local only -- prefix caching is a local-engine
+        # concept, and remote's own cache accounting (if any) isn't comparable to it.
+        if not _is_remote_relay and _exact_ptok[0] is not None:
+            _outkw["computed_actual"] = max(0, _exact_ptok[0] - (_exact_cached[0] or 0))
         _active_set(request, **_outkw)
         return "ok", resp
 
@@ -2772,9 +2911,18 @@ async def _route_completions(request):
     global _inflight, _waiting, _inflight_tokens
     path = request.path
     body = await request.read()
-    units = estimate_units(body)
+    client = _friendly_client(request)["name"]
+    units = estimate_units(body, client=client)
     streaming = wants_stream(body)
     ptok = _est_tokens(body)
+    # gw-admission-computed-token-cost: predicted UNCONDITIONALLY (not gated on
+    # USE_COMPUTED_COST, which only decides whether admission COST uses this number) so the
+    # card's own accuracy gate has real predicted-vs-actual data to grade from the moment this
+    # deploys, before that switch is ever flipped on. Observe must run AFTER predict, against
+    # the prefix state predict just read -- a miss this turn still becomes next turn's hit.
+    est_computed = predict_computed_tokens(client, body, ptok)
+    _active_set(request, est_tokens=ptok, est_computed=est_computed)
+    _prefix_cache_observe(client, body, ptok)
     try:
         maxtok = int(json.loads(body).get("max_tokens") or 0)
     except Exception:
@@ -2945,7 +3093,7 @@ async def _route_completions(request):
             # most big bg requests fit under lane_limit without ever needing this bypass; it
             # only fires for requests so large that even the proportional estimate would still
             # exceed budget-FG_RESERVED.
-            _desired = _desired_units(body)
+            _desired = _desired_units(body, client)
             _bg_big_idle = (background and BG_BIG_LOCAL_WHEN_IDLE and _desired > lane_limit
                             and _inflight == 0 and _waiting <= (1 if queued else 0))
             _admit_units = min(effective_budget(), _desired) if _bg_big_idle else units
@@ -3174,6 +3322,7 @@ async def gateway_telemetry(request):
         "series": {"fast": list(_TELEM_FAST), "slow": list(_TELEM_SLOW)},
         "per_client": per_client,
         "errors": list(_ERROR_FEED)[:60],
+        "mis_estimates": list(_MISESTIMATE_FEED)[:60],
         "percentiles": pct,
         "engine_scrape": {"ok": _ENGINE_METRICS["ok"],
                           "age_s": round(time.time() - _ENGINE_METRICS["at"], 1) if _ENGINE_METRICS["at"] else None,
@@ -4796,6 +4945,10 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
     <input id=f_big_tokens type=number min=0 step=1000></label>
    <label><span class=k>How many tokens equal one lane, for a big request?</span><span class=hint>tokens/unit &middot; e.g. a 100K-token request costs ceil(100000&divide;this) lanes, capped by the budget</span>
     <input id=f_tokens_per_unit type=number min=1000 step=1000></label>
+   <label><span class=k>Charge lanes for PREDICTED computed tokens instead of raw prompt size?</span><span class=hint>0 = off, default &middot; 1 = a repeated-prefix turn with a small new suffix costs ~1 lane instead of its full size &middot; check the mis-estimate feed before flipping this on</span>
+    <input id=f_use_computed_cost type=number min=0 max=1></label>
+   <label><span class=k>Safety margin added to a predicted-cheap request's cost</span><span class=hint>tokens &middot; padding for tokenizer/cache-boundary slop</span>
+    <input id=f_prefix_hit_margin_tokens type=number min=0 step=128></label>
    <label><span class=k>Treat this much in-flight context as "a monster is running"</span><span class=hint>tokens &middot; caused reason "monster"</span>
     <input id=f_monster_inflight type=number min=0 step=10000></label>
    <label><span class=k>Upper bound on the first-token wait budget</span><span class=hint>seconds</span>
