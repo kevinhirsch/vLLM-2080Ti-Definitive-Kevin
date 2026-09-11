@@ -1042,6 +1042,7 @@ def _telemetry_note_request(info, resp=None):
         reason = info.get("reason") or ""
         outtok, outtok_lb = info.get("outtok"), info.get("outtok_lb")
         waited = info.get("waited") or 0.0
+        duration = round(now - info["t0"], 3) if info.get("t0") else None
         status = getattr(resp, "status", None)
         if status is None:
             status = info.get("http_status")
@@ -1097,10 +1098,15 @@ def _telemetry_note_request(info, resp=None):
             "content_empty": info.get("content_empty"),
             "has_tool_calls": info.get("has_tool_calls"),
             "ptok_exact": info.get("ptok_exact"),
-            "duration": round(now - info["t0"], 3) if info.get("t0") else None,
+            "duration": duration,
             "status": status, "stream": bool(info.get("stream")),
             "bg": bool(info.get("bg")), "tiny": bool(info.get("tiny")),
             "preview": info.get("preview"), "cost_est": req_cost,
+            # gw-ttft-decomposition-telemetry: admission_wait duplicates `waited` under the
+            # AC-named field so the JSONL is self-auditable against the card without a lookup
+            # table; decode_time is new (see decompose_timing()'s docstring for why engine_queue
+            # and prefill_time aren't split out here).
+            **decompose_timing(waited, ttft, duration),
         })
     except Exception as e:
         log.warning("telemetry note_request: %s", e)
@@ -1366,6 +1372,57 @@ def _raw_pctl(sorted_vals, q):
     return round(sorted_vals[idx], 3)
 
 
+def decompose_timing(waited, ttft, duration):
+    """Split one request's shim-observed wall-clock into the phases the SHIM can actually see.
+
+    gw-ttft-decomposition-telemetry (Kevin 2026-09-11) asked for admission_wait, engine_queue,
+    prefill_time and decode_time as four separately-measured fields. The shim can only deliver
+    three: engine_queue and prefill_time both happen between the upstream POST and the first
+    streamed byte, entirely inside the engine's own scheduler -- the shim has no vantage point
+    between them (the engine tracks them separately as vllm:request_queue_time_seconds /
+    vllm:request_prefill_time_seconds, but those are process-wide Prometheus histograms, not
+    attributable to one request under concurrency, and the per-request values that do exist
+    internally -- see vllm's output_processor.do_tracing()/RequestStateStats -- are never
+    surfaced on the OpenAI-compatible response; exposing them needs an engine-side patch, which
+    needs a restart). What IS real and shim-only: admission_wait (this shim's own queue, always
+    known), queue_plus_prefill (the combined engine phase -- exactly today's `ttft` field, kept
+    under its existing name in the JSONL rather than duplicated), and decode_time (derived).
+
+    ttft is None for every non-streaming response (see _relay()'s own TELEMETRY comment) --
+    decode_time must then be None too, never a wrong 0."""
+    admission_wait = round(waited or 0.0, 3)
+    if ttft is None or duration is None:
+        return {"admission_wait": admission_wait, "queue_plus_prefill": None, "decode_time": None}
+    queue_plus_prefill = round(ttft, 3)
+    decode_time = round(max(0.0, duration - admission_wait - queue_plus_prefill), 3)
+    return {"admission_wait": admission_wait, "queue_plus_prefill": queue_plus_prefill, "decode_time": decode_time}
+
+
+def _latency_class_pctls(rows):
+    """rows: iterable of (is_background, admission_wait, queue_plus_prefill, decode_time)
+    already-observed tuples (any of the three may be None). Buckets by class exactly like
+    _waiting_by_class (bg=True -> background, else interactive) and returns p50/p90 -- p90, not
+    the p95 the pre-existing duration/ttft aggregate uses, matching this card's own AC and
+    gw-slo-panel's target definitions (p50/p90 per class)."""
+    buckets = {"interactive": {"admission_wait": [], "queue_plus_prefill": [], "decode_time": []},
+               "background": {"admission_wait": [], "queue_plus_prefill": [], "decode_time": []}}
+    for is_bg, aw, qp, dt in rows:
+        b = buckets["background" if is_bg else "interactive"]
+        if aw is not None:
+            b["admission_wait"].append(aw)
+        if qp is not None:
+            b["queue_plus_prefill"].append(qp)
+        if dt is not None:
+            b["decode_time"].append(dt)
+    out = {}
+    for cls, metrics in buckets.items():
+        out[cls] = {}
+        for metric, vals in metrics.items():
+            vals.sort()
+            out[cls][metric] = {"p50": _raw_pctl(vals, 0.50), "p90": _raw_pctl(vals, 0.90), "n": len(vals)}
+    return out
+
+
 def _history_summary_blocking(since_ts, max_files, hard_line_cap=500000):
     """Off-loop full read (forward this time -- aggregation needs every line in the window
     anyway, so the reverse tail-reader's early-exit trick buys nothing here) of each day-file
@@ -1376,6 +1433,7 @@ def _history_summary_blocking(since_ts, max_files, hard_line_cap=500000):
                                                     "tokens_in": 0, "tokens_out": 0, "errors": 0})
     per_route = collections.defaultdict(lambda: {"requests": 0, "tokens_out": 0, "errors": 0})
     durations, ttfts = [], []
+    latency_rows = []   # gw-ttft-decomposition-telemetry: (is_bg, admission_wait, queue_plus_prefill, decode_time)
     files_scanned = []
     lines_seen = 0
     truncated = False
@@ -1428,6 +1486,8 @@ def _history_summary_blocking(since_ts, max_files, hard_line_cap=500000):
                         durations.append(rec["duration"])
                     if rec.get("ttft") is not None:
                         ttfts.append(rec["ttft"])
+                    latency_rows.append((rec.get("bg"), rec.get("admission_wait"),
+                                         rec.get("queue_plus_prefill"), rec.get("decode_time")))
         except OSError as e:
             log.warning("history summary: read %s failed: %s", fn, e)
         if truncated:
@@ -1437,6 +1497,7 @@ def _history_summary_blocking(since_ts, max_files, hard_line_cap=500000):
     total_requests = sum(c["requests"] for c in per_client.values())
     return {
         "per_client": dict(per_client), "per_route": dict(per_route),
+        "latency_by_class": _latency_class_pctls(latency_rows),
         "duration_p50": _raw_pctl(durations, 0.50), "duration_p95": _raw_pctl(durations, 0.95),
         "ttft_p50": _raw_pctl(ttfts, 0.50), "ttft_p95": _raw_pctl(ttfts, 0.95),
         "requests": total_requests, "files_scanned": files_scanned, "truncated": truncated,
@@ -3299,11 +3360,13 @@ async def gateway_history(request):
 
 async def gateway_history_summary(request):
     """GET /gateway/history/summary?hours=24 -- per-client/per-route counts, p50/p95
-    duration+TTFT, tokens in/out, and error counts over the trailing `hours` (default 24, capped
-    at 30 days). Cached for HISTORY_SUMMARY_CACHE_TTL seconds (default 5s): the History dashboard
-    section polls this every 10s and a full scan of one-to-several ~200MB/day files on every
-    single poll is real disk+CPU work not worth repeating for back-to-back callers -- see
-    REPORT.md disk-math."""
+    duration+TTFT, tokens in/out, error counts, and (gw-ttft-decomposition-telemetry) per-class
+    (interactive/background) p50/p90/n for admission_wait, queue_plus_prefill and decode_time
+    under `latency_by_class` -- over the trailing `hours` (default 24, capped at 30 days). Pass
+    hours=1 for the "last hour" window the card asks for. Cached for HISTORY_SUMMARY_CACHE_TTL
+    seconds (default 5s): the History dashboard section polls this every 10s and a full scan of
+    one-to-several ~200MB/day files on every single poll is real disk+CPU work not worth
+    repeating for back-to-back callers -- see REPORT.md disk-math."""
     try:
         hours = float(request.query.get("hours") or 24)
     except (TypeError, ValueError):
