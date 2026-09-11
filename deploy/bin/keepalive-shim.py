@@ -8,9 +8,14 @@ add to vLLM tomorrow just works. When local is at capacity or unhealthy, request
 transparently overflow to a remote OpenAI-compatible endpoint (DeepSeek).
 
 Placement (per request):
-  - Estimate cost in "units": moderate = 1, big (est. prompt >= SHIM_BIG_TOKENS) = 2.
-  - Local budget = SHIM_LOCAL_BUDGET units (default 2) => "2 moderate OR 1 big",
-    matching the box's chaos-tested envelope (44GB VRAM, ~1.7GB activation headroom).
+  - Estimate cost in "units": under SHIM_BIG_TOKENS = 1; at or above it,
+    ceil(tokens / SHIM_TOKENS_PER_UNIT), capped at budget-SHIM_FG_RESERVED so one big
+    request can never claim every lane (2026-09-11: it used to cost the WHOLE budget,
+    which let a single 100K+ prompt lock out every other caller -- see
+    gw-admission-proportional-units in the vault's Qwen3.8 Capacity Tuning Backlog).
+  - Local budget = SHIM_LOCAL_BUDGET units (default 14 in production), matching the
+    box's chaos-tested envelope; the per-request KV/token safety net is TOKEN_BUDGET
+    (total in-flight PROMPT tokens across ALL admitted requests), independent of units.
   - If local is healthy AND admitting this request stays within budget => LOCAL.
     Otherwise => REMOTE (model rewritten to SHIM_REMOTE_MODEL).
 Self-heal:
@@ -21,7 +26,7 @@ Cost-first: a single request is always local (free); only real overflow costs mo
 
 NEVER manages the vLLM process (that's vllm-qwen27b.service + its watchdog).
 """
-import asyncio, os, sys, json, time, logging, collections, subprocess, re, hmac
+import asyncio, os, sys, json, time, logging, collections, subprocess, re, hmac, math
 import urllib.request
 import aiohttp
 from aiohttp import web
@@ -214,6 +219,23 @@ FG_RESERVED = int(os.environ.get("SHIM_FG_RESERVED", "2"))
 # is completely idle (nothing in flight, nobody queued) a big background request may take the
 # whole budget, exactly like a big foreground one does. Set 0 to restore the old always-remote rule.
 BG_BIG_LOCAL_WHEN_IDLE = int(os.environ.get("SHIM_BG_BIG_LOCAL_WHEN_IDLE", "1"))
+# 2026-09-11 (Kevin: "response time... is unbearably slow"; gw-admission-proportional-units).
+# estimate_units() used to charge ANY request >= BIG_TOKENS the WHOLE current budget, on the
+# theory that a big prefill "runs alone." Measured effect: one of Kevin's own 111K-token pi
+# turns holds 14/14 lanes for the length of its wait+prefill+decode, so every OTHER request --
+# including his own next interactive turn -- queues up to LOCAL_WAIT and then overflows to
+# paid remote (his pi session was served locally only 7% of the time). The engine already has
+# an independent, finer-grained memory-safety net for concurrent big prefills: TOKEN_BUDGET
+# bounds total in-flight PROMPT TOKENS across ALL admitted requests regardless of unit count
+# (see the `_inflight_tokens + ptok <= TOKEN_BUDGET` check below) -- "units" is a proxy for
+# concurrent SEQUENCE SLOTS (vLLM's max_num_seqs), not for KV/token budget, so a big request
+# does not need every slot just because it is big. Units are now proportional to estimated
+# size, capped so a single request can never claim more than budget-FG_RESERVED (at least
+# FG_RESERVED lanes free for the NEXT caller, always, regardless of class) and floored at 1
+# (a request is never inadmissible). SHIM_TOKENS_PER_UNIT is hot-reloadable via
+# /gateway/config so the ratio can be tuned from the bake-off without a restart. This does NOT
+# relax the TOKEN_BUDGET check, which remains the real KV-safety gate.
+TOKENS_PER_UNIT = int(os.environ.get("SHIM_TOKENS_PER_UNIT", "12000"))
 # 2026-09-05 (evalkit run-2 forensics): background classification by X-Client only matched the
 # substrings "cron"/"batch", so the research service ("workflow-bg"), the research feeder and the
 # local digester all ran as FOREGROUND and could fill every lane, queueing genuinely interactive
@@ -327,6 +349,7 @@ _CFG = {
     "SHIM_TINY_EXTRA_LANES": ("TINY_EXTRA_LANES", int),
     "SHIM_FG_RESERVED":      ("FG_RESERVED",      int),
     "SHIM_BG_BIG_LOCAL_WHEN_IDLE": ("BG_BIG_LOCAL_WHEN_IDLE", int),
+    "SHIM_TOKENS_PER_UNIT":  ("TOKENS_PER_UNIT", int),
     "SHIM_BG_XCLIENTS":      ("BG_XCLIENTS", lambda v: [m.lower() for m in _parse_seq(v, _CFG_SEP["SHIM_BG_XCLIENTS"])]),
     "SHIM_POOL_TOKENS":      ("POOL_TOKENS",      int),
     "SHIM_BG_WAIT_SECS":     ("BG_WAIT",          float),
@@ -1736,12 +1759,33 @@ def _local_model_name():
     return os.environ.get("SHIM_LOCAL_MODEL_NAME", "qwen-local")
 
 
-def estimate_units(body):
-    # A "big" request occupies the WHOLE current local budget (runs alone, nothing concurrent),
-    # rather than a fixed 2. This means at budget=1 a single big request still runs LOCAL (safe:
-    # 1 big alone never OOMs) instead of needlessly overflowing to DeepSeek, while at budget>=2 it
-    # still blocks anything running alongside it.
-    return effective_budget() if _est_tokens(body) >= BIG_TOKENS else 1
+def _desired_units(body):
+    """The size-implied unit cost with NO ceiling applied -- how many lanes this request would
+    take if it could have as many as it wants. Used two ways: estimate_units() clamps it to
+    the normal reserved cap; the bg-idle-bypass below reads it directly to decide whether a
+    truly enormous background job should be allowed MORE than that cap when nothing else is
+    running (see BG_BIG_LOCAL_WHEN_IDLE)."""
+    tokens = _est_tokens(body)
+    return 1 if tokens < BIG_TOKENS else max(1, math.ceil(tokens / max(1, TOKENS_PER_UNIT)))
+
+
+def estimate_units(body, budget=None, allow_full_budget=False):
+    """How many of the `budget` lane-slots this request should claim.
+
+    2026-09-11 (gw-admission-proportional-units): proportional to estimated size, not
+    all-or-nothing. A request under BIG_TOKENS still costs 1 (unchanged -- most traffic).
+    A request at or above BIG_TOKENS costs ceil(tokens / TOKENS_PER_UNIT), floored at 1 (never
+    inadmissible) and capped at `budget - FG_RESERVED` (at least FG_RESERVED lanes stay free
+    for the NEXT caller, of any class, no matter how big this one is) -- UNLESS
+    allow_full_budget is set, which raises that ceiling to `budget` itself; that escape hatch
+    exists only for the bg-idle-bypass path, which already independently confirms nothing else
+    is running or waiting before it ever asks for allow_full_budget=True. `budget` is
+    injectable for testing; defaults to the live effective_budget() so callers need not import
+    it too.
+    """
+    budget = effective_budget() if budget is None else budget
+    ceiling = max(1, budget if allow_full_budget else budget - FG_RESERVED)
+    return min(ceiling, _desired_units(body))
 
 
 def first_token_timeout(body, concurrency=1):
@@ -2728,14 +2772,25 @@ async def _route_completions(request):
     try:
         while True:
             # big background request + idle engine: nothing in flight and nobody else queued
-            # (this request counts itself in _waiting once queued) -> may take the whole budget.
-            _bg_big_idle = (background and BG_BIG_LOCAL_WHEN_IDLE and units >= effective_budget()
+            # (this request counts itself in _waiting once queued) -> may take MORE than the
+            # bg-only reserved cap (up to the whole budget), since nothing is competing for the
+            # reserved lanes anyway. 2026-09-11: gated on the UNCAPPED desired size now that
+            # `units` itself is already capped by estimate_units() -- under proportional units
+            # most big bg requests fit under lane_limit without ever needing this bypass; it
+            # only fires for requests so large that even the proportional estimate would still
+            # exceed budget-FG_RESERVED.
+            _desired = _desired_units(body)
+            _bg_big_idle = (background and BG_BIG_LOCAL_WHEN_IDLE and _desired > lane_limit
                             and _inflight == 0 and _waiting <= (1 if queued else 0))
-            if _health["ok"] and ((_inflight + units) <= lane_limit or _bg_big_idle) \
+            _admit_units = min(effective_budget(), _desired) if _bg_big_idle else units
+            if _health["ok"] and ((_inflight + _admit_units) <= lane_limit or _bg_big_idle) \
                     and (TOKEN_BUDGET <= 0 or _inflight_tokens + ptok <= TOKEN_BUDGET or _inflight == 0):
-                if _bg_big_idle and (_inflight + units) > lane_limit:
+                if _bg_big_idle and (_inflight + _admit_units) > lane_limit:
                     _stats["bg_big_idle_local"] = _stats.get("bg_big_idle_local", 0) + 1
                     _local_reason = "bg-big-idle"
+                units = _admit_units   # reassign the OUTER units: the release below (and any
+                                       # telemetry/record_event after this block) must charge
+                                       # and refund the SAME amount that was actually admitted.
                 _inflight += units
                 _inflight_tokens += ptok
                 admitted_conc = _inflight
