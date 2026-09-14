@@ -928,6 +928,37 @@ class Platform:
             if indexer_align:
                 attn_block_size = indexer_align * cdiv(attn_block_size, indexer_align)
 
+        # Opt-in (VLLM_QWEN4_KV_BLOCK_CAP=<tokens>): cap the attention block so
+        # a narrower KV dtype (int8) keeps the fp16 block instead of doubling
+        # it; the mamba page is then padded to a whole multiple of the
+        # attention page and the block-outermost packed grouping lays the two
+        # page sizes out side by side. Prefix-cache granularity stays at the
+        # capped block.
+        block_cap = int(os.environ.get("VLLM_QWEN4_KV_BLOCK_CAP", "0") or 0)
+        mamba_page_multiple = 1
+        if block_cap > 0 and attn_block_size > block_cap:
+            capped = max(
+                kernel_block_alignment_size,
+                block_cap - block_cap % kernel_block_alignment_size,
+            )
+            cap_indexer_align = cls._get_indexer_block_alignment(vllm_config)
+            if cap_indexer_align:
+                capped = max(
+                    cap_indexer_align, capped - capped % cap_indexer_align
+                )
+            mamba_page_multiple = cdiv(
+                mamba_page_size, capped * attn_page_size_1_token
+            )
+            logger.info(
+                "VLLM_QWEN4_KV_BLOCK_CAP=%d: attention block %d -> %d tokens; "
+                "the mamba page will span %d attention pages.",
+                block_cap,
+                attn_block_size,
+                capped,
+                mamba_page_multiple,
+            )
+            attn_block_size = capped
+
         if cache_config.block_size < attn_block_size:
             cache_config.block_size = attn_block_size
             logger.info(
@@ -939,20 +970,22 @@ class Platform:
         if cache_config.mamba_cache_mode == "align":
             cache_config.mamba_block_size = cache_config.block_size
 
-        # Pad mamba page size to exactly match attention page size
+        # Pad mamba page size to exactly match attention page size (or a whole
+        # multiple of it under VLLM_QWEN4_KV_BLOCK_CAP)
         attn_page_size = cache_config.block_size * attn_page_size_1_token
-        assert attn_page_size >= mamba_page_size
+        target_page_size = attn_page_size * mamba_page_multiple
+        assert target_page_size >= mamba_page_size
 
-        if attn_page_size == mamba_page_size:
+        if target_page_size == mamba_page_size:
             return
 
         if (
             cache_config.mamba_page_size_padded is None
-            or cache_config.mamba_page_size_padded != attn_page_size
+            or cache_config.mamba_page_size_padded != target_page_size
         ):
-            cache_config.mamba_page_size_padded = attn_page_size
+            cache_config.mamba_page_size_padded = target_page_size
             mamba_padding_pct = (
-                100 * (attn_page_size - mamba_page_size) / mamba_page_size
+                100 * (target_page_size - mamba_page_size) / mamba_page_size
             )
             logger.info(
                 "Padding mamba page size by %.2f%% to ensure "
