@@ -361,7 +361,9 @@ _CFG = {
 # budget=1 (context + generation peaks past this box's tiny free VRAM), so route it straight
 # to remote. Prevents single-big-request OOM crashes. (2026-08-12: observed a solo OOM here.)
 MAX_LOCAL_TOKENS = int(os.environ.get("SHIM_MAX_LOCAL_TOKENS", "80000"))
-# Size-aware admission: cap TOTAL in-flight prompt tokens across local lanes (activation ∝
+# Size-aware admission: cap reserved prompt + bounded output tokens across local lanes.
+# Prefix-cache compute savings do not reduce this conservative KV reservation.
+# Historical prompt-only calibration (activation ∝
 # concurrent context). Benchmark (2026-08-12, util 0.82) held 4x170K=680K with 611MB margin;
 # 500K default leaves comfortable headroom while allowing generous concurrency. 0 = disabled.
 TOKEN_BUDGET     = int(os.environ.get("SHIM_TOKEN_BUDGET", "500000"))
@@ -435,6 +437,7 @@ def _admin_ok(request):
 
 _inflight = 0            # local capacity units currently in flight
 _inflight_tokens = 0    # sum of est prompt tokens of in-flight local requests (size-aware cap)
+_inflight_reserved_tokens = 0  # prompt + maximum bounded generation, across all local lanes
 _waiting  = 0           # requests currently blocked in the queue-first wait loop (backlog)
 _backoff_until = 0.0
 _health = {"ok": False, "at": 0.0}
@@ -2010,11 +2013,48 @@ def bound_local_output(body):
         j = json.loads(body)
     except Exception:
         return body
-    mt = j.get("max_tokens")
+    # Normalize the alternate OpenAI output limit before reservation/relay so
+    # the engine cannot prefer a larger uncapped max_completion_tokens value.
+    mt = j.get("max_completion_tokens", j.get("max_tokens"))
+    had_alias = "max_completion_tokens" in j
+    j.pop("max_completion_tokens", None)
     if not mt or int(mt) <= 0 or int(mt) > LOCAL_MAX_OUT:
         j["max_tokens"] = LOCAL_MAX_OUT
         return json.dumps(j).encode()
+    if had_alias:
+        j["max_tokens"] = int(mt)
+        return json.dumps(j).encode()
     return body
+
+
+def local_memory_reservation(body):
+    """Conservative KV-token ceiling for the exact prepared body sent locally.
+
+    Count every requested sequence; cached prefixes still occupy KV memory.
+    With output bounding disabled, an unspecified limit reserves the complete
+    configured local context ceiling instead of assuming a short generation.
+    """
+    data = json.loads(body)
+    count = data.get("n", 1)
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        raise ValueError("n must be a positive integer")
+    best_of = data.get("best_of") or count
+    if isinstance(best_of, bool) or not isinstance(best_of, int) or best_of < count:
+        raise ValueError("best_of must be an integer at least n")
+    count = best_of
+    prompt = _est_tokens(body)
+    output = data.get("max_completion_tokens", data.get("max_tokens"))
+    if output is None or output == 0:
+        if MAX_LOCAL_TOKENS <= 0:
+            raise ValueError("local output requires a finite token limit")
+        return max(prompt, MAX_LOCAL_TOKENS) * count, count
+    if isinstance(output, bool) or not isinstance(output, int) or output < 0:
+        raise ValueError("local output token limit must be a positive integer")
+    return (prompt + output) * count, count
+
+
+def _memory_available(reservation):
+    return TOKEN_BUDGET <= 0 or _inflight_reserved_tokens + reservation <= TOKEN_BUDGET
 
 
 def wants_stream(body):
@@ -2556,7 +2596,7 @@ def _bg_reject_response():
 
 
 async def _route_completions(request):
-    global _inflight, _waiting, _inflight_tokens
+    global _inflight, _waiting, _inflight_tokens, _inflight_reserved_tokens
     path = request.path
     body = await request.read()
     units = estimate_units(body)
@@ -2667,14 +2707,45 @@ async def _route_completions(request):
         record_event("remote", "monster", request, units, 0, **ev)
         return await _forward_remote(request, path, body, streaming)
 
-    # TINY fast-lane: negligible-VRAM micro-calls skip the queue-first wait and use headroom slots
+    try:
+        local_body = _prepare_local_body(request, body, background)
+        reservation, sequences = local_memory_reservation(local_body)
+    except (ValueError, TypeError, AttributeError) as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    if TOKEN_BUDGET > 0 and reservation > TOKEN_BUDGET:
+        # Waiting cannot make a request larger than the entire pool admissible.
+        if remote_ok() and not local_pin:
+            record_event("remote", "tokens", request, units, 0, **ev)
+            return await _forward_remote(request, path, body, streaming)
+        return web.json_response({"error": "request exceeds local token reservation budget"}, status=503)
+    units *= sequences
+    reserved = False
+
+    def claim_local():
+        nonlocal reserved
+        global _inflight, _inflight_tokens, _inflight_reserved_tokens
+        _inflight += units
+        _inflight_tokens += ptok
+        _inflight_reserved_tokens += reservation
+        reserved = True
+
+    def release_local():
+        nonlocal reserved
+        global _inflight, _inflight_tokens, _inflight_reserved_tokens
+        if reserved:
+            _inflight -= units
+            _inflight_tokens -= ptok
+            _inflight_reserved_tokens -= reservation
+            reserved = False
+
+    # TINY fast-lane: small calls skip the queue, but never the KV memory limit.
     # BEYOND the big-request budget (bounded by TINY_EXTRA_LANES, staying within max-num-seqs), so a
     # trivial call never eats a 15s wait or gets starved during a budget=1 backoff. If even that
     # headroom is full, fast-overflow immediately (a tiny call on DeepSeek is cheap + fast).
     if tiny:
-        if _health["ok"] and (_inflight + units) <= (effective_budget() + TINY_EXTRA_LANES):
-            _inflight += units
-            _inflight_tokens += ptok
+        if (_health["ok"] and (_inflight + units) <= (effective_budget() + TINY_EXTRA_LANES)
+                and _memory_available(reservation)):
+            claim_local()
             log.info("route %s TINY units=%d inflight=%d/%d(+%d) -> local(tiny)",
                      path, units, _inflight, effective_budget(), TINY_EXTRA_LANES)
             _active_set(request, phase="local", route="local")
@@ -2685,7 +2756,7 @@ async def _route_completions(request):
                 # cover. It used to inline its own copy of the chain and omitted
                 # strip_thinking, so the no-think policy was dead on this lane specifically.
                 kind, payload = await _relay(request, LOCAL, path,
-                                             _prepare_local_body(request, body, background),
+                                             local_body,
                                              None, streaming, concurrency=1)
                 if kind == "ok":
                     _note_payload_outcome(request, payload, streaming)   # TELEMETRY
@@ -2697,14 +2768,14 @@ async def _route_completions(request):
                     trigger_backoff(f"local {status}: {text[:120]}")
                 log.warning("local(tiny) failed (%s) -> failover to remote", status)
                 record_event("remote", "failover", request, units, 0, **ev)
+                release_local()
                 return await _forward_remote(request, path, body, streaming)
             finally:
-                _inflight -= units
-                _inflight_tokens -= ptok
+                release_local()
         elif remote_ok():
             log.info("route %s TINY inflight=%d/%d(+%d) full -> remote(tiny-fast)",
                      path, _inflight, effective_budget(), TINY_EXTRA_LANES)
-            record_event("remote", "tiny-fast", request, units, 0, **ev)
+            record_event("remote", "tiny-fast" if _memory_available(reservation) else "tokens", request, units, 0, **ev)
             return await _forward_remote(request, path, body, streaming)
         # no remote configured -> fall through to the normal local wait loop
 
@@ -2730,14 +2801,14 @@ async def _route_completions(request):
             # big background request + idle engine: nothing in flight and nobody else queued
             # (this request counts itself in _waiting once queued) -> may take the whole budget.
             _bg_big_idle = (background and BG_BIG_LOCAL_WHEN_IDLE and units >= effective_budget()
+                            and units <= effective_budget()
                             and _inflight == 0 and _waiting <= (1 if queued else 0))
             if _health["ok"] and ((_inflight + units) <= lane_limit or _bg_big_idle) \
-                    and (TOKEN_BUDGET <= 0 or _inflight_tokens + ptok <= TOKEN_BUDGET or _inflight == 0):
+                    and _memory_available(reservation):
                 if _bg_big_idle and (_inflight + units) > lane_limit:
                     _stats["bg_big_idle_local"] = _stats.get("bg_big_idle_local", 0) + 1
                     _local_reason = "bg-big-idle"
-                _inflight += units
-                _inflight_tokens += ptok
+                claim_local()
                 admitted_conc = _inflight
                 admitted = True
                 break
@@ -2779,15 +2850,15 @@ async def _route_completions(request):
     # next Xid-31 crash leaves a deterministic repro payload. Ring of 40 files, 0600.
     # Directory made configurable (SHIM_FLIGHTREC_DIR, default unchanged) by the
     # shim-remote-observability lane, 2026-09-05 -- see _flightrec_dir()'s docstring.
-    if ptok >= int(os.environ.get("SHIM_FLIGHTREC_MIN_TOK", "15000")):
-        try:
-            fr = _flightrec_dir()
-            fn = f"{fr}/{int(time.time())}_{ptok}tok.json"
-            await asyncio.get_running_loop().run_in_executor(None, _write_flightrec, fr, fn, body)
-        except Exception as e:
-            log.warning("flightrec: %s", e)
     try:
-        _lb = _prepare_local_body(request, body, background)
+        if ptok >= int(os.environ.get("SHIM_FLIGHTREC_MIN_TOK", "15000")):
+            try:
+                fr = _flightrec_dir()
+                fn = f"{fr}/{int(time.time())}_{ptok}tok.json"
+                await asyncio.get_running_loop().run_in_executor(None, _write_flightrec, fr, fn, body)
+            except Exception as e:
+                log.warning("flightrec: %s", e)
+        _lb = local_body
         kind, payload = await _relay(request, LOCAL, path, _lb, None, streaming, concurrency=admitted_conc)
         if kind == "ok":
             _note_payload_outcome(request, payload, streaming)   # TELEMETRY (see DESIGN.md (c))
@@ -2820,10 +2891,10 @@ async def _route_completions(request):
             trigger_backoff(f"local {status}: {text[:120]}")
         log.warning("local failed (%s) -> failover to remote", status)
         record_event("remote", "failover", request, units, waited, **ev)
+        release_local()
         return await _forward_remote(request, path, body, streaming)
     finally:
-        _inflight -= units
-        _inflight_tokens -= ptok
+        release_local()
 
 
 # ---------------- passthrough (dynamic; no hardcoded models) ----------------
@@ -2894,6 +2965,7 @@ async def gateway_stats(request):
         "waiting": _waiting, "peak_waiting": _stats["peak_waiting"],
         "overflowed_after_wait": _stats["overflowed_after_wait"],
         "inflight_tokens": _inflight_tokens, "token_budget": TOKEN_BUDGET,
+        "inflight_reserved_tokens": _inflight_reserved_tokens,
         "backoff": max(0, int(_backoff_until - time.time())),
         "remote_model": REMOTE_MODEL, "remote_enabled": REMOTE_ENABLED,
         "local_only": bool(LOCAL_ONLY), "mode": routing_mode(),
@@ -2987,6 +3059,8 @@ async def gateway_metrics(request):
          "gauge", effective_budget())
     emit("gateway_waiting_requests", "Requests currently blocked in the admission wait loop.",
          "gauge", _waiting)
+    emit("gateway_inflight_reserved_tokens", "Reserved prompt plus bounded output tokens across local requests.",
+         "gauge", _inflight_reserved_tokens)
     emit("gateway_inflight_tokens", "Sum of estimated prompt tokens across in-flight local requests.",
          "gauge", _inflight_tokens)
     emit("gateway_backoff_seconds", "Seconds remaining in an OOM-triggered budget=1 backoff.",
@@ -4541,7 +4615,7 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
     <input id=f_local_budget type=number min=1 max=8></label>
    <label><span class=k>How long should an interactive request wait for a free lane?</span><span class=hint>seconds, before overflowing to the paid provider</span>
     <input id=f_local_wait_secs type=number min=0 step=1></label>
-   <label><span class=k>Total context all lanes together may hold</span><span class=hint>tokens &middot; prevents an out-of-memory crash</span>
+   <label><span class=k>Prompt and output tokens all lanes may reserve</span><span class=hint>estimated tokens &middot; admission memory limit</span>
     <input id=f_token_budget type=number min=0 step=50000></label>
    <label><span class=k>After an out-of-memory crash, how long to back off?</span><span class=hint>seconds before probing the local engine again</span>
     <input id=f_oom_backoff_secs type=number min=0 step=10></label>
@@ -4787,7 +4861,7 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
     setBanner('oom', s.backoff>0?('Local engine is in OOM backoff for another '+s.backoff+'s -- new requests overflow to the paid provider until it clears.'):null, 'warn');
     $('#strip').innerHTML=[
       `<div class=tile><div class=k><abbr title="Whether the local vLLM engine on :8001 is responding to /health.">Local engine</abbr></div><div class=v><span class="dot ${s.local_healthy?'up':'down'}"></span> ${s.local_healthy?'up':'DOWN'}</div><div class=sub title="${esc(modelName)}">${esc(modelShort||'--')}</div></div>`,
-      `<div class=tile><div class=k><abbr title="Concurrent request slots (lanes) in use / total available. Waiting shown when requests are queued for one.">Lanes</abbr></div><div class=v class=mono>${s.inflight}<small>/${s.budget}</small>${s.waiting?` <span style=color:var(--amb)>+${s.waiting} waiting</span>`:''}</div><div class=sub><abbr title="Rolling in-flight prompt tokens across all lanes / token-budget cap.">context in use ${((s.inflight_tokens||0)/1000).toFixed(0)}K / ${((s.token_budget||0)/1000).toFixed(0)}K cap</abbr>${bk?' &middot; '+bk:''}</div></div>`,
+      `<div class=tile><div class=k><abbr title="Concurrent request slots (lanes) in use / total available. Waiting shown when requests are queued for one.">Lanes</abbr></div><div class=v class=mono>${s.inflight}<small>/${s.budget}</small>${s.waiting?` <span style=color:var(--amb)>+${s.waiting} waiting</span>`:''}</div><div class=sub><abbr title="Reserved prompt plus bounded output tokens across all lanes / token-budget cap.">context reserved ${((s.inflight_reserved_tokens||0)/1000).toFixed(0)}K / ${((s.token_budget||0)/1000).toFixed(0)}K cap</abbr>${bk?' &middot; '+bk:''}</div></div>`,
       `<div class=tile><div class=k><abbr title="Share of requests served by the local engine vs sent to the overflow provider.">Served local</abbr></div><div class=v class=mono style=color:var(--grn)>${s.local_pct}<small>%</small></div><div class=sub>overflow ${s.remote_pct}% &middot; avg wait ${s.avg_wait}s</div></div>`,
       `<div class=tile><div class=k><abbr title="Live tokens/s from the engine's Prometheus metrics (prompt + generation combined). '--' if the engine is down or not yet scraped.">Tokens/s now</abbr></div><div class=v class=mono id=tps_now>--</div><div class=sub>time to first token <span id=ttft_line>--</span></div></div>`,
       `<div class=tile><div class=k><abbr title="Average GPU utilisation across all cards, as reported by nvidia-smi.">GPU util avg</abbr></div><div class=v class=mono>${gpuAvg==null?'--':gpuAvg+'<small>%</small>'}</div><div class=sub>${(s.gpu||[]).map((g,i)=>'GPU'+i+' '+((g.util==null?'?':g.util)+'%')).join(' &middot; ')||'no GPU data'}</div></div>`,
