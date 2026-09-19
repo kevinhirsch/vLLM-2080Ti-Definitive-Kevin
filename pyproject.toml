@@ -100,6 +100,14 @@ check_untyped_defs = true
 follow_imports = "silent"
 
 [tool.pytest.ini_options]
+# deploy/templates holds jinja chat-template fixtures, not tests. One of them is
+# named scripts/test_v21.py and calls sys.exit(1) at IMPORT time when jinja2 is
+# absent -- and pytest's assertion rewriter executes module bodies during
+# collection, so the whole run dies with "INTERNALERROR: SystemExit: 1" before a
+# single test executes. Any card whose baseline is `pytest` in this repo
+# therefore failed before its model was ever invoked. The rest of this list is
+# pytest's own default, restated because setting the key replaces the default.
+norecursedirs = ["*.egg", ".*", "_darcs", "build", "CVS", "dist", "node_modules", "venv", "{arch}", "deploy/templates"]
 markers = [
     "slow_test",
     "skip_global_cleanup",
