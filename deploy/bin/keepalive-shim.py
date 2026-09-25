@@ -8,9 +8,14 @@ add to vLLM tomorrow just works. When local is at capacity or unhealthy, request
 transparently overflow to a remote OpenAI-compatible endpoint (DeepSeek).
 
 Placement (per request):
-  - Estimate cost in "units": moderate = 1, big (est. prompt >= SHIM_BIG_TOKENS) = 2.
-  - Local budget = SHIM_LOCAL_BUDGET units (default 2) => "2 moderate OR 1 big",
-    matching the box's chaos-tested envelope (44GB VRAM, ~1.7GB activation headroom).
+  - Estimate cost in "units": under SHIM_BIG_TOKENS = 1; at or above it,
+    ceil(tokens / SHIM_TOKENS_PER_UNIT), capped at budget-SHIM_FG_RESERVED so one big
+    request can never claim every lane (2026-09-11: it used to cost the WHOLE budget,
+    which let a single 100K+ prompt lock out every other caller -- see
+    gw-admission-proportional-units in the vault's Qwen3.8 Capacity Tuning Backlog).
+  - Local budget = SHIM_LOCAL_BUDGET units (default 14 in production), matching the
+    box's chaos-tested envelope; the per-request KV/token safety net is TOKEN_BUDGET
+    (total in-flight PROMPT tokens across ALL admitted requests), independent of units.
   - If local is healthy AND admitting this request stays within budget => LOCAL.
     Otherwise => REMOTE (model rewritten to SHIM_REMOTE_MODEL).
 Self-heal:
@@ -21,7 +26,7 @@ Cost-first: a single request is always local (free); only real overflow costs mo
 
 NEVER manages the vLLM process (that's vllm-qwen27b.service + its watchdog).
 """
-import asyncio, os, sys, json, time, logging, collections, subprocess, re, hmac
+import asyncio, os, sys, json, time, logging, collections, subprocess, re, hmac, math, hashlib
 import urllib.request
 import aiohttp
 from aiohttp import web
@@ -120,6 +125,16 @@ SHIM_ENV_FILE = os.environ.get("SHIM_ENV_FILE", "/home/kevin/.local/share/vllm-q
 REMOTE_BASE  = os.environ.get("SHIM_REMOTE_BASE", "").rstrip("/")
 REMOTE_KEY   = os.environ.get("SHIM_REMOTE_KEY", "")
 REMOTE_MODEL = os.environ.get("SHIM_REMOTE_MODEL", "deepseek-v4-flash")
+# Provider context capabilities.  These are admission limits, not prompt truncation
+# instructions: every provider receives an explicit, intact transcript or an explicit
+# context-capacity error.  The local value is kept separate from MAX_LOCAL_TOKENS so a
+# deployment can change the engine's output guard without lying about its context window.
+LOCAL_CONTEXT_LIMIT = int(os.environ.get("SHIM_LOCAL_CONTEXT_LIMIT", "524288"))
+REMOTE_CONTEXT_LIMIT = int(os.environ.get("SHIM_REMOTE_CONTEXT_LIMIT", "128000"))
+CONTEXT_SAFETY_MARGIN = int(os.environ.get("SHIM_CONTEXT_SAFETY_MARGIN", "1024"))
+CONTEXT_COMPACTION_ENABLED = os.environ.get("SHIM_CONTEXT_COMPACTION", "1").lower() not in ("0", "false", "off")
+CONTEXT_COMPACTION_KEEP = int(os.environ.get("SHIM_CONTEXT_COMPACTION_KEEP", "12"))
+ALIASES_FILE = os.environ.get("SHIM_ALIASES_FILE", "/home/kevin/.local/share/vllm-qwen27b/gateway-aliases.json")
 BUDGET       = int(os.environ.get("SHIM_LOCAL_BUDGET", "2"))
 BIG_TOKENS   = int(os.environ.get("SHIM_BIG_TOKENS", "40000"))
 OOM_BACKOFF  = int(os.environ.get("SHIM_OOM_BACKOFF_SECS", "120"))
@@ -214,6 +229,52 @@ FG_RESERVED = int(os.environ.get("SHIM_FG_RESERVED", "2"))
 # is completely idle (nothing in flight, nobody queued) a big background request may take the
 # whole budget, exactly like a big foreground one does. Set 0 to restore the old always-remote rule.
 BG_BIG_LOCAL_WHEN_IDLE = int(os.environ.get("SHIM_BG_BIG_LOCAL_WHEN_IDLE", "1"))
+# 2026-09-11 (Kevin: "the uncensored local model IS the point of the estate"; measured: his
+# interactive pi session was served locally only 7% of the time, 448/482 requests overflowed
+# to paid DeepSeek in 2 days). gw-interactive-never-overflows: an INTERACTIVE (non-background)
+# request that is merely WAITING for a lane -- local is healthy, just busy -- no longer times
+# out into an overflow. It keeps waiting for a local lane instead (same 1e9 sentinel already
+# used when no remote is configured at all). This does NOT touch the local-DOWN path above
+# (a genuinely dead/unhealthy engine still overflows interactive immediately, same as before --
+# waiting for a lane that will never open is not "the point"), and does not touch background,
+# which still yields and overflows on its own short timer. Default on; set 0 to restore the
+# previous LOCAL_WAIT-then-overflow behaviour for interactive traffic.
+INTERACTIVE_NEVER_OVERFLOW = int(os.environ.get("SHIM_INTERACTIVE_NEVER_OVERFLOW", "1"))
+# 2026-09-11 (Kevin: "response time... is unbearably slow"; gw-admission-proportional-units).
+# estimate_units() used to charge ANY request >= BIG_TOKENS the WHOLE current budget, on the
+# theory that a big prefill "runs alone." Measured effect: one of Kevin's own 111K-token pi
+# turns holds 14/14 lanes for the length of its wait+prefill+decode, so every OTHER request --
+# including his own next interactive turn -- queues up to LOCAL_WAIT and then overflows to
+# paid remote (his pi session was served locally only 7% of the time). The engine already has
+# an independent, finer-grained memory-safety net for concurrent big prefills: TOKEN_BUDGET
+# bounds total in-flight PROMPT TOKENS across ALL admitted requests regardless of unit count
+# (see the `_inflight_tokens + ptok <= TOKEN_BUDGET` check below) -- "units" is a proxy for
+# concurrent SEQUENCE SLOTS (vLLM's max_num_seqs), not for KV/token budget, so a big request
+# does not need every slot just because it is big. Units are now proportional to estimated
+# size, capped so a single request can never claim more than budget-FG_RESERVED (at least
+# FG_RESERVED lanes free for the NEXT caller, always, regardless of class) and floored at 1
+# (a request is never inadmissible). SHIM_TOKENS_PER_UNIT is hot-reloadable via
+# /gateway/config so the ratio can be tuned from the bake-off without a restart. This does NOT
+# relax the TOKEN_BUDGET check, which remains the real KV-safety gate.
+TOKENS_PER_UNIT = int(os.environ.get("SHIM_TOKENS_PER_UNIT", "12000"))
+# 2026-09-11 (gw-admission-computed-token-cost). estimate_units() charges a big request by its
+# PROMPT LENGTH, but prefix caching means a growing multi-turn conversation (pi's own pattern --
+# each turn resends the whole history plus one new message) only actually costs the engine the
+# NEW suffix, not the whole resent prefix: a 111K-token turn that is 98% cached is ~2K tokens of
+# real prefill work. predict_computed_tokens() tracks a one-deep per-client prefix hash and
+# predicts "only the delta since last turn" on a hit, full cost on any miss (new client, first
+# turn, edited/branched history). PREFIX_HIT_MARGIN_TOKENS pads that delta for tokenizer/
+# block-alignment slop at the cache boundary. USE_COMPUTED_COST is a KILL SWITCH, default OFF:
+# est_computed/computed_actual are measured and logged from the moment this deploys (so the
+# card's own 200-live-turn accuracy gate has something to grade), but admission cost keeps using
+# the existing raw-token math until that gate is actually checked against real telemetry --
+# shipping the measurement ahead of the behaviour change on a brand-new heuristic that touches
+# live admission, not after it, per Kevin's own benchmark-rigor standard. Flipping it to 1 does
+# NOT relax TOKEN_BUDGET (unchanged, still raw-prompt-token-based, still the real KV-safety net)
+# -- it only changes how many LANES a correctly-predicted-cheap request is charged.
+PREFIX_HIT_MARGIN_TOKENS = int(os.environ.get("SHIM_PREFIX_HIT_MARGIN_TOKENS", "512"))
+USE_COMPUTED_COST = int(os.environ.get("SHIM_USE_COMPUTED_COST", "0"))
+PREFIX_CACHE_MAX_CLIENTS = 200   # bound on _prefix_seen's size; not a tuning knob, not hot-reloadable
 # 2026-09-05 (evalkit run-2 forensics): background classification by X-Client only matched the
 # substrings "cron"/"batch", so the research service ("workflow-bg"), the research feeder and the
 # local digester all ran as FOREGROUND and could fill every lane, queueing genuinely interactive
@@ -306,6 +367,11 @@ _CFG = {
     "SHIM_REMOTE_BASE":      ("REMOTE_BASE",  lambda v: str(v).rstrip("/")),
     "SHIM_REMOTE_KEY":       ("REMOTE_KEY",   str),
     "SHIM_REMOTE_MODEL":     ("REMOTE_MODEL", str),
+    "SHIM_LOCAL_CONTEXT_LIMIT": ("LOCAL_CONTEXT_LIMIT", int),
+    "SHIM_REMOTE_CONTEXT_LIMIT": ("REMOTE_CONTEXT_LIMIT", int),
+    "SHIM_CONTEXT_SAFETY_MARGIN": ("CONTEXT_SAFETY_MARGIN", int),
+    "SHIM_CONTEXT_COMPACTION": ("CONTEXT_COMPACTION_ENABLED", lambda v: str(v).lower() not in ("0", "false", "off")),
+    "SHIM_CONTEXT_COMPACTION_KEEP": ("CONTEXT_COMPACTION_KEEP", int),
     "SHIM_FORCE_REMOTE":     ("FORCE_REMOTE", lambda v: 1 if str(v).lower() in ("1","true","on") else 0),
     "SHIM_LOCAL_ONLY":       ("LOCAL_ONLY",   lambda v: 1 if str(v).lower() in ("1","true","on") else 0),
     # local capacity
@@ -327,6 +393,10 @@ _CFG = {
     "SHIM_TINY_EXTRA_LANES": ("TINY_EXTRA_LANES", int),
     "SHIM_FG_RESERVED":      ("FG_RESERVED",      int),
     "SHIM_BG_BIG_LOCAL_WHEN_IDLE": ("BG_BIG_LOCAL_WHEN_IDLE", int),
+    "SHIM_TOKENS_PER_UNIT":  ("TOKENS_PER_UNIT", int),
+    "SHIM_INTERACTIVE_NEVER_OVERFLOW": ("INTERACTIVE_NEVER_OVERFLOW", int),
+    "SHIM_PREFIX_HIT_MARGIN_TOKENS": ("PREFIX_HIT_MARGIN_TOKENS", int),
+    "SHIM_USE_COMPUTED_COST": ("USE_COMPUTED_COST", int),
     "SHIM_BG_XCLIENTS":      ("BG_XCLIENTS", lambda v: [m.lower() for m in _parse_seq(v, _CFG_SEP["SHIM_BG_XCLIENTS"])]),
     "SHIM_POOL_TOKENS":      ("POOL_TOKENS",      int),
     "SHIM_BG_WAIT_SECS":     ("BG_WAIT",          float),
@@ -356,6 +426,15 @@ _CFG = {
     "SHIM_NONTHINK_TOP_P":   ("NONTHINK_TOP_P", float),
     "SHIM_NONTHINK_TEMP":    ("NONTHINK_TEMP",  float),
     "SHIM_NONTHINK_TOP_K":   ("NONTHINK_TOP_K", int),
+    "SHIM_PREDICTED_OCCUPANCY_SECS": ("PREDICTED_OCCUPANCY_SECS", float),
+    "SHIM_DECODE_TPS_FLOOR": ("DECODE_TPS_FLOOR", float),
+    "SHIM_PERF_BREAKER_ENABLED": ("PERF_BREAKER_ENABLED", lambda v: str(v).lower() not in ("0", "false", "")),
+    "SHIM_PERF_BREAKER_TTFT_P95_SECS": ("PERF_BREAKER_TTFT_P95_SECS", float),
+    "SHIM_PERF_BREAKER_GPU_UTIL_PCT": ("PERF_BREAKER_GPU_UTIL_PCT", float),
+    "SHIM_PERF_BREAKER_KV_PCT": ("PERF_BREAKER_KV_PCT", float),
+    "SHIM_PERF_BREAKER_MIN_SAMPLES": ("PERF_BREAKER_MIN_SAMPLES", int),
+    "SHIM_PERF_BREAKER_HOLD_SECS": ("PERF_BREAKER_HOLD_SECS", float),
+    "SHIM_STREAM_IDLE_TIMEOUT_SECS": ("STREAM_IDLE_TIMEOUT_SECS", float),
 }
 # A single request whose est. (prompt + max_tokens) exceeds this will OOM local even at
 # budget=1 (context + generation peaks past this box's tiny free VRAM), so route it straight
@@ -394,6 +473,18 @@ LOG_PREVIEW_CHARS = int(os.environ.get("SHIM_LOG_PREVIEW_CHARS", "70"))
 REMOTE_STRIP = ("chat_template_kwargs", "mamba_cache_mode", "guided_decoding_backend")
 # Force non-thinking on the DeepSeek failover (see remap_for_remote). Disable with SHIM_REMOTE_NO_THINK=0.
 REMOTE_NO_THINK = os.environ.get("SHIM_REMOTE_NO_THINK", "1") not in ("0", "false", "")
+
+# Congestion controls.  These guards run inside the gateway before local admission.  Callers
+# never select a provider; they may only express an optional route intent.
+PREDICTED_OCCUPANCY_SECS = float(os.environ.get("SHIM_PREDICTED_OCCUPANCY_SECS", "180"))
+DECODE_TPS_FLOOR = float(os.environ.get("SHIM_DECODE_TPS_FLOOR", "20"))
+PERF_BREAKER_ENABLED = os.environ.get("SHIM_PERF_BREAKER_ENABLED", "1") not in ("0", "false", "")
+PERF_BREAKER_TTFT_P95_SECS = float(os.environ.get("SHIM_PERF_BREAKER_TTFT_P95_SECS", "20"))
+PERF_BREAKER_GPU_UTIL_PCT = float(os.environ.get("SHIM_PERF_BREAKER_GPU_UTIL_PCT", "95"))
+PERF_BREAKER_KV_PCT = float(os.environ.get("SHIM_PERF_BREAKER_KV_PCT", "85"))
+PERF_BREAKER_MIN_SAMPLES = int(os.environ.get("SHIM_PERF_BREAKER_MIN_SAMPLES", "3"))
+PERF_BREAKER_HOLD_SECS = float(os.environ.get("SHIM_PERF_BREAKER_HOLD_SECS", "45"))
+STREAM_IDLE_TIMEOUT_SECS = float(os.environ.get("SHIM_STREAM_IDLE_TIMEOUT_SECS", "45"))
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout,
                     format="%(asctime)s [gateway] %(levelname)s %(message)s")
@@ -439,6 +530,22 @@ _inflight = 0            # local capacity units currently in flight
 _inflight_tokens = 0    # sum of est prompt tokens of in-flight local requests (size-aware cap)
 _inflight_reserved_tokens = 0  # prompt + maximum bounded generation, across all local lanes
 _waiting  = 0           # requests currently blocked in the queue-first wait loop (backlog)
+# 2026-09-11 (gw-queue-position-header): per-class split of the SAME count above. Kevin's
+# dashboard showed one aggregate "waiting" number with no way to tell "am I, personally,
+# waiting" from "a cron job is waiting" -- exactly the ambiguity behind his "response time...
+# is unbearably slow" complaint, since a page full of background waiters looks identical to
+# one interactive waiter. Mutated at the SAME two sites as _waiting, by construction (see the
+# comment there): never drifts from it because it is updated in the same breath.
+_waiting_by_class = {"interactive": 0, "background": 0}
+# gw-admission-computed-token-cost: client name -> {"hashes": per-message sha256 list of that
+# client's last request, "prompt_tokens": that request's estimated prompt tokens, "ts":
+# time.time()}. One entry per client (not per request) -- a one-deep prefix-cache model, matching
+# the shape of a growing multi-turn conversation where each new turn's messages list starts with
+# ALL of the previous turn's messages (see _is_prefix_of() -- a real conversation typically grows
+# by 2+ messages per turn, since the client echoes the assistant's own reply back alongside the
+# next user message, not by exactly 1). Bounded by PREFIX_CACHE_MAX_CLIENTS (FIFO eviction) so an
+# attacker or a runaway number of distinct X-Client values can't grow this without bound.
+_prefix_seen = {}
 _backoff_until = 0.0
 _health = {"ok": False, "at": 0.0}
 REMOTE_ENABLED = bool(REMOTE_BASE and REMOTE_KEY)
@@ -607,8 +714,13 @@ _PER_CLIENT = collections.defaultdict(lambda: {
     "tokens_out_lb": 0, "wait_sum": 0.0, "wait_n": 0, "ttft_sum": 0.0, "ttft_n": 0,
     "errors": 0, "cost_est_usd": 0.0})
 _ERROR_FEED = collections.deque(maxlen=200)
+# gw-admission-computed-token-cost safety AC: a request whose actual computed tokens exceed
+# what predict_computed_tokens() would have charged it by > 2x, regardless of whether
+# USE_COMPUTED_COST is even on -- this must be visible BEFORE the switch is flipped, not after.
+_MISESTIMATE_FEED = collections.deque(maxlen=200)
 _cpu_prev = {"t": 0.0, "total": 0, "idle": 0}
 _telem_lr_prev = {"local": None, "remote": None}   # previous tick's cumulative local/remote counts
+_PERF_STATE = {"bad_streak": 0, "good_streak": 0, "until": 0.0, "reason": ""}
 
 
 def _remote_share_delta():
@@ -623,6 +735,79 @@ def _remote_share_delta():
     dl, dr = cl - pl, cr - pr
     tot = dl + dr
     return round(100 * dr / tot, 1) if tot > 0 else None
+
+
+def _perf_sample_bad(sample):
+    """Return measurable overload reasons from one telemetry sample."""
+    if not PERF_BREAKER_ENABLED or not sample:
+        return []
+    eng = sample.get("engine") or {}
+    reasons = []
+    waiting = eng.get("waiting")
+    ttft = eng.get("ttft_p95")
+    kv = eng.get("kv_cache_pct")
+    if isinstance(waiting, (int, float)) and waiting > 0:
+        reasons.append("engine-queue")
+    if isinstance(ttft, (int, float)) and ttft >= PERF_BREAKER_TTFT_P95_SECS:
+        reasons.append("ttft-p95")
+    if isinstance(kv, (int, float)) and kv >= PERF_BREAKER_KV_PCT:
+        reasons.append("kv-pressure")
+    gpu = [g.get("util") for g in (sample.get("gpu") or []) if isinstance(g.get("util"), (int, float))]
+    running = eng.get("running") or 0
+    if gpu and sum(gpu) / len(gpu) >= PERF_BREAKER_GPU_UTIL_PCT and running >= 2:
+        reasons.append("gpu-saturation")
+    return reasons
+
+
+def _update_perf_breaker(sample):
+    """Small hysteretic circuit breaker, driven only by sampled runtime evidence."""
+    reasons = _perf_sample_bad(sample)
+    if reasons:
+        _PERF_STATE["bad_streak"] += 1
+        _PERF_STATE["good_streak"] = 0
+        _PERF_STATE["reason"] = ",".join(reasons)
+        if _PERF_STATE["bad_streak"] >= max(1, PERF_BREAKER_MIN_SAMPLES):
+            _PERF_STATE["until"] = max(_PERF_STATE["until"], time.time() + PERF_BREAKER_HOLD_SECS)
+    else:
+        _PERF_STATE["good_streak"] += 1
+        _PERF_STATE["bad_streak"] = 0
+        if _PERF_STATE["good_streak"] >= max(1, PERF_BREAKER_MIN_SAMPLES):
+            _PERF_STATE["until"] = 0.0
+            _PERF_STATE["reason"] = ""
+
+
+def perf_breaker_active():
+    return bool(PERF_BREAKER_ENABLED and time.time() < _PERF_STATE.get("until", 0.0))
+
+
+def _latest_decode_tps():
+    """Use the most recent measured engine decode rate, with a conservative floor."""
+    for sample in reversed(_TELEM_FAST):
+        value = ((sample.get("engine") or {}).get("gen_tok_s"))
+        if isinstance(value, (int, float)) and value > 0:
+            # Do not let a quiet/partially sampled engine report 0--20 tok/s become a
+            # self-fulfilling remote-routing loop.  The measured 30-day local baseline is
+            # ~74 tok/s, so clamp only the warm-start estimate; the performance breaker handles
+            # genuinely sustained degradation separately.
+            return max(60.0, float(value))
+    # The live 30-day Qwen measurements cluster around 70--75 tok/s.  Use a modestly
+    # conservative warm-start value instead of the hard safety floor; otherwise every first
+    # 4K-token request after a restart would be pessimistically classified as a 200s job.
+    return max(DECODE_TPS_FLOOR, 60.0)
+
+
+def predicted_occupancy_seconds(ptok, maxtok, concurrency=1):
+    """Conservative local occupancy estimate used before admission.
+
+    It intentionally applies only when the caller supplies a positive max_tokens value.  An
+    omitted max_tokens request is already bounded by LOCAL_MAX_OUT on the local path and is too
+    often a short tool call to classify from its nominal ceiling alone.
+    """
+    if not maxtok or PREDICTED_OCCUPANCY_SECS <= 0:
+        return None
+    prefill = (max(0, ptok) / max(1.0, PREFILL_TPS)) * max(1, concurrency)
+    decode = max(0, maxtok) / _latest_decode_tps()
+    return round(prefill + decode, 3)
 
 
 # ---- (b) GPU: extended nvidia-smi fields, off-loop refresh. _gpu_stats() (edited below)
@@ -884,7 +1069,9 @@ async def _take_sample():
         "gateway": {"inflight": _inflight, "budget": effective_budget(), "waiting": _waiting,
                     "backoff_s": max(0, int(_backoff_until - time.time())),
                     "local_healthy": _health.get("ok", False),
-                    "remote_share_pct": _remote_share_delta()},
+                    "remote_share_pct": _remote_share_delta(),
+                    "perf_breaker": perf_breaker_active(),
+                    "perf_reason": _PERF_STATE.get("reason", "")},
     }
 
 
@@ -909,6 +1096,8 @@ def _downsample(samples):
         "backoff_s": max(s["gateway"]["backoff_s"] for s in samples),
         "local_healthy": any(s["gateway"]["local_healthy"] for s in samples),
         "remote_share_pct": _avg(s["gateway"].get("remote_share_pct") for s in samples),
+        "perf_breaker": any(s["gateway"].get("perf_breaker", False) for s in samples),
+        "perf_reason": last["gateway"].get("perf_reason", ""),
     }
     out["host"] = {k: _avg(s["host"].get(k) for s in samples) for k in
                    ("cpu_pct", "ram_used_gb", "ram_total_gb", "disk_free_gb", "models_disk_free_gb")}
@@ -939,6 +1128,7 @@ async def _telemetry_sampler():
             sample = await _take_sample()
             _TELEM_FAST.append(sample)
             _TELEM_WINDOW.append(sample)
+            _update_perf_breaker(sample)
             _TELEM_TICK += 1
             if _TELEM_TICK % max(1, TELEM_SLOW_EVERY) == 0:
                 ds = _downsample(_TELEM_WINDOW)
@@ -1003,6 +1193,7 @@ def _telemetry_note_request(info, resp=None):
         reason = info.get("reason") or ""
         outtok, outtok_lb = info.get("outtok"), info.get("outtok_lb")
         waited = info.get("waited") or 0.0
+        duration = round(now - info["t0"], 3) if info.get("t0") else None
         status = getattr(resp, "status", None)
         if status is None:
             status = info.get("http_status")
@@ -1023,11 +1214,18 @@ def _telemetry_note_request(info, resp=None):
             req_cost = _remote_cost_estimate(
                 info.get("ptok") or 0, outtok if outtok is not None else outtok_lb)
             c["cost_est_usd"] += req_cost
-        if (status is not None and status >= 400) or reason == "failover":
+        if (status is not None and status >= 400) or reason == "failover" or info.get("stream_watchdog"):
             c["errors"] += 1
             _ERROR_FEED.appendleft({"t": round(now, 1), "client": name, "ep": info.get("ep"),
                                     "route": route, "reason": reason, "status": status,
                                     "preview": info.get("preview")})
+        est_computed = info.get("est_computed")
+        computed_actual = info.get("computed_actual")
+        if est_computed is not None and computed_actual is not None and computed_actual > 2 * est_computed:
+            log.warning("mis-estimate: client=%s est_computed=%d computed_actual=%d (%.1fx)",
+                        name, est_computed, computed_actual, computed_actual / max(1, est_computed))
+            _MISESTIMATE_FEED.appendleft({"t": round(now, 1), "client": name,
+                                          "est_computed": est_computed, "computed_actual": computed_actual})
         # (e) append-only JSONL request log -- see DESIGN.md (e) / REPORT.md. Never write on the
         # request path: this only appends a small dict to a bounded in-memory list;
         # _jsonl_flusher() (sibling to _stats_saver()) does the actual blocking file I/O off the
@@ -1038,28 +1236,51 @@ def _telemetry_note_request(info, resp=None):
             "xclient": info.get("xclient"), "ua": info.get("ua"),
             "ep": info.get("ep"), "model": info.get("model"),
             "route": route, "reason": reason,
+            "alias": info.get("alias"), "alias_kind": info.get("alias_kind"),
             "waited": round(waited, 3) if waited else 0.0,
             "ttft": ttft, "ptok": info.get("ptok"), "maxtok": info.get("maxtok"),
             "outtok": outtok, "outtok_lb": outtok_lb,
-            # RESPONSE-SHAPE fields (shim-remote-observability lane, 2026-09-05). Populated
-            # today for route=="remote" non-streaming responses only (_forward_remote ->
-            # _note_remote_response -> classify_remote_response; see REPORT.md) -- always None
-            # for route=="local" (out of scope for this lane: the local path already has its
-            # own real-time empty-response check, _is_empty_thinking_response()/EMPTY_RETRY, it
-            # just never persisted the verdict here) and for content_len/content_empty/
-            # has_tool_calls on ANY streaming response (not reconstructable from a chunked
-            # stream without reassembling every delta -- documented limitation, see REPORT.md).
-            # finish_reason is the one exception that CAN show up on a streaming remote
-            # response too: _relay()'s _scan_usage best-effort-scans the SSE trailer for it.
+            # RESPONSE-SHAPE fields. content_empty/has_tool_calls/finish_reason:
+            #   - non-streaming remote: _forward_remote -> _note_remote_response ->
+            #     classify_remote_response (shim-remote-observability lane, 2026-09-05).
+            #   - ANY streaming response, local or remote (gw-streaming-content-classifier,
+            #     2026-09-11): _relay()'s _sse_content_shape() scans every delta for
+            #     non-whitespace content / tool_calls WITHOUT reassembling the full message --
+            #     content_len is the one field that stays None for streaming (a running char
+            #     count was judged not worth the extra per-chunk work; content_empty already
+            #     answers the question content_len existed to answer).
+            #   - non-streaming local: still None -- the local path already has its own
+            #     real-time empty-response check (_is_empty_thinking_response()/EMPTY_RETRY),
+            #     it just never persisted the verdict here; out of THIS lane's scope.
             "finish_reason": info.get("finish_reason"),
             "content_len": info.get("content_len"),
             "content_empty": info.get("content_empty"),
             "has_tool_calls": info.get("has_tool_calls"),
             "ptok_exact": info.get("ptok_exact"),
-            "duration": round(now - info["t0"], 3) if info.get("t0") else None,
+            "predicted_occupancy_s": info.get("predicted_occupancy_s"),
+            "context_provider": info.get("context_provider"),
+            "context_limit": info.get("context_limit"),
+            "context_prompt_tokens": info.get("context_prompt_tokens"),
+            "context_compacted": bool(info.get("context_compacted")),
+            "context_omitted": info.get("context_omitted", 0),
+            "stream_watchdog": bool(info.get("stream_watchdog")),
+            "stream_idle_timeout_s": info.get("stream_idle_timeout_s"),
+            "duration": duration,
             "status": status, "stream": bool(info.get("stream")),
             "bg": bool(info.get("bg")), "tiny": bool(info.get("tiny")),
             "preview": info.get("preview"), "cost_est": req_cost,
+            # gw-ttft-decomposition-telemetry: admission_wait duplicates `waited` under the
+            # AC-named field so the JSONL is self-auditable against the card without a lookup
+            # table; decode_time is new (see decompose_timing()'s docstring for why engine_queue
+            # and prefill_time aren't split out here).
+            **decompose_timing(waited, ttft, duration),
+            # gw-admission-computed-token-cost: est_tokens/est_computed set unconditionally in
+            # _route_completions (regardless of USE_COMPUTED_COST); computed_actual only when
+            # the engine's usage trailer carried prompt_tokens (local only -- see _relay()).
+            # None (not 0) whenever the engine side isn't known, same "missing != zero" rule as
+            # decompose_timing() -- a null here must never be mistaken for "0 tokens computed".
+            "est_tokens": info.get("est_tokens"), "est_computed": info.get("est_computed"),
+            "computed_actual": info.get("computed_actual"),
         })
     except Exception as e:
         log.warning("telemetry note_request: %s", e)
@@ -1325,6 +1546,57 @@ def _raw_pctl(sorted_vals, q):
     return round(sorted_vals[idx], 3)
 
 
+def decompose_timing(waited, ttft, duration):
+    """Split one request's shim-observed wall-clock into the phases the SHIM can actually see.
+
+    gw-ttft-decomposition-telemetry (Kevin 2026-09-11) asked for admission_wait, engine_queue,
+    prefill_time and decode_time as four separately-measured fields. The shim can only deliver
+    three: engine_queue and prefill_time both happen between the upstream POST and the first
+    streamed byte, entirely inside the engine's own scheduler -- the shim has no vantage point
+    between them (the engine tracks them separately as vllm:request_queue_time_seconds /
+    vllm:request_prefill_time_seconds, but those are process-wide Prometheus histograms, not
+    attributable to one request under concurrency, and the per-request values that do exist
+    internally -- see vllm's output_processor.do_tracing()/RequestStateStats -- are never
+    surfaced on the OpenAI-compatible response; exposing them needs an engine-side patch, which
+    needs a restart). What IS real and shim-only: admission_wait (this shim's own queue, always
+    known), queue_plus_prefill (the combined engine phase -- exactly today's `ttft` field, kept
+    under its existing name in the JSONL rather than duplicated), and decode_time (derived).
+
+    ttft is None for every non-streaming response (see _relay()'s own TELEMETRY comment) --
+    decode_time must then be None too, never a wrong 0."""
+    admission_wait = round(waited or 0.0, 3)
+    if ttft is None or duration is None:
+        return {"admission_wait": admission_wait, "queue_plus_prefill": None, "decode_time": None}
+    queue_plus_prefill = round(ttft, 3)
+    decode_time = round(max(0.0, duration - admission_wait - queue_plus_prefill), 3)
+    return {"admission_wait": admission_wait, "queue_plus_prefill": queue_plus_prefill, "decode_time": decode_time}
+
+
+def _latency_class_pctls(rows):
+    """rows: iterable of (is_background, admission_wait, queue_plus_prefill, decode_time)
+    already-observed tuples (any of the three may be None). Buckets by class exactly like
+    _waiting_by_class (bg=True -> background, else interactive) and returns p50/p90 -- p90, not
+    the p95 the pre-existing duration/ttft aggregate uses, matching this card's own AC and
+    gw-slo-panel's target definitions (p50/p90 per class)."""
+    buckets = {"interactive": {"admission_wait": [], "queue_plus_prefill": [], "decode_time": []},
+               "background": {"admission_wait": [], "queue_plus_prefill": [], "decode_time": []}}
+    for is_bg, aw, qp, dt in rows:
+        b = buckets["background" if is_bg else "interactive"]
+        if aw is not None:
+            b["admission_wait"].append(aw)
+        if qp is not None:
+            b["queue_plus_prefill"].append(qp)
+        if dt is not None:
+            b["decode_time"].append(dt)
+    out = {}
+    for cls, metrics in buckets.items():
+        out[cls] = {}
+        for metric, vals in metrics.items():
+            vals.sort()
+            out[cls][metric] = {"p50": _raw_pctl(vals, 0.50), "p90": _raw_pctl(vals, 0.90), "n": len(vals)}
+    return out
+
+
 def _history_summary_blocking(since_ts, max_files, hard_line_cap=500000):
     """Off-loop full read (forward this time -- aggregation needs every line in the window
     anyway, so the reverse tail-reader's early-exit trick buys nothing here) of each day-file
@@ -1335,6 +1607,7 @@ def _history_summary_blocking(since_ts, max_files, hard_line_cap=500000):
                                                     "tokens_in": 0, "tokens_out": 0, "errors": 0})
     per_route = collections.defaultdict(lambda: {"requests": 0, "tokens_out": 0, "errors": 0})
     durations, ttfts = [], []
+    latency_rows = []   # gw-ttft-decomposition-telemetry: (is_bg, admission_wait, queue_plus_prefill, decode_time)
     files_scanned = []
     lines_seen = 0
     truncated = False
@@ -1366,7 +1639,9 @@ def _history_summary_blocking(since_ts, max_files, hard_line_cap=500000):
                     name = rec.get("client") or "?"
                     route = rec.get("route") or "?"
                     status = rec.get("status")
-                    is_err = (status is not None and status >= 400) or rec.get("reason") == "failover"
+                    is_err = ((status is not None and status >= 400)
+                              or rec.get("reason") == "failover"
+                              or rec.get("stream_watchdog"))
                     outtok = rec.get("outtok")
                     if outtok is None:
                         outtok = rec.get("outtok_lb") or 0
@@ -1387,6 +1662,8 @@ def _history_summary_blocking(since_ts, max_files, hard_line_cap=500000):
                         durations.append(rec["duration"])
                     if rec.get("ttft") is not None:
                         ttfts.append(rec["ttft"])
+                    latency_rows.append((rec.get("bg"), rec.get("admission_wait"),
+                                         rec.get("queue_plus_prefill"), rec.get("decode_time")))
         except OSError as e:
             log.warning("history summary: read %s failed: %s", fn, e)
         if truncated:
@@ -1396,6 +1673,7 @@ def _history_summary_blocking(since_ts, max_files, hard_line_cap=500000):
     total_requests = sum(c["requests"] for c in per_client.values())
     return {
         "per_client": dict(per_client), "per_route": dict(per_route),
+        "latency_by_class": _latency_class_pctls(latency_rows),
         "duration_p50": _raw_pctl(durations, 0.50), "duration_p95": _raw_pctl(durations, 0.95),
         "ttft_p50": _raw_pctl(ttfts, 0.50), "ttft_p95": _raw_pctl(ttfts, 0.95),
         "requests": total_requests, "files_scanned": files_scanned, "truncated": truncated,
@@ -1410,7 +1688,11 @@ def record_event(decision, reason, request, units, waited, ptok=0, maxtok=0, str
     # LOCALLY once it recovered) and "rejected-bg" (503'd instead of ever reaching remote).
     # Neither ever touched the remote provider, so neither is counted in _remote_reasons
     # (that breakdown is specifically "why did we pay for remote").
-    _active_set(request, route=decision, reason=reason,
+    prior = _ACTIVE.get(id(request)) or {}
+    # A post-commit stream watchdog has a more specific outcome than the admission reason
+    # (usually "-" for a normal local request). Preserve it in the receipt and history.
+    final_reason = "stream-idle-timeout" if prior.get("stream_watchdog") else reason
+    _active_set(request, route=decision, reason=final_reason,
                 phase=("done" if decision in ("local", "held") else "remote"))
     _stats["total"] += 1
     if decision == "local":
@@ -1433,11 +1715,12 @@ def record_event(decision, reason, request, units, waited, ptok=0, maxtok=0, str
     # _ACTIVE entry but read later, in handle_completions' finally, after the request finishes).
     _rinfo = _ACTIVE.get(id(request)) or {}
     _outtok, _outtok_lb = _rinfo.get("outtok"), _rinfo.get("outtok_lb")
-    _events.appendleft({"t": round(time.time(), 1), "d": decision, "r": reason,
+    _events.appendleft({"t": round(time.time(), 1), "d": decision, "r": final_reason,
                         "client": _client_label(request), "units": units,
                         "waited": round(waited or 0, 1),
                         "ep": request.path.rsplit("/", 1)[-1],
                         "ptok": ptok, "maxtok": maxtok, "stream": stream,
+                        "alias": _rinfo.get("alias"), "alias_kind": _rinfo.get("alias_kind"),
                         "ttft": _rinfo.get("ttft"), "outtok": _outtok, "outtok_lb": _outtok_lb,
                         "cost_est": (_remote_cost_estimate(ptok, _outtok if _outtok is not None else _outtok_lb)
                                      if decision == "remote" else 0.0)})
@@ -1505,6 +1788,8 @@ def current_config(masked=True):
     out["remote_key_set"] = bool(k)
     out["admin_token_set"] = bool(SHIM_ADMIN_TOKEN)  # dashboard auth-state badge (never the value itself)
     out["mode"] = routing_mode()  # the three-way badge reads this, never its own guess
+    out["aliases_count"] = len(_ALIASES)
+    out["aliases_url"] = "/gateway/aliases/page"
     if masked:
         out.pop("remote_key", None)
     return out
@@ -1528,6 +1813,115 @@ def apply_config(fields):
     if changed and _config_owner():
         _persist_config()
     return changed
+
+
+# ---------------- model aliases and provider registry ----------------
+# Aliases are resolved here, at the gateway boundary.  Callers never receive credentials and
+# never choose a provider by URL; they choose a stable model name and this process resolves it.
+_BUILTIN_ALIASES = {"estate", "estate-local", "estate-remote"}
+_ALIASES = {}
+_ALIAS_NAME_RE = re.compile(r"^[a-z][a-z0-9._-]{1,63}$", re.I)
+
+
+def _alias_name(value):
+    return str(value or "").strip().lower()
+
+
+def _validate_alias_record(name, record):
+    name = _alias_name(name)
+    if not _ALIAS_NAME_RE.fullmatch(name) or name in _BUILTIN_ALIASES:
+        raise ValueError("alias must be 2-64 characters and cannot be a built-in alias")
+    if not isinstance(record, dict):
+        raise ValueError("alias record must be an object")
+    base = str(record.get("base") or "").strip().rstrip("/")
+    if not re.match(r"^https?://[^\s]+$", base, re.I):
+        raise ValueError("base must be an http(s) OpenAI-compatible endpoint")
+    model = str(record.get("model") or "").strip()
+    if not model or len(model) > 256:
+        raise ValueError("model is required")
+    key = str(record.get("key") or "")
+    try:
+        context_limit = int(record.get("context_limit", REMOTE_CONTEXT_LIMIT))
+        max_output = int(record.get("max_output", 65536))
+    except (TypeError, ValueError):
+        raise ValueError("context_limit and max_output must be integers")
+    if context_limit < 1024 or max_output < 1 or max_output >= context_limit:
+        raise ValueError("context_limit must exceed max_output and both must be positive")
+    return {"name": name, "base": base, "key": key, "model": model,
+            "context_limit": context_limit, "max_output": max_output,
+            "enabled": bool(record.get("enabled", True))}
+
+
+def _load_aliases():
+    global _ALIASES
+    try:
+        with open(ALIASES_FILE) as fh:
+            raw = json.load(fh)
+        rows = raw.get("aliases", raw) if isinstance(raw, dict) else raw
+        loaded = {}
+        if isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, dict):
+                    name = row.get("name")
+                    if name:
+                        try:
+                            rec = _validate_alias_record(name, row)
+                            loaded[rec["name"]] = rec
+                        except ValueError as exc:
+                            log.warning("ignoring invalid gateway alias %r: %s", name, exc)
+        _ALIASES = loaded
+    except FileNotFoundError:
+        _ALIASES = {}
+    except Exception as exc:
+        log.warning("gateway alias registry load failed: %s", exc)
+        _ALIASES = {}
+
+
+def _save_aliases():
+    os.makedirs(os.path.dirname(ALIASES_FILE) or ".", mode=0o700, exist_ok=True)
+    tmp = ALIASES_FILE + ".tmp"
+    payload = {"version": 1, "aliases": list(_ALIASES.values())}
+    with open(tmp, "w") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, ALIASES_FILE)
+
+
+def _public_alias(record, masked=True):
+    out = dict(record)
+    if masked:
+        key = out.get("key") or ""
+        out["key_display"] = ("set (" + key[:5] + "…" + key[-4:] + ")") if len(key) > 12 else ("set" if key else "")
+        out.pop("key", None)
+    return out
+
+
+def _resolve_alias(model):
+    name = _alias_name(model)
+    if name == "estate":
+        return {"name": name, "kind": "default"}
+    if name == "estate-remote":
+        return {"name": name, "kind": "builtin-remote"}
+    if name == "estate-local":
+        return {"name": name, "kind": "builtin-local"}
+    rec = _ALIASES.get(name)
+    if rec:
+        if rec.get("enabled", True):
+            return {"name": name, "kind": "custom-remote", "endpoint": rec}
+        return {"name": name, "kind": "disabled"}
+    return {"name": name, "kind": "native"}
+
+
+def _alias_for_request(body):
+    try:
+        model = json.loads(body).get("model", "")
+    except Exception:
+        model = ""
+    return _resolve_alias(model)
+
+
+_load_aliases()
 
 def _config_owner():
     """May THIS process rewrite SHIM_ENV_FILE?
@@ -1739,12 +2133,144 @@ def _local_model_name():
     return os.environ.get("SHIM_LOCAL_MODEL_NAME", "qwen-local")
 
 
-def estimate_units(body):
-    # A "big" request occupies the WHOLE current local budget (runs alone, nothing concurrent),
-    # rather than a fixed 2. This means at budget=1 a single big request still runs LOCAL (safe:
-    # 1 big alone never OOMs) instead of needlessly overflowing to DeepSeek, while at budget>=2 it
-    # still blocks anything running alongside it.
-    return effective_budget() if _est_tokens(body) >= BIG_TOKENS else 1
+# Sentinel meaning "never time out and overflow" -- the same value the code already relied on
+# for "no remote configured at all" long before this file added a second reason to want it.
+NO_OVERFLOW_SECONDS = 1e9
+
+
+def admission_lane_limit(background, budget, fg_reserved):
+    """How many of `budget` lanes THIS class may fill. Background may only use lanes beyond
+    fg_reserved (kept free for interactive); interactive may use the whole budget."""
+    return max(1, budget - fg_reserved) if background else budget
+
+
+def admission_wait_seconds(background, remote_available, peak, local_wait, bg_wait,
+                            interactive_never_overflow):
+    """How long a queued request waits for a local lane before the caller overflows it to
+    remote. Pulled out of _route_completions as a pure function so the policy is testable
+    without an event loop (gw-interactive-never-overflows, 2026-09-11).
+
+    - No remote configured at all: nobody can overflow -- wait forever, for any class
+      (unchanged, pre-existing behaviour).
+    - Background: unchanged -- BG_WAIT normally, biased up to LOCAL_WAIT during peak hours
+      (peak-hours DeepSeek pricing makes queueing locally cheaper than robot busywork on the
+      2x-priced remote).
+    - Interactive, with the policy on (default): NEVER overflow on a timeout. Local merely
+      being busy is not local being unavailable, and "the uncensored local model is the point"
+      (Kevin, 2026-09-11) -- so it keeps waiting for a lane instead of paying for remote. This
+      does not touch the SEPARATE local-DOWN check earlier in _route_completions, which still
+      overflows interactive immediately on a genuinely dead engine.
+    - Interactive, with the policy off: the previous behaviour (LOCAL_WAIT then overflow).
+    """
+    if not remote_available:
+        return NO_OVERFLOW_SECONDS
+    if background:
+        return local_wait if peak else bg_wait
+    return NO_OVERFLOW_SECONDS if interactive_never_overflow else local_wait
+
+
+def _parse_messages(body):
+    try:
+        return json.loads(body).get("messages") or []
+    except Exception:
+        return []
+
+
+def _message_hashes(msgs):
+    """Per-message content hash -- one sha256 per message, not one hash of the whole list.
+    This is what makes "is request N a prefix of request N+1" a cheap elementwise comparison
+    (see _is_prefix_of) instead of needing to store or re-hash raw conversation text, which for
+    a 100K-token pi turn would mean holding that much text in memory per tracked client. None
+    for an unhashable message -- treated as a guaranteed non-match, never a crash."""
+    out = []
+    for m in msgs:
+        try:
+            out.append(hashlib.sha256(json.dumps(m, sort_keys=True, default=str)
+                                       .encode("utf-8", "replace")).hexdigest())
+        except Exception:
+            out.append(None)
+    return out
+
+
+def _is_prefix_of(prev_hashes, this_hashes):
+    """True iff prev_hashes is a non-empty, strictly-shorter, elementwise-equal prefix of
+    this_hashes. A real multi-turn conversation grows by MORE than one message per turn (the
+    client echoes back the assistant's own reply alongside the next user message), so this
+    checks list-prefix containment at any growth amount, not "exactly one message longer"."""
+    if not prev_hashes or len(prev_hashes) >= len(this_hashes):
+        return False
+    return all(a is not None and a == b for a, b in zip(prev_hashes, this_hashes))
+
+
+def predict_computed_tokens(client, body, est_tokens):
+    """Predict how many tokens the engine will actually have to compute fresh for THIS request,
+    using the previous request from the SAME client as a one-deep prefix-cache model
+    (gw-admission-computed-token-cost). Falls back to full cost (est_tokens) whenever there is
+    nothing to predict FROM: no prior request for this client, fewer than 2 messages (nothing
+    could be a carried-over prefix), or -- the common non-hit case -- the previous request's
+    messages aren't a prefix of this one (first turn, edited/branched history, a different
+    conversation entirely). Never returns less than 1."""
+    msgs = _parse_messages(body)
+    if len(msgs) < 2:
+        return max(1, est_tokens)
+    prev = _prefix_seen.get(client)
+    if prev is None or not _is_prefix_of(prev.get("hashes"), _message_hashes(msgs)):
+        return max(1, est_tokens)
+    delta = max(0, est_tokens - prev.get("prompt_tokens", 0))
+    return max(1, delta + PREFIX_HIT_MARGIN_TOKENS)
+
+
+def _prefix_cache_observe(client, body, prompt_tokens):
+    """Record this request's per-message hashes + size so the NEXT turn from the same client can
+    predict against it. Called once per request, regardless of hit/miss/route -- observation is
+    unconditional so a miss this turn can still become a hit next turn."""
+    msgs = _parse_messages(body)
+    if not msgs:
+        return
+    if len(_prefix_seen) >= PREFIX_CACHE_MAX_CLIENTS and client not in _prefix_seen:
+        _prefix_seen.pop(next(iter(_prefix_seen)), None)   # oldest-inserted, dict preserves order
+    _prefix_seen[client] = {"hashes": _message_hashes(msgs), "prompt_tokens": prompt_tokens,
+                             "ts": time.time()}
+
+
+def _desired_units(body, client=None):
+    """The size-implied unit cost with NO ceiling applied -- how many lanes this request would
+    take if it could have as many as it wants. Used two ways: estimate_units() clamps it to
+    the normal reserved cap; the bg-idle-bypass below reads it directly to decide whether a
+    truly enormous background job should be allowed MORE than that cap when nothing else is
+    running (see BG_BIG_LOCAL_WHEN_IDLE).
+
+    `client` is optional and, while USE_COMPUTED_COST stays at its default (0), unused --
+    existing callers/tests that don't pass it see byte-identical behaviour. When flipped on,
+    a request at or above BIG_TOKENS is costed by its PREDICTED computed tokens instead of its
+    raw size (see predict_computed_tokens())."""
+    tokens = _est_tokens(body)
+    if tokens < BIG_TOKENS:
+        return 1
+    if USE_COMPUTED_COST and client is not None:
+        tokens = predict_computed_tokens(client, body, tokens)
+        if tokens < BIG_TOKENS:
+            return 1
+    return max(1, math.ceil(tokens / max(1, TOKENS_PER_UNIT)))
+
+
+def estimate_units(body, budget=None, allow_full_budget=False, client=None):
+    """How many of the `budget` lane-slots this request should claim.
+
+    2026-09-11 (gw-admission-proportional-units): proportional to estimated size, not
+    all-or-nothing. A request under BIG_TOKENS still costs 1 (unchanged -- most traffic).
+    A request at or above BIG_TOKENS costs ceil(tokens / TOKENS_PER_UNIT), floored at 1 (never
+    inadmissible) and capped at `budget - FG_RESERVED` (at least FG_RESERVED lanes stay free
+    for the NEXT caller, of any class, no matter how big this one is) -- UNLESS
+    allow_full_budget is set, which raises that ceiling to `budget` itself; that escape hatch
+    exists only for the bg-idle-bypass path, which already independently confirms nothing else
+    is running or waiting before it ever asks for allow_full_budget=True. `budget` is
+    injectable for testing; defaults to the live effective_budget() so callers need not import
+    it too.
+    """
+    budget = effective_budget() if budget is None else budget
+    ceiling = max(1, budget if allow_full_budget else budget - FG_RESERVED)
+    return min(ceiling, _desired_units(body, client))
 
 
 def first_token_timeout(body, concurrency=1):
@@ -1812,7 +2338,9 @@ def over_local_cap(body):
         mt = int(json.loads(body).get("max_tokens") or DEFAULT_MAX_OUT)
     except Exception:
         mt = DEFAULT_MAX_OUT
-    return (_est_tokens(body) + mt) > MAX_LOCAL_TOKENS
+    # Never advertise more capacity than the engine actually exposes.  Older deployments had a
+    # 700K shim cap beside a 524K vLLM -- the provider capability limit is authoritative here.
+    return (_est_tokens(body) + mt + max(0, CONTEXT_SAFETY_MARGIN)) > min(MAX_LOCAL_TOKENS, LOCAL_CONTEXT_LIMIT)
 
 
 def strip_thinking(body):
@@ -1857,6 +2385,14 @@ def _prepare_local_body(request, body, background):
     Duplication was the mechanism, so the fix is one function rather than a corrected copy.
     test_no_think_ips.py asserts the chain appears exactly once in this file.
     """
+    try:
+        alias = _alias_for_request(body)
+        if alias["kind"] in ("default", "builtin-local"):
+            local_alias_body = json.loads(body)
+            local_alias_body["model"] = _local_model_name()
+            body = json.dumps(local_alias_body).encode()
+    except Exception:
+        pass
     prepared = repetition_guard(nonthinking_sampling_profile(thinking_budget_guard(bound_local_output(body))))
     if _no_think_policy(request, background):
         prepared = strip_thinking(prepared)
@@ -2064,13 +2600,115 @@ def wants_stream(body):
         return False
 
 
-def remap_for_remote(body):
-    """Rewrite the model to the remote model and strip vLLM-only params."""
+def _requested_output_tokens(body, default=DEFAULT_MAX_OUT):
+    try:
+        data = json.loads(body)
+        value = data.get("max_completion_tokens", data.get("max_tokens"))
+        value = int(value or 0)
+        return value if value > 0 else int(default)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return int(default)
+
+
+def _context_fits(body, context_limit, provider_max_output=None):
+    """Return (fits, prompt_tokens, output_tokens, total_tokens) for one provider.
+
+    This is deliberately conservative.  A provider-specific context limit includes both input
+    and output, and the safety margin absorbs tokenizer/serialization overhead.  No provider is
+    selected by this helper; it only answers whether an intact request can fit.
+    """
+    try:
+        limit = int(context_limit)
+    except (TypeError, ValueError):
+        return False, 0, 0, 0
+    ptok = int(_est_tokens(body))
+    requested = _requested_output_tokens(body, DEFAULT_MAX_OUT)
+    if provider_max_output:
+        requested = min(requested, int(provider_max_output))
+    total = ptok + requested + max(0, int(CONTEXT_SAFETY_MARGIN))
+    return total <= limit, ptok, requested, total
+
+
+def _compact_context_body(body, context_limit, provider_max_output=None):
+    """Deterministically compact old turns while preserving instructions and active tool state.
+
+    The gateway never silently drops context: it inserts an explicit system marker containing the
+    number of omitted messages.  System/developer instructions and a contiguous recent tail are
+    retained.  If even that cannot fit, return (None, metadata) and the caller returns a precise
+    413 rather than sending a provider an invalid request.
+    """
+    try:
+        data = json.loads(body)
+        messages = data.get("messages")
+        if not isinstance(messages, list) or len(messages) <= CONTEXT_COMPACTION_KEEP:
+            return None, {"omitted": 0, "reason": "no-compaction-candidate"}
+    except Exception:
+        return None, {"omitted": 0, "reason": "invalid-json"}
+    prefix = [m for m in messages if isinstance(m, dict) and m.get("role") in ("system", "developer")]
+    non_prefix = [m for m in messages if not (isinstance(m, dict) and m.get("role") in ("system", "developer"))]
+    keep = max(2, int(CONTEXT_COMPACTION_KEEP))
+    for tail_count in range(min(keep, len(non_prefix)), 1, -1):
+        tail = non_prefix[-tail_count:]
+        # Never start with an orphaned tool result. Include its assistant tool-call turn and the
+        # immediately preceding user turn when present.
+        start = len(non_prefix) - tail_count
+        while start > 0 and isinstance(non_prefix[start], dict) and non_prefix[start].get("role") == "tool":
+            start -= 1
+        if start < len(non_prefix) - tail_count:
+            tail = non_prefix[start:]
+        omitted = len(messages) - len(prefix) - len(tail)
+        marker = {"role": "system", "content":
+                  f"[Gateway context compaction: {omitted} older messages omitted to fit the selected provider; "
+                  "the retained instructions, recent turns, and active tool state are authoritative.]"}
+        candidate = dict(data)
+        candidate["messages"] = prefix + ([marker] if omitted else []) + tail
+        candidate.pop("max_completion_tokens", None)
+        raw = json.dumps(candidate, ensure_ascii=False).encode()
+        fits, ptok, outtok, total = _context_fits(raw, context_limit, provider_max_output)
+        if fits:
+            return raw, {"omitted": omitted, "prompt_tokens": ptok, "output_tokens": outtok, "total_tokens": total}
+    return None, {"omitted": len(messages), "reason": "instructions-exceed-context"}
+
+
+def _prepare_provider_context(body, context_limit, provider_max_output=None):
+    fits, ptok, outtok, total = _context_fits(body, context_limit, provider_max_output)
+    if fits:
+        return body, {"compacted": False, "prompt_tokens": ptok, "output_tokens": outtok, "total_tokens": total}
+    if not CONTEXT_COMPACTION_ENABLED:
+        return None, {"compacted": False, "reason": "context-exceeded", "prompt_tokens": ptok,
+                       "output_tokens": outtok, "total_tokens": total, "limit": int(context_limit)}
+    compacted, meta = _compact_context_body(body, context_limit, provider_max_output)
+    if compacted is None:
+        return None, {"compacted": False, "reason": meta.get("reason", "context-exceeded"),
+                       "prompt_tokens": ptok, "output_tokens": outtok, "total_tokens": total,
+                       "limit": int(context_limit)}
+    return compacted, {"compacted": True, **meta, "limit": int(context_limit)}
+
+
+def _context_error(meta, provider):
+    return web.json_response({"error": {"message":
+        f"context exceeds {provider} capacity: prompt={meta.get('prompt_tokens', 0)} + "
+        f"output={meta.get('output_tokens', 0)} + margin={CONTEXT_SAFETY_MARGIN} > "
+        f"limit={meta.get('limit', 0)}", "type": "context_length_exceeded",
+        "provider": provider, "compaction_attempted": CONTEXT_COMPACTION_ENABLED}}, status=413)
+
+
+def remap_for_remote(body, remote_model=None, remote_max_output=None):
+    """Rewrite the model to a remote model and strip vLLM-only params."""
     try:
         j = json.loads(body)
     except Exception:
         return body
-    j["model"] = REMOTE_MODEL
+    j["model"] = remote_model or REMOTE_MODEL
+    if remote_max_output:
+        try:
+            requested = int(j.get("max_completion_tokens", j.get("max_tokens")) or 0)
+            if requested <= 0 or requested > int(remote_max_output):
+                j.pop("max_completion_tokens", None)
+                j["max_tokens"] = int(remote_max_output)
+        except (TypeError, ValueError):
+            j.pop("max_completion_tokens", None)
+            j["max_tokens"] = int(remote_max_output)
     for k in REMOTE_STRIP:
         j.pop(k, None)
     rf = j.get("response_format")
@@ -2147,7 +2785,15 @@ async def _open(session, base, path, body, key, streaming):
     if key:
         headers["Authorization"] = f"Bearer {key}"
     to = aiohttp.ClientTimeout(total=None, sock_read=600) if streaming else aiohttp.ClientTimeout(total=600)
-    return await session.post(f"{base}{path}", data=body, headers=headers, timeout=to)
+    base = str(base or "").rstrip("/")
+    path = "/" + str(path or "").lstrip("/")
+    # Callers address the gateway as /v1/chat/completions.  Accept both endpoint styles in the
+    # registry: https://host (append /v1) and https://host/v1 (avoid /v1/v1 duplication).
+    if base.lower().endswith("/v1") and path.lower().startswith("/v1/"):
+        url = base + path[3:]
+    else:
+        url = base + path
+    return await session.post(url, data=body, headers=headers, timeout=to)
 
 
 # First-token gate: hold a streaming response before committing to the client, so a
@@ -2174,7 +2820,36 @@ def _looks_meaningful(text):
     return False
 
 
-async def _relay(request, base, path, body, key, streaming, concurrency=1):
+def _sse_content_shape(data, saw_content, saw_tool_call):
+    """Update (saw_content, saw_tool_call) from one chunk of raw SSE bytes -- possibly several
+    'data: {...}' lines, possibly a partial line at either end (like every other scanner in
+    _relay, it is fed overlapping/repeated chunks and is safe to call on the same bytes more
+    than once: OR-ing booleans is idempotent). Never raises; an unparseable line is skipped,
+    not fatal, exactly like _scan_usage's existing tolerance for the same input shape.
+
+    2026-09-11 (gw-streaming-content-classifier): pulled out of _relay's closure so the
+    content-shape LOGIC is testable without mocking the aiohttp streaming machinery around it.
+    """
+    try:
+        for ln in bytes(data).split(b"\n"):
+            ln = ln.strip()
+            if not ln.startswith(b"data:"):
+                continue
+            raw = ln[5:].strip()
+            if raw in (b"", b"[DONE]"):
+                continue
+            delta = ((json.loads(raw).get("choices") or [{}])[0].get("delta") or {})
+            c = delta.get("content")
+            if c and str(c).strip():
+                saw_content = True
+            if delta.get("tool_calls"):
+                saw_tool_call = True
+    except Exception:
+        pass
+    return saw_content, saw_tool_call
+
+
+async def _relay(request, base, path, body, key, streaming, concurrency=1, provider_name=None):
     """
     Forward to (base) and relay the response to the client.
     Returns ("ok", web.Response|StreamResponse) on success,
@@ -2184,6 +2859,23 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1):
     """
     t_relay_start = time.time()   # TELEMETRY: TTFT reference point -- see DESIGN.md (c)
     session = aiohttp.ClientSession()
+
+    def _route_receipt():
+        info = _ACTIVE.get(id(request)) or {}
+        route = "local" if base.rstrip("/") == LOCAL.rstrip("/") else "remote"
+        provider = (_local_model_name() if route == "local" else (provider_name or REMOTE_MODEL))
+        return {
+            "X-Gateway-Route": route,
+            "X-Gateway-Provider": str(provider),
+            "X-Gateway-Reason": str(info.get("reason") or "admitted"),
+            "X-Gateway-Queue-Wait": str(round(info.get("waited") or 0.0, 3)),
+            "X-Gateway-Predicted-Occupancy": str(info.get("predicted_occupancy_s") or ""),
+            "X-Gateway-Context-Provider": str(info.get("context_provider") or provider),
+            "X-Gateway-Context-Limit": str(info.get("context_limit") or ""),
+            "X-Gateway-Context-Prompt": str(info.get("context_prompt_tokens") or ""),
+            "X-Gateway-Context-Compacted": "1" if info.get("context_compacted") else "0",
+            "X-Gateway-Context-Omitted": str(info.get("context_omitted") or "0"),
+        }
     try:
         if streaming:
             # bound time-to-response-headers for streaming so a backend that accepts the
@@ -2220,7 +2912,9 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1):
                         data[:500].decode("utf-8", "replace"))
             ct = up.headers.get("Content-Type", "application/json").split(";")[0]
             await session.close()
-            return "ok", web.Response(body=data, status=up.status, content_type=ct)
+            resp = web.Response(body=data, status=up.status, content_type=ct,
+                                headers=_route_receipt())
+            return "ok", resp
         except Exception as e:
             await session.close()
             return "fail", (up.status, f"streaming 4xx read error: {e}", False)
@@ -2234,7 +2928,8 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1):
                 log.warning("upstream %s returned %d: %s", base, up.status,
                             data[:400].decode("utf-8", "replace"))
             ct = up.headers.get("Content-Type", "application/json").split(";")[0]
-            return "ok", web.Response(body=data, status=up.status, content_type=ct)
+            return "ok", web.Response(body=data, status=up.status, content_type=ct,
+                                       headers=_route_receipt())
         finally:
             await session.close()
 
@@ -2245,7 +2940,8 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1):
     def _mk_resp():
         return web.StreamResponse(status=up.status, headers={
             "Content-Type": up.headers.get("Content-Type", "text/event-stream"),
-            "Cache-Control": "no-cache", "Connection": "keep-alive"})
+            "Cache-Control": "no-cache", "Connection": "keep-alive",
+            **_route_receipt()})
 
     buf = bytearray()
     # TELEMETRY: closure-shared counters (not new params/return values -- see DESIGN.md (c) for
@@ -2263,7 +2959,15 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1):
     # forwards chunks), so recovering a full message here would need materially more surgery
     # than this lane's scope -- documented limitation, see REPORT.md.
     _exact_finish = [None]
-    _is_remote_relay = (base == REMOTE_BASE)
+    # gw-admission-computed-token-cost: prompt_tokens + prefix-cache hit, from the SAME usage
+    # trailer _exact_outtok already scans (live-measured: 96% of streaming rows already carry
+    # it -- pi/OpenCode/OpenHands request stream_options.include_usage today, no shim-side
+    # injection needed). cached_tokens is only ever present (per vLLM's chat_completion/
+    # serving.py) when it is truthy, i.e. a genuine cache hit -- a miss or a non-hit prompt
+    # leaves this None, which computed_actual below must NOT treat as "0 cached" by accident.
+    _exact_ptok = [None]
+    _exact_cached = [None]
+    _is_remote_relay = (base.rstrip("/") != LOCAL.rstrip("/"))
 
     def _scan_usage(data):
         """Best-effort exact completion-token count from stream_options.include_usage's final
@@ -2295,6 +2999,11 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1):
                     uu = (json.loads(raw).get("usage") or {})
                     if "completion_tokens" in uu:
                         _exact_outtok[0] = int(uu["completion_tokens"])
+                    if "prompt_tokens" in uu:
+                        _exact_ptok[0] = int(uu["prompt_tokens"])
+                    ptd = uu.get("prompt_tokens_details")
+                    if ptd and "cached_tokens" in ptd:
+                        _exact_cached[0] = int(ptd["cached_tokens"])
                 if _exact_finish[0] is None and b'"finish_reason"' in ln:
                     ch = (json.loads(raw).get("choices") or [{}])[0]
                     fr = ch.get("finish_reason")
@@ -2304,6 +3013,24 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1):
                     break
         except Exception:
             pass
+
+    # TELEMETRY (gw-streaming-content-classifier, 2026-09-11): content_empty/has_tool_calls
+    # for STREAMING responses. Kevin's coding runner (pi/OpenCode/OpenHands) streams 100% of
+    # its traffic, so the empty-content-on-200 case reproduced live in the gateway black-box
+    # audit (forced thinking + a max_tokens too small for the reasoning trace to finish, which
+    # leaves `content` empty while `reasoning_content` is populated) was structurally invisible
+    # for exactly the client it hurts -- classify_remote_response() only ever ran on the
+    # non-streaming path. _sse_content_shape() (module-level, unit-tested independently of this
+    # closure -- see test_streaming_content_classifier.py) does NOT reassemble the full message
+    # (the 2026-09-05 comment above is right that doing so would be real surgery); it keeps only
+    # two cheap running facts across every delta: whether ANY non-whitespace content character
+    # has been seen, and whether ANY tool_call has been seen -- exactly what content_empty/
+    # has_tool_calls reduce to.
+    _saw_content = [False]
+    _saw_tool_call = [False]
+
+    def _scan_content_shape(data):
+        _saw_content[0], _saw_tool_call[0] = _sse_content_shape(data, _saw_content[0], _saw_tool_call[0])
 
     async def _read_until_commit():
         async for chunk in up.content.iter_any():
@@ -2335,6 +3062,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1):
         _active_set(request, ttft=round(_t_first[0] - t_relay_start, 3))
     _scan_usage(buf)   # TELEMETRY: covers the (common, for short responses) case where the whole
                         # stream -- usage trailer included -- already arrived within the gate
+    _scan_content_shape(buf)
 
     if phase == "clean_end":
         # upstream finished before any 'meaningful' chunk — deliver as-is (short/empty response),
@@ -2343,12 +3071,19 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1):
         if buf:
             await resp.write(bytes(buf))
         await resp.write_eof(); await session.close()
-        _outkw = {"outtok_lb": _chunk_ct[0]}
+        _outkw = {"outtok_lb": _chunk_ct[0],
+                  "content_empty": not _saw_content[0], "has_tool_calls": _saw_tool_call[0]}
         if _exact_outtok[0] is not None:
             _outkw["outtok"] = _exact_outtok[0]
         if _is_remote_relay and _exact_finish[0] is not None:
             _outkw["finish_reason"] = _exact_finish[0]
+        # gw-admission-computed-token-cost: local only -- prefix caching is a local-engine
+        # concept, and remote's own cache accounting (if any) isn't comparable to it.
+        if not _is_remote_relay and _exact_ptok[0] is not None:
+            _outkw["computed_actual"] = max(0, _exact_ptok[0] - (_exact_cached[0] or 0))
         _active_set(request, **_outkw)
+        for k, v in _route_receipt().items():
+            resp.headers[k] = v
         return "ok", resp
 
     # committed to the client: flush buffered first chunk(s), then stream the rest. A mid-stream
@@ -2359,17 +3094,41 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1):
     # and the usage trailer didn't already arrive within the gate phase above (long streams) --
     # same cheap per-chunk scan, applied to whatever's left of the stream.
     try:
-        async for chunk in up.content.iter_any():
+        while True:
+            try:
+                # A connected stream that stops producing bytes is a stuck generation, not a
+                # healthy long run.  Abort it after the bounded idle window; the client already
+                # received output, so migration is unsafe, but the lane is released and the
+                # event is recorded for the next admission decision.
+                chunk = await asyncio.wait_for(up.content.readany(), timeout=STREAM_IDLE_TIMEOUT_SECS)
+            except asyncio.TimeoutError:
+                _active_set(request, stream_watchdog=True, stream_idle_timeout_s=STREAM_IDLE_TIMEOUT_SECS,
+                            reason="stream-idle-timeout")
+                log.warning("stream idle for %.1fs -> aborting %s request", STREAM_IDLE_TIMEOUT_SECS,
+                            "remote" if _is_remote_relay else "local")
+                try:
+                    await up.release()
+                except Exception:
+                    pass
+                try:
+                    await resp.write(b'data: {"error":{"message":"stream idle timeout"}}\n\n')
+                except Exception:
+                    pass
+                break
+            if not chunk:
+                break
             await resp.write(chunk)
             _chunk_ct[0] += 1
             _scan_usage(chunk)
+            _scan_content_shape(chunk)
     except Exception as e:
         try:
             await resp.write(f'data: {{"error":{{"message":"stream interrupted: {e}"}}}}\n\n'.encode())
         except Exception:
             pass
     await resp.write_eof(); await session.close()
-    _outkw = {"outtok_lb": _chunk_ct[0]}
+    _outkw = {"outtok_lb": _chunk_ct[0],
+              "content_empty": not _saw_content[0], "has_tool_calls": _saw_tool_call[0]}
     if _exact_outtok[0] is not None:
         _outkw["outtok"] = _exact_outtok[0]
     if _is_remote_relay and _exact_finish[0] is not None:
@@ -2511,11 +3270,35 @@ async def _note_remote_response(request, payload, body):
         log.warning("remote response note: %s", e)
 
 
-async def _forward_remote(request, path, body, streaming):
-    if not remote_ok():
+async def _forward_remote(request, path, body, streaming, endpoint=None):
+    """Forward intact or deterministically compacted context to the selected remote endpoint."""
+    ep = endpoint or {"base": REMOTE_BASE, "key": REMOTE_KEY, "model": REMOTE_MODEL,
+                     "context_limit": REMOTE_CONTEXT_LIMIT, "max_output": 65536,
+                     "name": "default"}
+    base = str(ep.get("base") or "").rstrip("/")
+    key = str(ep.get("key") or "")
+    model = str(ep.get("model") or REMOTE_MODEL)
+    limit = int(ep.get("context_limit") or REMOTE_CONTEXT_LIMIT)
+    max_output = int(ep.get("max_output") or 65536)
+    if not base or (endpoint is None and not remote_ok()):
         return web.json_response(
             {"error": {"message": "local unavailable and no remote overflow configured"}}, status=503)
-    kind, payload = await _relay(request, REMOTE_BASE, path, remap_for_remote(body), REMOTE_KEY, streaming)
+    prepared, ctx = _prepare_provider_context(body, limit, max_output)
+    if prepared is None:
+        log.warning("remote %s context rejected provider=%s prompt=%s total=%s limit=%s",
+                    path, ep.get("name", "default"), ctx.get("prompt_tokens"),
+                    ctx.get("total_tokens"), ctx.get("limit"))
+        _active_set(request, context_provider=ep.get("name", "default"),
+                    context_limit=ctx.get("limit"), context_prompt_tokens=ctx.get("prompt_tokens"),
+                    context_compacted=False)
+        return _context_error(ctx, ep.get("name", "default"))
+    _active_set(request, context_provider=ep.get("name", "default"),
+                context_limit=limit, context_prompt_tokens=ctx.get("prompt_tokens"),
+                context_compacted=bool(ctx.get("compacted")),
+                context_omitted=int(ctx.get("omitted", 0) or 0))
+    relay_body = remap_for_remote(prepared, model, max_output)
+    kind, payload = await _relay(request, base, path, relay_body, key, streaming,
+                                 provider_name=model)
     if kind == "ok":
         _note_payload_outcome(request, payload, streaming)   # TELEMETRY: see DESIGN.md (c)
         if not streaming:
@@ -2523,7 +3306,7 @@ async def _forward_remote(request, path, body, streaming):
             # _note_remote_response()'s docstring. Streaming remote responses only get the
             # finish_reason capture inside _relay() above (best-effort, SSE-scan-based);
             # content-shape telemetry and the flight recorder are non-streaming-only.
-            await _note_remote_response(request, payload, body)
+            await _note_remote_response(request, payload, prepared)
         return payload
     status, text, _ = payload
     return web.json_response({"error": {"message": f"remote overflow failed: {status} {text}"}}, status=502)
@@ -2599,9 +3382,18 @@ async def _route_completions(request):
     global _inflight, _waiting, _inflight_tokens, _inflight_reserved_tokens
     path = request.path
     body = await request.read()
-    units = estimate_units(body)
+    client = _friendly_client(request)["name"]
+    units = estimate_units(body, client=client)
     streaming = wants_stream(body)
     ptok = _est_tokens(body)
+    # gw-admission-computed-token-cost: predicted UNCONDITIONALLY (not gated on
+    # USE_COMPUTED_COST, which only decides whether admission COST uses this number) so the
+    # card's own accuracy gate has real predicted-vs-actual data to grade from the moment this
+    # deploys, before that switch is ever flipped on. Observe must run AFTER predict, against
+    # the prefix state predict just read -- a miss this turn still becomes next turn's hit.
+    est_computed = predict_computed_tokens(client, body, ptok)
+    _active_set(request, est_tokens=ptok, est_computed=est_computed)
+    _prefix_cache_observe(client, body, ptok)
     try:
         maxtok = int(json.loads(body).get("max_tokens") or 0)
     except Exception:
@@ -2609,6 +3401,12 @@ async def _route_completions(request):
     ev = dict(ptok=ptok, maxtok=maxtok, stream=streaming)
     tiny = is_tiny(body)
     background = is_background(body, request)
+    alias = _alias_for_request(body)
+    alias_kind = alias.get("kind")
+    alias_local_only = alias_kind == "builtin-local"
+    alias_force_remote = alias_kind == "builtin-remote"
+    custom_endpoint = alias.get("endpoint") if alias_kind == "custom-remote" else None
+    _active_set(request, alias=alias.get("name"), alias_kind=alias_kind)
     # BG-LOCAL-ONLY: set to the triggering reason ("local-down") once a background request has
     # been HELD for an engine-health recovery below. When set, a local success further down in
     # this function (tiny fast-lane / empty-retry / normal admission) is recorded as
@@ -2627,8 +3425,25 @@ async def _route_completions(request):
                  getattr(request, "remote", "?"), request.headers.get("User-Agent", "?")[:45],
                  model_req, ptok, maxtok, streaming, tiny, background, _preview(body))
 
-    # MASTER SWITCH: full-remote mode (maintenance/debug) — everything -> DeepSeek
-    if remote_ok() and FORCE_REMOTE:
+    # Explicit aliases are gateway-owned routing contracts.  Custom aliases always target their
+    # configured OpenAI-compatible endpoint; built-ins are stable local/remote modes.  They are
+    # evaluated before the global dashboard mode so `estate-local` cannot spend money and
+    # `estate-remote` remains useful even while the dashboard is in FULL LOCAL.
+    if custom_endpoint:
+        log.info("route %s alias=%s -> remote(alias)", path, alias.get("name"))
+        record_event("remote", "alias", request, units, 0, **ev)
+        return await _forward_remote(request, path, body, streaming, endpoint=custom_endpoint)
+    if alias_kind == "disabled":
+        return web.json_response({"error": {"message": f"gateway alias {alias.get('name')} is disabled",
+                                              "type": "alias_disabled"}}, status=409)
+    if alias_force_remote:
+        log.info("route %s alias=estate-remote -> remote(alias)", path)
+        record_event("remote", "alias", request, units, 0, **ev)
+        return await _forward_remote(request, path, body, streaming)
+
+    # MASTER SWITCH: full-remote mode (maintenance/debug) — everything -> DeepSeek.  The
+    # estate-local alias is the one explicit per-request exception.
+    if remote_ok() and FORCE_REMOTE and not alias_local_only:
         # BG-LOCAL-ONLY: a maintenance window is a deliberate, operator-chosen full-remote
         # mode -- not a transient outage worth waiting out -- so background traffic is
         # REJECTED immediately (no wait, no paid remote) rather than held or forwarded.
@@ -2645,23 +3460,33 @@ async def _route_completions(request):
     # It queues behind whatever is running instead. A truly dead local still
     # falls through to the local-down branch (remote beats a hard failure).
     local_pin = "local-pin" in (request.headers.get("X-Client") or "").lower()
+    route_intent = (request.headers.get("X-Gateway-Route-Intent") or "").strip().lower()
+    remote_intent = route_intent in {"remote", "overflow", "deepseek"}
+
+    # ROUTE-INTENT: callers can ask the gateway to treat this as overflow work (for example an
+    # explicit brain escalation), but the gateway still checks remote_ok() and local-pin before
+    # making the provider decision.  This keeps routing authority in one place.
+    if remote_intent and remote_ok() and not local_pin and not alias_local_only:
+        log.info("route %s gateway route intent=%s -> remote(intent)", path, route_intent)
+        record_event("remote", "intent", request, units, 0, **ev)
+        return await _forward_remote(request, path, body, streaming)
 
     # size cap: too-big-for-this-box requests OOM local even at budget=1 -> send straight to remote
-    if remote_ok() and not local_pin and over_local_cap(body):
+    if remote_ok() and not local_pin and not alias_local_only and over_local_cap(body):
         log.info("route %s est prompt+max > %d -> remote(size)", path, MAX_LOCAL_TOKENS)
         record_event("remote", "size", request, units, 0, **ev)
         return await _forward_remote(request, path, body, streaming)
 
     # big-OUTPUT requests (e.g. Hermes max_tokens=65536): long generations that saturate this slow
     # box and hang interactive clients -> straight to remote (DeepSeek serves them far faster).
-    if remote_ok() and not local_pin and BIG_OUTPUT > 0 and maxtok >= BIG_OUTPUT:
+    if remote_ok() and not local_pin and not alias_local_only and BIG_OUTPUT > 0 and maxtok >= BIG_OUTPUT:
         log.info("route %s maxtok=%d >= %d -> remote(big-out)", path, maxtok, BIG_OUTPUT)
         record_event("remote", "big-out", request, units, 0, **ev)
         return await _forward_remote(request, path, body, streaming)
 
     # big-PROMPT requests (e.g. a pi session whose context has grown huge): can't prefill within the
     # first-token cap on this slow box and would saturate/OOM local -> straight to remote up front.
-    if remote_ok() and not local_pin and BIG_PROMPT > 0 and ptok >= BIG_PROMPT:
+    if remote_ok() and not local_pin and not alias_local_only and BIG_PROMPT > 0 and ptok >= BIG_PROMPT:
         log.info("route %s ptok=%d >= %d -> remote(big-prompt)", path, ptok, BIG_PROMPT)
         record_event("remote", "big-prompt", request, units, 0, **ev)
         return await _forward_remote(request, path, body, streaming)
@@ -2689,32 +3514,70 @@ async def _route_completions(request):
             # FALL THROUGH: local is healthy again, so every check below (monster bypass, tiny
             # fast-lane, admission wait, relay) runs exactly as it would have if
             # local_healthy() had returned True on the very first check above.
-        elif remote_ok():
+        elif remote_ok() and not alias_local_only:
             log.info("route %s local unhealthy -> remote(local-down)", path)
             record_event("remote", "local-down", request, units, 0, **ev)
             return await _forward_remote(request, path, body, streaming)
+        elif alias_local_only:
+            return web.json_response({"error": {"message": "estate-local requires the local engine, which is currently unavailable",
+                                                  "type": "local_unavailable"}}, status=503)
 
     # MONSTER-IN-FLIGHT bypass: a huge prefill is monopolizing engine steps; anything admitted
     # now would crawl (~1 tok per chunk-step). Route new arrivals remote until it drains.
     _foreign = _health.get("foreign", 0) if FOREIGN_LOAD_GUARD else 0
     _foreign_heavy = bool(_health.get("foreign_heavy", False)) if FOREIGN_LOAD_GUARD else False
-    if remote_ok() and not local_pin and (
-        (MONSTER_INFLIGHT > 0 and _inflight_tokens >= MONSTER_INFLIGHT)
-        or _foreign_heavy
+    if remote_ok() and not local_pin and not alias_local_only and (
+            (MONSTER_INFLIGHT > 0 and _inflight_tokens >= MONSTER_INFLIGHT)
+            or _foreign_heavy
     ):
         log.info("route %s monster/foreign inflight tok=%d foreign=%d foreign_tok=%d -> remote(monster)",
                  path, _inflight_tokens, _foreign, int(_health.get("foreign_tokens", 0) or 0))
         record_event("remote", "monster", request, units, 0, **ev)
         return await _forward_remote(request, path, body, streaming)
 
+    # PERFORMANCE BREAKER: sustained measured queue/prefill/KV/GPU pressure sends new work to
+    # the configured remote provider. In-flight local work is allowed to finish; no unsafe
+    # mid-generation migration is attempted.
+    if remote_ok() and not local_pin and not alias_local_only and perf_breaker_active():
+        log.info("route %s performance breaker (%s) -> remote(perf)",
+                 path, _PERF_STATE.get("reason", "overload"))
+        record_event("remote", "perf", request, units, 0, **ev)
+        return await _forward_remote(request, path, body, streaming)
+
+    predicted = predicted_occupancy_seconds(ptok, maxtok, max(1, _inflight + 1))
+    _active_set(request, predicted_occupancy_s=predicted)
+    if (remote_ok() and not local_pin and not alias_local_only and predicted is not None
+            and predicted >= PREDICTED_OCCUPANCY_SECS):
+        log.info("route %s predicted occupancy %.1fs >= %.1fs -> remote(predicted)",
+                 path, predicted, PREDICTED_OCCUPANCY_SECS)
+        record_event("remote", "predicted", request, units, 0, **ev)
+        return await _forward_remote(request, path, body, streaming)
+
     try:
         local_body = _prepare_local_body(request, body, background)
+        local_context_body, local_ctx = _prepare_provider_context(
+            local_body, LOCAL_CONTEXT_LIMIT, LOCAL_MAX_OUT)
+        if local_context_body is None:
+            if alias_local_only or LOCAL_ONLY:
+                return _context_error(local_ctx, "local")
+            if remote_ok() and not local_pin:
+                record_event("remote", "context", request, units, 0, **ev)
+                return await _forward_remote(request, path, body, streaming)
+            return _context_error(local_ctx, "local")
+        if local_ctx.get("compacted"):
+            local_body = _prepare_local_body(request, local_context_body, background)
+            _active_set(request, context_provider="local", context_limit=LOCAL_CONTEXT_LIMIT,
+                        context_prompt_tokens=local_ctx.get("prompt_tokens"),
+                        context_compacted=True, context_omitted=int(local_ctx.get("omitted", 0) or 0))
+        else:
+            _active_set(request, context_provider="local", context_limit=LOCAL_CONTEXT_LIMIT,
+                        context_prompt_tokens=local_ctx.get("prompt_tokens"), context_compacted=False)
         reservation, sequences = local_memory_reservation(local_body)
     except (ValueError, TypeError, AttributeError) as exc:
         return web.json_response({"error": str(exc)}, status=400)
     if TOKEN_BUDGET > 0 and reservation > TOKEN_BUDGET:
         # Waiting cannot make a request larger than the entire pool admissible.
-        if remote_ok() and not local_pin:
+        if remote_ok() and not local_pin and not alias_local_only and not LOCAL_ONLY:
             record_event("remote", "tokens", request, units, 0, **ev)
             return await _forward_remote(request, path, body, streaming)
         return web.json_response({"error": "request exceeds local token reservation budget"}, status=503)
@@ -2779,18 +3642,15 @@ async def _route_completions(request):
             return await _forward_remote(request, path, body, streaming)
         # no remote configured -> fall through to the normal local wait loop
 
-    # local UP: claim a slot, WAITING up to LOCAL_WAIT for capacity instead of instant-overflow.
+    # local UP: claim a slot, WAITING for capacity instead of instant-overflow.
     # PRIORITY LANES: background (cron/batch) may only fill lanes beyond FG_RESERVED — those
     # stay free so an interactive turn NEVER queues behind robot busywork — and background
-    # waits only BG_WAIT before overflowing to the cheap remote.
+    # waits only BG_WAIT before overflowing to the cheap remote. Interactive traffic, by
+    # policy (2026-09-11), does not overflow on a mere timeout at all -- see admission_wait().
     # The check-and-increment is done with no await in between, so it's race-free under asyncio.
-    if background:
-        lane_limit = max(1, effective_budget() - FG_RESERVED)
-        _bgw = LOCAL_WAIT if is_peak() else BG_WAIT   # peak: bias bg toward local queueing
-        deadline = time.time() + (_bgw if remote_ok() else 1e9)
-    else:
-        lane_limit = effective_budget()
-        deadline = time.time() + (LOCAL_WAIT if remote_ok() else 1e9)
+    lane_limit = admission_lane_limit(background, effective_budget(), FG_RESERVED)
+    deadline = time.time() + admission_wait_seconds(
+        background, remote_ok(), is_peak(), LOCAL_WAIT, BG_WAIT, INTERACTIVE_NEVER_OVERFLOW)
     admitted = False
     _local_reason = "-"      # "bg-big-idle" when the idle-engine rule admitted a big background request
     admitted_conc = 1        # local concurrency at admission -> scales the first-token deadline
@@ -2799,15 +3659,25 @@ async def _route_completions(request):
     try:
         while True:
             # big background request + idle engine: nothing in flight and nobody else queued
-            # (this request counts itself in _waiting once queued) -> may take the whole budget.
-            _bg_big_idle = (background and BG_BIG_LOCAL_WHEN_IDLE and units >= effective_budget()
-                            and units <= effective_budget()
+            # (this request counts itself in _waiting once queued) -> may take MORE than the
+            # bg-only reserved cap (up to the whole budget), since nothing is competing for the
+            # reserved lanes anyway. 2026-09-11: gated on the UNCAPPED desired size now that
+            # `units` itself is already capped by estimate_units() -- under proportional units
+            # most big bg requests fit under lane_limit without ever needing this bypass; it
+            # only fires for requests so large that even the proportional estimate would still
+            # exceed budget-FG_RESERVED.
+            _desired = _desired_units(body, client) * sequences
+            _bg_big_idle = (background and BG_BIG_LOCAL_WHEN_IDLE and _desired > lane_limit
                             and _inflight == 0 and _waiting <= (1 if queued else 0))
-            if _health["ok"] and ((_inflight + units) <= lane_limit or _bg_big_idle) \
+            _admit_units = min(effective_budget(), _desired) if _bg_big_idle else units
+            if _health["ok"] and _admit_units >= sequences and ((_inflight + _admit_units) <= lane_limit or _bg_big_idle) \
                     and _memory_available(reservation):
-                if _bg_big_idle and (_inflight + units) > lane_limit:
+                if _bg_big_idle and (_inflight + _admit_units) > lane_limit:
                     _stats["bg_big_idle_local"] = _stats.get("bg_big_idle_local", 0) + 1
                     _local_reason = "bg-big-idle"
+                units = _admit_units   # reassign the OUTER units: the release below (and any
+                                       # telemetry/record_event after this block) must charge
+                                       # and refund the SAME amount that was actually admitted.
                 claim_local()
                 admitted_conc = _inflight
                 admitted = True
@@ -2816,8 +3686,10 @@ async def _route_completions(request):
                 break
             if not queued:                       # first time we couldn't get a slot -> we're backlogged
                 queued = True
-                _active_set(request, phase="queued")
+                _active_set(request, phase="queued",
+                            queue_position=_waiting_by_class["background" if background else "interactive"] + 1)
                 _waiting += 1
+                _waiting_by_class["background" if background else "interactive"] += 1
                 _stats["peak_waiting"] = max(_stats["peak_waiting"], _waiting)
             await asyncio.sleep(SLOT_POLL)
             waited += SLOT_POLL
@@ -2825,6 +3697,7 @@ async def _route_completions(request):
     finally:
         if queued:
             _waiting -= 1
+            _waiting_by_class["background" if background else "interactive"] -= 1
 
     if not admitted:
         # distinguish WHY we couldn't admit: lane-count vs total-context (size-aware) cap
@@ -2912,13 +3785,52 @@ async def _passthrough(request):
             return web.Response(body=data, status=up.status, content_type=ct)
 
 
+def _alias_model_rows():
+    """The gateway's own routable model names, in OpenAI /v1/models shape.
+
+    These are real models from a client's point of view -- `estate-remote`
+    reaches DeepSeek, a custom alias reaches its configured provider -- but they
+    exist only in the gateway, so a pure passthrough of vLLM's list never
+    mentioned them. Open WebUI builds its picker from this endpoint, so every
+    proxy alias was unreachable from the UI even though POSTing to it worked
+    (2026-09-17). Disabled custom aliases are deliberately omitted.
+    """
+    now = int(time.time())
+    rows = []
+    for name, kind in (("estate", "gateway-default"),
+                       ("estate-local", "gateway-local"),
+                       ("estate-remote", "gateway-remote")):
+        rows.append({"id": name, "object": "model", "created": now,
+                     "owned_by": "gateway", "gateway_alias": kind})
+    for name, rec in sorted(_ALIASES.items()):
+        if not rec.get("enabled", True):
+            continue
+        rows.append({"id": name, "object": "model", "created": now,
+                     "owned_by": "gateway", "gateway_alias": "custom-remote",
+                     "gateway_target": rec.get("model") or "", })
+    return rows
+
+
 async def h_models(request):
-    # Pure passthrough of whatever vLLM serves (new models appear automatically).
+    # Passthrough of whatever vLLM serves (new models appear automatically),
+    # UNIONED with the gateway's own aliases so clients can discover the proxy
+    # routes as well as the local engine's names.
+    local_rows, local_ok = [], False
     try:
-        return await _passthrough(request)
+        resp = await _passthrough(request)
+        body = json.loads(resp.body.decode() or "{}") if getattr(resp, "body", None) else {}
+        local_rows = body.get("data") or []
+        local_ok = True
     except Exception as e:
         log.warning("h_models: local unreachable (%r)", e)
+
+    seen = {r.get("id") for r in local_rows}
+    rows = list(local_rows) + [r for r in _alias_model_rows() if r["id"] not in seen]
+    if not rows:
         return web.json_response({"object": "list", "data": []}, status=503)
+    # Aliases can still serve while the engine is down, so this is not a 503.
+    return web.json_response({"object": "list", "data": rows},
+                             status=200 if (local_ok or rows) else 503)
 
 
 async def h_health(request):
@@ -2963,6 +3875,13 @@ async def gateway_stats(request):
         "budget": effective_budget(), "configured_budget": BUDGET,
         "inflight": _inflight, "peak_inflight": _stats["peak_inflight"],
         "waiting": _waiting, "peak_waiting": _stats["peak_waiting"],
+        # gw-queue-position-header (2026-09-11): per-class queue depth, so "am I personally
+        # waiting" is answerable at a glance instead of one aggregate number that background
+        # traffic can dominate. Deliberately NOT paired with a fake per-class wait estimate --
+        # avg_wait below stays a single honest aggregate rather than two numbers dressed up as
+        # a per-class split that record_event() does not actually track. See
+        # gw-ttft-decomposition-telemetry for the real per-class latency breakdown this wants.
+        "waiting_by_class": dict(_waiting_by_class),
         "overflowed_after_wait": _stats["overflowed_after_wait"],
         "inflight_tokens": _inflight_tokens, "token_budget": TOKEN_BUDGET,
         "inflight_reserved_tokens": _inflight_reserved_tokens,
@@ -2975,6 +3894,8 @@ async def gateway_stats(request):
         "held": _stats["held"], "rejected_bg": _stats["rejected_bg"],
         "local_pct": round(100 * _stats["local"] / total, 1),
         "remote_pct": round(100 * _stats["remote"] / total, 1),
+        "perf_breaker": perf_breaker_active(),
+        "perf_breaker_reason": _PERF_STATE.get("reason", ""),
         "avg_wait": round(_stats["waited_total"] / (_stats["waited_n"] or 1), 1),
         "remote_reasons": dict(_remote_reasons),
         "gpu": _gpu_stats(),
@@ -3015,6 +3936,7 @@ async def gateway_telemetry(request):
         "series": {"fast": list(_TELEM_FAST), "slow": list(_TELEM_SLOW)},
         "per_client": per_client,
         "errors": list(_ERROR_FEED)[:60],
+        "mis_estimates": list(_MISESTIMATE_FEED)[:60],
         "percentiles": pct,
         "engine_scrape": {"ok": _ENGINE_METRICS["ok"],
                           "age_s": round(time.time() - _ENGINE_METRICS["at"], 1) if _ENGINE_METRICS["at"] else None,
@@ -3203,11 +4125,13 @@ async def gateway_history(request):
 
 async def gateway_history_summary(request):
     """GET /gateway/history/summary?hours=24 -- per-client/per-route counts, p50/p95
-    duration+TTFT, tokens in/out, and error counts over the trailing `hours` (default 24, capped
-    at 30 days). Cached for HISTORY_SUMMARY_CACHE_TTL seconds (default 5s): the History dashboard
-    section polls this every 10s and a full scan of one-to-several ~200MB/day files on every
-    single poll is real disk+CPU work not worth repeating for back-to-back callers -- see
-    REPORT.md disk-math."""
+    duration+TTFT, tokens in/out, error counts, and (gw-ttft-decomposition-telemetry) per-class
+    (interactive/background) p50/p90/n for admission_wait, queue_plus_prefill and decode_time
+    under `latency_by_class` -- over the trailing `hours` (default 24, capped at 30 days). Pass
+    hours=1 for the "last hour" window the card asks for. Cached for HISTORY_SUMMARY_CACHE_TTL
+    seconds (default 5s): the History dashboard section polls this every 10s and a full scan of
+    one-to-several ~200MB/day files on every single poll is real disk+CPU work not worth
+    repeating for back-to-back callers -- see REPORT.md disk-math."""
     try:
         hours = float(request.query.get("hours") or 24)
     except (TypeError, ValueError):
@@ -3332,6 +4256,52 @@ async def gateway_config(request):
     changed = apply_config(fields if isinstance(fields, dict) else {})
     log.info("config updated via dashboard: %s", ",".join(changed) or "(none)")
     return web.json_response({"changed": changed, "config": current_config(masked=True)})
+
+
+async def gateway_aliases(request):
+    """Manage named OpenAI-compatible remote endpoints.
+
+    GET is safe for the dashboard and masks credentials. POST/DELETE require the same admin
+    token as other gateway mutations and persist atomically in a mode-600 registry file.
+    """
+    if request.method == "GET":
+        return web.json_response({"builtins": sorted(_BUILTIN_ALIASES),
+                                  "aliases": [_public_alias(v) for v in sorted(_ALIASES.values(), key=lambda x: x["name"])]})
+    if not _admin_ok(request):
+        return web.json_response({"error": "unauthorized: X-Admin-Token required"}, status=401)
+    if request.method == "DELETE":
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        name = _alias_name((payload or {}).get("name") or request.query.get("name"))
+        if name in _BUILTIN_ALIASES:
+            return web.json_response({"error": "built-in aliases cannot be deleted"}, status=400)
+        if name not in _ALIASES:
+            return web.json_response({"error": "alias not found"}, status=404)
+        del _ALIASES[name]
+        _save_aliases()
+        return web.json_response({"deleted": name})
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid json"}, status=400)
+    try:
+        name = (payload or {}).get("name")
+        record = _validate_alias_record(name, payload or {})
+    except (ValueError, TypeError) as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    # An omitted key on update means keep the existing credential; an explicit empty key clears it.
+    if "key" not in (payload or {}) and record["name"] in _ALIASES:
+        record["key"] = _ALIASES[record["name"]].get("key", "")
+    _ALIASES[record["name"]] = record
+    _save_aliases()
+    log.info("gateway alias saved: %s -> %s model=%s", record["name"], record["base"], record["model"])
+    return web.json_response({"saved": record["name"], "alias": _public_alias(record)})
+
+
+async def gateway_aliases_page(request):
+    return web.Response(text=ALIASES_HTML, content_type="text/html")
 
 # ---------------- research & lanes aggregator (for the dashboard) ----------------
 _LANES_CACHE = {"t": 0.0, "data": None}
@@ -4364,7 +5334,7 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
 </header>
 
 <div class=subrow>
- <span class=rz><abbr title="This gateway listens on :8000 and forwards to the local vLLM engine on :8001. It queues, serialises, and (when local is full) overflows to a paid remote provider.">:8000 capacity-routing gateway</abbr> &rarr; local engine :8001 &middot; overflow provider <b id=rm class=mono>--</b></span>
+ <span class=rz><abbr title="This gateway listens on :8000 and forwards to the local vLLM engine on :8001. It queues, serialises, and (when local is full) overflows to a paid remote provider.">:8000 capacity-routing gateway</abbr> &rarr; local engine :8001 &middot; overflow provider <b id=rm class=mono>--</b> &middot; <a href=/gateway/aliases/page>custom aliases</a></span>
  <button class=chip id=glossary_btn type=button>? Glossary</button>
 </div>
 
@@ -4613,8 +5583,10 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
   <div class=row>
    <label><span class=k>How many requests can run locally at once?</span><span class=hint>concurrent lanes &middot; 1 = strictly one at a time</span>
     <input id=f_local_budget type=number min=1 max=8></label>
-   <label><span class=k>How long should an interactive request wait for a free lane?</span><span class=hint>seconds, before overflowing to the paid provider</span>
+   <label><span class=k>How long should a request wait for a free lane?</span><span class=hint>seconds &middot; used for background during peak hours, and for interactive only if "never overflow" below is off</span>
     <input id=f_local_wait_secs type=number min=0 step=1></label>
+   <label><span class=k>Should interactive traffic ever overflow while waiting?</span><span class=hint>0 = never, it queues until a lane is free (default) &middot; 1 = restores the wait-above-then-overflow behaviour</span>
+    <input id=f_interactive_never_overflow type=number min=0 max=1></label>
    <label><span class=k>Prompt and output tokens all lanes may reserve</span><span class=hint>estimated tokens &middot; admission memory limit</span>
     <input id=f_token_budget type=number min=0 step=50000></label>
    <label><span class=k>After an out-of-memory crash, how long to back off?</span><span class=hint>seconds before probing the local engine again</span>
@@ -4631,8 +5603,14 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
     <input id=f_max_local_tokens type=number min=0 step=10000></label>
    <label><span class=k>Clamp any local request's output to at most&hellip;</span><span class=hint>tokens</span>
     <input id=f_local_max_out type=number min=0 step=1024></label>
-   <label><span class=k>A request this big claims the whole budget alone</span><span class=hint>tokens (serialize-solo)</span>
+   <label><span class=k>Above this size, a request's lane cost scales with its size</span><span class=hint>tokens &middot; below this, every request costs exactly 1 lane</span>
     <input id=f_big_tokens type=number min=0 step=1000></label>
+   <label><span class=k>How many tokens equal one lane, for a big request?</span><span class=hint>tokens/unit &middot; e.g. a 100K-token request costs ceil(100000&divide;this) lanes, capped by the budget</span>
+    <input id=f_tokens_per_unit type=number min=1000 step=1000></label>
+   <label><span class=k>Charge lanes for PREDICTED computed tokens instead of raw prompt size?</span><span class=hint>0 = off, default &middot; 1 = a repeated-prefix turn with a small new suffix costs ~1 lane instead of its full size &middot; check the mis-estimate feed before flipping this on</span>
+    <input id=f_use_computed_cost type=number min=0 max=1></label>
+   <label><span class=k>Safety margin added to a predicted-cheap request's cost</span><span class=hint>tokens &middot; padding for tokenizer/cache-boundary slop</span>
+    <input id=f_prefix_hit_margin_tokens type=number min=0 step=128></label>
    <label><span class=k>Treat this much in-flight context as "a monster is running"</span><span class=hint>tokens &middot; caused reason "monster"</span>
     <input id=f_monster_inflight type=number min=0 step=10000></label>
    <label><span class=k>Upper bound on the first-token wait budget</span><span class=hint>seconds</span>
@@ -4861,7 +5839,7 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
     setBanner('oom', s.backoff>0?('Local engine is in OOM backoff for another '+s.backoff+'s -- new requests overflow to the paid provider until it clears.'):null, 'warn');
     $('#strip').innerHTML=[
       `<div class=tile><div class=k><abbr title="Whether the local vLLM engine on :8001 is responding to /health.">Local engine</abbr></div><div class=v><span class="dot ${s.local_healthy?'up':'down'}"></span> ${s.local_healthy?'up':'DOWN'}</div><div class=sub title="${esc(modelName)}">${esc(modelShort||'--')}</div></div>`,
-      `<div class=tile><div class=k><abbr title="Concurrent request slots (lanes) in use / total available. Waiting shown when requests are queued for one.">Lanes</abbr></div><div class=v class=mono>${s.inflight}<small>/${s.budget}</small>${s.waiting?` <span style=color:var(--amb)>+${s.waiting} waiting</span>`:''}</div><div class=sub><abbr title="Reserved prompt plus bounded output tokens across all lanes / token-budget cap.">context reserved ${((s.inflight_reserved_tokens||0)/1000).toFixed(0)}K / ${((s.token_budget||0)/1000).toFixed(0)}K cap</abbr>${bk?' &middot; '+bk:''}</div></div>`,
+      `<div class=tile><div class=k><abbr title="Concurrent request slots (lanes) in use / total available. Waiting shown when requests are queued for one, broken out by class.">Lanes</abbr></div><div class=v class=mono>${s.inflight}<small>/${s.budget}</small>${s.waiting?` <span style=color:var(--amb)>+${s.waiting} waiting${s.waiting_by_class?` (${s.waiting_by_class.interactive||0} interactive, ${s.waiting_by_class.background||0} bg)`:''}</span>`:''}</div><div class=sub><abbr title="Reserved prompt plus bounded output tokens across all lanes / token-budget cap.">context reserved ${((s.inflight_reserved_tokens||0)/1000).toFixed(0)}K / ${((s.token_budget||0)/1000).toFixed(0)}K cap</abbr>${bk?' &middot; '+bk:''}</div></div>`,
       `<div class=tile><div class=k><abbr title="Share of requests served by the local engine vs sent to the overflow provider.">Served local</abbr></div><div class=v class=mono style=color:var(--grn)>${s.local_pct}<small>%</small></div><div class=sub>overflow ${s.remote_pct}% &middot; avg wait ${s.avg_wait}s</div></div>`,
       `<div class=tile><div class=k><abbr title="Live tokens/s from the engine's Prometheus metrics (prompt + generation combined). '--' if the engine is down or not yet scraped.">Tokens/s now</abbr></div><div class=v class=mono id=tps_now>--</div><div class=sub>time to first token <span id=ttft_line>--</span></div></div>`,
       `<div class=tile><div class=k><abbr title="Average GPU utilisation across all cards, as reported by nvidia-smi.">GPU util avg</abbr></div><div class=v class=mono>${gpuAvg==null?'--':gpuAvg+'<small>%</small>'}</div><div class=sub>${(s.gpu||[]).map((g,i)=>'GPU'+i+' '+((g.util==null?'?':g.util)+'%')).join(' &middot; ')||'no GPU data'}</div></div>`,
@@ -4942,13 +5920,14 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
       // deadline estimate (item 7): how much of the configured wait is left before this
       // would overflow, computed client-side from the live config -- no backend change needed.
       let deadline=null;
-      if(queued&&CFG){
+      const guaranteedLocal=queued&&!a.bg&&CFG&&Number(CFG.interactive_never_overflow)===1;
+      if(queued&&CFG&&!guaranteedLocal){
         const waitS=(a.bg?CFG.bg_wait_secs:CFG.local_wait_secs);
         if(waitS!=null)deadline=Math.max(0,Number(waitS)-(a.waited||0));
       }
       rows.push({kind:'request',who:clientDisplay(a.name,a.ip,a.ua),
         what:(a.preview?'"'+esc(a.preview)+'"':'<span class=rz>(no text preview)</span>')+(a.bg?' &middot; background':'')+(a.tiny?' &middot; tiny':'')+(a.model?' &middot; '+esc(a.model):''),
-        state, badgeText: queued?'waiting for a lane'+(deadline!=null?' \u00b7 overflows in ~'+Math.round(deadline)+'s':''):held?'holding for local (background) -- never billed':remote?'remote overflow \u00b7 '+esc(a.reason||''):a.phase==='local'?'local model'+(a.waited?' \u00b7 waited '+a.waited+'s':''):'routing',
+        state, badgeText: queued?'waiting for a lane'+(deadline!=null?' \u00b7 overflows in ~'+Math.round(deadline)+'s':(guaranteedLocal?' \u00b7 guaranteed local (never overflows)':'')):held?'holding for local (background) -- never billed':remote?'remote overflow \u00b7 '+esc(a.reason||''):a.phase==='local'?'local model'+(a.waited?' \u00b7 waited '+a.waited+'s':''):'routing',
         age:a.elapsed_s||0, meta:esc(a.ep)+(a.ptok?' \u00b7 '+Math.round(a.ptok/1000)+'K in':'')+(a.maxtok?' \u00b7 '+a.maxtok+' max out':'')+(a.stream?' \u00b7 \u26a1 stream':''),
         sortkey:(a.name||'')+' '+(a.preview||'')});
     });
@@ -5247,6 +6226,32 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
 })();
 </script></body></html>"""
 
+ALIASES_HTML = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>Gateway aliases</title>
+<style>
+:root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--dim:#8b949e;--blu:#58a6ff;--red:#f85149;--grn:#3fb950}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,sans-serif}.wrap{max-width:1000px;margin:auto;padding:20px}.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:16px;margin:14px 0}h1{font-size:20px}h2{font-size:15px;border-bottom:1px solid var(--bd);padding-bottom:8px}label{display:flex;flex-direction:column;gap:4px;color:var(--dim);font-size:12px}input{background:var(--bg);border:1px solid var(--bd);border-radius:6px;color:var(--fg);padding:8px;font:inherit}form .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.wide{grid-column:1/-1}button{border:1px solid var(--bd);border-radius:6px;background:var(--blu);color:#06111f;padding:8px 14px;font-weight:600;cursor:pointer}.danger{background:transparent;color:var(--red)}table{width:100%;border-collapse:collapse}th,td{text-align:left;border-bottom:1px solid var(--bd);padding:8px}small,.muted{color:var(--dim)}#msg{margin:10px 0}.ok{color:var(--grn)}.err{color:var(--red)}
+</style></head><body><div class=wrap><a href=/gateway/dashboard>&larr; gateway dashboard</a><h1>Gateway provider aliases</h1>
+<p class=muted>Use <code>estate</code> for the dashboard mode, <code>estate-local</code> for local-only, and <code>estate-remote</code> for the default remote. Custom aliases always target their configured OpenAI-compatible endpoint. Context limits are enforced per endpoint.</p>
+<div class=card><h2>Admin token</h2><label>Token (stored only in this browser)<input id=token type=password autocomplete=off></label></div>
+<div class=card><h2>Create or update custom alias</h2><form id=form><div class=grid>
+<label>Alias name <small>e.g. estate-openai</small><input id=name required pattern="[A-Za-z][A-Za-z0-9._-]{1,63}"></label>
+<label>Model id<input id=model required></label><label class=wide>Base URL<input id=base type=url placeholder=https://api.openai.com/v1 required></label>
+<label>API key <small>blank on update keeps existing key</small><input id=key type=password autocomplete=off></label>
+<label>Context limit (tokens)<input id=context_limit type=number min=1024 value=128000 required></label>
+<label>Maximum output (tokens)<input id=max_output type=number min=1 value=16384 required></label>
+<label><span>Enabled</span><input id=enabled type=checkbox checked></label>
+</div><p><button type=submit>Save alias</button></p></form><div id=msg></div></div>
+<div class=card><h2>Configured aliases</h2><div id=list>Loading...</div></div>
+<script>
+const $=id=>document.getElementById(id), esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const headers=()=>{const t=$('token').value.trim();return t?{'X-Admin-Token':t,'Content-Type':'application/json'}:{'Content-Type':'application/json'}};
+if(localStorage.gatewayAdminToken){$('token').value=localStorage.gatewayAdminToken} $('token').onchange=()=>localStorage.gatewayAdminToken=$('token').value;
+async function load(){const r=await fetch('/gateway/aliases',{cache:'no-store'}),d=await r.json();let h='<p class=muted>Built-ins: '+d.builtins.map(esc).join(', ')+'</p>';
+if(!d.aliases.length)h+='<p class=muted>No custom aliases.</p>';else h+='<table><thead><tr><th>alias</th><th>endpoint</th><th>model</th><th>context</th><th>status</th><th></th></tr></thead><tbody>'+d.aliases.map(a=>'<tr><td><code>'+esc(a.name)+'</code></td><td>'+esc(a.base)+'</td><td>'+esc(a.model)+'</td><td>'+Number(a.context_limit).toLocaleString()+' / '+Number(a.max_output).toLocaleString()+'</td><td>'+ (a.enabled?'enabled':'disabled')+'</td><td><button class=danger data-del="'+esc(a.name)+'">Delete</button></td></tr>').join('')+'</tbody></table>';$('list').innerHTML=h;document.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{if(!confirm('Delete '+b.dataset.del+'?'))return;const r=await fetch('/gateway/aliases',{method:'DELETE',headers:headers(),body:JSON.stringify({name:b.dataset.del})});$('msg').textContent=(await r.json()).error||'Deleted';load()})}
+$('form').onsubmit=async e=>{e.preventDefault();const d={name:$('name').value,base:$('base').value,model:$('model').value,context_limit:Number($('context_limit').value),max_output:Number($('max_output').value),enabled:$('enabled').checked};if($('key').value)d.key=$('key').value;const r=await fetch('/gateway/aliases',{method:'POST',headers:headers(),body:JSON.stringify(d)}),j=await r.json();$('msg').className=r.ok?'ok':'err';$('msg').textContent=j.error||('Saved '+j.saved);if(r.ok){$('key').value='';load()}};load();
+</script></div></body></html>"""
+
 async def _on_startup(app):
     _load_stats()
     app["saver"] = asyncio.create_task(_stats_saver())
@@ -5294,6 +6299,10 @@ def make_app():
     app.router.add_post("/gateway/models/local", gateway_models_local)
     app.router.add_get("/gateway/config", gateway_config)
     app.router.add_post("/gateway/config", gateway_config)
+    app.router.add_get("/gateway/aliases", gateway_aliases)
+    app.router.add_post("/gateway/aliases", gateway_aliases)
+    app.router.add_delete("/gateway/aliases", gateway_aliases)
+    app.router.add_get("/gateway/aliases/page", gateway_aliases_page)
     app.router.add_get("/gateway/lanes", gateway_lanes)
     app.router.add_get("/gateway/windows", gateway_windows)
     app.router.add_get("/gateway/windows/{name}/log", gateway_window_log)
