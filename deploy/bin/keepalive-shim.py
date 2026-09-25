@@ -1308,11 +1308,20 @@ def _request_remote_cost(info):
     'estimate': no usage at all (no-cache list estimate, an upper bound)."""
     out = info.get("outtok") if info.get("outtok") is not None else info.get("outtok_lb")
     model = info.get("remote_model") or REMOTE_MODEL
+    prices = info.get("remote_prices")                 # a metered custom endpoint's own prices
     hit, miss = info.get("remote_cache_hit"), info.get("remote_cache_miss")
+
+    def priced(h, m):
+        if prices:
+            return round((max(0, h or 0) * prices[0] + max(0, m or 0) * prices[1]
+                          + max(0, out or 0) * prices[2]) / 1e6, 9)
+        return _remote_cost_actual(model, h, m, out)
     if hit is not None and miss is not None:
-        return _remote_cost_actual(model, hit, miss, out), "actual"
+        return priced(hit, miss), "actual"
     if info.get("ptok_exact") is not None:
-        return _remote_cost_actual(model, 0, info.get("ptok_exact"), out), "usage"
+        return priced(0, info.get("ptok_exact")), "usage"
+    if prices:
+        return priced(0, info.get("ptok") or 0), "estimate"
     return _remote_cost_estimate(info.get("ptok") or 0, out), "estimate"
 
 
@@ -1433,9 +1442,14 @@ def telemetry_remote_cost(start, end, telemetry_dir=None):
                         continue
                     t = float(r.get("t") or 0)
                     status = r.get("status")
-                    if (start <= t < end and r.get("route") == "remote"
-                            and r.get("alias_kind") != "custom-remote"
-                            and (status is None or int(status) < 400)):
+                    # v6: every paid row counts (custom metered included); only a declared-free
+                    # endpoint is excluded. Rows since v6 count at any status (the provider
+                    # bills errors that carried usage); pre-v6 rows keep the old status rule.
+                    if "remote_sent" in r:
+                        counted = r.get("remote_sent") and r.get("cost_policy") != "free"
+                    else:
+                        counted = status is None or int(status) < 400
+                    if start <= t < end and r.get("route") == "remote" and counted:
                         usd += float(r.get("cost_est") or 0.0)
                         n += 1
                         if r.get("cost_basis") not in ("actual", "usage"):
@@ -1528,6 +1542,7 @@ class SpendLedger:
         directory = os.path.dirname(os.path.abspath(self.path))
         os.makedirs(directory, mode=0o700, exist_ok=True)
         tmp = f"{self.path}.tmp.{os.getpid()}.{time.time_ns()}"
+        self.state["revision"] = int(self.state.get("revision") or 0) + 1   # CAS token for REPLACE
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         try:
             with os.fdopen(fd, "w") as fh:
@@ -1688,6 +1703,7 @@ class SpendLedger:
                     "imported": st.get("imported"), "since": st.get("since"),
                     "corrupt": st.get("corrupt"), "corrupt_artifact": st.get("corrupt_artifact"),
                     "durable": not self._dirty, "in_flight": len(st["holds"]),
+                    "revision": int(st.get("revision") or 0), "last_settle_at": st.get("last_settle_at"),
                     "orphans_charged": st.get("orphans_charged", 0.0),
                     "gateway_sha256": GATEWAY_SHA256, "reservations": active, **self._totals()}
 
@@ -1816,7 +1832,10 @@ class SpendLedger:
             if req_key in self._settled or (req_key not in self.state["holds"] and not cost):
                 self._flush_quietly()
                 return 0.0
+            if cost is None:                   # no trustworthy usage: charge the full hold
+                cost = float((self.state["holds"].get(req_key) or {}).get("amount") or 0.0)
             charged = self._settle_locked(self.state, req_key, cost)
+            self.state["last_settle_at"] = now
             self._settled[req_key] = charged
             while len(self._settled) > 20000:
                 self._settled.popitem(last=False)
@@ -1824,13 +1843,21 @@ class SpendLedger:
             self._flush_quietly()
             return charged
 
-    def recover(self, spent=None, reason="", replace=False, source=None):
+    def recover(self, spent=None, reason="", replace=False, source=None, expected_revision=None):
         """Governed recovery from a corrupt ledger (or a re-import): a fresh ledger whose
         spend is the operator's figure or, if none, the gateway's own telemetry for today.
         The corrupt artifact is left untouched. -> (ok, detail)."""
         with self._lock:
             now = self._clock()
             prior = self.state
+            if replace and not prior.get("corrupt"):
+                # v6: a REPLACE may lower today's figure, so it is compare-and-set: bound to the
+                # exact revision the caller computed against, with nothing in flight.
+                if expected_revision is None or int(expected_revision) != int(prior.get("revision") or 0):
+                    return False, (f"conflict: ledger is at revision {int(prior.get('revision') or 0)}, "
+                                   f"not {expected_revision}; recompute")
+                if prior.get("holds"):
+                    return False, f"conflict: {len(prior['holds'])} paid request(s) in flight; recompute"
             fresh = self._fresh(now)
             fresh["process"] = self.process
             if spent is None:
@@ -1853,6 +1880,7 @@ class SpendLedger:
                 fresh["since"] = prior.get("since")
             if replace and spent is not None and not str(source).startswith("operator-replace"):
                 return False, "replace needs an explicit operator figure"
+            fresh["revision"] = int(prior.get("revision") or 0)
             fresh.update(spent=round(spent, 6), complete_day=fresh["day"],
                          recovered={"at": now, "source": source, "reason": str(reason)[:200],
                                     "prior_corrupt": prior.get("corrupt"),
@@ -1877,10 +1905,23 @@ def _spend():
         if __name__ == "__main__" or "SHIM_SPEND_FILE" in os.environ:
             _SPEND_LEDGER = SpendLedger(SPEND_FILE)
         else:
-            import tempfile
-            _SPEND_LEDGER = SpendLedger(os.path.join(tempfile.mkdtemp(prefix="shim-spend-"), "gateway-spend.json"),
+            _SPEND_LEDGER = SpendLedger(os.path.join(_spend_scratch_dir(), "gateway-spend.json"),
                                         importer=None)
     return _SPEND_LEDGER
+
+
+_SPEND_SCRATCH = None
+
+
+def _spend_scratch_dir():
+    """ONE managed temp dir per imported (non-service) process, removed at exit (v6)."""
+    global _SPEND_SCRATCH
+    if _SPEND_SCRATCH is None:
+        import atexit
+        import tempfile
+        _SPEND_SCRATCH = tempfile.TemporaryDirectory(prefix="shim-spend-")
+        atexit.register(_SPEND_SCRATCH.cleanup)
+    return _SPEND_SCRATCH.name
 
 
 _SPEND_CLIENTS = {"mtime": None, "map": {}}
@@ -1936,8 +1977,9 @@ def _spend_allows_overflow(ptok, maxtok):
         return False
 
 
-def _spend_hold_for(request, body):
-    """Hold this paid request's upper-bound cost before forwarding. None = go ahead."""
+def _spend_hold_for(request, body, prices=None):
+    """Hold this paid request's upper-bound cost before forwarding. None = go ahead.
+    `prices` ($/Mtok hit, miss, out) for a metered custom endpoint; default provider otherwise."""
     info = _ACTIVE.get(id(request))
     key = (info or {}).get("spend_key") or ("anon-" + os.urandom(8).hex())
     try:
@@ -1946,8 +1988,12 @@ def _spend_hold_for(request, body):
         maxtok = 0
     ptok = (info or {}).get("ptok") or _est_tokens(body)
     rid = _alias_for_request(body).get("reservation")
-    ok, reason = _spend().hold(key, _spend_hold_estimate(ptok, maxtok), rid=rid,
-                               client_ip=getattr(request, "remote", None))
+    if prices:
+        out = maxtok if maxtok and maxtok > 0 else SPEND_DEFAULT_OUT_TOKENS
+        amount = round((max(0, ptok or 0) * prices[1] + out * prices[2]) / 1e6, 6)   # no-cache bound
+    else:
+        amount = _spend_hold_estimate(ptok, maxtok)
+    ok, reason = _spend().hold(key, amount, rid=rid, client_ip=getattr(request, "remote", None))
     if not ok:
         log.info("spend refused %s: %s", key, reason)
         kind = ("spend_reservation_invalid" if reason.startswith("spend reservation")
@@ -1959,20 +2005,33 @@ def _spend_hold_for(request, body):
 
 
 def _spend_settle(info, resp):
-    """handle_completions' finally: price what actually went remote, release the hold."""
+    """handle_completions' finally: charge what the provider bills, release the hold.
+
+    v6 (Terra 13:15): provider-reported usage is charged REGARDLESS of HTTP status. A request
+    that reached the provider (remote_sent) without trustworthy usage -- an error, a truncated
+    or lost stream, a client disconnect -- is charged its full held amount (conservative). A
+    request that was held but never sent (context rejection, refusal) is charged nothing. A
+    free-policy endpoint is never charged."""
     try:
         key = info.get("spend_key")
         if not key:
             return
-        status = getattr(resp, "status", None)
-        if status is None:
-            status = info.get("http_status")
-        cost = 0.0
-        if (info.get("route") == "remote" and info.get("alias_kind") != "custom-remote"
-                and (status is None or status < 400)):
-            cost, _basis = _request_remote_cost(info)     # cache-aware ACTUAL when usage is known
-        if info.get("spend_held") or cost:
-            _spend().settle(key, cost)
+        if info.get("cost_policy") == "free":
+            if info.get("spend_held"):
+                _spend().settle(key, 0.0)
+            return
+        sent = bool(info.get("remote_sent"))
+        cost, basis = _request_remote_cost(info) if sent else (0.0, None)
+        if sent and basis in ("actual", "usage"):
+            charge = cost
+        elif sent and info.get("spend_held"):
+            charge = None                      # no trustworthy usage: the held amount
+        elif sent and info.get("route") == "remote":
+            charge = cost                      # unheld (pre-v6 path) estimate
+        else:
+            charge = 0.0
+        if info.get("spend_held") or charge:
+            _spend().settle(key, charge)
     except Exception as exc:
         log.warning("spend settle failed (hold expires and is charged): %s", exc)
 
@@ -2030,7 +2089,8 @@ async def gateway_spend_recover(request):
         return web.json_response({"ok": False, "error": "unauthorized: X-Admin-Token required"}, status=401)
     f = await _spend_body(request) or {}
     ok, detail = _spend().recover(f.get("spent"), f.get("reason") or "",
-                                  replace=bool(f.get("replace")), source=f.get("source"))
+                                  replace=bool(f.get("replace")), source=f.get("source"),
+                                  expected_revision=f.get("expected_revision"))
     log.warning("spend ledger recovery requested: ok=%s detail=%s", ok, detail)
     return web.json_response({"ok": ok, "detail": detail, "spend": _spend().snapshot()},
                              status=200 if ok else 409)
@@ -2095,7 +2155,7 @@ def _telemetry_note_request(info, resp=None):
         if ttft is not None:
             c["ttft_sum"] += ttft; c["ttft_n"] += 1
         req_cost, cost_basis = 0.0, None
-        if route == "remote":
+        if route == "remote" and info.get("remote_sent") and info.get("cost_policy") != "free":
             req_cost, cost_basis = _request_remote_cost(info)
             c["cost_est_usd"] += req_cost
         if (status is not None and status >= 400) or reason == "failover" or info.get("stream_watchdog"):
@@ -2154,6 +2214,8 @@ def _telemetry_note_request(info, resp=None):
             "bg": bool(info.get("bg")), "tiny": bool(info.get("tiny")),
             "preview": info.get("preview"), "cost_est": req_cost, "cost_basis": cost_basis,
             "remote_model": info.get("remote_model"), "remote_cache_hit": info.get("remote_cache_hit"),
+            "cost_policy": info.get("cost_policy"), "remote_provider": info.get("remote_provider"),
+            "remote_sent": bool(info.get("remote_sent")),
             "remote_cache_miss": info.get("remote_cache_miss"),
             # gw-ttft-decomposition-telemetry: admission_wait duplicates `waited` under the
             # AC-named field so the JSONL is self-auditable against the card without a lookup
@@ -2704,7 +2766,10 @@ def apply_config(fields):
 # ---------------- model aliases and provider registry ----------------
 # Aliases are resolved here, at the gateway boundary.  Callers never receive credentials and
 # never choose a provider by URL; they choose a stable model name and this process resolves it.
-_BUILTIN_ALIASES = {"estate", "estate-local", "estate-remote"}
+_BUILTIN_ALIASES = {"estate", "estate-local", "estate-remote", "estate-remote-pro"}
+# R2 v6: the default provider's top model under the SAME spend authority. It is refused (fail
+# closed) until its per-type prices are configured in SHIM_REMOTE_PRICES_JSON.
+REMOTE_PRO_MODEL = os.environ.get("SHIM_REMOTE_PRO_MODEL", "deepseek-v4-pro")
 _ALIASES = {}
 _ALIAS_NAME_RE = re.compile(r"^[a-z][a-z0-9._-]{1,63}$", re.I)
 
@@ -2735,7 +2800,37 @@ def _validate_alias_record(name, record):
         raise ValueError("context_limit must exceed max_output and both must be positive")
     return {"name": name, "base": base, "key": key, "model": model,
             "context_limit": context_limit, "max_output": max_output,
-            "enabled": bool(record.get("enabled", True))}
+            "enabled": bool(record.get("enabled", True)),
+            "cost": _validate_cost_policy(record.get("cost"))}
+
+
+def _validate_cost_policy(cost):
+    """R2 v6: every custom endpoint declares what it costs. None = undeclared -> the alias
+    fails CLOSED for paid routing. {"policy": "free"}, or {"policy": "metered", "provider":
+    "<id>", "cache_hit": $/Mtok, "cache_miss": $/Mtok, "output": $/Mtok} (held, settled and
+    capped by the same authority as the default provider)."""
+    if cost in (None, ""):
+        return None
+    if not isinstance(cost, dict):
+        raise ValueError("cost must be an object")
+    policy = str(cost.get("policy") or "").strip().lower()
+    if policy == "free":
+        return {"policy": "free"}
+    if policy != "metered":
+        raise ValueError("cost.policy must be 'free' or 'metered'")
+    provider = str(cost.get("provider") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", provider):
+        raise ValueError("metered cost needs a provider identity")
+    out = {"policy": "metered", "provider": provider}
+    for k in ("cache_hit", "cache_miss", "output"):
+        try:
+            v = float(cost[k])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(f"metered cost needs a numeric {k} price ($/Mtok)")
+        if v < 0:
+            raise ValueError(f"{k} price must be >= 0")
+        out[k] = v
+    return out
 
 
 def _load_aliases():
@@ -2789,10 +2884,16 @@ def _resolve_alias(model):
         return {"name": name, "kind": "default"}
     if name == "estate-remote":
         return {"name": name, "kind": "builtin-remote"}
-    if name.startswith("estate-remote.") and _SPEND_RID.match(name[len("estate-remote."):]):
-        # R2: a reservation-backed request (POST /gateway/spend/reserve returns this name).
-        return {"name": "estate-remote", "kind": "builtin-remote",
-                "reservation": name[len("estate-remote."):]}
+    if name == "estate-remote-pro":
+        return {"name": name, "kind": "builtin-remote", "model": REMOTE_PRO_MODEL}
+    for alias_name, model in (("estate-remote-pro", REMOTE_PRO_MODEL), ("estate-remote", None)):
+        prefix = alias_name + "."
+        if name.startswith(prefix) and _SPEND_RID.match(name[len(prefix):]):
+            # R2: a reservation-backed request (POST /gateway/spend/reserve returns this name).
+            out = {"name": alias_name, "kind": "builtin-remote", "reservation": name[len(prefix):]}
+            if model:
+                out["model"] = model
+            return out
     if name == "estate-local":
         return {"name": name, "kind": "builtin-local"}
     rec = _ALIASES.get(name)
@@ -4202,9 +4303,9 @@ async def _note_remote_response(request, payload, body):
         log.warning("remote response note: %s", e)
 
 
-async def _forward_remote(request, path, body, streaming, endpoint=None):
+async def _forward_remote(request, path, body, streaming, endpoint=None, model=None):
     """Forward intact or deterministically compacted context to the selected remote endpoint."""
-    ep = endpoint or {"base": REMOTE_BASE, "key": REMOTE_KEY, "model": REMOTE_MODEL,
+    ep = endpoint or {"base": REMOTE_BASE, "key": REMOTE_KEY, "model": model or REMOTE_MODEL,
                      "context_limit": REMOTE_CONTEXT_LIMIT, "max_output": 65536,
                      "name": "default"}
     base = str(ep.get("base") or "").rstrip("/")
@@ -4215,11 +4316,20 @@ async def _forward_remote(request, path, body, streaming, endpoint=None):
     if not base or (endpoint is None and not remote_ok()):
         return web.json_response(
             {"error": {"message": "local unavailable and no remote overflow configured"}}, status=503)
-    if endpoint is None:
-        # R2: every paid call to the metered default provider -- alias, route intent,
-        # overflow, size, big-prompt, forced window, local-down -- passes the one spend
-        # authority BEFORE anything is sent. There is no uncapped route.
-        refused = _spend_hold_for(request, body)
+    # R2: every paid call -- the default provider on any route (alias, route intent, overflow,
+    # size, big-prompt, forced window, local-down) AND every metered custom endpoint -- passes
+    # the one spend authority BEFORE anything is sent. v6: a custom endpoint with no declared
+    # cost policy, or a default-provider model with no configured price, fails CLOSED.
+    policy = _endpoint_cost_policy(endpoint, model)
+    if policy is None:
+        what = (f"gateway alias {ep.get('name')} declares no cost policy" if endpoint is not None
+                else f"model {model} has no configured price (SHIM_REMOTE_PRICES_JSON)")
+        return web.json_response({"error": {"message": f"gateway spend authority: {what}; refused",
+                                            "type": "cost_policy_missing"}}, status=409)
+    _active_set(request, cost_policy=policy["policy"], remote_provider=policy.get("provider"),
+                remote_prices=policy.get("prices"))
+    if policy["policy"] == "metered":
+        refused = _spend_hold_for(request, body, prices=policy.get("prices") if endpoint is not None else None)
         if refused is not None:
             return refused
     prepared, ctx = _prepare_provider_context(body, limit, max_output)
@@ -4237,6 +4347,9 @@ async def _forward_remote(request, path, body, streaming, endpoint=None):
                 context_omitted=int(ctx.get("omitted", 0) or 0))
     _active_set(request, remote_model=model)
     relay_body = remap_for_remote(prepared, model, max_output)
+    if streaming:
+        relay_body = _with_stream_usage(relay_body)   # v6: settle needs the provider's usage
+    _active_set(request, remote_sent=True)            # v6: from here the provider may bill
     kind, payload = await _relay(request, base, path, relay_body, key, streaming,
                                  provider_name=model)
     if kind == "ok":
@@ -4250,6 +4363,54 @@ async def _forward_remote(request, path, body, streaming, endpoint=None):
         return payload
     status, text, _ = payload
     return web.json_response({"error": {"message": f"remote overflow failed: {status} {text}"}}, status=502)
+
+
+def _remote_provider_id():
+    host = re.sub(r"^https?://", "", str(REMOTE_BASE or "")).split("/")[0].lower()
+    return os.environ.get("SHIM_REMOTE_PROVIDER") or ("deepseek" if "deepseek" in host else host or "default")
+
+
+def _price_configured(model):
+    """The default provider's prices: the knobs price REMOTE_MODEL; any other model needs an
+    explicit SHIM_REMOTE_PRICES_JSON entry."""
+    if not model or model == REMOTE_MODEL:
+        return True
+    try:
+        return str(model) in (json.loads(REMOTE_PRICES_JSON) if REMOTE_PRICES_JSON else {})
+    except Exception:
+        return False
+
+
+def _endpoint_cost_policy(endpoint, model=None):
+    """{"policy": "free"|"metered", "provider": id, "prices": ($/Mtok hit, miss, out)|None} or
+    None when the endpoint's cost is undeclared (-> refuse)."""
+    if endpoint is None:
+        if not _price_configured(model):
+            return None
+        return {"policy": "metered", "provider": _remote_provider_id(), "prices": None}
+    cost = endpoint.get("cost")
+    if not isinstance(cost, dict):
+        return None
+    if cost.get("policy") == "free":
+        return {"policy": "free", "provider": None, "prices": None}
+    if cost.get("policy") == "metered":
+        return {"policy": "metered", "provider": cost.get("provider"),
+                "prices": (float(cost["cache_hit"]), float(cost["cache_miss"]), float(cost["output"]))}
+    return None
+
+
+def _with_stream_usage(relay_body):
+    """Ask the provider for its usage trailer on a streamed response (OpenAI-compatible
+    stream_options.include_usage) so settlement prices the provider's own counts."""
+    try:
+        j = json.loads(relay_body)
+        so = j.get("stream_options") if isinstance(j.get("stream_options"), dict) else {}
+        if so.get("include_usage") is True:
+            return relay_body
+        j["stream_options"] = {**so, "include_usage": True}
+        return json.dumps(j).encode()
+    except Exception:
+        return relay_body
 
 
 async def handle_completions(request):
@@ -4418,6 +4579,8 @@ async def _route_completions(request, _no_overflow=False):
     if alias_force_remote:
         log.info("route %s alias=estate-remote -> remote(alias)", path)
         record_event("remote", "alias", request, units, 0, **ev)
+        if alias.get("model"):
+            return await _forward_remote(request, path, body, streaming, model=alias["model"])
         return await _forward_remote(request, path, body, streaming)
 
     # MASTER SWITCH: full-remote mode (maintenance/debug) — everything -> DeepSeek.  The
@@ -4786,7 +4949,8 @@ def _alias_model_rows():
     rows = []
     for name, kind in (("estate", "gateway-default"),
                        ("estate-local", "gateway-local"),
-                       ("estate-remote", "gateway-remote")):
+                       ("estate-remote", "gateway-remote"),
+                       ("estate-remote-pro", "gateway-remote-pro")):
         rows.append({"id": name, "object": "model", "created": now,
                      "owned_by": "gateway", "gateway_alias": kind})
     for name, rec in sorted(_ALIASES.items()):

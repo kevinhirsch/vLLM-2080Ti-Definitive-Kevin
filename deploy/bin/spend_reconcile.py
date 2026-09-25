@@ -18,8 +18,10 @@ It reports, for the same window:
     every row in the window carries provider usage;
   * the BEST FIGURE for today so far: the bill for the billed window, plus the telemetry after
     the bill's end priced at the bill's own effective $/token (for rows without cache fields).
-With --post it hands that best figure to POST /gateway/spend/recover as an operator REPLACE
-(admin token read from a file, never from argv or the environment dump), recording the source.
+With --post it hands that best figure to POST /gateway/spend/recover as an operator REPLACE,
+compare-and-set bound to the exact ledger revision it read, with nothing in flight and the
+telemetry flushed past the last settle; a conflict recomputes (v6). The admin token is read
+from a file, never from argv or the environment dump.
 The billing CSV is only read; nothing from it (user id, key prefix) is written anywhere.
 """
 from __future__ import annotations
@@ -32,6 +34,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.request
 
 TYPES = ("input_cache_hit_tokens", "input_cache_miss_tokens", "output_tokens")
@@ -69,7 +72,21 @@ def read_billing(paths) -> list:
     return rows
 
 
-def telemetry_rows(tdir: str, start: float, end: float) -> list:
+def _counted(r: dict, provider: str) -> bool:
+    """The spend authority's rule for one telemetry row (v6): rows since v6 carry
+    remote_sent / cost_policy / remote_provider -- a paid row is one that reached a metered
+    provider, at any HTTP status; older rows keep the old rule (status < 400, and only the
+    default provider, i.e. not a custom alias)."""
+    if r.get("route") != "remote":
+        return False
+    if "remote_sent" in r:
+        return bool(r.get("remote_sent")) and r.get("cost_policy") != "free" and \
+            (r.get("remote_provider") or provider) == provider
+    status = r.get("status")
+    return r.get("alias_kind") != "custom-remote" and (status is None or int(status) < 400)
+
+
+def telemetry_rows(tdir: str, start: float, end: float, provider: str = "deepseek") -> list:
     out = []
     for path in sorted(glob.glob(os.path.join(tdir, "requests-*.jsonl"))):
         with open(path, encoding="utf-8", errors="replace") as fh:
@@ -78,11 +95,7 @@ def telemetry_rows(tdir: str, start: float, end: float) -> list:
                     r = json.loads(line)
                 except ValueError:
                     continue
-                t = float(r.get("t") or 0)
-                status = r.get("status")
-                if (start <= t < end and r.get("route") == "remote"
-                        and r.get("alias_kind") != "custom-remote"
-                        and (status is None or int(status) < 400)):
+                if start <= float(r.get("t") or 0) < end and _counted(r, provider):
                     out.append(r)
     return out
 
@@ -150,16 +163,54 @@ def reconcile(billing_rows, tel_rows, start, end, tolerance=0.02) -> dict:
             "ok": bool(comparable and delta is not None and abs(delta) <= tolerance)}
 
 
-def post_replace(base: str, token_file: str, usd: float, source: str) -> dict:
+def _http(url: str, payload=None, token=None, timeout=15):
+    """(status, json) for a GET (payload None) or POST to the local gateway."""
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["X-Admin-Token"] = token
+    req = urllib.request.Request(url, data=None if payload is None else json.dumps(payload).encode(),
+                                 headers=headers, method="GET" if payload is None else "POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 -- the local gateway
+            return resp.status, json.loads(resp.read().decode() or "{}")
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode() or "{}")
+
+
+def post_replace_cas(base: str, token_file: str, compute, source: str, *, telemetry_max_t=None,
+                     tries: int = 6, wait: float = 5.0, http=_http, sleep=time.sleep) -> dict:
+    """Compare-and-set REPLACE of today's spend (v6, Terra 13:15).
+
+    Each try: read the ledger (revision, in-flight, last settle); require nothing in flight and
+    the telemetry to already contain the last settled request; compute the figure; POST it
+    bound to that exact revision. A conflict (any settle/hold/write since the read) refuses on
+    the gateway side and this recomputes. It never posts an unconditional replace; after
+    `tries` conflicts it gives up and reports why, leaving the live total untouched."""
     with open(token_file) as fh:
         token = fh.read().strip()
-    req = urllib.request.Request(base.rstrip("/") + "/gateway/spend/recover",
-                                 data=json.dumps({"spent": usd, "replace": True, "source": source,
-                                                  "reason": "provider bill reconciliation"}).encode(),
-                                 headers={"Content-Type": "application/json", "X-Admin-Token": token},
-                                 method="POST")
-    with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310 -- the local gateway
-        return json.loads(resp.read().decode())
+    base = base.rstrip("/")
+    last = None
+    for attempt in range(1, tries + 1):
+        status, snap = http(base + "/gateway/spend")
+        if status != 200:
+            last = f"GET /gateway/spend -> {status}"
+        elif snap.get("in_flight"):
+            last = f"{snap['in_flight']} paid request(s) in flight"
+        elif telemetry_max_t is not None and snap.get("last_settle_at") and \
+                (telemetry_max_t() or 0) < float(snap["last_settle_at"]) - 2:
+            last = "telemetry has not flushed the last settled request yet"
+        else:
+            usd = compute()
+            status, body = http(base + "/gateway/spend/recover",
+                                {"spent": usd, "replace": True, "source": source,
+                                 "reason": "provider bill reconciliation",
+                                 "expected_revision": int(snap.get("revision") or 0)}, token=token)
+            if status == 200 and body.get("ok"):
+                return {"ok": True, "attempts": attempt, "spent": usd,
+                        "revision": snap.get("revision"), "detail": body.get("detail")}
+            last = f"conflict: {body.get('detail') or body.get('error') or status}"
+        sleep(wait)
+    return {"ok": False, "attempts": tries, "reason": last}
 
 
 def main(argv=None):
@@ -170,20 +221,29 @@ def main(argv=None):
     ap.add_argument("--end", required=True, help="end of the billed window")
     ap.add_argument("--now", help="end of today's figure (default: now)")
     ap.add_argument("--tolerance", type=float, default=0.02)
+    ap.add_argument("--provider", default="deepseek", help="the billed provider's identity in the telemetry")
     ap.add_argument("--post", help="gateway base URL: replace today's spend with the best figure")
     ap.add_argument("--admin-token-file", default=os.path.expanduser("~/.local/share/vllm-qwen27b/admin.token"))
     a = ap.parse_args(argv)
     start, end = _ts(a.start), _ts(a.end)
     now = _ts(a.now) if a.now else time.time()
     rows = read_billing(a.billing)
-    tel = telemetry_rows(a.telemetry, start, max(end, now))
+    tel = telemetry_rows(a.telemetry, start, max(end, now), a.provider)
     result = reconcile(rows, tel, start, end, a.tolerance)
     result["best"] = best_figure(result["billing"], bill_prices(rows),
                                  [r for r in tel if end <= float(r.get("t") or 0) < now])
     if a.post:
-        result["posted"] = post_replace(a.post, a.admin_token_file, result["best"]["best_usd"],
-                                        f"provider bill {a.start}..{a.end} + telemetry to "
-                                        f"{datetime.datetime.fromtimestamp(now).isoformat(timespec='seconds')}")
+        def compute():
+            t_now = time.time()
+            gap = [r for r in telemetry_rows(a.telemetry, end, t_now, a.provider)]
+            return best_figure(result["billing"], bill_prices(rows), gap)["best_usd"]
+
+        def telemetry_max_t():
+            return max((float(r.get("t") or 0) for r in telemetry_rows(a.telemetry, start, time.time(), a.provider)),
+                       default=0.0)
+        result["posted"] = post_replace_cas(a.post, a.admin_token_file, compute,
+                                            f"provider bill {a.start}..{a.end} + gateway telemetry after it",
+                                            telemetry_max_t=telemetry_max_t)
     print(json.dumps(result, indent=2, default=str))
     return 0
 

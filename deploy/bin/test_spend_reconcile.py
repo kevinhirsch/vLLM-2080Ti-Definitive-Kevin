@@ -8,6 +8,7 @@ here is synthetic (no user id, no key): only the columns the tool reads.
 
 Run:  python3 -m unittest test_spend_reconcile
 """
+import atexit
 import csv
 import importlib.util
 import io
@@ -22,6 +23,8 @@ SPEC = importlib.util.spec_from_file_location("spend_reconcile", Path(__file__).
 sr = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(sr)
 
+_TMPDIR = tempfile.TemporaryDirectory(prefix="reconcile-test-")   # managed: removed at exit
+atexit.register(_TMPDIR.cleanup)
 START, END = "2026-09-25T00:00:00-07:00", "2026-09-25T13:00:00-07:00"
 BILL = {"request_count": ("", 5_754), "input_cache_hit_tokens": ("0.000000003", 262_519_512),
         "input_cache_miss_tokens": ("0.00000015", 9_879_145), "output_tokens": ("0.0000006", 1_733_123)}
@@ -58,7 +61,7 @@ def usage_rows(n=5_754, hit=262_519_512, miss=9_879_145, out=1_733_123, t0=None)
 
 class Reconcile(unittest.TestCase):
     def setUp(self):
-        self.dir = Path(tempfile.mkdtemp(prefix="reconcile-"))
+        self.dir = Path(tempfile.mkdtemp(prefix="reconcile-", dir=_TMPDIR.name))
         self.bill = self.dir / "amount.csv"
         write_bill(self.bill)
         self.rows = sr.read_billing([str(self.bill)])
@@ -98,28 +101,67 @@ class Reconcile(unittest.TestCase):
         self.assertAlmostEqual(best["gap_usd"], 1_000_000 * per_prompt + 1_000 * 6e-7, places=6)
         self.assertAlmostEqual(best["effective_prompt_usd_per_mtok"], per_prompt * 1e6, places=4)
 
-    def test_post_replace_sends_an_operator_replace_with_the_admin_token_from_a_file(self):
+    # ---- v6: the REPLACE is compare-and-set, never unconditional -------------------
+
+    def _gateway(self, snaps, answers):
+        calls = []
+
+        def http(url, payload=None, token=None, timeout=15):
+            calls.append((url.rsplit("/", 1)[-1], payload, token))
+            if payload is None:
+                return 200, snaps.pop(0) if len(snaps) > 1 else snaps[0]
+            return answers.pop(0) if len(answers) > 1 else answers[0]
+        return http, calls
+
+    def _token(self):
         token = self.dir / "admin.token"
         token.write_text("adm-secret\n")
-        seen = {}
+        return str(token)
 
-        class Resp(io.BytesIO):
-            def __enter__(self):
-                return self
+    def test_a_conflict_recomputes_and_retries_bound_to_the_new_revision(self):
+        snaps = [{"revision": 7, "in_flight": 0}, {"revision": 9, "in_flight": 0}]
+        http, calls = self._gateway(snaps, [(409, {"ok": False, "detail": "conflict: revision 8"}),
+                                             (200, {"ok": True, "detail": {}})])
+        figures = iter([3.31, 3.32])
+        out = sr.post_replace_cas("http://gw", self._token(), lambda: next(figures), "bill",
+                                  http=http, sleep=lambda s: None)
+        self.assertEqual((out["ok"], out["attempts"], out["spent"]), (True, 2, 3.32))
+        posts = [c for c in calls if c[1] is not None]
+        self.assertEqual([p[1]["expected_revision"] for p in posts], [7, 9])
+        self.assertTrue(all(p[1]["replace"] is True and p[2] == "adm-secret" for p in posts))
 
-            def __exit__(self, *a):
-                return False
+    def test_in_flight_requests_or_unflushed_telemetry_defer_the_replace(self):
+        snaps = [{"revision": 3, "in_flight": 2}, {"revision": 4, "in_flight": 0, "last_settle_at": 1000.0},
+                 {"revision": 4, "in_flight": 0, "last_settle_at": 1000.0}]
+        http, calls = self._gateway(snaps, [(200, {"ok": True})])
+        seen_t = iter([990.0, 1000.5])
+        out = sr.post_replace_cas("http://gw", self._token(), lambda: 3.31, "bill", http=http,
+                                  telemetry_max_t=lambda: next(seen_t), sleep=lambda s: None)
+        self.assertEqual((out["ok"], out["attempts"]), (True, 3))
+        self.assertEqual(len([c for c in calls if c[1] is not None]), 1)
 
-        def urlopen(req, timeout=0):
-            seen.update(url=req.full_url, headers=dict(req.header_items()), body=json.loads(req.data))
-            return Resp(b'{"ok": true}')
-        with patch.object(sr.urllib.request, "urlopen", urlopen):
-            sr.post_replace("http://127.0.0.1:8000", str(token), 3.31, "bill")
-        self.assertEqual(seen["url"], "http://127.0.0.1:8000/gateway/spend/recover")
-        self.assertEqual(seen["headers"]["X-admin-token"], "adm-secret")
-        self.assertEqual(seen["body"], {"spent": 3.31, "replace": True, "source": "bill",
-                                        "reason": "provider bill reconciliation"})
+    def test_persistent_conflict_gives_up_without_ever_posting_unconditionally(self):
+        http, calls = self._gateway([{"revision": 5, "in_flight": 0}],
+                                    [(409, {"ok": False, "detail": "conflict"})])
+        out = sr.post_replace_cas("http://gw", self._token(), lambda: 3.31, "bill", http=http,
+                                  tries=4, sleep=lambda s: None)
+        self.assertFalse(out["ok"])
+        self.assertIn("conflict", out["reason"])
+        self.assertTrue(all("expected_revision" in c[1] for c in calls if c[1] is not None))
 
+    def test_telemetry_rows_follow_the_v6_counting_rule(self):
+        t = sr._ts(START) + 5
+        rows = [{"t": t, "route": "remote", "remote_sent": True, "cost_policy": "metered",
+                 "remote_provider": "deepseek", "status": 502},                     # billed error: counts
+                {"t": t, "route": "remote", "remote_sent": False, "cost_policy": "metered"},   # never sent
+                {"t": t, "route": "remote", "remote_sent": True, "cost_policy": "free"},       # free alias
+                {"t": t, "route": "remote", "remote_sent": True, "cost_policy": "metered",
+                 "remote_provider": "openrouter"},                                   # another provider
+                {"t": t, "route": "remote", "alias_kind": "default", "status": 200},  # pre-v6 default
+                {"t": t, "route": "remote", "alias_kind": "custom-remote", "status": 200}]  # pre-v6 custom
+        telemetry(self.dir / "t", rows)
+        got = sr.telemetry_rows(str(self.dir / "t"), sr._ts(START), sr._ts(END))
+        self.assertEqual([(r.get("status"), r.get("alias_kind")) for r in got], [(502, None), (200, "default")])
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,6 +12,7 @@ alias, route intent, overflow -- is held/refused before anything is forwarded).
 Run:  python3 -m unittest test_gateway_spend_authority
 """
 import asyncio
+import atexit
 import hashlib
 import importlib.util
 import json
@@ -25,7 +26,9 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 os.environ["SHIM_EXACT_TOKENS"] = "0"
-_TMP = tempfile.mkdtemp(prefix="spend-test-")
+_TMPDIR = tempfile.TemporaryDirectory(prefix="spend-test-")   # managed: removed at exit
+atexit.register(_TMPDIR.cleanup)
+_TMP = _TMPDIR.name
 # No SHIM_SPEND_FILE here: an imported shim never opens the production ledger on its own
 # (see _spend()), and setting it would leak into every other test module in the same run.
 SPEC = importlib.util.spec_from_file_location("shim_spend_test", os.environ.get(
@@ -239,7 +242,8 @@ class DayCompleteness(LedgerBase):
             name = "requests-%s.jsonl" % shim.time.strftime("%Y%m%d", shim.time.gmtime(r["t"]))
             with open(tdir / name, "a") as fh:
                 fh.write(json.dumps(r) + "\n")
-        self.assertEqual(shim.telemetry_remote_cost(start, DAY0, str(tdir)), (1.5, 2, 2))   # both pre-v5 rows: estimates
+        # v6: pre-v6 custom-remote rows declared no cost policy, so they count (fail closed)
+        self.assertEqual(shim.telemetry_remote_cost(start, DAY0, str(tdir)), (10.5, 3, 3))
 
 
 class EnforceTransition(LedgerBase):
@@ -401,12 +405,21 @@ class Seam(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(resp.body)["error"]["type"], "local_unavailable_cap_exhausted")
         self.relay.assert_not_called()
 
-    async def test_a_forwarded_request_is_held_then_settled_at_the_gateway_price(self):
-        resp = await shim.handle_completions(Request())
+    async def test_a_forwarded_request_is_held_then_settled_at_the_providers_usage(self):
+        async def relay(request, *a, **k):
+            shim._active_set(request, remote_cache_hit=90_000, remote_cache_miss=10_000, outtok=500)
+            return "ok", shim.web.json_response({"ok": True})
+        with patch.object(shim, "_relay", relay), patch.object(shim, "REMOTE_PRICES_JSON", ""):
+            resp = await shim.handle_completions(Request())
         self.assertEqual(resp.status, 200)
         snap = self.led.snapshot()
         self.assertEqual(snap["in_flight"], 0)
-        self.assertAlmostEqual(snap["spent"], 0.015, places=6)
+        self.assertAlmostEqual(snap["spent"], (90_000 * 0.003 + 10_000 * 0.15 + 500 * 0.6) / 1e6, places=9)
+
+    async def test_a_forwarded_request_without_usage_is_charged_its_hold(self):
+        resp = await shim.handle_completions(Request())      # the fake provider returns no usage
+        self.assertEqual(resp.status, 200)
+        self.assertAlmostEqual(self.led.snapshot()["spent"], 0.0312, places=6)
 
     async def test_reserve_requires_the_spend_credential_and_binds_owner_and_ip(self):
         self.assertEqual((await self._reserve(token=None))[0], 401)
@@ -519,7 +532,8 @@ class DayOverTheCap(LedgerBase):
         self.assertTrue(snap["enforce"] and snap["imported"]["upper_bound"])
         self.assertEqual((snap["available"], round(snap["spent"], 2)), (0.0, 42.0))
         # the operator replaces the no-cache upper bound with the provider's bill
-        ok, detail = led.recover(spent=3.309304, replace=True, source="DeepSeek bill 00:00-13:00")
+        ok, detail = led.recover(spent=3.309304, replace=True, source="DeepSeek bill 00:00-13:00",
+                                 expected_revision=led.snapshot()["revision"])
         self.assertTrue(ok)
         self.assertAlmostEqual(led.snapshot()["available"], 25.0 - 3.309304, places=5)
         self.assertTrue(led.can_hold(0.05))
@@ -608,7 +622,7 @@ class ThroughputGuard(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls, ["local"])
 
     async def test_with_budget_the_same_big_prompt_still_overflows(self):
-        self.led.recover(spent=0.0, replace=True, source="test")
+        self.led.recover(spent=0.0, replace=True, source="test", expected_revision=self.led.snapshot()["revision"])
         # This pins the SPEND seam (budget available -> the overflow is not blocked), so it runs
         # under the pre-L1 routing policy: with LOCAL_FIRST on, an idle local engine keeps the
         # big prompt local (covered in test_gateway_local_first.py).
