@@ -65,6 +65,7 @@ _CFG_SEP = {
     "SHIM_NO_THINK_IPS": ",",
     "SHIM_BG_XCLIENTS":  ",",
     "SHIM_BG_MARKERS":   "|",   # free-text phrases: a marker may itself contain a comma
+    "SHIM_LOCAL_FIRST_REASONS": ",",   # read back by _parse_reason_set's comma split
 }
 _CFG_SEP_DEFAULT = "|"
 # Punctuation a Python container repr leaves around a member. Stripped from the ENDS only,
@@ -437,6 +438,13 @@ _CFG = {
     "SHIM_PERF_BREAKER_MIN_SAMPLES": ("PERF_BREAKER_MIN_SAMPLES", int),
     "SHIM_PERF_BREAKER_HOLD_SECS": ("PERF_BREAKER_HOLD_SECS", float),
     "SHIM_STREAM_IDLE_TIMEOUT_SECS": ("STREAM_IDLE_TIMEOUT_SECS", float),
+    # LOCAL-FIRST (L1, 2026-09-25) -- see the block after STREAM_IDLE_TIMEOUT_SECS below.
+    "SHIM_LOCAL_FIRST":      ("LOCAL_FIRST", lambda v: str(v).lower() not in ("0", "false", "off", "")),
+    "SHIM_LOCAL_FIRST_REASONS": ("LOCAL_FIRST_REASONS", lambda v: _parse_reason_set(v)),
+    "SHIM_LOCAL_FIRST_QUEUE_WAIT_SECS": ("LOCAL_FIRST_QUEUE_WAIT_SECS", float),
+    "SHIM_LOCAL_FIRST_WAIT_WINDOW_SECS": ("LOCAL_FIRST_WAIT_WINDOW_SECS", float),
+    "SHIM_LOCAL_FIRST_FIRST_TOKEN_MAX": ("LOCAL_FIRST_FIRST_TOKEN_MAX", float),
+    "SHIM_LOCAL_FIRST_INTERACTIVE_TTFT_SECS": ("LOCAL_FIRST_INTERACTIVE_TTFT_SECS", float),
 }
 # A single request whose est. (prompt + max_tokens) exceeds this will OOM local even at
 # budget=1 (context + generation peaks past this box's tiny free VRAM), so route it straight
@@ -487,6 +495,54 @@ PERF_BREAKER_KV_PCT = float(os.environ.get("SHIM_PERF_BREAKER_KV_PCT", "85"))
 PERF_BREAKER_MIN_SAMPLES = int(os.environ.get("SHIM_PERF_BREAKER_MIN_SAMPLES", "3"))
 PERF_BREAKER_HOLD_SECS = float(os.environ.get("SHIM_PERF_BREAKER_HOLD_SECS", "45"))
 STREAM_IDLE_TIMEOUT_SECS = float(os.environ.get("SHIM_STREAM_IDLE_TIMEOUT_SECS", "45"))
+
+# ---------------- LOCAL-FIRST overflow policy (L1, 2026-09-25) ----------------
+# Kevin 2026-09-25: "Is the GPU being used? Otherwise ... we're wasting money and/or time
+# without using the local model." Measured from the gateway's own request log (24h to 13:20
+# MST): 10,211 remote routes, and at the start of EVERY one of the capacity/latency-predictive
+# ones (big-prompt 4,500, perf 3,556, monster 24, big-out 22, predicted 11) the local engine had
+# free lanes and free token budget (reconstructed lane occupancy: mean 1.3 of 14, >=7 lanes
+# only 3.2% of the time, never 14). The engine was idle ~50% of wall time while they went out.
+#   * big-prompt fired at a fixed 24K-token threshold that predates prefix caching: the gateway's
+#     own predictor put the p50 COMPUTED (uncached) prefill of those prompts at 2,334 tokens
+#     (5% of the prompt) -- incremental pi turns whose prefix local already holds.
+#   * perf fired on "gpu-saturation" 60% of the time: nvidia-smi util is a duty cycle, ~88% with
+#     ONE stream running, so avg>=95% with running>=2 is "the GPU is doing work", not "full".
+#     Local requests admitted while it was active: TTFT p95 18.4s vs 10.4s, >20s for 4.4%;
+#     interactive local TTFT over the whole day never exceeded 20.05s (1 of 2,244).
+# So these reasons now PREDICT; they no longer DECIDE. A request that one of them would have
+# sent remote stays LOCAL unless local is measurably saturated right now:
+#   lanes      -- this class's lanes are full (inflight + units > lane limit),
+#   tokens     -- the KV token budget cannot fit its reservation,
+#   queued     -- requests of this class are already waiting for a lane,
+#   queue-wait -- the mean admission wait over the last LOCAL_FIRST_WAIT_WINDOW_SECS reached
+#                 LOCAL_FIRST_QUEUE_WAIT_SECS.
+# Kept requests then go through normal admission, which still overflows ("cap"/"tokens"/
+# "bg-yield") if lanes do not free within the class's wait -- the saturation fallback.
+# UNCHANGED: explicit remote intents (estate-remote/custom aliases, route-intent, the forced
+# window), safety routes (local-down, failover), hard impossibilities (size, tokens, context).
+# ROLLBACK: SHIM_LOCAL_FIRST=0 restores the previous behavior exactly (dashboard-editable).
+def _parse_reason_set(v):
+    if isinstance(v, (set, frozenset, list, tuple)):
+        v = ",".join(str(x) for x in v)
+    parts = str(v or "").replace("|", ",").split(",")
+    return frozenset(x.strip(_REPR_JUNK) for x in parts if x.strip(_REPR_JUNK))
+
+
+LOCAL_FIRST = os.environ.get("SHIM_LOCAL_FIRST", "1").lower() not in ("0", "false", "off", "")
+LOCAL_FIRST_REASONS = _parse_reason_set(os.environ.get(
+    "SHIM_LOCAL_FIRST_REASONS", "big-prompt,perf,predicted,big-out,monster"))
+LOCAL_FIRST_QUEUE_WAIT_SECS = float(os.environ.get("SHIM_LOCAL_FIRST_QUEUE_WAIT_SECS", "5"))
+LOCAL_FIRST_WAIT_WINDOW_SECS = float(os.environ.get("SHIM_LOCAL_FIRST_WAIT_WINDOW_SECS", "60"))
+# A prompt >= BIG_PROMPT kept local may need a cold prefill longer than FIRST_TOKEN_MAX
+# (100K tokens at the measured ~1,600 tok/s is ~62s); without a wider cap it would be misread
+# as a wedge and fail over after wasting the prefill. Applies only to LOCAL relays.
+LOCAL_FIRST_FIRST_TOKEN_MAX = float(os.environ.get("SHIM_LOCAL_FIRST_FIRST_TOKEN_MAX", "300"))
+# Optional latency ceiling for INTERACTIVE requests: > 0 sends an interactive request remote
+# (under its original reason) when its predicted local TTFT -- predicted computed tokens /
+# PREFILL_TPS, scaled by concurrency -- exceeds this. 0 = off: the data above shows local does
+# not breach a 20s interactive ceiling, so it is off by default.
+LOCAL_FIRST_INTERACTIVE_TTFT_SECS = float(os.environ.get("SHIM_LOCAL_FIRST_INTERACTIVE_TTFT_SECS", "0"))
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout,
                     format="%(asctime)s [gateway] %(levelname)s %(message)s")
@@ -780,6 +836,71 @@ def _update_perf_breaker(sample):
 
 def perf_breaker_active():
     return bool(PERF_BREAKER_ENABLED and time.time() < _PERF_STATE.get("until", 0.0))
+
+
+# ---- LOCAL-FIRST state + decision (see the LOCAL_FIRST config block) ----
+_ADMISSION_WAITS = collections.deque(maxlen=512)       # (t, waited_s) per admission outcome
+_local_first_kept = collections.Counter()              # reason -> kept local
+_local_first_remote = collections.Counter()            # "reason:why" -> still sent remote
+
+
+def _note_admission_wait(waited, now=None):
+    """Record how long one request waited in the admission loop (0 for an immediate slot)."""
+    _ADMISSION_WAITS.append((time.time() if now is None else now, float(waited or 0.0)))
+
+
+def recent_admission_wait(now=None, window=None):
+    """Mean admission wait (s) over the last `window` seconds; 0.0 with no samples."""
+    now = time.time() if now is None else now
+    window = LOCAL_FIRST_WAIT_WINDOW_SECS if window is None else window
+    vals = [w for (t, w) in _ADMISSION_WAITS if now - t <= window]
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def local_reservation_estimate(ptok, maxtok):
+    """KV reservation the local path will charge (prompt + bounded output), mirroring
+    _prepare_local_body's LOCAL_MAX_OUT clamp + local_memory_reservation()."""
+    out = maxtok if maxtok and maxtok > 0 else 0
+    if LOCAL_MAX_OUT > 0 and (out <= 0 or out > LOCAL_MAX_OUT):
+        out = LOCAL_MAX_OUT
+    elif out <= 0:
+        out = max(0, MAX_LOCAL_TOKENS - ptok)
+    return max(0, int(ptok)) + int(out)
+
+
+def local_saturation(background, units, reservation, now=None):
+    """Measured reasons local cannot take this request NOW ([] = it has capacity)."""
+    why = []
+    lane_limit = admission_lane_limit(background, effective_budget(), FG_RESERVED)
+    if _inflight + max(1, units) > lane_limit:
+        why.append("lanes")
+    if not _memory_available(reservation):
+        why.append("tokens")
+    if _waiting_by_class.get("background" if background else "interactive", 0) > 0:
+        why.append("queued")
+    if LOCAL_FIRST_QUEUE_WAIT_SECS > 0 and recent_admission_wait(now) >= LOCAL_FIRST_QUEUE_WAIT_SECS:
+        why.append("queue-wait")
+    return why
+
+
+def local_first_decision(reason, *, background, units, reservation, est_computed=0, now=None):
+    """(keep_local, why) for a capacity/latency-PREDICTIVE remote reason.
+
+    keep_local=False means: route remote under `reason` exactly as before this policy
+    existed (policy off, reason not covered, local saturated, or the interactive ceiling)."""
+    if not LOCAL_FIRST or reason not in LOCAL_FIRST_REASONS:
+        return False, "policy-off"
+    if not _health.get("ok", False):
+        return False, "local-unhealthy"
+    sat = local_saturation(background, units, reservation, now)
+    if sat:
+        return False, "saturated:" + "+".join(sat)
+    if LOCAL_FIRST_INTERACTIVE_TTFT_SECS > 0 and not background:
+        conc = max(1, _inflight + 1) if FT_CONCURRENCY_SCALE else 1
+        predicted_ttft = (max(0, est_computed or 0) / max(1.0, PREFILL_TPS)) * conc
+        if predicted_ttft > LOCAL_FIRST_INTERACTIVE_TTFT_SECS:
+            return False, "interactive-ttft"
+    return True, "capacity"
 
 
 def _latest_decode_tps():
@@ -3042,13 +3163,19 @@ def estimate_units(body, budget=None, allow_full_budget=False, client=None):
     return min(ceiling, _desired_units(body, client))
 
 
-def first_token_timeout(body, concurrency=1):
+def first_token_timeout(body, concurrency=1, local=False):
     # Prefill throughput is shared across concurrent local requests, so time-to-first-token scales
     # with how many are in flight. Without this, a legit big prefill queued behind others is misread
     # as a "wedged backend" (false failover + a 120s budget=1 backoff cascade). concurrency=1 for
     # remote/uncontended calls preserves the original tight deadline.
+    # LOCAL-FIRST: a big prompt (>= BIG_PROMPT) on a LOCAL relay may take longer than
+    # FIRST_TOKEN_MAX to prefill cold; its cap widens to LOCAL_FIRST_FIRST_TOKEN_MAX.
     factor = max(1, concurrency) if FT_CONCURRENCY_SCALE else 1
-    return min(FIRST_TOKEN_MAX, FIRST_TOKEN_BASE + (_est_tokens(body) / PREFILL_TPS) * factor)
+    est = _est_tokens(body)
+    cap = FIRST_TOKEN_MAX
+    if local and LOCAL_FIRST and BIG_PROMPT > 0 and est >= BIG_PROMPT:
+        cap = max(FIRST_TOKEN_MAX, LOCAL_FIRST_FIRST_TOKEN_MAX)
+    return min(cap, FIRST_TOKEN_BASE + (est / PREFILL_TPS) * factor)
 
 
 def is_background(body, request):
@@ -3650,7 +3777,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
             # bound time-to-response-headers for streaming so a backend that accepts the
             # connection but never responds (a wedge) fails over instead of hanging.
             up = await asyncio.wait_for(_open(session, base, path, body, key, streaming),
-                                        timeout=first_token_timeout(body, concurrency))
+                                        timeout=first_token_timeout(body, concurrency, local=(base == LOCAL)))
         else:
             up = await _open(session, base, path, body, key, streaming)
     except asyncio.TimeoutError:
@@ -3818,7 +3945,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
 
     # Adaptive first-token deadline: fail over from a wedged backend without stalling, while
     # allowing a legit big-context prefill the time it actually needs (scaled by concurrency).
-    deadline = first_token_timeout(body, concurrency)
+    deadline = first_token_timeout(body, concurrency, local=(base == LOCAL))
     try:
         phase = await asyncio.wait_for(_read_until_commit(), timeout=deadline)
     except asyncio.TimeoutError:
@@ -4251,6 +4378,23 @@ async def _route_completions(request, _no_overflow=False):
     # covers, byte-for-byte the same recorded route as before.
     bg_held_reason = None
 
+    # LOCAL-FIRST (L1): a predictive overflow reason routes remote only when local is measurably
+    # saturated. _lf_keep() is evaluated LAST in each guard below, so it only runs (and only
+    # counts) when that guard would otherwise have sent the request remote.
+    _lf_res = local_reservation_estimate(ptok, maxtok)
+    _lf_kept = []
+
+    def _lf_keep(reason):
+        keep, why = local_first_decision(reason, background=background, units=units,
+                                         reservation=_lf_res, est_computed=est_computed)
+        if keep:
+            _local_first_kept[reason] += 1
+            _lf_kept.append(reason)
+            log.info("route %s %s predicted but local has capacity -> local-first", path, reason)
+        elif why != "policy-off":
+            _local_first_remote[f"{reason}:{why}"] += 1
+        return keep
+
     if LOG_REQUESTS:
         try:
             model_req = json.loads(body).get("model", "?")
@@ -4314,14 +4458,16 @@ async def _route_completions(request, _no_overflow=False):
 
     # big-OUTPUT requests (e.g. Hermes max_tokens=65536): long generations that saturate this slow
     # box and hang interactive clients -> straight to remote (DeepSeek serves them far faster).
-    if overflow_ok and not local_pin and not alias_local_only and BIG_OUTPUT > 0 and maxtok >= BIG_OUTPUT:
+    if (overflow_ok and not local_pin and not alias_local_only and BIG_OUTPUT > 0 and maxtok >= BIG_OUTPUT
+            and not _lf_keep("big-out")):
         log.info("route %s maxtok=%d >= %d -> remote(big-out)", path, maxtok, BIG_OUTPUT)
         record_event("remote", "big-out", request, units, 0, **ev)
         return await _overflow_forward()
 
     # big-PROMPT requests (e.g. a pi session whose context has grown huge): can't prefill within the
     # first-token cap on this slow box and would saturate/OOM local -> straight to remote up front.
-    if overflow_ok and not local_pin and not alias_local_only and BIG_PROMPT > 0 and ptok >= BIG_PROMPT:
+    if (overflow_ok and not local_pin and not alias_local_only and BIG_PROMPT > 0 and ptok >= BIG_PROMPT
+            and not _lf_keep("big-prompt")):
         log.info("route %s ptok=%d >= %d -> remote(big-prompt)", path, ptok, BIG_PROMPT)
         record_event("remote", "big-prompt", request, units, 0, **ev)
         return await _overflow_forward()
@@ -4367,7 +4513,7 @@ async def _route_completions(request, _no_overflow=False):
     if overflow_ok and not local_pin and not alias_local_only and (
             (MONSTER_INFLIGHT > 0 and _inflight_tokens >= MONSTER_INFLIGHT)
             or _foreign_heavy
-    ):
+    ) and not _lf_keep("monster"):
         log.info("route %s monster/foreign inflight tok=%d foreign=%d foreign_tok=%d -> remote(monster)",
                  path, _inflight_tokens, _foreign, int(_health.get("foreign_tokens", 0) or 0))
         record_event("remote", "monster", request, units, 0, **ev)
@@ -4376,7 +4522,7 @@ async def _route_completions(request, _no_overflow=False):
     # PERFORMANCE BREAKER: sustained measured queue/prefill/KV/GPU pressure sends new work to
     # the configured remote provider. In-flight local work is allowed to finish; no unsafe
     # mid-generation migration is attempted.
-    if overflow_ok and not local_pin and not alias_local_only and perf_breaker_active():
+    if overflow_ok and not local_pin and not alias_local_only and perf_breaker_active() and not _lf_keep("perf"):
         log.info("route %s performance breaker (%s) -> remote(perf)",
                  path, _PERF_STATE.get("reason", "overload"))
         record_event("remote", "perf", request, units, 0, **ev)
@@ -4385,7 +4531,7 @@ async def _route_completions(request, _no_overflow=False):
     predicted = predicted_occupancy_seconds(ptok, maxtok, max(1, _inflight + 1))
     _active_set(request, predicted_occupancy_s=predicted)
     if (overflow_ok and not local_pin and not alias_local_only and predicted is not None
-            and predicted >= PREDICTED_OCCUPANCY_SECS):
+            and predicted >= PREDICTED_OCCUPANCY_SECS and not _lf_keep("predicted")):
         log.info("route %s predicted occupancy %.1fs >= %.1fs -> remote(predicted)",
                  path, predicted, PREDICTED_OCCUPANCY_SECS)
         record_event("remote", "predicted", request, units, 0, **ev)
@@ -4491,6 +4637,8 @@ async def _route_completions(request, _no_overflow=False):
         background, overflow_ok, is_peak(), LOCAL_WAIT, BG_WAIT, INTERACTIVE_NEVER_OVERFLOW)
     admitted = False
     _local_reason = "-"      # "bg-big-idle" when the idle-engine rule admitted a big background request
+    if _lf_kept:             # LOCAL-FIRST: telemetry shows which predictive reason was overridden
+        _local_reason = "lf-" + _lf_kept[0]
     admitted_conc = 1        # local concurrency at admission -> scales the first-token deadline
     waited = 0.0
     queued = False
@@ -4536,6 +4684,7 @@ async def _route_completions(request, _no_overflow=False):
         if queued:
             _waiting -= 1
             _waiting_by_class["background" if background else "interactive"] -= 1
+        _note_admission_wait(waited)   # LOCAL-FIRST queue-wait signal (admitted or overflowed)
 
     if not admitted:
         # distinguish WHY we couldn't admit: lane-count vs total-context (size-aware) cap
@@ -4736,6 +4885,12 @@ async def gateway_stats(request):
         "perf_breaker_reason": _PERF_STATE.get("reason", ""),
         "avg_wait": round(_stats["waited_total"] / (_stats["waited_n"] or 1), 1),
         "remote_reasons": dict(_remote_reasons),
+        "local_first": {
+            "enabled": bool(LOCAL_FIRST), "reasons": sorted(LOCAL_FIRST_REASONS),
+            "queue_wait_secs": LOCAL_FIRST_QUEUE_WAIT_SECS,
+            "recent_admission_wait": round(recent_admission_wait(), 2),
+            "kept_local": dict(_local_first_kept), "still_remote": dict(_local_first_remote),
+        },
         "gpu": _gpu_stats(),
         "events": list(_events)[:60],
     })

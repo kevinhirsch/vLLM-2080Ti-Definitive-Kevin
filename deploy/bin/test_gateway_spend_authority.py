@@ -609,7 +609,11 @@ class ThroughputGuard(unittest.IsolatedAsyncioTestCase):
 
     async def test_with_budget_the_same_big_prompt_still_overflows(self):
         self.led.recover(spent=0.0, replace=True, source="test")
-        with patch.object(shim, "_spend_hold_estimate", lambda p, m: 0.001):
+        # This pins the SPEND seam (budget available -> the overflow is not blocked), so it runs
+        # under the pre-L1 routing policy: with LOCAL_FIRST on, an idle local engine keeps the
+        # big prompt local (covered in test_gateway_local_first.py).
+        with patch.object(shim, "_spend_hold_estimate", lambda p, m: 0.001), \
+                patch.object(shim, "LOCAL_FIRST", False):
             resp = await shim.handle_completions(Request(model="qwen-local", max_tokens=1000))
         self.assertEqual((resp.status, self.calls), (200, ["remote"]))
 
