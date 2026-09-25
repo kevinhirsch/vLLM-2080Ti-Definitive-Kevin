@@ -111,7 +111,14 @@ class ReservationRouting(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(shim._inflight_reserved_tokens, 300)
             return "ok", "local"
 
-        with patch.object(shim, "_relay", relay):
+        # The 2026-09-17 context work added CONTEXT_SAFETY_MARGIN (1024 by default) to the
+        # size gate: 100 prompt + 9000 max + 1024 > this fixture's 10000-token local cap, so
+        # the 9000 case now routes remote for size before the reservation cap is ever
+        # reached. This test is about capping the RESERVATION (9000 -> LOCAL_MAX_OUT 200),
+        # not the size gate, so give the size gate room for the margin explicitly.
+        room = 100 + 9000 + max(0, shim.CONTEXT_SAFETY_MARGIN) + 1
+        with patch.object(shim, "_relay", relay), patch.object(shim, "MAX_LOCAL_TOKENS", room), \
+                patch.object(shim, "LOCAL_CONTEXT_LIMIT", room):
             for fields in ({"max_tokens": 9000}, {"max_tokens": 0},
                            {"max_tokens": None}, {"max_tokens": 1, "max_completion_tokens": 9000}):
                 self.assertEqual(await shim._route_completions(Request(**fields)), "local")
