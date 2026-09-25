@@ -27,6 +27,7 @@ Cost-first: a single request is always local (free); only real overflow costs mo
 NEVER manages the vLLM process (that's vllm-qwen27b.service + its watchdog).
 """
 import asyncio, os, sys, json, time, logging, collections, subprocess, re, hmac, math, hashlib
+import datetime
 import urllib.request
 import aiohttp
 from aiohttp import web
@@ -1151,6 +1152,372 @@ def _remote_cost_estimate(ptok, outtok):
     return round(((ptok or 0) / 1e6) * cin + ((outtok or 0) / 1e6) * cout, 6)
 
 
+# ---------------- remote spend authority (R2, 2026-09-25) ----------------
+# ONE atomic daily cap for every paid remote call the gateway makes. Before this, the
+# estate's "$25/day DeepSeek cap" was two unconnected SpendGuard files (brain on .10 at $25,
+# Halo on HNET00 at a $5 default) and neither saw traffic on the `estate-remote` alias, which
+# is exactly where Halo's W4 runs and the card runner's escalations go. The gateway already
+# prices every remote request (_remote_cost_estimate), so it is the one place a cap can be
+# both authoritative and atomic: every decision below happens synchronously on the event
+# loop under one lock, and every mutation is persisted (atomic replace) before it returns.
+#
+#   * reservation  -- POST /gateway/spend/reserve {owner, key, amount, ttl_s}: a client with
+#                     a bounded multi-request job (a runner attempt) reserves up front.
+#                     Idempotent on (owner, key). Refused (429) when the cap cannot cover it.
+#                     Its id rides on the model name: `estate-remote.<reservation id>`.
+#   * request hold -- every `estate-remote` / route-intent-remote request holds its upper-
+#                     bound cost (prompt + max_tokens at the higher of normal/peak rates)
+#                     before it is forwarded: first from its reservation, then from the
+#                     shared remainder. No room -> 429 `spend_cap_exhausted`, nothing sent.
+#   * settle       -- when the request finishes, the hold is replaced by the gateway's own
+#                     price for it (the same figure the per-client dashboard shows). Other
+#                     remote routes (overflow, forced window, route intent) are charged too,
+#                     so the total is the real total; they are not refused (serving policy).
+#   * finalize     -- POST /gateway/spend/finalize {reservation_id | owner+key}: releases
+#                     the unused remainder; idempotent. A finalized/expired reservation
+#                     refuses further requests.
+#   * expiry/crash -- reservations expire at ttl (remainder released). A request hold left
+#                     by a crashed process (different process token on load) or older than
+#                     SPEND_REQUEST_HOLD_TTL is charged at its full hold: it may have spent.
+#   * read         -- GET /gateway/spend: the one total every controller reads.
+SPEND_FILE = os.environ.get("SHIM_SPEND_FILE", "/home/kevin/.local/share/vllm-qwen27b/gateway-spend.json")
+SPEND_CAP_USD = float(os.environ.get("SHIM_SPEND_CAP_USD", "25.0"))
+SPEND_ENFORCE = os.environ.get("SHIM_SPEND_ENFORCE", "1").lower() not in ("0", "false", "off", "")
+SPEND_TZ = os.environ.get("SHIM_SPEND_TZ", "America/Phoenix")   # the estate host's day (SpendGuard's)
+SPEND_RESERVATION_TTL_MAX = int(os.environ.get("SHIM_SPEND_RESERVATION_TTL_MAX", str(4 * 3600)))
+SPEND_REQUEST_HOLD_TTL = int(os.environ.get("SHIM_SPEND_REQUEST_HOLD_TTL", "1800"))
+SPEND_DEFAULT_OUT_TOKENS = int(os.environ.get("SHIM_SPEND_DEFAULT_OUT_TOKENS", "16384"))
+SPEND_KEEP_SECS = 2 * 86400          # finalized/expired reservations kept for idempotent replays
+_SPEND_RID = re.compile(r"^[0-9a-f]{32}$")
+_CFG.update({
+    "SHIM_SPEND_CAP_USD": ("SPEND_CAP_USD", float),
+    "SHIM_SPEND_ENFORCE": ("SPEND_ENFORCE", lambda v: str(v).lower() not in ("0", "false", "off", "")),
+})
+
+
+def _spend_day(now, tz=None):
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.datetime.fromtimestamp(now, ZoneInfo(tz or SPEND_TZ)).strftime("%Y-%m-%d")
+    except Exception:
+        return time.strftime("%Y-%m-%d", time.gmtime(now))
+
+
+def _spend_hold_estimate(ptok, maxtok):
+    """Upper bound for one remote request: prompt + max output at the HIGHER of the normal
+    and peak rates (a request can straddle the peak boundary)."""
+    rin = max(REMOTE_COST_IN_PER_MTOK, REMOTE_COST_IN_PER_MTOK_PEAK)
+    rout = max(REMOTE_COST_OUT_PER_MTOK, REMOTE_COST_OUT_PER_MTOK_PEAK)
+    out = maxtok if maxtok and maxtok > 0 else SPEND_DEFAULT_OUT_TOKENS
+    return round((max(0, ptok or 0) / 1e6) * rin + (out / 1e6) * rout, 6)
+
+
+class SpendLedger:
+    """The atomic, persisted daily remote-spend ledger. Pure apart from its own file."""
+
+    def __init__(self, path, cap=lambda: SPEND_CAP_USD, clock=time.time, tz=None,
+                 process_token=None):
+        import threading
+        self.path, self._cap, self._clock, self.tz = path, cap, clock, tz
+        self.process = process_token or hashlib.sha256(
+            f"{os.getpid()}:{time.time_ns()}".encode()).hexdigest()[:16]
+        self._lock = threading.Lock()
+        self._settled = collections.OrderedDict()   # request keys already settled (bounded)
+        self._dirty = False
+        self.state = self._load()
+        if self._dirty:
+            self._save()                             # orphan charges are durable exactly once
+
+    # -- persistence --
+    def _fresh(self, now):
+        return {"version": 1, "day": _spend_day(now, self.tz), "spent": 0.0,
+                "orphans_charged": 0.0, "reservations": {}, "holds": {}, "process": self.process}
+
+    def _load(self):
+        now = self._clock()
+        try:
+            with open(self.path) as fh:
+                st = json.load(fh)
+            if not isinstance(st, dict) or st.get("version") != 1:
+                raise ValueError("bad spend file")
+        except FileNotFoundError:
+            return self._fresh(now)
+        except Exception as exc:
+            # A corrupt ledger must not silently reset spend to $0: refuse everything until
+            # an operator looks (the file is kept for inspection).
+            log.error("spend ledger %s unreadable (%s): cap treated as exhausted", self.path, exc)
+            st = self._fresh(now)
+            st["corrupt"] = str(exc)[:200]
+            return st
+        st.setdefault("reservations", {}); st.setdefault("holds", {})
+        # Holds from another process are orphans of a crash/restart: their requests are gone
+        # and may have been billed, so each is charged at its full hold, exactly once.
+        if st.get("process") != self.process and st["holds"]:
+            for key, h in list(st["holds"].items()):
+                self._settle_locked(st, key, float(h.get("amount") or 0.0), orphan=True)
+            self._dirty = True
+        st["process"] = self.process
+        return st
+
+    def _save(self):
+        self._dirty = False
+        tmp = f"{self.path}.tmp.{os.getpid()}"
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        with open(tmp, "w") as fh:
+            json.dump(self.state, fh, sort_keys=True)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, self.path)
+
+    def _flush(self):
+        if self._dirty:
+            self._save()
+
+    # -- bookkeeping --
+    def _roll_and_sweep(self, now):
+        st = self.state
+        day = _spend_day(now, self.tz)
+        if st.get("day") != day:
+            st["day"], st["spent"], st["orphans_charged"] = day, 0.0, 0.0
+            self._dirty = True
+        for key, h in list(st["holds"].items()):
+            if now - float(h.get("created") or 0) >= SPEND_REQUEST_HOLD_TTL:
+                self._settle_locked(st, key, float(h.get("amount") or 0.0), orphan=True)
+                self._dirty = True
+        for rid, r in list(st["reservations"].items()):
+            if r.get("status") == "active" and now >= float(r.get("expires") or 0):
+                self._close_reservation(st, r, "expired", now)
+                self._dirty = True
+            elif r.get("status") != "active" and now - float(r.get("closed_at") or now) > SPEND_KEEP_SECS:
+                del st["reservations"][rid]
+                self._dirty = True
+
+    @staticmethod
+    def _close_reservation(st, r, status, now):
+        # In-flight holds drawn from this reservation stay counted, now against the shared pool.
+        for h in st["holds"].values():
+            if h.get("rid") == r["id"] and h.get("from_res"):
+                h["from_global"] = round(float(h.get("from_global") or 0) + float(h["from_res"]), 6)
+                h["from_res"] = 0.0
+        r["held"] = 0.0
+        r["status"], r["closed_at"] = status, now
+
+    @staticmethod
+    def _settle_locked(st, key, cost, orphan=False):
+        h = st["holds"].pop(key, None)
+        cost = round(max(0.0, float(cost or 0.0)), 6)
+        if h is not None and h.get("rid"):
+            r = st["reservations"].get(h["rid"])
+            if r is not None:
+                r["held"] = round(max(0.0, float(r.get("held") or 0) - float(h.get("from_res") or 0)), 6)
+                r["used"] = round(float(r.get("used") or 0) + cost, 6)
+        st["spent"] = round(float(st.get("spent") or 0) + cost, 6)
+        if orphan:
+            st["orphans_charged"] = round(float(st.get("orphans_charged") or 0) + cost, 6)
+        return cost
+
+    def _totals(self):
+        st = self.state
+        cap = float(self._cap())
+        outstanding = sum(max(0.0, float(r.get("amount") or 0) - float(r.get("used") or 0))
+                          for r in st["reservations"].values() if r.get("status") == "active")
+        held = sum(float(h.get("from_global") or 0) for h in st["holds"].values())
+        spent = float(st.get("spent") or 0)
+        available = cap - spent - outstanding - held
+        if st.get("corrupt"):
+            available = 0.0
+        return {"cap": round(cap, 6), "spent": round(spent, 6), "reserved": round(outstanding, 6),
+                "held": round(held, 6), "available": round(max(0.0, available), 6)}
+
+    # -- public API (each call is one atomic step) --
+    def snapshot(self):
+        with self._lock:
+            now = self._clock()
+            self._roll_and_sweep(now)
+            if self._dirty:
+                self._save()
+            active = [dict(r) for r in self.state["reservations"].values() if r.get("status") == "active"]
+            return {"day": self.state["day"], "tz": self.tz or SPEND_TZ, "enforce": bool(SPEND_ENFORCE),
+                    "corrupt": self.state.get("corrupt"), "in_flight": len(self.state["holds"]),
+                    "orphans_charged": self.state.get("orphans_charged", 0.0),
+                    "reservations": active, **self._totals()}
+
+    def reserve(self, owner, key, amount, ttl_s, meta=None):
+        owner, key = str(owner or "").strip()[:64], str(key or "").strip()[:128]
+        if not owner or not key:
+            return False, None, "owner and key are required"
+        try:
+            amount, ttl_s = float(amount), int(ttl_s)
+        except (TypeError, ValueError):
+            return False, None, "amount and ttl_s must be numbers"
+        if not (0 < amount <= 1000) or not (60 <= ttl_s <= SPEND_RESERVATION_TTL_MAX):
+            return False, None, f"amount must be in (0, 1000] and ttl_s in [60, {SPEND_RESERVATION_TTL_MAX}]"
+        with self._lock:
+            now = self._clock()
+            self._roll_and_sweep(now)
+            for r in self.state["reservations"].values():
+                if r.get("owner") == owner and r.get("key") == key:
+                    self._flush()
+                    return True, dict(r, replayed=True), "replayed"      # retry-idempotent
+            tot = self._totals()
+            if SPEND_ENFORCE and amount > tot["available"]:
+                self._flush()
+                return False, None, (f"daily remote cap: ${tot['spent']:.2f} spent + ${tot['reserved']:.2f} reserved "
+                                     f"+ ${tot['held']:.2f} in flight leaves ${tot['available']:.2f} of "
+                                     f"${tot['cap']:.2f}; ${amount:.2f} requested")
+            rid = hashlib.sha256(f"{owner}\0{key}\0{now}\0{self.process}".encode()).hexdigest()[:32]
+            r = {"id": rid, "owner": owner, "key": key, "amount": round(amount, 6), "used": 0.0,
+                 "held": 0.0, "status": "active", "created": now, "expires": now + ttl_s,
+                 "meta": {k: str(v)[:128] for k, v in (meta or {}).items()}}
+            self.state["reservations"][rid] = r
+            self._save()
+            return True, dict(r), "reserved"
+
+    def finalize(self, rid=None, owner=None, key=None):
+        with self._lock:
+            now = self._clock()
+            self._roll_and_sweep(now)
+            r = self.state["reservations"].get(str(rid or ""))
+            if r is None and owner and key:
+                r = next((x for x in self.state["reservations"].values()
+                          if x.get("owner") == owner and x.get("key") == key), None)
+            if r is None:
+                return None
+            if r.get("status") == "active":
+                self._close_reservation(self.state, r, "finalized", now)
+            if self._dirty or r.get("closed_at") == now:
+                self._save()
+            return dict(r)
+
+    def hold(self, req_key, amount, rid=None):
+        """(ok, reason). Atomic check-and-hold for one request before it is forwarded."""
+        amount = round(max(0.0, float(amount or 0.0)), 6)
+        with self._lock:
+            now = self._clock()
+            self._roll_and_sweep(now)
+            from_res = 0.0
+            r = None
+            if rid:
+                r = self.state["reservations"].get(rid)
+                if r is None or r.get("status") != "active":
+                    status = "unknown" if r is None else r.get("status")
+                    if SPEND_ENFORCE:
+                        self._flush()
+                        return False, f"spend reservation {rid} is {status}"
+                    r = None
+                if r is not None:
+                    remaining = max(0.0, float(r["amount"]) - float(r.get("used") or 0) - float(r.get("held") or 0))
+                    from_res = min(amount, remaining)
+            need = round(amount - from_res, 6)
+            tot = self._totals()
+            if SPEND_ENFORCE and need > tot["available"]:
+                self._flush()
+                return False, (f"daily remote cap: ${tot['available']:.2f} of ${tot['cap']:.2f} left, "
+                               f"this request needs up to ${need:.4f} beyond its reservation")
+            if r is not None:
+                r["held"] = round(float(r.get("held") or 0) + from_res, 6)
+            self.state["holds"][req_key] = {"amount": amount, "from_res": from_res, "from_global": need,
+                                            "rid": r["id"] if r is not None else None, "created": now}
+            self._save()
+            return True, "held"
+
+    def settle(self, req_key, cost):
+        """Replace a request's hold with its priced cost, or charge an unheld remote request.
+        Idempotent per request key: a repeated settle charges nothing."""
+        with self._lock:
+            now = self._clock()
+            self._roll_and_sweep(now)
+            if req_key in self._settled or (req_key not in self.state["holds"] and not cost):
+                self._flush()
+                return 0.0
+            charged = self._settle_locked(self.state, req_key, cost)
+            self._settled[req_key] = charged
+            while len(self._settled) > 20000:
+                self._settled.popitem(last=False)
+            self._save()
+            return charged
+
+
+_SPEND_LEDGER = None
+
+
+def _spend():
+    """Lazily built so importing this module (tests, tooling) never touches the live file."""
+    global _SPEND_LEDGER
+    if _SPEND_LEDGER is None:
+        _SPEND_LEDGER = SpendLedger(SPEND_FILE)
+    return _SPEND_LEDGER
+
+
+def _spend_refusal(reason, kind="spend_cap_exhausted"):
+    return web.json_response({"error": {"message": f"gateway spend authority: {reason}", "type": kind}},
+                             status=429, headers={"Retry-After": "600"})
+
+
+def _spend_hold_for(request, ptok, maxtok, rid):
+    """Hold this remote request's upper-bound cost before forwarding. None = go ahead."""
+    info = _ACTIVE.get(id(request))
+    key = (info or {}).get("spend_key") or ("anon-" + os.urandom(8).hex())
+    ok, reason = _spend().hold(key, _spend_hold_estimate(ptok, maxtok), rid=rid)
+    if not ok:
+        log.info("spend refused %s: %s", key, reason)
+        return _spend_refusal(reason, "spend_reservation_invalid" if reason.startswith("spend reservation") else "spend_cap_exhausted")
+    if info is not None:
+        info["spend_held"] = True
+    return None
+
+
+def _spend_settle(info, resp):
+    """handle_completions' finally: price what actually went remote, release the hold."""
+    try:
+        key = info.get("spend_key")
+        if not key:
+            return
+        status = getattr(resp, "status", None)
+        if status is None:
+            status = info.get("http_status")
+        cost = 0.0
+        if (info.get("route") == "remote" and info.get("alias_kind") != "custom-remote"
+                and (status is None or status < 400)):
+            out = info.get("outtok") if info.get("outtok") is not None else info.get("outtok_lb")
+            cost = _remote_cost_estimate(info.get("ptok") or 0, out)
+        if info.get("spend_held") or cost:
+            _spend().settle(key, cost)
+    except Exception as exc:
+        log.warning("spend settle failed (hold expires and is charged): %s", exc)
+
+
+async def gateway_spend(request):
+    """GET /gateway/spend: the one daily remote-spend total (read by every controller)."""
+    return web.json_response(_spend().snapshot())
+
+
+async def gateway_spend_reserve(request):
+    try:
+        f = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+    f = f if isinstance(f, dict) else {}
+    ok, rec, reason = _spend().reserve(f.get("owner"), f.get("key"), f.get("amount"),
+                                       f.get("ttl_s", 3600), f.get("meta") or {})
+    if not ok:
+        return web.json_response({"ok": False, "reason": reason, "spend": _spend().snapshot()},
+                                 status=429 if reason.startswith("daily remote cap") else 400)
+    return web.json_response({"ok": True, "reservation": rec, "model": f"estate-remote.{rec['id']}",
+                              "outcome": reason})
+
+
+async def gateway_spend_finalize(request):
+    try:
+        f = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+    f = f if isinstance(f, dict) else {}
+    rec = _spend().finalize(f.get("reservation_id"), f.get("owner"), f.get("key"))
+    if rec is None:
+        return web.json_response({"ok": False, "error": "unknown reservation"}, status=404)
+    return web.json_response({"ok": True, "reservation": rec})
+
+
 def _note_payload_outcome(request, payload, stream):
     """Best-effort: stash the finished response's HTTP status and (non-streaming) exact
     completion-token count onto the live request registry entry (_ACTIVE), for the
@@ -1903,6 +2270,10 @@ def _resolve_alias(model):
         return {"name": name, "kind": "default"}
     if name == "estate-remote":
         return {"name": name, "kind": "builtin-remote"}
+    if name.startswith("estate-remote.") and _SPEND_RID.match(name[len("estate-remote."):]):
+        # R2: a reservation-backed request (POST /gateway/spend/reserve returns this name).
+        return {"name": "estate-remote", "kind": "builtin-remote",
+                "reservation": name[len("estate-remote."):]}
     if name == "estate-local":
         return {"name": name, "kind": "builtin-local"}
     rec = _ALIASES.get(name)
@@ -3329,7 +3700,8 @@ async def handle_completions(request):
     info.update({"ep": request.path.rsplit("/", 1)[-1], "model": str(j.get("model") or "")[:40],
                  "ptok": _est_tokens(body), "maxtok": maxtok, "stream": wants_stream(body),
                  "t0": time.time(), "phase": "routing", "route": None, "reason": None,
-                 "preview": _preview(body)[:100], "bg": is_background(body, request), "tiny": is_tiny(body)})
+                 "preview": _preview(body)[:100], "bg": is_background(body, request), "tiny": is_tiny(body),
+                 "spend_key": os.urandom(16).hex()})
     _ACTIVE[id(request)] = info
     _resp = None
     try:
@@ -3338,6 +3710,7 @@ async def handle_completions(request):
     finally:
         _info = _ACTIVE.pop(id(request), None)
         if _info is not None:
+            _spend_settle(_info, _resp)             # R2: price what went remote, release its hold
             _telemetry_note_request(_info, _resp)   # TELEMETRY: per-client rollups + error feed
 
 
@@ -3437,6 +3810,9 @@ async def _route_completions(request):
         return web.json_response({"error": {"message": f"gateway alias {alias.get('name')} is disabled",
                                               "type": "alias_disabled"}}, status=409)
     if alias_force_remote:
+        refused = _spend_hold_for(request, ptok, maxtok, alias.get("reservation"))
+        if refused is not None:
+            return refused
         log.info("route %s alias=estate-remote -> remote(alias)", path)
         record_event("remote", "alias", request, units, 0, **ev)
         return await _forward_remote(request, path, body, streaming)
@@ -3467,6 +3843,9 @@ async def _route_completions(request):
     # explicit brain escalation), but the gateway still checks remote_ok() and local-pin before
     # making the provider decision.  This keeps routing authority in one place.
     if remote_intent and remote_ok() and not local_pin and not alias_local_only:
+        refused = _spend_hold_for(request, ptok, maxtok, None)
+        if refused is not None:
+            return refused
         log.info("route %s gateway route intent=%s -> remote(intent)", path, route_intent)
         record_event("remote", "intent", request, units, 0, **ev)
         return await _forward_remote(request, path, body, streaming)
@@ -6298,6 +6677,9 @@ def make_app():
     app.router.add_get("/gateway/models/local", gateway_models_local)
     app.router.add_post("/gateway/models/local", gateway_models_local)
     app.router.add_get("/gateway/config", gateway_config)
+    app.router.add_get("/gateway/spend", gateway_spend)                        # R2 spend authority
+    app.router.add_post("/gateway/spend/reserve", gateway_spend_reserve)
+    app.router.add_post("/gateway/spend/finalize", gateway_spend_finalize)
     app.router.add_post("/gateway/config", gateway_config)
     app.router.add_get("/gateway/aliases", gateway_aliases)
     app.router.add_post("/gateway/aliases", gateway_aliases)
