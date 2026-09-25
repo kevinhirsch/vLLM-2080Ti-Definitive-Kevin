@@ -15,6 +15,7 @@ after import so other test modules in the same pytest run see exactly what they 
 Run:  python -m pytest -q test_gateway_local_first.py
 """
 import asyncio
+import atexit
 import importlib.util
 import json
 import os
@@ -25,7 +26,9 @@ from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-_TMP = tempfile.mkdtemp(prefix="gw-local-first-test-")
+_TMPDIR = tempfile.TemporaryDirectory(prefix="gw-local-first-test-")   # managed: removed at exit
+atexit.register(_TMPDIR.cleanup)
+_TMP = _TMPDIR.name
 _ISOLATED_ENV = {
     "SHIM_SPEND_FILE": os.path.join(_TMP, "gateway-spend.json"),
     "SHIM_SPEND_CLIENTS_FILE": os.path.join(_TMP, "gateway-spend-clients.json"),
