@@ -26,7 +26,8 @@ from unittest.mock import AsyncMock, patch
 
 os.environ["SHIM_EXACT_TOKENS"] = "0"
 _TMP = tempfile.mkdtemp(prefix="spend-test-")
-os.environ["SHIM_SPEND_FILE"] = os.path.join(_TMP, "never-used.json")
+# No SHIM_SPEND_FILE here: an imported shim never opens the production ledger on its own
+# (see _spend()), and setting it would leak into every other test module in the same run.
 SPEC = importlib.util.spec_from_file_location("shim_spend_test", os.environ.get(
     "SHIM_TEST_CANDIDATE", str(Path(__file__).with_name("keepalive-shim.py"))))
 shim = importlib.util.module_from_spec(SPEC)
@@ -238,7 +239,7 @@ class DayCompleteness(LedgerBase):
             name = "requests-%s.jsonl" % shim.time.strftime("%Y%m%d", shim.time.gmtime(r["t"]))
             with open(tdir / name, "a") as fh:
                 fh.write(json.dumps(r) + "\n")
-        self.assertEqual(shim.telemetry_remote_cost(start, DAY0, str(tdir)), (1.5, 2))
+        self.assertEqual(shim.telemetry_remote_cost(start, DAY0, str(tdir)), (1.5, 2, 2))   # both pre-v5 rows: estimates
 
 
 class EnforceTransition(LedgerBase):
@@ -381,7 +382,7 @@ class Seam(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(resp.body)["error"]["type"], "spend_cap_exhausted")
         self.relay.assert_not_called()
 
-    async def test_every_paid_route_is_held_overflow_and_intent_included(self):
+    async def test_explicit_remote_routes_are_refused_with_429_when_the_cap_is_exhausted(self):
         self.led.settle("earlier", 0.99)
         with patch.object(shim, "FORCE_REMOTE", 1):                            # forced window
             resp = await shim.handle_completions(Request(model="qwen-local"))
@@ -389,9 +390,15 @@ class Seam(unittest.IsolatedAsyncioTestCase):
         resp = await shim.handle_completions(Request(model="qwen-local",
                                                      headers={"X-Gateway-Route-Intent": "overflow"}))
         self.assertEqual(resp.status, 429)
-        with patch.object(shim, "local_healthy", AsyncMock(return_value=False)):   # local-down overflow
+        self.relay.assert_not_called()
+
+    async def test_cap_exhausted_and_local_down_overflow_is_a_retryable_503(self):
+        self.led.settle("earlier", 0.99)
+        with patch.object(shim, "local_healthy", AsyncMock(return_value=False)):
             resp = await shim.handle_completions(Request(model="qwen-local"))
-        self.assertEqual(resp.status, 429)
+        self.assertEqual(resp.status, 503)
+        self.assertEqual(resp.headers.get("Retry-After"), "60")
+        self.assertEqual(json.loads(resp.body)["error"]["type"], "local_unavailable_cap_exhausted")
         self.relay.assert_not_called()
 
     async def test_a_forwarded_request_is_held_then_settled_at_the_gateway_price(self):
@@ -444,6 +451,193 @@ class Seam(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(shim._resolve_alias(f"estate-remote.{rid}"),
                          {"name": "estate-remote", "kind": "builtin-remote", "reservation": rid})
         self.assertNotEqual(shim._resolve_alias("estate-remote.not-an-id").get("kind"), "builtin-remote")
+
+
+# ---- R2 v5: real (cache-aware) prices, the throughput guard, a day over the cap ----------
+
+DEEPSEEK_USAGE = {"prompt_tokens": 47_300, "completion_tokens": 301, "total_tokens": 47_601,
+                  "prompt_tokens_details": {"cached_tokens": 45_600},
+                  "prompt_cache_hit_tokens": 45_600, "prompt_cache_miss_tokens": 1_700}   # live field names
+
+
+class Pricing(unittest.TestCase):
+    def test_provider_usage_is_split_into_cache_hit_and_miss(self):
+        self.assertEqual(shim._usage_cache_split(DEEPSEEK_USAGE), (45_600, 1_700))
+        self.assertEqual(shim._usage_cache_split({"prompt_tokens": 10, "prompt_tokens_details": {"cached_tokens": 4}}), (4, 6))
+        self.assertEqual(shim._usage_cache_split({"prompt_tokens": 10}), (None, None))
+
+    def test_one_pricing_function_actual_usage_estimate(self):
+        with ExitStack() as st:
+            for n, v in dict(REMOTE_PRICE_CACHE_HIT_PER_MTOK=0.003, REMOTE_PRICE_CACHE_MISS_PER_MTOK=0.15,
+                             REMOTE_PRICE_OUTPUT_PER_MTOK=0.6, REMOTE_PRICES_JSON="", REMOTE_COST_IN_PER_MTOK=0.15,
+                             REMOTE_COST_OUT_PER_MTOK=0.6, is_peak=lambda: False).items():
+                st.enter_context(patch.object(shim, n, v))
+            actual = {"remote_cache_hit": 45_600, "remote_cache_miss": 1_700, "outtok": 301, "ptok": 50_000}
+            self.assertEqual(shim._request_remote_cost(actual),
+                             (round(45_600 * 0.003e-6 + 1_700 * 0.15e-6 + 301 * 0.6e-6, 9), "actual"))
+            usage = {"ptok_exact": 47_300, "outtok": 301, "ptok": 50_000}
+            self.assertEqual(shim._request_remote_cost(usage)[1], "usage")
+            self.assertEqual(shim._request_remote_cost({"ptok": 50_000, "outtok": 301})[1], "estimate")
+            with patch.object(shim, "REMOTE_PRICES_JSON", '{"deepseek-pro": {"cache_hit": 1, "cache_miss": 2, "output": 3}}'):
+                self.assertEqual(shim._remote_prices("deepseek-pro"), (1.0, 2.0, 3.0))
+                self.assertEqual(shim._remote_prices("deepseek-flash"), (0.003, 0.15, 0.6))
+
+    def test_billing_day_replayed_through_the_pricing_matches_the_bill(self):
+        """Kevin's DeepSeek bill 2026-09-25 00:00-13:00 (numbers only): 5,754 requests,
+        262,519,512 cache-hit + 9,879,145 cache-miss input tokens, 1,733,123 output = $3.3093."""
+        with ExitStack() as st:
+            for n, v in dict(REMOTE_PRICE_CACHE_HIT_PER_MTOK=0.003, REMOTE_PRICE_CACHE_MISS_PER_MTOK=0.15,
+                             REMOTE_PRICE_OUTPUT_PER_MTOK=0.6, REMOTE_PRICES_JSON="").items():
+                st.enter_context(patch.object(shim, n, v))
+            total = sum(shim._request_remote_cost(row)[0] for row in _billing_day_rows())
+        self.assertAlmostEqual(total, 3.309304, delta=3.309304 * 0.02)
+
+
+def _billing_day_rows(n=5_754, hit=262_519_512, miss=9_879_145, out=1_733_123):
+    rows = []
+    for i in range(n):
+        rows.append({"remote_cache_hit": hit // n + (1 if i < hit % n else 0),
+                     "remote_cache_miss": miss // n + (1 if i < miss % n else 0),
+                     "outtok": out // n + (1 if i < out % n else 0), "ptok": 47_000})
+    return rows
+
+
+class DayOverTheCap(LedgerBase):
+    def test_an_imported_day_already_over_the_cap_refuses_cleanly_all_day(self):
+        clock, calls = Clock(), []
+        self.path.write_text(json.dumps({"version": 1, "day": shim._spend_day(DAY0), "spent": 0.5,
+                                         "reservations": {}, "holds": {}, "process": "old"}))
+        led = ledger(self.path, cap=25.0, clock=clock,
+                     importer=lambda s, e: (calls.append(1), (42.0, 5_743, 5_743))[1])
+        for _ in range(50):                                   # busy day: many reads, no reloop
+            snap = led.snapshot()
+            self.assertFalse(led.can_hold(0.01))
+            self.assertFalse(led.hold(f"r{_}", 0.01)[0])
+            self.assertFalse(led.reserve("card-runner", f"k{_}", 1.5, 600)[0])
+            clock.t += 60
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(snap["enforce"] and snap["imported"]["upper_bound"])
+        self.assertEqual((snap["available"], round(snap["spent"], 2)), (0.0, 42.0))
+        # the operator replaces the no-cache upper bound with the provider's bill
+        ok, detail = led.recover(spent=3.309304, replace=True, source="DeepSeek bill 00:00-13:00")
+        self.assertTrue(ok)
+        self.assertAlmostEqual(led.snapshot()["available"], 25.0 - 3.309304, places=5)
+        self.assertTrue(led.can_hold(0.05))
+        # next Phoenix day starts from zero, complete, enforcing
+        clock.t = shim._spend_day_start(DAY0) + 86400 + 1
+        snap = led.snapshot()
+        self.assertEqual((snap["spent"], snap["day_complete"], snap["enforce"]), (0.0, True, True))
+
+    def test_replace_needs_an_explicit_operator_figure(self):
+        led = ledger(self.path)
+        self.assertFalse(led.recover(replace=True)[0])
+        led.settle("x", 2.0)
+        self.assertTrue(led.recover(spent=1.0)[0])            # plain re-import never lowers
+        self.assertAlmostEqual(led.snapshot()["spent"], 2.0)
+
+
+class TodaysPaceNeverStrandsTheCap(LedgerBase):
+    def test_a_full_day_at_todays_pace_never_refuses_at_25(self):
+        """24h at today's measured pace (5,754 requests in 13h -> ~10,623/day), 16 requests in
+        flight, each HELD at the worst-case no-cache upper bound (peak rates, 32K max_tokens) and
+        SETTLED at the billed average ($3.3093/5,754), plus ten $1.50 runner reservations."""
+        clock = Clock(shim._spend_day_start(DAY0) + 1)
+        led = ledger(self.path, cap=25.0, clock=clock)
+        with ExitStack() as st:
+            for n, v in dict(REMOTE_COST_IN_PER_MTOK=0.15, REMOTE_COST_OUT_PER_MTOK=0.6,
+                             REMOTE_COST_IN_PER_MTOK_PEAK=0.3, REMOTE_COST_OUT_PER_MTOK_PEAK=1.2).items():
+                st.enter_context(patch.object(shim, n, v))
+            hold = shim._spend_hold_estimate(47_300, 32_768)
+        per_request = 3.309304 / 5_754
+        n, inflight, refused, peak = int(5_754 * 24 / 13), [], 0, 0.0
+        step = 86_000 / n
+        for i in range(n):
+            if i % 1_000 == 0:
+                ok, r, _ = led.reserve("card-runner", f"attempt-{i}", 1.5, 3600)
+                self.assertTrue(ok)
+                led.finalize(r["id"], owner="card-runner")
+            ok, _ = led.hold(f"q{i}", hold)
+            refused += not ok
+            inflight.append(f"q{i}")
+            if len(inflight) > 16:
+                led.settle(inflight.pop(0), per_request)
+            t = led._totals()
+            peak = max(peak, t["spent"] + t["reserved"] + t["held"])
+            clock.t += step
+        for k in inflight:
+            led.settle(k, per_request)
+        self.assertEqual(refused, 0)
+        self.assertLess(peak, 25.0)
+        self.assertAlmostEqual(led.snapshot()["spent"], n * per_request, places=2)   # ~$6.11
+
+
+class ThroughputGuard(unittest.IsolatedAsyncioTestCase):
+    """Cap exhausted: an OVERFLOW is served locally; explicit remote gets 429."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="spend-tg-", dir=_TMP))
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.led = ledger(self.dir / "gateway-spend.json", cap=1.0)
+        self.led.settle("earlier", 1.0)                         # the day's cap is spent
+        self.calls = []
+
+        async def relay(request, base, path, body, key, streaming, *a, **k):
+            self.calls.append("local" if base == shim.LOCAL else "remote")
+            return "ok", shim.web.json_response({"ok": True, "served": self.calls[-1]})
+        values = dict(_SPEND_LEDGER=self.led, _relay=relay, _inflight=0, _inflight_tokens=0,
+                      _inflight_reserved_tokens=0, _waiting=0, _health={"ok": True},
+                      TOKEN_BUDGET=10**7, LOCAL_MAX_OUT=4096, DEFAULT_MAX_OUT=4096,
+                      MAX_LOCAL_TOKENS=10**7, LOCAL_CONTEXT_LIMIT=10**7, FORCE_REMOTE=0,
+                      BIG_OUTPUT=0, BIG_PROMPT=96_000, MONSTER_INFLIGHT=0, FOREIGN_LOAD_GUARD=0,
+                      TINY_TOKENS=0, LOCAL_WAIT=0, BG_WAIT=0, BG_LOCAL_ONLY=0, FG_RESERVED=0,
+                      BG_BIG_LOCAL_WHEN_IDLE=0, LOG_REQUESTS=0, CRASH_ADAPTIVE=0, EMPTY_RETRY=0,
+                      REMOTE_BASE="https://remote.test", REMOTE_CONTEXT_LIMIT=10**7, _est_tokens=lambda body: 200_000,
+                      estimate_units=lambda *a, **k: 1, effective_budget=lambda: 10, remote_ok=lambda: True,
+                      local_healthy=AsyncMock(return_value=True), is_peak=lambda: False,
+                      record_event=lambda *a, **k: None, _note_payload_outcome=lambda *a, **k: None,
+                      _note_remote_response=AsyncMock(), perf_breaker_active=lambda: False,
+                      predicted_occupancy_seconds=lambda *a, **k: None, _telemetry_note_request=lambda *a, **k: None,
+                      _write_flightrec=lambda *a, **k: None)
+        for name, value in values.items():
+            self.stack.enter_context(patch.object(shim, name, value))
+
+    async def test_cap_exhausted_big_prompt_is_served_locally(self):
+        resp = await shim.handle_completions(Request(model="qwen-local", max_tokens=1000))
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(self.calls, ["local"])
+
+    async def test_with_budget_the_same_big_prompt_still_overflows(self):
+        self.led.recover(spent=0.0, replace=True, source="test")
+        with patch.object(shim, "_spend_hold_estimate", lambda p, m: 0.001):
+            resp = await shim.handle_completions(Request(model="qwen-local", max_tokens=1000))
+        self.assertEqual((resp.status, self.calls), (200, ["remote"]))
+
+    async def test_cap_exhausted_estate_remote_is_429(self):
+        resp = await shim.handle_completions(Request(model="estate-remote", max_tokens=1000))
+        self.assertEqual(resp.status, 429)
+        self.assertEqual(self.calls, [])
+
+    async def test_cap_exhausted_and_local_down_is_a_retryable_503(self):
+        with patch.object(shim, "local_healthy", AsyncMock(return_value=False)):
+            resp = await shim.handle_completions(Request(model="qwen-local", max_tokens=1000))
+        self.assertEqual((resp.status, resp.headers.get("Retry-After")), (503, "60"))
+        self.assertEqual(self.calls, [])
+
+    async def test_an_overflow_refused_in_a_race_falls_back_to_local(self):
+        """The pre-check said yes, the atomic hold said no (another spender got there first)."""
+        with patch.object(shim, "_spend_allows_overflow", lambda p, m: True):
+            resp = await shim.handle_completions(Request(model="qwen-local", max_tokens=1000))
+        self.assertEqual((resp.status, self.calls), (200, ["local"]))
+
+    async def test_local_failure_with_no_budget_is_a_503_not_a_second_local_try(self):
+        async def failing(request, base, *a, **k):
+            self.calls.append("local" if base == shim.LOCAL else "remote")
+            return "error", (500, "engine fault", False)
+        with patch.object(shim, "_relay", failing), patch.object(shim, "BIG_PROMPT", 0), \
+                patch.object(shim, "_spend_allows_overflow", lambda p, m: True):
+            resp = await shim.handle_completions(Request(model="qwen-local", max_tokens=1000))
+        self.assertEqual((resp.status, self.calls), (503, ["local"]))
 
 
 if __name__ == "__main__":

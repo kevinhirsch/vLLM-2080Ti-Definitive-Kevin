@@ -1143,6 +1143,58 @@ async def _telemetry_sampler():
             log.warning("telemetry sampler: %s", e)
 
 
+# R2 v5 (2026-09-25): ACTUAL provider prices, per token type, from Kevin's DeepSeek billing
+# export for 2026-09-25 (model deepseek-flash): input cache hit $0.003/Mtok, input cache miss
+# $0.15/Mtok, output $0.60/Mtok. 96.4% of today's input tokens were cache hits, so the
+# no-cache list estimate below overstated the real bill 12.7x ($41.90 vs $3.31 for
+# 00:00-13:00). Settlement, the dashboard's per-client cost and the telemetry use these
+# prices on the provider's own usage counts (prompt_cache_hit_tokens / prompt_cache_miss_tokens
+# / completion_tokens). Per-model overrides: SHIM_REMOTE_PRICES_JSON, e.g.
+# {"deepseek-flash": {"cache_hit": 0.003, "cache_miss": 0.15, "output": 0.6}} ($/Mtok).
+REMOTE_PRICE_CACHE_HIT_PER_MTOK = float(os.environ.get("SHIM_REMOTE_PRICE_CACHE_HIT_PER_MTOK", "0.003"))
+REMOTE_PRICE_CACHE_MISS_PER_MTOK = float(os.environ.get("SHIM_REMOTE_PRICE_CACHE_MISS_PER_MTOK", "0.15"))
+REMOTE_PRICE_OUTPUT_PER_MTOK = float(os.environ.get("SHIM_REMOTE_PRICE_OUTPUT_PER_MTOK", "0.6"))
+REMOTE_PRICES_JSON = os.environ.get("SHIM_REMOTE_PRICES_JSON", "")
+_CFG.update({
+    "SHIM_REMOTE_PRICE_CACHE_HIT_PER_MTOK": ("REMOTE_PRICE_CACHE_HIT_PER_MTOK", float),
+    "SHIM_REMOTE_PRICE_CACHE_MISS_PER_MTOK": ("REMOTE_PRICE_CACHE_MISS_PER_MTOK", float),
+    "SHIM_REMOTE_PRICE_OUTPUT_PER_MTOK": ("REMOTE_PRICE_OUTPUT_PER_MTOK", float),
+    "SHIM_REMOTE_PRICES_JSON": ("REMOTE_PRICES_JSON", str),
+})
+
+
+def _remote_prices(model=None):
+    """($/Mtok cache hit, cache miss, output) for a remote model."""
+    try:
+        row = (json.loads(REMOTE_PRICES_JSON) if REMOTE_PRICES_JSON else {}).get(str(model or "")) or {}
+    except Exception:
+        row = {}
+    return (float(row.get("cache_hit", REMOTE_PRICE_CACHE_HIT_PER_MTOK)),
+            float(row.get("cache_miss", REMOTE_PRICE_CACHE_MISS_PER_MTOK)),
+            float(row.get("output", REMOTE_PRICE_OUTPUT_PER_MTOK)))
+
+
+def _remote_cost_actual(model, cache_hit, cache_miss, outtok):
+    hit_p, miss_p, out_p = _remote_prices(model)
+    return round((max(0, cache_hit or 0) / 1e6) * hit_p + (max(0, cache_miss or 0) / 1e6) * miss_p
+                 + (max(0, outtok or 0) / 1e6) * out_p, 9)
+
+
+def _request_remote_cost(info):
+    """(usd, basis) for one finished remote request -- the ONE pricing function behind
+    settlement, the per-client dashboard and the telemetry. 'actual': the provider reported
+    cache hit/miss counts; 'usage': it reported only prompt_tokens (priced as cache misses);
+    'estimate': no usage at all (no-cache list estimate, an upper bound)."""
+    out = info.get("outtok") if info.get("outtok") is not None else info.get("outtok_lb")
+    model = info.get("remote_model") or REMOTE_MODEL
+    hit, miss = info.get("remote_cache_hit"), info.get("remote_cache_miss")
+    if hit is not None and miss is not None:
+        return _remote_cost_actual(model, hit, miss, out), "actual"
+    if info.get("ptok_exact") is not None:
+        return _remote_cost_actual(model, 0, info.get("ptok_exact"), out), "usage"
+    return _remote_cost_estimate(info.get("ptok") or 0, out), "estimate"
+
+
 def _remote_cost_estimate(ptok, outtok):
     """est. remote cost = tokens x configurable $/Mtok, peak/off-peak aware (reuses the
     EXISTING is_peak() rather than a second copy of the peak-hours logic)."""
@@ -1237,11 +1289,14 @@ def _spend_hold_estimate(ptok, maxtok):
 
 
 def telemetry_remote_cost(start, end, telemetry_dir=None):
-    """(usd, requests) the gateway itself recorded as remote spend in [start, end), from its
-    request telemetry (requests-YYYYMMDD.jsonl, UTC-named). Same rule as settle: default
-    provider only, status < 400. None when a needed file cannot be read."""
+    """(usd, requests, estimated_requests) the gateway itself recorded as remote spend in
+    [start, end), from its request telemetry (requests-YYYYMMDD.jsonl, UTC-named). Same rule as
+    settle: default provider only, status < 400. Rows written since R2 v5 carry the
+    cache-aware ACTUAL cost (cost_basis 'actual'/'usage'); older rows carry only the no-cache
+    list estimate and are counted in `estimated_requests` (their sum is an upper bound --
+    replace it with the provider's bill via spend_reconcile.py). None when unreadable."""
     tdir = telemetry_dir or TELEMETRY_DIR
-    usd, n = 0.0, 0
+    usd, n, est = 0.0, 0, 0
     day = int(start // 86400)
     while day * 86400 < end:
         path = os.path.join(tdir, "requests-%s.jsonl" % time.strftime("%Y%m%d", time.gmtime(day * 86400)))
@@ -1262,9 +1317,11 @@ def telemetry_remote_cost(start, end, telemetry_dir=None):
                             and (status is None or int(status) < 400)):
                         usd += float(r.get("cost_est") or 0.0)
                         n += 1
+                        if r.get("cost_basis") not in ("actual", "usage"):
+                            est += 1
         except OSError:
             return None
-    return round(usd, 6), n
+    return round(usd, 6), n, est
 
 
 class SpendLedgerError(RuntimeError):
@@ -1409,9 +1466,11 @@ class SpendLedger:
         got = self._importer(_spend_day_start(now, self.tz), now)
         if got is None:
             return
-        usd, n = got
+        usd, n = got[0], got[1]
+        est = got[2] if len(got) > 2 else 0
         st["spent"] = round(max(float(st.get("spent") or 0), float(usd)), 6)
-        st["imported"] = {"day": st["day"], "telemetry_usd": usd, "requests": n, "at": now}
+        st["imported"] = {"day": st["day"], "telemetry_usd": usd, "requests": n,
+                          "estimated_requests": est, "upper_bound": bool(est), "at": now}
         st["complete_day"] = st["day"]
         self._dirty = True
 
@@ -1616,6 +1675,16 @@ class SpendLedger:
                 self._dirty = True
             return True, "held"
 
+    def can_hold(self, amount):
+        """Non-mutating: would a hold of `amount` without a reservation be granted now?"""
+        with self._lock:
+            now = self._clock()
+            self._roll_and_sweep(now)
+            self._flush_quietly()
+            if self.state.get("corrupt"):
+                return False
+            return (not self.enforcing()) or round(float(amount), 6) <= self._totals()["available"]
+
     def settle(self, req_key, cost):
         """Replace a request's hold with its priced cost, or charge an unheld remote request.
         Idempotent per request key. A failed write keeps the charge in memory (still counted)
@@ -1634,7 +1703,7 @@ class SpendLedger:
             self._flush_quietly()
             return charged
 
-    def recover(self, spent=None, reason=""):
+    def recover(self, spent=None, reason="", replace=False, source=None):
         """Governed recovery from a corrupt ledger (or a re-import): a fresh ledger whose
         spend is the operator's figure or, if none, the gateway's own telemetry for today.
         The corrupt artifact is left untouched. -> (ok, detail)."""
@@ -1653,10 +1722,16 @@ class SpendLedger:
                 spent = float(spent)
                 if spent < 0:
                     return False, "spent must be >= 0"
-                source = "operator"
+                source = ("operator-replace" if replace else "operator") + (f": {str(source)[:120]}" if source else "")
             if not prior.get("corrupt"):
-                spent = max(spent, float(prior.get("spent") or 0))
+                # A re-import never lowers today's figure unless the operator explicitly REPLACES
+                # it with an attested provider figure (spend_reconcile.py, from the bill).
+                if not replace:
+                    spent = max(spent, float(prior.get("spent") or 0))
                 fresh["reservations"], fresh["holds"] = prior.get("reservations", {}), prior.get("holds", {})
+                fresh["since"] = prior.get("since")
+            if replace and spent is not None and not str(source).startswith("operator-replace"):
+                return False, "replace needs an explicit operator figure"
             fresh.update(spent=round(spent, 6), complete_day=fresh["day"],
                          recovered={"at": now, "source": source, "reason": str(reason)[:200],
                                     "prior_corrupt": prior.get("corrupt"),
@@ -1671,10 +1746,19 @@ _SPEND_LEDGER = None
 
 
 def _spend():
-    """Lazily built so importing this module (tests, tooling) never touches the live file."""
+    """The process's ledger. Only the SERVICE (run as __main__) or a caller that sets
+    SHIM_SPEND_FILE explicitly ever opens the production path. An imported copy (tests,
+    tooling) that merely routes a request gets a private throwaway ledger with no telemetry
+    import -- 2026-09-25: a v5 test run that imported this module without SHIM_SPEND_FILE
+    rewrote the live ledger file for ~7 minutes (the live process then overwrote it back)."""
     global _SPEND_LEDGER
     if _SPEND_LEDGER is None:
-        _SPEND_LEDGER = SpendLedger(SPEND_FILE)
+        if __name__ == "__main__" or "SHIM_SPEND_FILE" in os.environ:
+            _SPEND_LEDGER = SpendLedger(SPEND_FILE)
+        else:
+            import tempfile
+            _SPEND_LEDGER = SpendLedger(os.path.join(tempfile.mkdtemp(prefix="shim-spend-"), "gateway-spend.json"),
+                                        importer=None)
     return _SPEND_LEDGER
 
 
@@ -1713,7 +1797,22 @@ def _spend_client(request):
 
 def _spend_refusal(reason, kind="spend_cap_exhausted"):
     return web.json_response({"error": {"message": f"gateway spend authority: {reason}", "type": kind}},
-                             status=429, headers={"Retry-After": "600"})
+                             status=429, headers={"Retry-After": "600", "X-Gateway-Spend-Refused": kind})
+
+
+def _cap_exhausted_unavailable(why):
+    return web.json_response({"error": {"message": f"{why}; retry later", "type": "local_unavailable_cap_exhausted"}},
+                             status=503, headers={"Retry-After": "60"})
+
+
+def _spend_allows_overflow(ptok, maxtok):
+    """May an OVERFLOW (gateway-chosen, not caller-requested) request go remote right now?
+    False when the cap is exhausted or the ledger is unusable -- the router then serves it
+    locally (queueing for a lane) instead of refusing it."""
+    try:
+        return _spend().can_hold(_spend_hold_estimate(ptok, maxtok))
+    except Exception:
+        return False
 
 
 def _spend_hold_for(request, body):
@@ -1750,8 +1849,7 @@ def _spend_settle(info, resp):
         cost = 0.0
         if (info.get("route") == "remote" and info.get("alias_kind") != "custom-remote"
                 and (status is None or status < 400)):
-            out = info.get("outtok") if info.get("outtok") is not None else info.get("outtok_lb")
-            cost = _remote_cost_estimate(info.get("ptok") or 0, out)
+            cost, _basis = _request_remote_cost(info)     # cache-aware ACTUAL when usage is known
         if info.get("spend_held") or cost:
             _spend().settle(key, cost)
     except Exception as exc:
@@ -1810,7 +1908,8 @@ async def gateway_spend_recover(request):
     if not _admin_ok(request):
         return web.json_response({"ok": False, "error": "unauthorized: X-Admin-Token required"}, status=401)
     f = await _spend_body(request) or {}
-    ok, detail = _spend().recover(f.get("spent"), f.get("reason") or "")
+    ok, detail = _spend().recover(f.get("spent"), f.get("reason") or "",
+                                  replace=bool(f.get("replace")), source=f.get("source"))
     log.warning("spend ledger recovery requested: ok=%s detail=%s", ok, detail)
     return web.json_response({"ok": ok, "detail": detail, "spend": _spend().snapshot()},
                              status=200 if ok else 409)
@@ -1874,10 +1973,9 @@ def _telemetry_note_request(info, resp=None):
         ttft = info.get("ttft")
         if ttft is not None:
             c["ttft_sum"] += ttft; c["ttft_n"] += 1
-        req_cost = 0.0
+        req_cost, cost_basis = 0.0, None
         if route == "remote":
-            req_cost = _remote_cost_estimate(
-                info.get("ptok") or 0, outtok if outtok is not None else outtok_lb)
+            req_cost, cost_basis = _request_remote_cost(info)
             c["cost_est_usd"] += req_cost
         if (status is not None and status >= 400) or reason == "failover" or info.get("stream_watchdog"):
             c["errors"] += 1
@@ -1933,7 +2031,9 @@ def _telemetry_note_request(info, resp=None):
             "duration": duration,
             "status": status, "stream": bool(info.get("stream")),
             "bg": bool(info.get("bg")), "tiny": bool(info.get("tiny")),
-            "preview": info.get("preview"), "cost_est": req_cost,
+            "preview": info.get("preview"), "cost_est": req_cost, "cost_basis": cost_basis,
+            "remote_model": info.get("remote_model"), "remote_cache_hit": info.get("remote_cache_hit"),
+            "remote_cache_miss": info.get("remote_cache_miss"),
             # gw-ttft-decomposition-telemetry: admission_wait duplicates `waited` under the
             # AC-named field so the JSONL is self-auditable against the card without a lookup
             # table; decode_time is new (see decompose_timing()'s docstring for why engine_queue
@@ -3636,6 +3736,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
     # leaves this None, which computed_actual below must NOT treat as "0 cached" by accident.
     _exact_ptok = [None]
     _exact_cached = [None]
+    _exact_hit, _exact_miss = [None], [None]     # R2 v5: provider cache accounting (remote)
     _is_remote_relay = (base.rstrip("/") != LOCAL.rstrip("/"))
 
     def _scan_usage(data):
@@ -3673,6 +3774,9 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
                     ptd = uu.get("prompt_tokens_details")
                     if ptd and "cached_tokens" in ptd:
                         _exact_cached[0] = int(ptd["cached_tokens"])
+                    hit, miss = _usage_cache_split(uu)
+                    if hit is not None:
+                        _exact_hit[0], _exact_miss[0] = hit, miss
                 if _exact_finish[0] is None and b'"finish_reason"' in ln:
                     ch = (json.loads(raw).get("choices") or [{}])[0]
                     fr = ch.get("finish_reason")
@@ -3750,6 +3854,8 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
         # concept, and remote's own cache accounting (if any) isn't comparable to it.
         if not _is_remote_relay and _exact_ptok[0] is not None:
             _outkw["computed_actual"] = max(0, _exact_ptok[0] - (_exact_cached[0] or 0))
+        if _is_remote_relay:
+            _outkw.update(_remote_usage_kw(_exact_ptok[0], _exact_hit[0], _exact_miss[0]))
         _active_set(request, **_outkw)
         for k, v in _route_receipt().items():
             resp.headers[k] = v
@@ -3802,8 +3908,35 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
         _outkw["outtok"] = _exact_outtok[0]
     if _is_remote_relay and _exact_finish[0] is not None:
         _outkw["finish_reason"] = _exact_finish[0]
+    if _is_remote_relay:
+        _outkw.update(_remote_usage_kw(_exact_ptok[0], _exact_hit[0], _exact_miss[0]))
     _active_set(request, **_outkw)
     return "ok", resp
+
+
+def _usage_cache_split(usage):
+    """(cache_hit, cache_miss) prompt tokens from a provider usage object, or (None, None).
+    DeepSeek reports prompt_cache_hit_tokens / prompt_cache_miss_tokens (verified on a live
+    response 2026-09-25); OpenAI-compatible providers report prompt_tokens_details.cached_tokens."""
+    try:
+        if "prompt_cache_hit_tokens" in usage and "prompt_cache_miss_tokens" in usage:
+            return int(usage["prompt_cache_hit_tokens"]), int(usage["prompt_cache_miss_tokens"])
+        ptd = usage.get("prompt_tokens_details") or {}
+        if "cached_tokens" in ptd and "prompt_tokens" in usage:
+            hit = int(ptd["cached_tokens"])
+            return hit, max(0, int(usage["prompt_tokens"]) - hit)
+    except Exception:
+        pass
+    return None, None
+
+
+def _remote_usage_kw(ptok_exact, hit, miss):
+    kw = {}
+    if ptok_exact is not None:
+        kw["ptok_exact"] = ptok_exact
+    if hit is not None and miss is not None:
+        kw["remote_cache_hit"], kw["remote_cache_miss"] = hit, miss
+    return kw
 
 
 def classify_remote_response(payload):
@@ -3921,6 +4054,9 @@ async def _note_remote_response(request, payload, body):
         _active_set(request, finish_reason=cls["finish_reason"], content_len=cls["content_len"],
                     content_empty=cls["content_empty"], has_tool_calls=cls["has_tool_calls"],
                     ptok_exact=cls["prompt_tokens"])
+        hit, miss = _usage_cache_split(parsed.get("usage") or {}) if isinstance(parsed, dict) else (None, None)
+        if hit is not None:
+            _active_set(request, remote_cache_hit=hit, remote_cache_miss=miss)
         empty_no_tool = cls["content_empty"] and not cls["has_tool_calls"]
         if empty_no_tool:
             log.warning("remote returned EMPTY content (finish_reason=%s, completion_tokens=%s)",
@@ -3972,6 +4108,7 @@ async def _forward_remote(request, path, body, streaming, endpoint=None):
                 context_limit=limit, context_prompt_tokens=ctx.get("prompt_tokens"),
                 context_compacted=bool(ctx.get("compacted")),
                 context_omitted=int(ctx.get("omitted", 0) or 0))
+    _active_set(request, remote_model=model)
     relay_body = remap_for_remote(prepared, model, max_output)
     kind, payload = await _relay(request, base, path, relay_body, key, streaming,
                                  provider_name=model)
@@ -4056,7 +4193,7 @@ def _bg_reject_response():
                          headers={"Retry-After": str(BG_REJECT_RETRY_SECS)})
 
 
-async def _route_completions(request):
+async def _route_completions(request, _no_overflow=False):
     global _inflight, _waiting, _inflight_tokens, _inflight_reserved_tokens
     path = request.path
     body = await request.read()
@@ -4085,6 +4222,26 @@ async def _route_completions(request):
     alias_force_remote = alias_kind == "builtin-remote"
     custom_endpoint = alias.get("endpoint") if alias_kind == "custom-remote" else None
     _active_set(request, alias=alias.get("name"), alias_kind=alias_kind)
+    # R2 v5 THROUGHPUT GUARD (Kevin, 2026-09-25): the daily remote cap is hard, but an OVERFLOW
+    # -- a remote trip the GATEWAY chose (size, big-prompt, big-out, local-down, monster, perf,
+    # predicted, tiny-fast, admission timeout) -- must never die of it. When the cap has no room
+    # for this request (or the ledger is unusable), every overflow branch below sees
+    # overflow_ok=False and the request is served LOCALLY instead: it queues for a lane (the
+    # engine serves 524K context; latency is acceptable). Only explicit remote -- the
+    # estate-remote alias, route-intent remote, the forced window -- gets the 429, because those
+    # callers handle refusal themselves. Local genuinely DOWN with no budget -> 503 + Retry-After.
+    overflow_ok = (not _no_overflow) and remote_ok() and _spend_allows_overflow(ptok, maxtok)
+
+    async def _overflow_forward(reentry=True):
+        """Forward an overflow; if the spend authority refuses it after all (a race with other
+        spenders), serve it locally (reentry) or, when local has already failed, report 503."""
+        resp = await _forward_remote(request, path, body, streaming)
+        if resp is not None and getattr(resp, "headers", {}).get("X-Gateway-Spend-Refused"):
+            if reentry:
+                log.info("route %s overflow refused by the spend authority -> local", path)
+                return await _route_completions(request, _no_overflow=True)
+            return _cap_exhausted_unavailable("local failed and the daily remote cap is exhausted")
+        return resp
     # BG-LOCAL-ONLY: set to the triggering reason ("local-down") once a background request has
     # been HELD for an engine-health recovery below. When set, a local success further down in
     # this function (tiny fast-lane / empty-retry / normal admission) is recorded as
@@ -4142,7 +4299,7 @@ async def _route_completions(request):
     remote_intent = route_intent in {"remote", "overflow", "deepseek"}
 
     # ROUTE-INTENT: callers can ask the gateway to treat this as overflow work (for example an
-    # explicit brain escalation), but the gateway still checks remote_ok() and local-pin before
+    # explicit brain escalation), but the gateway still checks overflow_ok and local-pin before
     # making the provider decision.  This keeps routing authority in one place.
     if remote_intent and remote_ok() and not local_pin and not alias_local_only:
         log.info("route %s gateway route intent=%s -> remote(intent)", path, route_intent)
@@ -4150,24 +4307,24 @@ async def _route_completions(request):
         return await _forward_remote(request, path, body, streaming)
 
     # size cap: too-big-for-this-box requests OOM local even at budget=1 -> send straight to remote
-    if remote_ok() and not local_pin and not alias_local_only and over_local_cap(body):
+    if overflow_ok and not local_pin and not alias_local_only and over_local_cap(body):
         log.info("route %s est prompt+max > %d -> remote(size)", path, MAX_LOCAL_TOKENS)
         record_event("remote", "size", request, units, 0, **ev)
-        return await _forward_remote(request, path, body, streaming)
+        return await _overflow_forward()
 
     # big-OUTPUT requests (e.g. Hermes max_tokens=65536): long generations that saturate this slow
     # box and hang interactive clients -> straight to remote (DeepSeek serves them far faster).
-    if remote_ok() and not local_pin and not alias_local_only and BIG_OUTPUT > 0 and maxtok >= BIG_OUTPUT:
+    if overflow_ok and not local_pin and not alias_local_only and BIG_OUTPUT > 0 and maxtok >= BIG_OUTPUT:
         log.info("route %s maxtok=%d >= %d -> remote(big-out)", path, maxtok, BIG_OUTPUT)
         record_event("remote", "big-out", request, units, 0, **ev)
-        return await _forward_remote(request, path, body, streaming)
+        return await _overflow_forward()
 
     # big-PROMPT requests (e.g. a pi session whose context has grown huge): can't prefill within the
     # first-token cap on this slow box and would saturate/OOM local -> straight to remote up front.
-    if remote_ok() and not local_pin and not alias_local_only and BIG_PROMPT > 0 and ptok >= BIG_PROMPT:
+    if overflow_ok and not local_pin and not alias_local_only and BIG_PROMPT > 0 and ptok >= BIG_PROMPT:
         log.info("route %s ptok=%d >= %d -> remote(big-prompt)", path, ptok, BIG_PROMPT)
         record_event("remote", "big-prompt", request, units, 0, **ev)
-        return await _forward_remote(request, path, body, streaming)
+        return await _overflow_forward()
 
     # local DOWN -> overflow immediately (waiting for a slot won't help a dead engine) --
     # UNLESS this is background traffic under BG_LOCAL_ONLY: hold it and poll for recovery
@@ -4192,44 +4349,47 @@ async def _route_completions(request):
             # FALL THROUGH: local is healthy again, so every check below (monster bypass, tiny
             # fast-lane, admission wait, relay) runs exactly as it would have if
             # local_healthy() had returned True on the very first check above.
-        elif remote_ok() and not alias_local_only:
+        elif overflow_ok and not alias_local_only:
             log.info("route %s local unhealthy -> remote(local-down)", path)
             record_event("remote", "local-down", request, units, 0, **ev)
-            return await _forward_remote(request, path, body, streaming)
+            return await _overflow_forward()
         elif alias_local_only:
             return web.json_response({"error": {"message": "estate-local requires the local engine, which is currently unavailable",
                                                   "type": "local_unavailable"}}, status=503)
+        elif remote_ok():
+            # local DOWN and the remote cap has no room for this overflow: nothing can serve it now
+            return _cap_exhausted_unavailable("local engine is down and the daily remote cap is exhausted")
 
     # MONSTER-IN-FLIGHT bypass: a huge prefill is monopolizing engine steps; anything admitted
     # now would crawl (~1 tok per chunk-step). Route new arrivals remote until it drains.
     _foreign = _health.get("foreign", 0) if FOREIGN_LOAD_GUARD else 0
     _foreign_heavy = bool(_health.get("foreign_heavy", False)) if FOREIGN_LOAD_GUARD else False
-    if remote_ok() and not local_pin and not alias_local_only and (
+    if overflow_ok and not local_pin and not alias_local_only and (
             (MONSTER_INFLIGHT > 0 and _inflight_tokens >= MONSTER_INFLIGHT)
             or _foreign_heavy
     ):
         log.info("route %s monster/foreign inflight tok=%d foreign=%d foreign_tok=%d -> remote(monster)",
                  path, _inflight_tokens, _foreign, int(_health.get("foreign_tokens", 0) or 0))
         record_event("remote", "monster", request, units, 0, **ev)
-        return await _forward_remote(request, path, body, streaming)
+        return await _overflow_forward()
 
     # PERFORMANCE BREAKER: sustained measured queue/prefill/KV/GPU pressure sends new work to
     # the configured remote provider. In-flight local work is allowed to finish; no unsafe
     # mid-generation migration is attempted.
-    if remote_ok() and not local_pin and not alias_local_only and perf_breaker_active():
+    if overflow_ok and not local_pin and not alias_local_only and perf_breaker_active():
         log.info("route %s performance breaker (%s) -> remote(perf)",
                  path, _PERF_STATE.get("reason", "overload"))
         record_event("remote", "perf", request, units, 0, **ev)
-        return await _forward_remote(request, path, body, streaming)
+        return await _overflow_forward()
 
     predicted = predicted_occupancy_seconds(ptok, maxtok, max(1, _inflight + 1))
     _active_set(request, predicted_occupancy_s=predicted)
-    if (remote_ok() and not local_pin and not alias_local_only and predicted is not None
+    if (overflow_ok and not local_pin and not alias_local_only and predicted is not None
             and predicted >= PREDICTED_OCCUPANCY_SECS):
         log.info("route %s predicted occupancy %.1fs >= %.1fs -> remote(predicted)",
                  path, predicted, PREDICTED_OCCUPANCY_SECS)
         record_event("remote", "predicted", request, units, 0, **ev)
-        return await _forward_remote(request, path, body, streaming)
+        return await _overflow_forward()
 
     try:
         local_body = _prepare_local_body(request, body, background)
@@ -4238,9 +4398,9 @@ async def _route_completions(request):
         if local_context_body is None:
             if alias_local_only or LOCAL_ONLY:
                 return _context_error(local_ctx, "local")
-            if remote_ok() and not local_pin:
+            if overflow_ok and not local_pin:
                 record_event("remote", "context", request, units, 0, **ev)
-                return await _forward_remote(request, path, body, streaming)
+                return await _overflow_forward()
             return _context_error(local_ctx, "local")
         if local_ctx.get("compacted"):
             local_body = _prepare_local_body(request, local_context_body, background)
@@ -4255,9 +4415,9 @@ async def _route_completions(request):
         return web.json_response({"error": str(exc)}, status=400)
     if TOKEN_BUDGET > 0 and reservation > TOKEN_BUDGET:
         # Waiting cannot make a request larger than the entire pool admissible.
-        if remote_ok() and not local_pin and not alias_local_only and not LOCAL_ONLY:
+        if overflow_ok and not local_pin and not alias_local_only and not LOCAL_ONLY:
             record_event("remote", "tokens", request, units, 0, **ev)
-            return await _forward_remote(request, path, body, streaming)
+            return await _overflow_forward()
         return web.json_response({"error": "request exceeds local token reservation budget"}, status=503)
     units *= sequences
     reserved = False
@@ -4310,14 +4470,14 @@ async def _route_completions(request):
                 log.warning("local(tiny) failed (%s) -> failover to remote", status)
                 record_event("remote", "failover", request, units, 0, **ev)
                 release_local()
-                return await _forward_remote(request, path, body, streaming)
+                return await _overflow_forward(reentry=False)
             finally:
                 release_local()
-        elif remote_ok():
+        elif overflow_ok:
             log.info("route %s TINY inflight=%d/%d(+%d) full -> remote(tiny-fast)",
                      path, _inflight, effective_budget(), TINY_EXTRA_LANES)
             record_event("remote", "tiny-fast" if _memory_available(reservation) else "tokens", request, units, 0, **ev)
-            return await _forward_remote(request, path, body, streaming)
+            return await _overflow_forward()
         # no remote configured -> fall through to the normal local wait loop
 
     # local UP: claim a slot, WAITING for capacity instead of instant-overflow.
@@ -4328,7 +4488,7 @@ async def _route_completions(request):
     # The check-and-increment is done with no await in between, so it's race-free under asyncio.
     lane_limit = admission_lane_limit(background, effective_budget(), FG_RESERVED)
     deadline = time.time() + admission_wait_seconds(
-        background, remote_ok(), is_peak(), LOCAL_WAIT, BG_WAIT, INTERACTIVE_NEVER_OVERFLOW)
+        background, overflow_ok, is_peak(), LOCAL_WAIT, BG_WAIT, INTERACTIVE_NEVER_OVERFLOW)
     admitted = False
     _local_reason = "-"      # "bg-big-idle" when the idle-engine rule admitted a big background request
     admitted_conc = 1        # local concurrency at admission -> scales the first-token deadline
@@ -4385,13 +4545,13 @@ async def _route_completions(request):
             reason = "bg-yield"      # lanes exist but are reserved for interactive
         else:
             reason = "cap"
-        where = f"remote({reason})" if remote_ok() else "remote(none)"
+        where = f"remote({reason})" if overflow_ok else "remote(none)"
         log.info("route %s units=%d inflight=%d/%d tok=%d/%d waited=%.1fs -> %s",
                  path, units, _inflight, effective_budget(), _inflight_tokens, TOKEN_BUDGET, waited, where)
         if queued:
             _stats["overflowed_after_wait"] += 1
         record_event("remote", reason, request, units, waited, **ev)
-        return await _forward_remote(request, path, body, streaming)
+        return await _overflow_forward()
 
     log.info("route %s units=%d inflight=%d/%d waited=%.1fs -> local%s",
              path, units, _inflight, effective_budget(), waited,
@@ -4443,7 +4603,7 @@ async def _route_completions(request):
         log.warning("local failed (%s) -> failover to remote", status)
         record_event("remote", "failover", request, units, waited, **ev)
         release_local()
-        return await _forward_remote(request, path, body, streaming)
+        return await _overflow_forward(reentry=False)
     finally:
         release_local()
 
