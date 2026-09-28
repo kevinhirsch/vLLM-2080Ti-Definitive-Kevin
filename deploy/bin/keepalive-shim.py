@@ -694,6 +694,24 @@ def _active_set(request, **kw):
         a.update(kw)
 
 
+def _request_identity(request, body):
+    """Privacy-safe request identity for retry/duplicate forensics.
+
+    Callers may supply Idempotency-Key or X-Request-ID. We persist only its
+    digest, plus a digest of the exact request body, never the raw identifier or
+    prompt. This makes repeated paid submissions measurable without changing
+    routing or pretending identical prompts are always accidental.
+    """
+    headers = getattr(request, "headers", None) or {}
+    raw = (headers.get("Idempotency-Key") or headers.get("X-Request-ID") or "")[:512]
+    return {
+        "request_id": hashlib.sha256(raw.encode()).hexdigest()[:24] if raw else None,
+        "request_id_source": ("idempotency-key" if headers.get("Idempotency-Key")
+                              else "x-request-id" if headers.get("X-Request-ID") else None),
+        "request_body_sha256": hashlib.sha256(body).hexdigest(),
+    }
+
+
 def _active_snapshot(now):
     out = []
     for a in list(_ACTIVE.values()):
@@ -2201,6 +2219,9 @@ def _telemetry_note_request(info, resp=None):
             "t": round(now, 3), "client": name, "ip": info.get("ip"),
             "xclient": info.get("xclient"), "ua": info.get("ua"),
             "ep": info.get("ep"), "model": info.get("model"),
+            "request_id": info.get("request_id"),
+            "request_id_source": info.get("request_id_source"),
+            "request_body_sha256": info.get("request_body_sha256"),
             "route": route, "reason": reason,
             "alias": info.get("alias"), "alias_kind": info.get("alias_kind"),
             "waited": round(waited, 3) if waited else 0.0,
@@ -2574,13 +2595,18 @@ def _history_summary_blocking(since_ts, max_files, hard_line_cap=500000):
     misconfigured huge `hours` value, not expected to bite at the documented 200MB/day cap."""
     now = time.time()
     per_client = collections.defaultdict(lambda: {"requests": 0, "local": 0, "remote": 0,
-                                                    "tokens_in": 0, "tokens_out": 0, "errors": 0})
+                                                    "tokens_in": 0, "tokens_out": 0, "errors": 0,
+                                                    "remote_cache_hit_tokens": 0,
+                                                    "remote_cache_miss_tokens": 0,
+                                                    "remote_cost_usd": 0.0,
+                                                    "exact_body_repeats": 0})
     per_route = collections.defaultdict(lambda: {"requests": 0, "tokens_out": 0, "errors": 0})
     durations, ttfts = [], []
     latency_rows = []   # gw-ttft-decomposition-telemetry: (is_bg, admission_wait, queue_plus_prefill, decode_time)
     files_scanned = []
     lines_seen = 0
     truncated = False
+    seen_bodies = set()
     for day_i in range(max_files):
         day_epoch = now - day_i * 86400
         if day_epoch + 86400 < since_ts:
@@ -2621,6 +2647,17 @@ def _history_summary_blocking(since_ts, max_files, hard_line_cap=500000):
                         pc[route] += 1
                     pc["tokens_in"] += rec.get("ptok") or 0
                     pc["tokens_out"] += outtok or 0
+                    body_sha = rec.get("request_body_sha256")
+                    if body_sha:
+                        body_key = (name, body_sha)
+                        if body_key in seen_bodies:
+                            pc["exact_body_repeats"] += 1
+                        else:
+                            seen_bodies.add(body_key)
+                    if route == "remote" and rec.get("remote_sent"):
+                        pc["remote_cache_hit_tokens"] += rec.get("remote_cache_hit") or 0
+                        pc["remote_cache_miss_tokens"] += rec.get("remote_cache_miss") or 0
+                        pc["remote_cost_usd"] += float(rec.get("cost_est") or 0.0)
                     if is_err:
                         pc["errors"] += 1
                     pr = per_route[route]
@@ -2641,6 +2678,8 @@ def _history_summary_blocking(since_ts, max_files, hard_line_cap=500000):
     durations.sort()
     ttfts.sort()
     total_requests = sum(c["requests"] for c in per_client.values())
+    for pc in per_client.values():
+        pc["remote_cost_usd"] = round(pc["remote_cost_usd"], 6)
     return {
         "per_client": dict(per_client), "per_route": dict(per_route),
         "latency_by_class": _latency_class_pctls(latency_rows),
@@ -4453,7 +4492,7 @@ async def handle_completions(request):
                  "ptok": _est_tokens(body), "maxtok": maxtok, "stream": wants_stream(body),
                  "t0": time.time(), "phase": "routing", "route": None, "reason": None,
                  "preview": _preview(body)[:100], "bg": is_background(body, request), "tiny": is_tiny(body),
-                 "spend_key": os.urandom(16).hex()})
+                 "spend_key": os.urandom(16).hex(), **_request_identity(request, body)})
     _ACTIVE[id(request)] = info
     _resp = None
     try:
