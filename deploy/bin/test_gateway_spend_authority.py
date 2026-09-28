@@ -474,6 +474,23 @@ DEEPSEEK_USAGE = {"prompt_tokens": 47_300, "completion_tokens": 301, "total_toke
 
 
 class Pricing(unittest.TestCase):
+    def test_deepseek_peak_prices_cache_hits_and_misses_separately(self):
+        row = {"remote_cache_hit": 1_000_000, "remote_cache_miss": 1_000_000,
+               "outtok": 1_000_000, "remote_model": "deepseek-flash"}
+        with patch.object(shim, "REMOTE_PRICES_JSON", ""):
+            self.assertEqual(shim._request_remote_cost({**row, "remote_price_peak": False}),
+                             (0.753, "actual"))
+            self.assertEqual(shim._request_remote_cost({**row, "remote_price_peak": True}),
+                             (1.506, "actual"))
+
+    def test_peak_window_uses_utc_weekdays(self):
+        with patch.object(shim.time, "gmtime", return_value=shim.time.struct_time(
+                (2026, 9, 27, 7, 0, 0, 6, 270, 0))):
+            self.assertFalse(shim.is_peak())
+        with patch.object(shim.time, "gmtime", return_value=shim.time.struct_time(
+                (2026, 9, 28, 7, 0, 0, 0, 271, 0))):
+            self.assertTrue(shim.is_peak())
+
     def test_provider_usage_is_split_into_cache_hit_and_miss(self):
         self.assertEqual(shim._usage_cache_split(DEEPSEEK_USAGE), (45_600, 1_700))
         self.assertEqual(shim._usage_cache_split({"prompt_tokens": 10, "prompt_tokens_details": {"cached_tokens": 4}}), (4, 6))
@@ -500,7 +517,7 @@ class Pricing(unittest.TestCase):
         262,519,512 cache-hit + 9,879,145 cache-miss input tokens, 1,733,123 output = $3.3093."""
         with ExitStack() as st:
             for n, v in dict(REMOTE_PRICE_CACHE_HIT_PER_MTOK=0.003, REMOTE_PRICE_CACHE_MISS_PER_MTOK=0.15,
-                             REMOTE_PRICE_OUTPUT_PER_MTOK=0.6, REMOTE_PRICES_JSON="").items():
+                             REMOTE_PRICE_OUTPUT_PER_MTOK=0.6, REMOTE_PRICES_JSON="", is_peak=lambda: False).items():
                 st.enter_context(patch.object(shim, n, v))
             total = sum(shim._request_remote_cost(row)[0] for row in _billing_day_rows())
         self.assertAlmostEqual(total, 3.309304, delta=3.309304 * 0.02)

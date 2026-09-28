@@ -350,7 +350,12 @@ PEAK_HOURS = os.environ.get("SHIM_PEAK_HOURS_UTC", "1-4,6-10")
 
 def is_peak():
     try:
-        h = time.gmtime().tm_hour
+        utc = time.gmtime()
+        # DeepSeek's peak window applies Monday-Friday only.  Weekend UTC hours
+        # that look like a peak window are billed at the off-peak price.
+        if utc.tm_wday >= 5:
+            return False
+        h = utc.tm_hour
         for part in PEAK_HOURS.split(","):
             a, b = (part.split("-") + [part])[:2]
             if int(a) <= h < int(b):
@@ -1270,33 +1275,50 @@ async def _telemetry_sampler():
 # no-cache list estimate below overstated the real bill 12.7x ($41.90 vs $3.31 for
 # 00:00-13:00). Settlement, the dashboard's per-client cost and the telemetry use these
 # prices on the provider's own usage counts (prompt_cache_hit_tokens / prompt_cache_miss_tokens
-# / completion_tokens). Per-model overrides: SHIM_REMOTE_PRICES_JSON, e.g.
-# {"deepseek-flash": {"cache_hit": 0.003, "cache_miss": 0.15, "output": 0.6}} ($/Mtok).
+# / completion_tokens). DeepSeek doubles all three rates in its weekday UTC peak windows;
+# record peak/off-peak at forwarding so settlement and telemetry agree even across a boundary.
+# Per-model overrides: SHIM_REMOTE_PRICES_JSON, e.g.
+# {"deepseek-flash": {"cache_hit": 0.003, "cache_miss": 0.15, "output": 0.6,
+#                     "cache_hit_peak": 0.006, "cache_miss_peak": 0.3, "output_peak": 1.2}}
+# ($/Mtok). A model without explicit peak fields defaults to twice its off-peak rates.
 REMOTE_PRICE_CACHE_HIT_PER_MTOK = float(os.environ.get("SHIM_REMOTE_PRICE_CACHE_HIT_PER_MTOK", "0.003"))
 REMOTE_PRICE_CACHE_MISS_PER_MTOK = float(os.environ.get("SHIM_REMOTE_PRICE_CACHE_MISS_PER_MTOK", "0.15"))
 REMOTE_PRICE_OUTPUT_PER_MTOK = float(os.environ.get("SHIM_REMOTE_PRICE_OUTPUT_PER_MTOK", "0.6"))
+REMOTE_PRICE_CACHE_HIT_PER_MTOK_PEAK = float(os.environ.get("SHIM_REMOTE_PRICE_CACHE_HIT_PER_MTOK_PEAK", "0.006"))
+REMOTE_PRICE_CACHE_MISS_PER_MTOK_PEAK = float(os.environ.get("SHIM_REMOTE_PRICE_CACHE_MISS_PER_MTOK_PEAK", "0.3"))
+REMOTE_PRICE_OUTPUT_PER_MTOK_PEAK = float(os.environ.get("SHIM_REMOTE_PRICE_OUTPUT_PER_MTOK_PEAK", "1.2"))
 REMOTE_PRICES_JSON = os.environ.get("SHIM_REMOTE_PRICES_JSON", "")
 _CFG.update({
     "SHIM_REMOTE_PRICE_CACHE_HIT_PER_MTOK": ("REMOTE_PRICE_CACHE_HIT_PER_MTOK", float),
     "SHIM_REMOTE_PRICE_CACHE_MISS_PER_MTOK": ("REMOTE_PRICE_CACHE_MISS_PER_MTOK", float),
     "SHIM_REMOTE_PRICE_OUTPUT_PER_MTOK": ("REMOTE_PRICE_OUTPUT_PER_MTOK", float),
+    "SHIM_REMOTE_PRICE_CACHE_HIT_PER_MTOK_PEAK": ("REMOTE_PRICE_CACHE_HIT_PER_MTOK_PEAK", float),
+    "SHIM_REMOTE_PRICE_CACHE_MISS_PER_MTOK_PEAK": ("REMOTE_PRICE_CACHE_MISS_PER_MTOK_PEAK", float),
+    "SHIM_REMOTE_PRICE_OUTPUT_PER_MTOK_PEAK": ("REMOTE_PRICE_OUTPUT_PER_MTOK_PEAK", float),
     "SHIM_REMOTE_PRICES_JSON": ("REMOTE_PRICES_JSON", str),
 })
 
 
-def _remote_prices(model=None):
+def _remote_prices(model=None, *, peak=None):
     """($/Mtok cache hit, cache miss, output) for a remote model."""
     try:
         row = (json.loads(REMOTE_PRICES_JSON) if REMOTE_PRICES_JSON else {}).get(str(model or "")) or {}
     except Exception:
         row = {}
-    return (float(row.get("cache_hit", REMOTE_PRICE_CACHE_HIT_PER_MTOK)),
+    if peak is None:
+        peak = is_peak()
+    base = (float(row.get("cache_hit", REMOTE_PRICE_CACHE_HIT_PER_MTOK)),
             float(row.get("cache_miss", REMOTE_PRICE_CACHE_MISS_PER_MTOK)),
             float(row.get("output", REMOTE_PRICE_OUTPUT_PER_MTOK)))
+    if not peak:
+        return base
+    return (float(row.get("cache_hit_peak", REMOTE_PRICE_CACHE_HIT_PER_MTOK_PEAK if not row else base[0] * 2)),
+            float(row.get("cache_miss_peak", REMOTE_PRICE_CACHE_MISS_PER_MTOK_PEAK if not row else base[1] * 2)),
+            float(row.get("output_peak", REMOTE_PRICE_OUTPUT_PER_MTOK_PEAK if not row else base[2] * 2)))
 
 
-def _remote_cost_actual(model, cache_hit, cache_miss, outtok):
-    hit_p, miss_p, out_p = _remote_prices(model)
+def _remote_cost_actual(model, cache_hit, cache_miss, outtok, *, peak=None):
+    hit_p, miss_p, out_p = _remote_prices(model, peak=peak)
     return round((max(0, cache_hit or 0) / 1e6) * hit_p + (max(0, cache_miss or 0) / 1e6) * miss_p
                  + (max(0, outtok or 0) / 1e6) * out_p, 9)
 
@@ -1315,7 +1337,7 @@ def _request_remote_cost(info):
         if prices:
             return round((max(0, h or 0) * prices[0] + max(0, m or 0) * prices[1]
                           + max(0, out or 0) * prices[2]) / 1e6, 9)
-        return _remote_cost_actual(model, h, m, out)
+        return _remote_cost_actual(model, h, m, out, peak=info.get("remote_price_peak"))
     if hit is not None and miss is not None:
         return priced(hit, miss), "actual"
     if info.get("ptok_exact") is not None:
@@ -4345,7 +4367,7 @@ async def _forward_remote(request, path, body, streaming, endpoint=None, model=N
                 context_limit=limit, context_prompt_tokens=ctx.get("prompt_tokens"),
                 context_compacted=bool(ctx.get("compacted")),
                 context_omitted=int(ctx.get("omitted", 0) or 0))
-    _active_set(request, remote_model=model)
+    _active_set(request, remote_model=model, remote_price_peak=is_peak())
     relay_body = remap_for_remote(prepared, model, max_output)
     if streaming:
         relay_body = _with_stream_usage(relay_body)   # v6: settle needs the provider's usage
