@@ -304,6 +304,26 @@ class Routing(Isolated, unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await self.route(), "remote")
         self.assertEqual(self.events, [("remote", "cap")])
 
+    async def test_estate_local_never_overflows_when_admission_fills(self):
+        with patch.object(shim, "admission_lane_limit", lambda *a: 0), \
+                patch.object(shim, "local_saturation", lambda *a, **k: []):
+            response = await self.route(model="estate-local")
+        self.assertEqual(response.status, 503)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.events, [("held", "cap")])
+
+    async def test_estate_local_never_failovers_after_a_local_error(self):
+        async def failed_local(*args, **kwargs):
+            self.calls.append("local")
+            return "error", (500, "failed", False)
+
+        self.ptok = 3_000
+        with patch.object(shim, "_relay", failed_local):
+            response = await self.route(model="estate-local")
+        self.assertEqual(response.status, 503)
+        self.assertEqual(self.calls, ["local"])
+        self.assertEqual(self.events, [("held", "local-failed")])
+
     async def test_small_prompt_routing_is_byte_for_byte_unchanged(self):
         self.ptok = 3_000
         self.assertEqual(await self.route(), "local")

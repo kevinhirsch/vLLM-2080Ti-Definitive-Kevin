@@ -4799,12 +4799,17 @@ async def _route_completions(request, _no_overflow=False):
                 if oom:
                     trigger_backoff(f"local {status}: {text[:120]}")
                 log.warning("local(tiny) failed (%s) -> failover to remote", status)
+                if alias_local_only:
+                    record_event("held", "local-failed", request, units, 0, **ev)
+                    return web.json_response({"error": {
+                        "message": "estate-local local attempt failed; paid failover is disabled",
+                        "type": "local_only_unavailable"}}, status=503)
                 record_event("remote", "failover", request, units, 0, **ev)
                 release_local()
                 return await _overflow_forward(reentry=False)
             finally:
                 release_local()
-        elif overflow_ok:
+        elif overflow_ok and not alias_local_only:
             log.info("route %s TINY inflight=%d/%d(+%d) full -> remote(tiny-fast)",
                      path, _inflight, effective_budget(), TINY_EXTRA_LANES)
             record_event("remote", "tiny-fast" if _memory_available(reservation) else "tokens", request, units, 0, **ev)
@@ -4879,11 +4884,16 @@ async def _route_completions(request, _no_overflow=False):
             reason = "bg-yield"      # lanes exist but are reserved for interactive
         else:
             reason = "cap"
-        where = f"remote({reason})" if overflow_ok else "remote(none)"
+        where = f"remote({reason})" if overflow_ok and not alias_local_only else "local-only(wait-exhausted)"
         log.info("route %s units=%d inflight=%d/%d tok=%d/%d waited=%.1fs -> %s",
                  path, units, _inflight, effective_budget(), _inflight_tokens, TOKEN_BUDGET, waited, where)
-        if queued:
+        if queued and not alias_local_only:
             _stats["overflowed_after_wait"] += 1
+        if alias_local_only:
+            record_event("held", reason, request, units, waited, **ev)
+            return web.json_response({"error": {
+                "message": "estate-local capacity unavailable; paid overflow is disabled",
+                "type": "local_only_unavailable"}}, status=503)
         record_event("remote", reason, request, units, waited, **ev)
         return await _overflow_forward()
 
@@ -4935,6 +4945,11 @@ async def _route_completions(request, _no_overflow=False):
         if oom:
             trigger_backoff(f"local {status}: {text[:120]}")
         log.warning("local failed (%s) -> failover to remote", status)
+        if alias_local_only:
+            record_event("held", "local-failed", request, units, waited, **ev)
+            return web.json_response({"error": {
+                "message": "estate-local local attempt failed; paid failover is disabled",
+                "type": "local_only_unavailable"}}, status=503)
         record_event("remote", "failover", request, units, waited, **ev)
         release_local()
         return await _overflow_forward(reentry=False)
