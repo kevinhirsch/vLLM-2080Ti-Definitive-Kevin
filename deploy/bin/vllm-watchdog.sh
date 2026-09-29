@@ -4,13 +4,15 @@
 # Runs as a systemd oneshot service on a 60s timer (mirrors the az-watchdog.service/.timer
 # pattern already in use on this box). Each invocation does exactly ONE probe cycle:
 #
-#   1. GET  ENDPOINT_URL/v1/models        (cheap liveness of the vLLM engine on :8000)
+#   1. GET  ENDPOINT_URL/v1/models        (cheap liveness of the vLLM engine on :8001)
 #   2. POST ENDPOINT_URL/v1/chat/completions, max_tokens=5, enable_thinking=false, hard timeout
 #      (the real signal: is the engine actually GENERATING, not just answering metadata?)
 #
-# NOTE (2026-08-11): :8000 is now served by vLLM DIRECTLY — the model-router was retired.
-# This watchdog probes/guards the vLLM engine itself. The var is ENDPOINT_URL; the old
-# ROUTER_URL env name is still honored for back-compat.
+# NOTE (2026-09-05): probe the ENGINE DIRECTLY on :8001, never the gateway shim on :8000.
+# The shim fails over to DeepSeek when it marks local-down, so a probe through :8000 gets a
+# remote 200 and this watchdog logs HEALTHY while the engine is dead -- exactly what happened
+# 18:43-18:48 today (Xid 31 on TP1, EngineCore blocked on shm_broadcast for 4 min, watchdog
+# reset to 0 failures four times). The var is ENDPOINT_URL; ROUTER_URL is still honored.
 #
 # Only declares a "generation wedge" — and only then considers restarting the service —
 # when the generation probe has failed CONSEC_FAIL_THRESHOLD times *in a row* while
@@ -52,7 +54,7 @@
 set -uo pipefail
 
 # ---------- config (override via env) ----------
-ENDPOINT_URL="${ENDPOINT_URL:-${ROUTER_URL:-http://localhost:8000}}"   # :8000 = vLLM direct (router retired 2026-08-11); ROUTER_URL still honored
+ENDPOINT_URL="${ENDPOINT_URL:-${ROUTER_URL:-http://127.0.0.1:8001}}"   # :8001 = the vLLM engine itself (:8000 is the failover shim -- see NOTE above)
 # Auto-discover the served model from the endpoint so a model swap (e.g. Qwen 3.6 -> 3.8)
 # doesn't make the generation probe request a now-404 model id and false-positive as a wedge.
 # Falls back to qwen3.6:27b only if discovery fails. Override with WATCHDOG_MODEL.
@@ -130,6 +132,19 @@ probe_generation() {
   echo "$out"
 }
 
+# A queued watchdog request is not evidence of a wedged engine. Require the
+# engine's own counters to stay flat for the entire failed probe. Unreadable
+# counters fail closed: they cannot authorize a destructive restart.
+probe_progress() {
+  local metrics
+  metrics=$(curl -fsS -m 5 "$ENDPOINT_URL/metrics" 2>/dev/null) || return 1
+  printf '%s\n' "$metrics" | awk '
+    /^vllm:prompt_tokens_total[{ ]/ { prompt += $NF; have_prompt = 1 }
+    /^vllm:generation_tokens_total[{ ]/ { generation += $NF; have_generation = 1 }
+    END { if (have_prompt && have_generation) print prompt, generation; else exit 1 }
+  '
+}
+
 # ---------- main ----------
 init_state
 
@@ -137,9 +152,11 @@ models_result=$(probe_models)
 models_code="${models_result%% *}"
 models_time="${models_result#* }"
 
+progress_before=$(probe_progress) || progress_before=""
 gen_result=$(probe_generation)
 gen_code="${gen_result%% *}"
 gen_time="${gen_result#* }"
+progress_after=$(probe_progress) || progress_after=""
 
 models_ok=0; [ "$models_code" = "200" ] && models_ok=1
 gen_ok=0; [ "$gen_code" = "200" ] && gen_ok=1
@@ -158,6 +175,32 @@ if [ "$models_ok" != "1" ]; then
   # signature this watchdog targets (could be a full outage, a fresh cold-load in progress,
   # or a network blip). Do not count it toward the wedge threshold; just log it.
   log "PROBE fail models=${models_code}(${models_time}s) gen=${gen_code}(${gen_time}s) -> NOT the targeted wedge signature (models also down); no action, consecutive_failures unchanged (${prev_failures})"
+  exit 0
+fi
+
+if [ -z "$progress_before" ] || [ -z "$progress_after" ]; then
+  log "PROBE fail models=${models_code} gen=${gen_code} -> engine progress metrics unreadable; restart not authorized"
+  [ "$prev_failures" != "0" ] && state_set_consecutive_failures 0
+  exit 0
+fi
+
+if ! awk -v before="$progress_before" -v after="$progress_after" '
+  BEGIN {
+    split(before, b, " "); split(after, a, " ");
+    # A counter reset means the engine may have restarted independently.
+    exit (a[1] >= b[1] && a[2] >= b[2]) ? 0 : 1
+  }
+'; then
+  log "PROBE fail models=${models_code} gen=${gen_code} -> engine counters reset; restart not authorized"
+  [ "$prev_failures" != "0" ] && state_set_consecutive_failures 0
+  exit 0
+fi
+
+if awk -v before="$progress_before" -v after="$progress_after" '
+  BEGIN { split(before, b, " "); split(after, a, " "); exit (a[1] > b[1] || a[2] > b[2]) ? 0 : 1 }
+'; then
+  log "PROBE fail models=${models_code} gen=${gen_code} -> engine progressing (${progress_before} to ${progress_after}); watchdog request queued, no restart"
+  [ "$prev_failures" != "0" ] && state_set_consecutive_failures 0
   exit 0
 fi
 
@@ -199,6 +242,13 @@ log "DECISION wedge CONFIRMED (consecutive_failures=${new_failures}, models heal
 # the watchdog then logs a successful restart that never happened. This is not hypothetical:
 # it stranded the engine on 2026-08-14 during the quantization window.
 sudo -n systemctl reset-failed "$SERVICE" >> "$ACTION_LOG" 2>&1 || true
+# 2026-09-05 (wedge RCA): a CONFIRMED wedge has never honoured SIGTERM (0-for-2: 2026-09-02 and
+# 2026-09-05 both sat out the full TimeoutStopSec=180 before systemd's SIGKILL). Kill the whole
+# control group up front so the restart starts immediately; the 180 s grace stays for operator
+# restarts, where a clean TP=2 teardown is worth waiting for.
+sudo -n systemctl kill -s KILL "$SERVICE" >> "$ACTION_LOG" 2>&1 || true
+sleep 3
+log "ACTION SIGKILL sent to ${SERVICE} control group (wedged engines never exit on SIGTERM); restarting now"
 if sudo -n systemctl restart "$SERVICE" >> "$ACTION_LOG" 2>&1; then
   state_record_restart "$t"
   state_set_consecutive_failures 0
