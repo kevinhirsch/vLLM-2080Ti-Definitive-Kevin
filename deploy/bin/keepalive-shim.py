@@ -3425,6 +3425,22 @@ def _no_think_policy(request, background):
                 or (getattr(request, "remote", None) in NO_THINK_IPS))
 
 
+def _halo_control_request(request, body):
+    """True only for Halo's authenticated Hermes local-only control turn.
+
+    Hermes terminates the caller's control header, but its provider request is
+    still unambiguous: X-Client is halo-hermes and the model alias is
+    estate-local. Other Hermes turns use estate, while other estate-local
+    callers do not receive control priority.
+    """
+    try:
+        xclient = (request.headers.get("X-Client") or "").strip().lower()
+        model = str(json.loads(body).get("model") or "").strip().lower()
+        return xclient == "halo-hermes" and model == "estate-local"
+    except Exception:
+        return False
+
+
 def _prepare_local_body(request, body, background):
     """The one and only body transform for a request being sent to the LOCAL engine.
 
@@ -3443,16 +3459,24 @@ def _prepare_local_body(request, body, background):
     Duplication was the mechanism, so the fix is one function rather than a corrected copy.
     test_no_think_ips.py asserts the chain appears exactly once in this file.
     """
+    halo_control = _halo_control_request(request, body)
     try:
         alias = _alias_for_request(body)
         if alias["kind"] in ("default", "builtin-local"):
             local_alias_body = json.loads(body)
             local_alias_body["model"] = _local_model_name()
+            if halo_control:
+                # vLLM priority scheduling preempts bulk FCFS work for the one
+                # control decision that keeps the estate supervised. A bounded
+                # non-thinking answer is sufficient for ACTION/REASONING/ORDER.
+                local_alias_body["priority"] = -100
+                local_alias_body["max_tokens"] = min(
+                    int(local_alias_body.get("max_tokens") or 1024), 1024)
             body = json.dumps(local_alias_body).encode()
     except Exception:
         pass
     prepared = repetition_guard(nonthinking_sampling_profile(thinking_budget_guard(bound_local_output(body))))
-    if _no_think_policy(request, background):
+    if halo_control or _no_think_policy(request, background):
         prepared = strip_thinking(prepared)
     return prepared
 

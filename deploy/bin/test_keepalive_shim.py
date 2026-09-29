@@ -120,6 +120,27 @@ class Background(unittest.TestCase):
         self.assertTrue(shim.is_background(b, self._Req()))
 
 
+class HaloControlPriority(unittest.TestCase):
+    class _Req:
+        remote = "10.0.1.95"
+
+        def __init__(self, xclient="halo-hermes"):
+            self.headers = {"X-Client": xclient}
+
+    def test_exact_halo_local_request_is_control(self):
+        body = _body(model="estate-local", max_tokens=8192)
+        self.assertTrue(shim._halo_control_request(self._Req(), body))
+        out = json.loads(shim._prepare_local_body(self._Req(), body, False))
+        self.assertEqual(out["priority"], -100)
+        self.assertEqual(out["max_tokens"], 1024)
+        self.assertFalse(out["chat_template_kwargs"]["enable_thinking"])
+
+    def test_ordinary_halo_and_other_local_callers_are_not_control(self):
+        self.assertFalse(shim._halo_control_request(self._Req(), _body(model="estate")))
+        self.assertFalse(shim._halo_control_request(
+            self._Req("some-local-client"), _body(model="estate-local")))
+
+
 class RemapForRemote(unittest.TestCase):
     def test_rewrites_model_and_strips_local_only_params(self):
         b = _body(chat_template_kwargs={"enable_thinking": False},

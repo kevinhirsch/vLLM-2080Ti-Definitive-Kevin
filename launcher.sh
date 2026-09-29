@@ -3308,6 +3308,7 @@ build_args() {
     --enable-chunked-prefill
     --max-num-seqs "$MAX_NUM_SEQS"
     --max-num-batched-tokens "$MAX_BATCHED_TOKENS"
+    --scheduling-policy "${SCHEDULING_POLICY:-fcfs}"
   )
 
   [[ -n "${QUANTIZATION:-}" ]] && VLLM_ARGS+=(--quantization "$QUANTIZATION")
