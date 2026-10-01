@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Publish a committed gateway only after its accepted calls have drained.
+"""Publish a committed gateway after Halo runs and accepted calls have drained.
 
 The gateway's /gateway/drain admission fence and /gateway/lanes.active share
 one event loop. A request either registered before the fence and is counted,
 or sees the fence and is refused with Retry-After before it can consume local
 or paid work. A bounded wait aborts and releases the fence; it never kills an
 accepted call to make a release finish on schedule.
+
+Halo's separate bounded start lease pauses new incident runs while its fast
+lease enforcer keeps existing repairs supervised. The publisher verifies that
+the installed supervisor honors the lease before draining gateway calls.
 """
 from __future__ import annotations
 
@@ -16,6 +20,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import subprocess
 import time
 import urllib.request
@@ -29,6 +34,10 @@ DROPIN = REPO / "deploy/systemd/vllm-keepalive-shim.service.d/zz-graceful-stop.c
 DROPIN_LIVE = Path("/etc/systemd/system/vllm-keepalive-shim.service.d/zz-graceful-stop.conf")
 BASE = "http://127.0.0.1:8000"
 SERVICE = "vllm-keepalive-shim.service"
+HALO_INCIDENTS = Path("/home/kevin/.local/share/estate-overseer/halo-incidents")
+HALO_START_PAUSE = Path("/home/kevin/.local/share/estate-overseer/HALO_INCIDENT_START_PAUSE.json")
+HALO_SUPERVISOR_LOCK = Path("/tmp/halo-incident-supervisor.lock")
+ESTATE_RUNTIME = Path("/home/kevin/.local/share/estate-overseer")
 
 
 def _sha(data: bytes) -> str:
@@ -73,6 +82,84 @@ def _atomic_write(path: Path, data: bytes, mode: int = 0o755) -> None:
         os.close(fd)
 
 
+def _halo_active_runs() -> list[str]:
+    """Do not restart the gateway between turns of an active Halo repair."""
+    if not HALO_INCIDENTS.is_dir():
+        raise RuntimeError("Halo incident authority is unreadable")
+    active = []
+    for path in HALO_INCIDENTS.glob("*.json"):
+        try:
+            row = json.loads(path.read_text())
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"unreadable Halo incident: {path.name}") from exc
+        run = row.get("halo_run") or {}
+        if (row.get("status") in {"assigned", "running", "repair-requested"}
+                and run.get("status") in {"pending", "started", "queued", "running", "unknown", "stopping"}):
+            active.append(str(row.get("id") or path.stem))
+    return active
+
+
+def _begin_halo_quiesce(halo_wait_s: float, drain_timeout_s: float) -> str:
+    """Lease admission only; the independent Halo lease enforcer keeps running."""
+    try:
+        prior = json.loads(HALO_START_PAUSE.read_text())
+    except FileNotFoundError:
+        prior = {}
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("existing Halo start pause is unreadable") from exc
+    if float(prior.get("expires_at_epoch") or 0) > time.time():
+        raise RuntimeError("another release owns the Halo start pause")
+    token = secrets.token_hex(16)
+    now = time.time()
+    lease = {"owner": "gateway-safe-publish", "token": token,
+             "issued_at_epoch": now,
+             "expires_at_epoch": now + min(3550, halo_wait_s + drain_timeout_s + 180)}
+    _atomic_write(HALO_START_PAUSE, (json.dumps(lease, sort_keys=True) + "\n").encode(), 0o644)
+    return token
+
+
+def _end_halo_quiesce(token: str) -> None:
+    try:
+        row = json.loads(HALO_START_PAUSE.read_text())
+    except FileNotFoundError:
+        return
+    if row.get("owner") != "gateway-safe-publish" or row.get("token") != token:
+        raise RuntimeError("Halo start pause ownership changed during gateway publication")
+    HALO_START_PAUSE.unlink()
+    fd = os.open(HALO_START_PAUSE.parent, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _assert_halo_quiesce_live(token: str) -> None:
+    """The installed supervisor must actually honor this release lease."""
+    program = ("import json,sys; "
+               f"sys.path.insert(0,{str(ESTATE_RUNTIME)!r}); "
+               "from tools.halo_incident_supervisor import deployment_quiesce; "
+               "print(json.dumps(deployment_quiesce()))")
+    try:
+        output = subprocess.check_output(["/usr/bin/python3", "-c", program],
+                                         timeout=10, text=True)
+        row = json.loads(output.strip().splitlines()[-1])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError) as exc:
+        raise RuntimeError("installed Halo supervisor does not honor release quiescence") from exc
+    if not isinstance(row, dict) or row.get("token") != token:
+        raise RuntimeError("installed Halo supervisor did not read the exact release lease")
+
+
+def _wait_halo_quiet(timeout_s: float) -> None:
+    deadline = time.monotonic() + timeout_s
+    while True:
+        active = _halo_active_runs()
+        if not active:
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Halo runs did not reach terminal receipts: {active[:6]}")
+        time.sleep(3)
+
+
 def _wait_empty(token: str, timeout_s: float) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -102,9 +189,11 @@ def _fence_failed_release(token: str, timeout_s: float) -> None:
     _wait_empty(token, timeout_s)
 
 
-def publish(timeout_s: float = 1500) -> dict:
+def publish(timeout_s: float = 1500, halo_wait_s: float = 1800) -> dict:
     if not 1 <= timeout_s <= 1700:
         raise ValueError("timeout_s must be 1..1700")
+    if not 1 <= halo_wait_s <= 1800:
+        raise ValueError("halo_wait_s must be 1..1800")
     source = SOURCE.read_bytes()
     committed = subprocess.check_output(["git", "show", "HEAD:deploy/bin/keepalive-shim.py"], cwd=REPO)
     if source != committed:
@@ -124,26 +213,35 @@ def publish(timeout_s: float = 1500) -> dict:
     if drain_before.get("draining"):
         raise RuntimeError("another publisher already holds the drain lease")
 
-    # Unit readiness is installed without stopping the current process. A
-    # direct restart then also gives accepted calls the full aiohttp grace.
-    _run("sudo", "-n", "install", "-D", "-m", "0644", str(DROPIN), str(DROPIN_LIVE))
-    _run("sudo", "-n", "systemctl", "daemon-reload")
-    stop_time = _unit_seconds(subprocess.check_output(["systemctl", "show", "-p", "TimeoutStopUSec",
-                                                       "--value", SERVICE], text=True).strip())
-    if stop_time < 1830:
-        raise RuntimeError("systemd stop timeout is shorter than accepted-call grace")
-
-    backup = RUNTIME.with_name(f"{RUNTIME.name}.bak-{int(time.time())}-{os.getpid()}")
-    _atomic_write(backup, previous)
+    halo_pause = _begin_halo_quiesce(halo_wait_s, timeout_s)
     lease = None
     installed = False
     try:
+        _assert_halo_quiesce_live(halo_pause)
+        _wait_halo_quiet(halo_wait_s)
+        # Unit readiness is installed without stopping the current process.
+        _run("sudo", "-n", "install", "-D", "-m", "0644", str(DROPIN), str(DROPIN_LIVE))
+        _run("sudo", "-n", "systemctl", "daemon-reload")
+        stop_time = _unit_seconds(subprocess.check_output(["systemctl", "show", "-p", "TimeoutStopUSec",
+                                                           "--value", SERVICE], text=True).strip())
+        if stop_time < 1830:
+            raise RuntimeError("systemd stop timeout is shorter than accepted-call grace")
+        backup = RUNTIME.with_name(f"{RUNTIME.name}.bak-{int(time.time())}-{os.getpid()}")
+        _atomic_write(backup, previous)
         opened = _http("/gateway/drain", "POST", {"ttl_s": 1800, "reason": "governed gateway publish"}, token)
         lease = opened["lease"]
         _wait_empty(token, timeout_s)
-        _atomic_write(RUNTIME, source)
-        installed = True
-        _run("sudo", "-n", "systemctl", "restart", SERVICE)
+        # The minute scheduler and ten-second enforcer share this lock. Hold
+        # it only across the final active-run check and quick restart, never
+        # during the potentially long drain.
+        with HALO_SUPERVISOR_LOCK.open("a+") as guard:
+            fcntl.flock(guard, fcntl.LOCK_EX)
+            active = _halo_active_runs()
+            if active:
+                raise RuntimeError(f"Halo became active during gateway drain: {active[:6]}")
+            _atomic_write(RUNTIME, source)
+            installed = True
+            _run("sudo", "-n", "systemctl", "restart", SERVICE)
         for _ in range(30):
             try:
                 health = _http("/health", token=token)
@@ -166,8 +264,14 @@ def publish(timeout_s: float = 1500) -> dict:
                     "gateway publish failed; automatic rollback refused because the new process "
                     f"could not be safely drained: {fence_error}"
                 ) from publish_error
-            _atomic_write(RUNTIME, previous)
-            _run("sudo", "-n", "systemctl", "restart", SERVICE)
+            with HALO_SUPERVISOR_LOCK.open("a+") as guard:
+                fcntl.flock(guard, fcntl.LOCK_EX)
+                active = _halo_active_runs()
+                if active:
+                    raise RuntimeError(
+                        f"gateway rollback refused while Halo runs are active: {active[:6]}") from publish_error
+                _atomic_write(RUNTIME, previous)
+                _run("sudo", "-n", "systemctl", "restart", SERVICE)
         raise
     finally:
         if lease:
@@ -176,12 +280,14 @@ def publish(timeout_s: float = 1500) -> dict:
                     _http("/gateway/drain", "DELETE", {"lease": lease}, token)
             except Exception:
                 pass  # lease itself expires; no permanent admission stop
+        _end_halo_quiesce(halo_pause)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--timeout-s", type=float, default=1500)
+    parser.add_argument("--halo-wait-s", type=float, default=1800)
     args = parser.parse_args()
     if not args.apply:
         print(json.dumps({"status": "preview", "source_sha256": _sha(SOURCE.read_bytes()),
@@ -190,7 +296,7 @@ def main() -> None:
     lock_path = Path("/tmp/vllm-gateway-publish.lock")
     with lock_path.open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        print(json.dumps(publish(args.timeout_s), sort_keys=True))
+        print(json.dumps(publish(args.timeout_s, args.halo_wait_s), sort_keys=True))
 
 
 if __name__ == "__main__":
