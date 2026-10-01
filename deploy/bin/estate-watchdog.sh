@@ -574,7 +574,7 @@ fix_record() {
 do_fix() {
   if [ "${ST[agentsprod-egress]:-}" = "CRIT" ]; then
     local sig out recovered=0 _t0 _t1
-    sig=$(fix_signature "${DET[agentsprod-egress]}|$(stat -c %Y "$0" 2>/dev/null)")
+    sig=$(fix_signature "${DET[agentsprod-egress]}|$(sha256sum "$0" 2>/dev/null | cut -d' ' -f1)")
     if fix_allowed "agentsprod-egress" "$sig"; then
       log_line "FIX: agentsprod-egress is CRIT, attempting .10 pin-route remediation"
       out=$(timeout 14 ssh -o BatchMode=yes -o ConnectTimeout=5 "${AGENTSPROD_USER}@${AGENTSPROD_HOST}" \
@@ -591,7 +591,7 @@ do_fix() {
 
   if [ "${ST[hnet00-wg-active]:-}" = "CRIT" ]; then
     local sig out recovered=0 _t0 _t1
-    sig=$(fix_signature "${DET[hnet00-wg-active]}|$(sudo -n stat -c %Y /etc/wireguard/wg0.conf 2>/dev/null)|$(stat -c %Y "$0" 2>/dev/null)")
+    sig=$(fix_signature "${DET[hnet00-wg-active]}|$(sudo -n sha256sum /etc/wireguard/wg0.conf 2>/dev/null | cut -d' ' -f1)|$(sha256sum "$0" 2>/dev/null | cut -d' ' -f1)")
     if fix_allowed "hnet00-wg-active" "$sig"; then
       log_line "FIX: hnet00-wg-active is CRIT, attempting sudo -n systemctl restart wg-quick@wg0"
       out=$(timeout 10 sudo -n systemctl restart wg-quick@wg0 2>&1; echo "RC=$?")
