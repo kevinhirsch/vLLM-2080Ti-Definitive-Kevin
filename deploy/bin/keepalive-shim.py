@@ -4165,6 +4165,32 @@ def _sse_content_shape(data, saw_content, saw_tool_call):
     return saw_content, saw_tool_call
 
 
+async def _prepare_stream_response(resp, request, initial, session):
+    """A disconnected caller must not strand the upstream ClientSession."""
+    try:
+        await resp.prepare(request)
+        if initial:
+            await resp.write(initial)
+        return True
+    except (ConnectionResetError, BrokenPipeError):
+        _active_set(request, client_disconnected=True)
+        await session.close()
+        return False
+    except BaseException:
+        await session.close()
+        raise
+
+
+async def _finish_stream_response(resp, request, session):
+    """Close upstream even when write_eof sees a closed client transport."""
+    try:
+        await resp.write_eof()
+    except (ConnectionResetError, BrokenPipeError):
+        _active_set(request, client_disconnected=True)
+    finally:
+        await session.close()
+
+
 async def _relay(request, base, path, body, key, streaming, concurrency=1, provider_name=None):
     """
     Forward to (base) and relay the response to the client.
@@ -4387,10 +4413,10 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
     if phase == "clean_end":
         # upstream finished before any 'meaningful' chunk — deliver as-is (short/empty response),
         # don't fail over (avoids double-generating a real-but-tiny answer).
-        resp = _mk_resp(); await resp.prepare(request)
-        if buf:
-            await resp.write(bytes(buf))
-        await resp.write_eof(); await session.close()
+        resp = _mk_resp()
+        if not await _prepare_stream_response(resp, request, bytes(buf), session):
+            return "ok", resp
+        await _finish_stream_response(resp, request, session)
         _outkw = {"outtok_lb": _chunk_ct[0],
                   "content_empty": not _saw_content[0], "has_tool_calls": _saw_tool_call[0]}
         if _exact_outtok[0] is not None:
@@ -4410,8 +4436,9 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
 
     # committed to the client: flush buffered first chunk(s), then stream the rest. A mid-stream
     # error past this point can only be reported inline (client already receiving output).
-    resp = _mk_resp(); await resp.prepare(request)
-    await resp.write(bytes(buf))
+    resp = _mk_resp()
+    if not await _prepare_stream_response(resp, request, bytes(buf), session):
+        return "ok", resp
     # TELEMETRY: exact output-token count when the client asked for stream_options.include_usage
     # and the usage trailer didn't already arrive within the gate phase above (long streams) --
     # same cheap per-chunk scan, applied to whatever's left of the stream.
@@ -4448,7 +4475,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
             await resp.write(f'data: {{"error":{{"message":"stream interrupted: {e}"}}}}\n\n'.encode())
         except Exception:
             pass
-    await resp.write_eof(); await session.close()
+    await _finish_stream_response(resp, request, session)
     _outkw = {"outtok_lb": _chunk_ct[0],
               "content_empty": not _saw_content[0], "has_tool_calls": _saw_tool_call[0]}
     if _exact_outtok[0] is not None:
