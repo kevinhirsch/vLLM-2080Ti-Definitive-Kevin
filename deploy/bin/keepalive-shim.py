@@ -27,6 +27,7 @@ Cost-first: a single request is always local (free); only real overflow costs mo
 NEVER manages the vLLM process (that's vllm-qwen27b.service + its watchdog).
 """
 import asyncio, os, sys, json, time, logging, collections, subprocess, re, hmac, math, hashlib
+import fcntl
 import copy
 import datetime
 import urllib.request
@@ -1466,6 +1467,32 @@ def _remote_cost_estimate(ptok, outtok):
 #     older than SPEND_REQUEST_HOLD_TTL is charged in full, exactly once.
 #   * read -- GET /gateway/spend (unauthenticated, read-only): the one total.
 SPEND_FILE = os.environ.get("SHIM_SPEND_FILE", "/home/kevin/.local/share/vllm-qwen27b/gateway-spend.json")
+_RUNTIME_SPEND_LOCK = None
+
+
+def _claim_spend_authority(path=SPEND_FILE):
+    """Only one gateway process may mutate the daily ledger at a time.
+
+    SpendLedger's in-process mutex and atomic rename do not serialize two
+    processes. A second process would load a stale total, orphan another
+    process's holds, and could each spend up to the $25 cap. The lock is held
+    for this process's entire lifetime and released by the kernel on death.
+    """
+    global _RUNTIME_SPEND_LOCK
+    if _RUNTIME_SPEND_LOCK is not None:
+        return
+    lock_path = path + ".owner.lock"
+    os.makedirs(os.path.dirname(os.path.abspath(lock_path)), mode=0o700, exist_ok=True)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        os.close(fd)
+        raise RuntimeError("another gateway process already owns the spend ledger") from exc
+    except BaseException:
+        os.close(fd)
+        raise
+    _RUNTIME_SPEND_LOCK = fd
 SPEND_CLIENTS_FILE = os.environ.get("SHIM_SPEND_CLIENTS_FILE",
                                     "/home/kevin/.local/share/vllm-qwen27b/spend-clients.json")
 SPEND_CAP_USD = float(os.environ.get("SHIM_SPEND_CAP_USD", "25.0"))
@@ -7820,6 +7847,11 @@ def make_app():
 
 
 if __name__ == "__main__":
+    try:
+        _claim_spend_authority()
+    except RuntimeError as exc:
+        log.critical("gateway refuses duplicate spend authority: %s", exc)
+        raise SystemExit(75) from exc
     log.info("gateway-shim on :%d | local=%s | remote=%s model=%s | budget=%d big=%dtok backoff=%ds",
              PORT, LOCAL, REMOTE_BASE or "(none)", REMOTE_MODEL, BUDGET, BIG_TOKENS, OOM_BACKOFF)
     log.info("  tiny-lane<=%dtok +%d lanes | ft-concurrency-scale=%d | req-logging=%s",
