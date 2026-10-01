@@ -86,6 +86,22 @@ def _wait_empty(token: str, timeout_s: float) -> None:
     raise TimeoutError("accepted calls did not drain within the deployment bound")
 
 
+def _fence_failed_release(token: str, timeout_s: float) -> None:
+    """A failed new process may already have accepted work; fence it before rollback.
+
+    An unreadable process is ambiguous, including when systemd says it failed.
+    Leave it in place for diagnosis instead of issuing another destructive restart.
+    """
+    current = _http("/gateway/drain", token=token)
+    if current.get("draining"):
+        raise RuntimeError("new gateway already has an unknown drain owner")
+    opened = _http("/gateway/drain", "POST",
+                   {"ttl_s": 1800, "reason": "governed gateway rollback"}, token)
+    if not opened.get("lease"):
+        raise RuntimeError("new gateway did not grant a rollback drain lease")
+    _wait_empty(token, timeout_s)
+
+
 def publish(timeout_s: float = 1500) -> dict:
     if not 1 <= timeout_s <= 1700:
         raise ValueError("timeout_s must be 1..1700")
@@ -141,8 +157,15 @@ def publish(timeout_s: float = 1500) -> dict:
                 pass
             time.sleep(1)
         raise RuntimeError("new gateway failed health/spend/readback checks")
-    except Exception:
+    except Exception as publish_error:
         if installed:
+            try:
+                _fence_failed_release(token, timeout_s)
+            except Exception as fence_error:
+                raise RuntimeError(
+                    "gateway publish failed; automatic rollback refused because the new process "
+                    f"could not be safely drained: {fence_error}"
+                ) from publish_error
             _atomic_write(RUNTIME, previous)
             _run("sudo", "-n", "systemctl", "restart", SERVICE)
         raise

@@ -31,6 +31,22 @@ class SafePublish(unittest.TestCase):
             with self.assertRaises(TimeoutError):
                 pub._wait_empty("token", 1)
 
+    def test_failed_release_cannot_rollback_through_an_unknown_drain_owner(self):
+        with patch.object(pub, "_http", return_value={"draining": True, "active": 1}), \
+             patch.object(pub, "_wait_empty") as wait:
+            with self.assertRaisesRegex(RuntimeError, "unknown drain owner"):
+                pub._fence_failed_release("token", 10)
+            wait.assert_not_called()
+
+    def test_failed_release_fences_new_arrivals_and_waits_for_accepted_calls(self):
+        with patch.object(pub, "_http", side_effect=[
+                {"draining": False, "active": 1}, {"lease": "new-release"}]) as http, \
+             patch.object(pub, "_wait_empty") as wait:
+            pub._fence_failed_release("token", 10)
+            http.assert_any_call("/gateway/drain", "POST", {
+                "ttl_s": 1800, "reason": "governed gateway rollback"}, "token")
+            wait.assert_called_once_with("token", 10)
+
 
 if __name__ == "__main__":
     unittest.main()
