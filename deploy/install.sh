@@ -39,7 +39,7 @@ done
 sudo systemctl daemon-reload
 
 echo "==> [5/5] enable services (reboot-persistent)"
-sudo systemctl enable vllm-qwen27b vllm-keepalive-shim vllm-qwen27b-watchdog.timer
+sudo systemctl enable nvidia-powerprep vllm-qwen27b vllm-keepalive-shim vllm-qwen27b-watchdog.timer
 
 cat <<EOF
 

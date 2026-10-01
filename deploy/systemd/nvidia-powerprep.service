@@ -1,0 +1,15 @@
+[Unit]
+Description=NVIDIA module recovery and power preparation for vLLM
+After=network-online.target systemd-modules-load.service
+Wants=network-online.target
+Before=vllm-qwen27b.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/home/kevin/.local/share/vllm-qwen27b/ensure-nvidia-kernel-module.sh
+ExecStart=/usr/bin/nvidia-smi -pm 1
+ExecStart=/usr/bin/nvidia-smi -pl 260
+
+[Install]
+WantedBy=multi-user.target
