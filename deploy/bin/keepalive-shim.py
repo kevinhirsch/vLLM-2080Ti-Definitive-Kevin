@@ -4666,10 +4666,15 @@ async def _route_completions(request, _no_overflow=False):
                  getattr(request, "remote", "?"), request.headers.get("User-Agent", "?")[:45],
                  model_req, ptok, maxtok, streaming, tiny, background, _preview(body))
 
-    # Explicit aliases are gateway-owned routing contracts.  Custom aliases always target their
-    # configured OpenAI-compatible endpoint; built-ins are stable local/remote modes.  They are
-    # evaluated before the global dashboard mode so `estate-local` cannot spend money and
-    # `estate-remote` remains useful even while the dashboard is in FULL LOCAL.
+    # FULL LOCAL is the operator's $0 safety mode for every request. Explicit
+    # remote aliases cannot bypass it; callers must wait until the mode changes.
+    if LOCAL_ONLY and (custom_endpoint or alias_force_remote):
+        record_event("rejected", "full-local-remote-alias", request, units, 0, **ev)
+        return web.json_response({"error": {"message": "full-local mode disables paid remote aliases",
+                                            "type": "full_local_remote_disabled"}}, status=503)
+    # Explicit aliases are gateway-owned routing contracts.  Custom aliases target their
+    # configured OpenAI-compatible endpoint; built-ins are stable local/remote modes.
+    # They are evaluated before the normal local-first and full-remote choices.
     if custom_endpoint:
         log.info("route %s alias=%s -> remote(alias)", path, alias.get("name"))
         record_event("remote", "alias", request, units, 0, **ev)

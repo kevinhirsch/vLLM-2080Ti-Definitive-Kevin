@@ -250,6 +250,19 @@ class Routing(Isolated, unittest.IsolatedAsyncioTestCase):
         self.events.clear(); self.calls.clear()
         return await shim._route_completions(Request(**kw))
 
+    async def test_full_local_refuses_explicit_remote_aliases_without_forwarding(self):
+        with patch.object(shim, "LOCAL_ONLY", 1):
+            response = await self.route(model="estate-remote")
+            self.assertEqual(response.status, 503)
+            self.assertEqual(json.loads(response.body)["error"]["type"], "full_local_remote_disabled")
+            self.assertEqual(self.calls, [])
+            self.assertEqual(self.events, [("rejected", "full-local-remote-alias")])
+            with patch.object(shim, "_alias_for_request", lambda _body: {
+                    "name": "custom", "kind": "custom-remote", "endpoint": {"base": "https://example.invalid"}}):
+                response = await self.route(model="custom")
+            self.assertEqual(response.status, 503)
+            self.assertEqual(self.calls, [])
+
     async def test_big_prompt_with_free_capacity_is_served_locally(self):
         self.assertEqual(await self.route(), "local")
         self.assertEqual(self.calls, ["local"])

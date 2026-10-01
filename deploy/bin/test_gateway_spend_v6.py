@@ -167,6 +167,7 @@ class Settlement(unittest.TestCase):
         self.led = ledger(cap=100.0)
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(shim, "is_peak", lambda: False))
         for n, v in dict(_SPEND_LEDGER=self.led, REMOTE_PRICES_JSON="", REMOTE_MODEL="deepseek-flash",
                          REMOTE_PRICE_CACHE_HIT_PER_MTOK=0.003, REMOTE_PRICE_CACHE_MISS_PER_MTOK=0.15,
                          REMOTE_PRICE_OUTPUT_PER_MTOK=0.6).items():
