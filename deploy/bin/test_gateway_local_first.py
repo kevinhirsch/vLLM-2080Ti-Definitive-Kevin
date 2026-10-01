@@ -120,7 +120,7 @@ class Decision(Isolated):
             self.assertEqual(self.decide(units=5), (False, "saturated:lanes"))
 
     def test_token_budget_full_is_saturated(self):
-        with patch.object(shim, "_inflight_reserved_tokens", 450_000):
+        with patch.object(shim, "_inflight_reserved_tokens", 390_000):
             self.assertEqual(self.decide(reservation=60_000), (False, "saturated:tokens"))
             self.assertEqual(self.decide(reservation=40_000), (True, "capacity"))
 
@@ -351,18 +351,31 @@ class Routing(Isolated, unittest.IsolatedAsyncioTestCase):
 
     async def test_kept_request_still_overflows_as_cap_if_lanes_fill_during_admission(self):
         # decision saw a free lane; admission (the saturation fallback) finds the lanes full
-        with patch.object(shim, "admission_lane_limit", lambda *a: 0):
+        with patch.object(shim, "admission_lane_limit", lambda *a, **k: 0):
             with patch.object(shim, "local_saturation", lambda *a, **k: []):
                 self.assertEqual(await self.route(), "remote")
         self.assertEqual(self.events, [("remote", "cap")])
 
     async def test_estate_local_never_overflows_when_admission_fills(self):
-        with patch.object(shim, "admission_lane_limit", lambda *a: 0), \
+        with patch.object(shim, "admission_lane_limit", lambda *a, **k: 0), \
                 patch.object(shim, "local_saturation", lambda *a, **k: []):
             response = await self.route(model="estate-local")
         self.assertEqual(response.status, 503)
         self.assertEqual(self.calls, [])
         self.assertEqual(self.events, [("held", "cap")])
+
+    async def test_halo_control_uses_protected_place_when_ordinary_budget_is_full(self):
+        with patch.object(shim, "_inflight", 14), \
+                patch.object(shim, "TINY_EXTRA_LANES", 1), \
+                patch.object(Request, "remote", "10.0.1.95"):
+            response = await self.route(model="estate-local")
+            self.assertEqual(response.status, 503)
+            self.assertEqual(self.calls, [])
+            result = await self.route(model="estate-local",
+                                      headers={"X-Client": "halo-hermes"})
+            self.assertEqual(result, "local")
+            self.assertEqual(self.calls, ["local"])
+            self.assertEqual(shim._inflight, 14)
 
     async def test_estate_local_never_failovers_after_a_local_error(self):
         async def failed_local(*args, **kwargs):

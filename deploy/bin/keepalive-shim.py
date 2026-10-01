@@ -3424,10 +3424,22 @@ def _local_model_name():
 NO_OVERFLOW_SECONDS = 1e9
 
 
-def admission_lane_limit(background, budget, fg_reserved):
-    """How many of `budget` lanes THIS class may fill. Background may only use lanes beyond
-    fg_reserved (kept free for interactive); interactive may use the whole budget."""
-    return max(1, budget - fg_reserved) if background else budget
+def admission_lane_limit(background, budget, fg_reserved, *, halo_control=False,
+                         tiny=False, tiny_extra_lanes=0):
+    """Class limit with one physical admission place protected for Halo control.
+
+    Tiny calls may use spare engine places, but only Halo may take the final one.
+    With no spare place configured, ordinary foreground yields one budget unit.
+    The independent token reservation guard still applies to every class.
+    """
+    extra = max(0, tiny_extra_lanes)
+    if halo_control:
+        return budget + extra
+    if background:
+        return max(1, budget - fg_reserved)
+    if tiny:
+        return max(1, budget + extra - 1)
+    return max(1, budget - (extra == 0))
 
 
 def admission_wait_seconds(background, remote_available, peak, local_wait, bg_wait,
@@ -3660,17 +3672,17 @@ def _no_think_policy(request, background):
 
 
 def _halo_control_request(request, body):
-    """True only for Halo's authenticated Hermes local-only control turn.
+    """True only for Halo's Hermes local-only control turn from its host.
 
     Hermes terminates the caller's control header, but its provider request is
-    still unambiguous: X-Client is halo-hermes and the model alias is
-    estate-local. Other Hermes turns use estate, while other estate-local
-    callers do not receive control priority.
+    still identifiable by source host, X-Client and the estate-local alias.
+    Other Hermes turns use estate; other local callers do not get priority.
     """
     try:
         xclient = (request.headers.get("X-Client") or "").strip().lower()
         model = str(json.loads(body).get("model") or "").strip().lower()
-        return xclient == "halo-hermes" and model == "estate-local"
+        return (getattr(request, "remote", None) == "10.0.1.95"
+                and xclient == "halo-hermes" and model == "estate-local")
     except Exception:
         return False
 
@@ -3905,8 +3917,18 @@ def local_memory_reservation(body):
     return (prompt + output) * count, count
 
 
-def _memory_available(reservation):
-    return TOKEN_BUDGET <= 0 or _inflight_reserved_tokens + reservation <= TOKEN_BUDGET
+def _halo_control_token_reserve():
+    return min(65536, TOKEN_BUDGET // 8) if TOKEN_BUDGET >= 100000 else 0
+
+
+def _memory_available(reservation, *, halo_control=False):
+    if TOKEN_BUDGET <= 0:
+        return True
+    # Keep one bounded Halo control prompt's KV reservation available even
+    # when ordinary work fills the local engine. The reserve is a fraction of
+    # the validated token pool and does not narrow small test/backoff pools.
+    limit = TOKEN_BUDGET if halo_control else TOKEN_BUDGET - _halo_control_token_reserve()
+    return _inflight_reserved_tokens + reservation <= limit
 
 
 def wants_stream(body):
@@ -4873,6 +4895,7 @@ async def _route_completions(request, _no_overflow=False):
     ev = dict(ptok=ptok, maxtok=maxtok, stream=streaming)
     tiny = is_tiny(body)
     background = is_background(body, request)
+    halo_control = _halo_control_request(request, body)
     alias = _alias_for_request(body)
     alias_kind = alias.get("kind")
     alias_local_only = alias_kind == "builtin-local"
@@ -5105,6 +5128,12 @@ async def _route_completions(request, _no_overflow=False):
             return await _overflow_forward()
         return web.json_response({"error": "request exceeds local token reservation budget"}, status=503)
     units *= sequences
+    if halo_control:
+        # Units estimate scheduler pressure from prompt size. Halo's one
+        # control sequence must fit the protected place even with a long
+        # awareness prompt; the exact prompt/output KV reservation above
+        # remains charged and guarded independently.
+        units = sequences
     reserved = False
 
     def claim_local():
@@ -5125,15 +5154,17 @@ async def _route_completions(request, _no_overflow=False):
             reserved = False
 
     # TINY fast-lane: small calls skip the queue, but never the KV memory limit.
-    # BEYOND the big-request budget (bounded by TINY_EXTRA_LANES, staying within max-num-seqs), so a
-    # trivial call never eats a 15s wait or gets starved during a budget=1 backoff. If even that
-    # headroom is full, fast-overflow immediately (a tiny call on DeepSeek is cheap + fast).
+    # The final extra place belongs to Halo control, even when routine tiny
+    # requests are busy. Other tiny work keeps any remaining extra places.
     if tiny:
-        if (_health["ok"] and (_inflight + units) <= (effective_budget() + TINY_EXTRA_LANES)
-                and _memory_available(reservation)):
+        tiny_limit = admission_lane_limit(background, effective_budget(), FG_RESERVED,
+                                          halo_control=halo_control, tiny=True,
+                                          tiny_extra_lanes=TINY_EXTRA_LANES)
+        if (_health["ok"] and (_inflight + units) <= tiny_limit
+                and _memory_available(reservation, halo_control=halo_control)):
             claim_local()
-            log.info("route %s TINY units=%d inflight=%d/%d(+%d) -> local(tiny)",
-                     path, units, _inflight, effective_budget(), TINY_EXTRA_LANES)
+            log.info("route %s TINY units=%d inflight=%d/%d -> local(tiny)",
+                     path, units, _inflight, tiny_limit)
             _active_set(request, phase="local", route="local")
             try:
                 # tiny fast-lane needs the same body preparation as the main path: these are
@@ -5164,9 +5195,9 @@ async def _route_completions(request, _no_overflow=False):
             finally:
                 release_local()
         elif overflow_ok and not alias_local_only:
-            log.info("route %s TINY inflight=%d/%d(+%d) full -> remote(tiny-fast)",
-                     path, _inflight, effective_budget(), TINY_EXTRA_LANES)
-            record_event("remote", "tiny-fast" if _memory_available(reservation) else "tokens", request, units, 0, **ev)
+            log.info("route %s TINY inflight=%d/%d full -> remote(tiny-fast)",
+                     path, _inflight, tiny_limit)
+            record_event("remote", "tiny-fast" if _memory_available(reservation, halo_control=halo_control) else "tokens", request, units, 0, **ev)
             return await _overflow_forward()
         # no remote configured -> fall through to the normal local wait loop
 
@@ -5176,7 +5207,9 @@ async def _route_completions(request, _no_overflow=False):
     # waits only BG_WAIT before overflowing to the cheap remote. Interactive traffic, by
     # policy (2026-09-11), does not overflow on a mere timeout at all -- see admission_wait().
     # The check-and-increment is done with no await in between, so it's race-free under asyncio.
-    lane_limit = admission_lane_limit(background, effective_budget(), FG_RESERVED)
+    lane_limit = admission_lane_limit(background, effective_budget(), FG_RESERVED,
+                                      halo_control=halo_control,
+                                      tiny_extra_lanes=TINY_EXTRA_LANES)
     deadline = time.time() + admission_wait_seconds(
         background, overflow_ok, is_peak(), LOCAL_WAIT, BG_WAIT, INTERACTIVE_NEVER_OVERFLOW)
     admitted = False
@@ -5201,7 +5234,7 @@ async def _route_completions(request, _no_overflow=False):
                             and _inflight == 0 and _waiting <= (1 if queued else 0))
             _admit_units = min(effective_budget(), _desired) if _bg_big_idle else units
             if _health["ok"] and _admit_units >= sequences and ((_inflight + _admit_units) <= lane_limit or _bg_big_idle) \
-                    and _memory_available(reservation):
+                    and _memory_available(reservation, halo_control=halo_control):
                 if _bg_big_idle and (_inflight + _admit_units) > lane_limit:
                     _stats["bg_big_idle_local"] = _stats.get("bg_big_idle_local", 0) + 1
                     _local_reason = "bg-big-idle"
@@ -5427,6 +5460,10 @@ async def gateway_stats(request):
         "overflowed_after_wait": _stats["overflowed_after_wait"],
         "inflight_tokens": _inflight_tokens, "token_budget": TOKEN_BUDGET,
         "inflight_reserved_tokens": _inflight_reserved_tokens,
+        "halo_control_lane_limit": admission_lane_limit(
+            False, effective_budget(), FG_RESERVED, halo_control=True,
+            tiny_extra_lanes=TINY_EXTRA_LANES),
+        "halo_control_token_reserve": _halo_control_token_reserve(),
         "backoff": max(0, int(_backoff_until - time.time())),
         "remote_model": REMOTE_MODEL, "remote_enabled": REMOTE_ENABLED,
         "local_only": bool(LOCAL_ONLY), "mode": routing_mode(),

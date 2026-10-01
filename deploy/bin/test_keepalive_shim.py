@@ -20,6 +20,7 @@ import json
 import os
 import pathlib
 import unittest
+from unittest.mock import patch
 
 # Deterministic estimation: force the cheap char/CHARS_PER_TOK path (no
 # tokenizer round-trip) so token estimates are a pure function of input size.
@@ -139,6 +140,46 @@ class HaloControlPriority(unittest.TestCase):
         self.assertFalse(shim._halo_control_request(self._Req(), _body(model="estate")))
         self.assertFalse(shim._halo_control_request(
             self._Req("some-local-client"), _body(model="estate-local")))
+
+    def test_control_identity_requires_halo_host(self):
+        request = self._Req()
+        request.remote = "10.0.1.77"
+        self.assertFalse(shim._halo_control_request(
+            request, _body(model="estate-local")))
+
+
+class HaloControlAdmission(unittest.TestCase):
+    def test_one_place_survives_full_ordinary_budget(self):
+        budget = 14
+        ordinary = shim.admission_lane_limit(False, budget, 2,
+                                               tiny_extra_lanes=1)
+        tiny = shim.admission_lane_limit(False, budget, 2, tiny=True,
+                                           tiny_extra_lanes=1)
+        control = shim.admission_lane_limit(False, budget, 2,
+                                              halo_control=True,
+                                              tiny_extra_lanes=1)
+        self.assertEqual((ordinary, tiny, control), (14, 14, 15))
+        self.assertLess(ordinary, control)
+        self.assertLess(tiny, control)
+
+    def test_zero_extra_still_reserves_one_inside_budget(self):
+        ordinary = shim.admission_lane_limit(False, 14, 2,
+                                               tiny_extra_lanes=0)
+        control = shim.admission_lane_limit(False, 14, 2,
+                                              halo_control=True,
+                                              tiny_extra_lanes=0)
+        self.assertEqual((ordinary, control), (13, 14))
+
+    def test_background_still_yields_to_foreground(self):
+        self.assertEqual(shim.admission_lane_limit(True, 14, 2,
+                                                    tiny_extra_lanes=1), 12)
+
+    def test_token_pool_keeps_one_control_prompt_available(self):
+        with patch.object(shim, "TOKEN_BUDGET", 500000), \
+                patch.object(shim, "_inflight_reserved_tokens", 437000):
+            self.assertFalse(shim._memory_available(1000))
+            self.assertTrue(shim._memory_available(62000, halo_control=True))
+            self.assertFalse(shim._memory_available(64000, halo_control=True))
 
 
 class RemapForRemote(unittest.TestCase):
