@@ -669,6 +669,50 @@ def _client_label(request):
 # Every /v1 completion request is registered while in flight (queued, generating on the local model, or
 # overflowed to the remote provider) and dropped when it finishes. Nothing here is persisted.
 _ACTIVE = {}          # id(request) -> {name, ip, ua, ep, model, ptok, maxtok, stream, t0, phase, route, reason, preview, bg, tiny}
+# A deployment fence: set on the event loop before observing _ACTIVE. It has a
+# lease so a crashed deployer cannot leave the gateway rejecting work forever.
+_DRAIN_UNTIL = 0.0
+_DRAIN_LEASE = None
+_DRAIN_REASON = None
+
+
+def _draining(now=None):
+    return (time.time() if now is None else now) < _DRAIN_UNTIL
+
+
+async def gateway_drain(request):
+    """Admin-controlled, leased admission fence for lossless gateway publication."""
+    global _DRAIN_UNTIL, _DRAIN_LEASE, _DRAIN_REASON
+    if request.method == "GET":
+        return web.json_response({"draining": _draining(), "active": len(_ACTIVE),
+                                  "until": _DRAIN_UNTIL if _draining() else None,
+                                  "reason": _DRAIN_REASON if _draining() else None})
+    if not _admin_ok(request):
+        return web.json_response({"error": "admin token required"}, status=401)
+    if request.method == "DELETE":
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            body = None
+        if not isinstance(body, dict) or body.get("lease") != _DRAIN_LEASE or not _DRAIN_LEASE:
+            return web.json_response({"error": "drain lease mismatch"}, status=409)
+        _DRAIN_UNTIL, _DRAIN_LEASE, _DRAIN_REASON = 0.0, None, None
+        return web.json_response({"draining": False, "active": len(_ACTIVE)})
+    try:
+        body = await request.json()
+        ttl = int(body.get("ttl_s"))
+        if not isinstance(body, dict) or not 30 <= ttl <= 1800:
+            raise ValueError("ttl_s outside [30, 1800]")
+    except (ValueError, TypeError, AttributeError):
+        return web.json_response({"error": "ttl_s must be 30..1800 seconds"}, status=400)
+    if _draining():
+        return web.json_response({"error": "another drain lease is active", "active": len(_ACTIVE),
+                                  "until": _DRAIN_UNTIL}, status=409)
+    _DRAIN_LEASE = os.urandom(16).hex()
+    _DRAIN_UNTIL = time.time() + ttl
+    _DRAIN_REASON = str(body.get("reason") or "deployment")[:80]
+    return web.json_response({"draining": True, "active": len(_ACTIVE),
+                              "until": _DRAIN_UNTIL, "lease": _DRAIN_LEASE})
 _CLIENT_NAMES_FILE = "/home/kevin/.local/share/vllm-qwen27b/clients.map"   # "<ip or X-Client> = <friendly name>"
 _client_names_cache = {"t": 0.0, "map": {}}
 
@@ -4664,6 +4708,14 @@ def _with_stream_usage(relay_body):
 async def handle_completions(request):
     """Register the request as live work for the dashboard, then run the router (below)."""
     body = await request.read()          # aiohttp caches the body; the router re-reads it for free
+    # Check after the await and before _ACTIVE registration, with no await in
+    # between. The drain endpoint runs on this same event loop: every request
+    # accepted before its fence is visible to the deployer, and every later
+    # request is refused before either local work or a paid hold can begin.
+    if _draining():
+        return web.json_response({"error": {"type": "gateway_draining",
+                                            "message": "gateway deployment is draining accepted calls; retry shortly"}},
+                                 status=503, headers={"Retry-After": "30", "X-Gateway-Drain": "active"})
     try:
         j = json.loads(body)
         if not isinstance(j, dict):
@@ -7738,6 +7790,9 @@ def make_app():
     app.router.add_post("/v1/chat/completions", handle_completions)
     app.router.add_post("/v1/completions", handle_completions)
     app.router.add_get("/gateway/stats", gateway_stats)
+    app.router.add_get("/gateway/drain", gateway_drain)
+    app.router.add_post("/gateway/drain", gateway_drain)
+    app.router.add_delete("/gateway/drain", gateway_drain)
     app.router.add_get("/gateway/models/local", gateway_models_local)
     app.router.add_post("/gateway/models/local", gateway_models_local)
     app.router.add_get("/gateway/config", gateway_config)
@@ -7771,4 +7826,6 @@ if __name__ == "__main__":
              TINY_TOKENS, TINY_EXTRA_LANES, FT_CONCURRENCY_SCALE, LOG_REQUESTS)
     log.info("  guards: big-out>=%dtok big-prompt>=%dtok size-cap>=%dtok first-token-max=%.0fs local-out-cap=%dtok -> remote",
              BIG_OUTPUT, BIG_PROMPT, MAX_LOCAL_TOKENS, FIRST_TOKEN_MAX, LOCAL_MAX_OUT)
-    web.run_app(make_app(), host="0.0.0.0", port=PORT)
+    # An accepted stream can be live for a full bounded model turn. A default
+    # 60-second aiohttp shutdown would cancel it even if systemd waited longer.
+    web.run_app(make_app(), host="0.0.0.0", port=PORT, shutdown_timeout=1800)
