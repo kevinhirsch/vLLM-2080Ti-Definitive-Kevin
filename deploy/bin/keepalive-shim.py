@@ -1467,12 +1467,23 @@ def _spend_day_start(now, tz=None):
 
 
 def _spend_hold_estimate(ptok, maxtok):
-    """Upper bound for one remote request: prompt + max output at the HIGHER of the normal
-    and peak rates (a request can straddle the peak boundary)."""
+    """Price a supplied prompt-token upper bound and maximum output at peak rates."""
     rin = max(REMOTE_COST_IN_PER_MTOK, REMOTE_COST_IN_PER_MTOK_PEAK)
     rout = max(REMOTE_COST_OUT_PER_MTOK, REMOTE_COST_OUT_PER_MTOK_PEAK)
     out = maxtok if maxtok and maxtok > 0 else SPEND_DEFAULT_OUT_TOKENS
     return round((max(0, ptok or 0) / 1e6) * rin + (out / 1e6) * rout, 6)
+
+
+def _spend_prompt_token_upper(body, estimated):
+    """Conservatively reserve paid input before provider usage can be known.
+
+    `_est_tokens` is a capacity estimate, not a billing upper bound: non-English
+    or dense text can tokenize far above its characters/4 heuristic. The JSON
+    wire body's byte length bounds ordinary tokenized content and leaves room
+    for provider chat-template markers. This affects the temporary hold only;
+    settlement still charges actual provider usage and releases the difference.
+    """
+    return max(max(0, int(estimated or 0)), len(body) + 4096)
 
 
 def telemetry_remote_cost(start, end, telemetry_dir=None):
@@ -1520,6 +1531,41 @@ class SpendLedgerError(RuntimeError):
     pass
 
 
+SPEND_ATTRIBUTION_MAX_GROUPS = 512
+
+
+def _spend_attribution_meta(info, basis=None):
+    """Small, prompt-free dimensions persisted with the same write as spend."""
+    info = info or {}
+    return {k: str(v or "unknown")[:64] for k, v in {
+        "client": info.get("client") or info.get("name") or info.get("xclient") or info.get("ip"),
+        "model": info.get("remote_model") or info.get("model"),
+        "alias": info.get("alias"),
+        "reason": info.get("reason"),
+        "basis": basis or info.get("basis") or info.get("cost_basis") or "hold",
+    }.items()}
+
+
+def _spend_attribution_empty(day):
+    return {"day": day, "groups": {}, "unattributed_usd": 0.0,
+            "reconciliation_usd": 0.0, "overflow_usd": 0.0, "overflow_calls": 0}
+
+
+def _spend_attribution_view(audit):
+    if not isinstance(audit, dict):
+        return None
+    groups = sorted((audit.get("groups") or {}).values(),
+                    key=lambda row: -float(row.get("usd") or 0))
+    view = {k: v for k, v in audit.items() if k != "groups"}
+    view["groups"] = groups
+    view["accounted_usd"] = round(
+        sum(float(row.get("usd") or 0) for row in groups)
+        + float(audit.get("unattributed_usd") or 0)
+        + float(audit.get("overflow_usd") or 0)
+        + float(audit.get("reconciliation_usd") or 0), 6)
+    return view
+
+
 class SpendLedger:
     """The atomic, durable daily remote-spend ledger. Pure apart from its own file."""
 
@@ -1541,9 +1587,11 @@ class SpendLedger:
 
     # -- persistence --
     def _fresh(self, now):
-        return {"version": 1, "day": _spend_day(now, self.tz), "spent": 0.0, "since": now,
+        day = _spend_day(now, self.tz)
+        return {"version": 1, "day": day, "spent": 0.0, "since": now,
                 "complete_day": None, "orphans_charged": 0.0, "reservations": {}, "holds": {},
-                "process": self.process, "enforcing": False}
+                "process": self.process, "enforcing": False,
+                "attribution": _spend_attribution_empty(day)}
 
     def _load(self):
         now = self._clock()
@@ -1564,6 +1612,12 @@ class SpendLedger:
         st.setdefault("reservations", {}); st.setdefault("holds", {})
         st.setdefault("since", None); st.setdefault("complete_day", None)
         st.setdefault("enforcing", False)
+        if not isinstance(st.get("attribution"), dict) or st["attribution"].get("day") != st.get("day"):
+            st["attribution"] = _spend_attribution_empty(st["day"])
+            # Older ledgers had only a total. Preserve the gap explicitly;
+            # never manufacture attribution from delayed telemetry.
+            st["attribution"]["unattributed_usd"] = round(float(st.get("spent") or 0), 6)
+            self._dirty = True
         if st.get("process") != self.process and st["holds"]:
             for key, h in list(st["holds"].items()):
                 self._settle_locked(st, key, float(h.get("amount") or 0.0), orphan=True)
@@ -1642,11 +1696,18 @@ class SpendLedger:
         st = self.state
         return bool(self._enforce()) and not st.get("corrupt") and st.get("complete_day") == st.get("day")
 
+    def _attribution_gap(self):
+        audit = _spend_attribution_view(self.state.get("attribution"))
+        return round(float(self.state.get("spent") or 0)
+                     - float((audit or {}).get("accounted_usd") or 0), 6)
+
     def _enforce_blocker(self):
         if not self._enforce():
             return "observe mode (SHIM_SPEND_ENFORCE=0)"
         if self.state.get("corrupt"):
             return "ledger corrupt"
+        if abs(self._attribution_gap()) > 0.000001:
+            return "spend attribution does not match the durable ledger total"
         if self.state.get("complete_day") != self.state.get("day"):
             return "today's prior remote spend is not imported; enforcement starts at the next Phoenix day"
         return None
@@ -1661,7 +1722,12 @@ class SpendLedger:
             return
         usd, n = got[0], got[1]
         est = got[2] if len(got) > 2 else 0
+        old_spent = float(st.get("spent") or 0)
         st["spent"] = round(max(float(st.get("spent") or 0), float(usd)), 6)
+        imported_gap = round(float(st["spent"]) - old_spent, 6)
+        if imported_gap > 0:
+            st["attribution"]["unattributed_usd"] = round(
+                float(st["attribution"].get("unattributed_usd") or 0) + imported_gap, 6)
         st["imported"] = {"day": st["day"], "telemetry_usd": usd, "requests": n,
                           "estimated_requests": est, "upper_bound": bool(est), "at": now}
         st["complete_day"] = st["day"]
@@ -1675,6 +1741,8 @@ class SpendLedger:
         if st.get("day") != day:
             # Every remote request passes through this ledger, so a ledger that was live (or the
             # gateway down) across midnight has seen the whole new day: it starts complete.
+            st["previous_attribution"] = st.get("attribution")
+            st["attribution"] = _spend_attribution_empty(day)
             st["day"], st["spent"], st["orphans_charged"] = day, 0.0, 0.0
             st["complete_day"] = day
             self._dirty = True
@@ -1715,7 +1783,7 @@ class SpendLedger:
         r["status"], r["closed_at"] = status, now
 
     @staticmethod
-    def _settle_locked(st, key, cost, orphan=False):
+    def _settle_locked(st, key, cost, orphan=False, meta=None):
         h = st["holds"].pop(key, None)
         cost = round(max(0.0, float(cost or 0.0)), 6)
         if h is not None and h.get("rid"):
@@ -1726,6 +1794,25 @@ class SpendLedger:
         st["spent"] = round(float(st.get("spent") or 0) + cost, 6)
         if orphan:
             st["orphans_charged"] = round(float(st.get("orphans_charged") or 0) + cost, 6)
+        audit = st.setdefault("attribution", _spend_attribution_empty(st["day"]))
+        if cost:
+            dims = meta or ((h or {}).get("meta") if h else None)
+            if not isinstance(dims, dict) or not dims:
+                audit["unattributed_usd"] = round(float(audit.get("unattributed_usd") or 0) + cost, 6)
+            else:
+                dims = {k: str(dims.get(k) or "unknown")[:64]
+                        for k in ("client", "model", "alias", "reason", "basis")}
+                if orphan:
+                    dims["basis"] = "orphan-held"
+                group_key = json.dumps(dims, sort_keys=True, separators=(",", ":"))
+                groups = audit.setdefault("groups", {})
+                if group_key not in groups and len(groups) >= SPEND_ATTRIBUTION_MAX_GROUPS:
+                    audit["overflow_usd"] = round(float(audit.get("overflow_usd") or 0) + cost, 6)
+                    audit["overflow_calls"] = int(audit.get("overflow_calls") or 0) + 1
+                else:
+                    group = groups.setdefault(group_key, {**dims, "usd": 0.0, "calls": 0})
+                    group["usd"] = round(float(group["usd"]) + cost, 6)
+                    group["calls"] += 1
         return cost
 
     def _totals_raw(self):
@@ -1753,6 +1840,7 @@ class SpendLedger:
             st = self.state
             active = [{k: v for k, v in r.items() if k != "bound_ip"}
                       for r in st["reservations"].values() if r.get("status") == "active"]
+            audit_view = _spend_attribution_view(st.get("attribution"))
             return {"day": st["day"], "tz": self.tz or SPEND_TZ,
                     "enforce": self.enforcing(), "enforce_configured": bool(self._enforce()),
                     "enforce_blocked": self._enforce_blocker(),
@@ -1762,7 +1850,12 @@ class SpendLedger:
                     "durable": not self._dirty, "in_flight": len(st["holds"]),
                     "revision": int(st.get("revision") or 0), "last_settle_at": st.get("last_settle_at"),
                     "orphans_charged": st.get("orphans_charged", 0.0),
-                    "gateway_sha256": GATEWAY_SHA256, "reservations": active, **self._totals()}
+                    "gateway_sha256": GATEWAY_SHA256, "reservations": active,
+                    "attribution": audit_view,
+                    "attribution_gap_usd": round(float(st.get("spent") or 0)
+                                                  - float((audit_view or {}).get("accounted_usd") or 0), 6),
+                    "previous_attribution": _spend_attribution_view(st.get("previous_attribution")),
+                    **self._totals()}
 
     def get(self, rid):
         with self._lock:
@@ -1829,7 +1922,7 @@ class SpendLedger:
                 self._flush_quietly()
             return dict(r), None
 
-    def hold(self, req_key, amount, rid=None, client_ip=None):
+    def hold(self, req_key, amount, rid=None, client_ip=None, meta=None):
         """(ok, reason). Atomic check-and-hold for one paid request before it is forwarded."""
         amount = round(max(0.0, float(amount or 0.0)), 6)
         with self._lock:
@@ -1837,6 +1930,8 @@ class SpendLedger:
             self._roll_and_sweep(now)
             if self.state.get("corrupt"):
                 return False, "spend ledger corrupt: paid forwarding refused until recovered"
+            if abs(self._attribution_gap()) > 0.000001:
+                return False, "spend attribution mismatch: paid forwarding refused until recovered"
             if req_key in self.state["holds"]:
                 return True, "already held"
             enforcing = self.enforcing()
@@ -1859,13 +1954,15 @@ class SpendLedger:
             if r is not None:
                 r["held"] = round(float(r.get("held") or 0) + from_res, 6)
             self.state["holds"][req_key] = {"amount": amount, "from_res": from_res, "from_global": need,
-                                            "rid": r["id"] if r is not None else None, "created": now}
+                                            "rid": r["id"] if r is not None else None, "created": now,
+                                            "meta": _spend_attribution_meta(meta) if meta else None}
             if not self._commit_or_rollback(before):
                 if enforcing:
                     return False, "spend ledger write failed: paid forwarding refused"
                 # observe mode: keep the hold in memory (still counted) and retry durability later
                 self.state["holds"][req_key] = {"amount": amount, "from_res": 0.0, "from_global": amount,
-                                                "rid": None, "created": now}
+                                                "rid": None, "created": now,
+                                                "meta": _spend_attribution_meta(meta) if meta else None}
                 self._dirty = True
             return True, "held"
 
@@ -1877,9 +1974,11 @@ class SpendLedger:
             self._flush_quietly()
             if self.state.get("corrupt"):
                 return False
+            if abs(self._attribution_gap()) > 0.000001:
+                return False
             return (not self.enforcing()) or round(float(amount), 6) <= self._totals()["available"]
 
-    def settle(self, req_key, cost):
+    def settle(self, req_key, cost, meta=None):
         """Replace a request's hold with its priced cost, or charge an unheld remote request.
         Idempotent per request key. A failed write keeps the charge in memory (still counted)
         and marks the ledger not durable until a later write succeeds."""
@@ -1891,7 +1990,8 @@ class SpendLedger:
                 return 0.0
             if cost is None:                   # no trustworthy usage: charge the full hold
                 cost = float((self.state["holds"].get(req_key) or {}).get("amount") or 0.0)
-            charged = self._settle_locked(self.state, req_key, cost)
+            charged = self._settle_locked(self.state, req_key, cost,
+                                          meta=_spend_attribution_meta(meta) if meta else None)
             self.state["last_settle_at"] = now
             self._settled[req_key] = charged
             while len(self._settled) > 20000:
@@ -1935,6 +2035,12 @@ class SpendLedger:
                     spent = max(spent, float(prior.get("spent") or 0))
                 fresh["reservations"], fresh["holds"] = prior.get("reservations", {}), prior.get("holds", {})
                 fresh["since"] = prior.get("since")
+                if prior.get("day") == fresh["day"]:
+                    fresh["attribution"] = copy.deepcopy(prior.get("attribution") or
+                                                          _spend_attribution_empty(fresh["day"]))
+                    fresh["previous_attribution"] = copy.deepcopy(prior.get("previous_attribution"))
+                else:
+                    fresh["previous_attribution"] = copy.deepcopy(prior.get("attribution"))
             if replace and spent is not None and not str(source).startswith("operator-replace"):
                 return False, "replace needs an explicit operator figure"
             fresh["revision"] = int(prior.get("revision") or 0)
@@ -1942,6 +2048,11 @@ class SpendLedger:
                          recovered={"at": now, "source": source, "reason": str(reason)[:200],
                                     "prior_corrupt": prior.get("corrupt"),
                                     "artifact": prior.get("corrupt_artifact")})
+            audit = fresh["attribution"]
+            explained = (sum(float(row.get("usd") or 0) for row in (audit.get("groups") or {}).values())
+                         + float(audit.get("unattributed_usd") or 0)
+                         + float(audit.get("overflow_usd") or 0))
+            audit["reconciliation_usd"] = round(float(fresh["spent"]) - explained, 6)
             self.state = fresh
             if not self._commit_or_rollback(prior):
                 return False, "spend ledger write failed: recovery not recorded"
@@ -2067,14 +2178,15 @@ def _spend_hold_for(request, body, prices=None):
         maxtok = int(json.loads(body).get("max_tokens") or 0)
     except Exception:
         maxtok = 0
-    ptok = (info or {}).get("ptok") or _est_tokens(body)
+    ptok = _spend_prompt_token_upper(body, (info or {}).get("ptok") or _est_tokens(body))
     rid = _alias_for_request(body).get("reservation")
     if prices:
         out = maxtok if maxtok and maxtok > 0 else SPEND_DEFAULT_OUT_TOKENS
         amount = round((max(0, ptok or 0) * prices[1] + out * prices[2]) / 1e6, 6)   # no-cache bound
     else:
         amount = _spend_hold_estimate(ptok, maxtok)
-    ok, reason = _spend().hold(key, amount, rid=rid, client_ip=getattr(request, "remote", None))
+    ok, reason = _spend().hold(key, amount, rid=rid, client_ip=getattr(request, "remote", None),
+                               meta=_spend_attribution_meta(info))
     if not ok:
         log.info("spend refused %s: %s", key, reason)
         kind = ("spend_reservation_invalid" if reason.startswith("spend reservation")
@@ -2099,7 +2211,7 @@ def _spend_settle(info, resp):
             return
         if info.get("cost_policy") == "free":
             if info.get("spend_held"):
-                _spend().settle(key, 0.0)
+                _spend().settle(key, 0.0, meta=_spend_attribution_meta(info, "free"))
             return
         sent = bool(info.get("remote_sent"))
         cost, basis = _request_remote_cost(info) if sent else (0.0, None)
@@ -2112,7 +2224,11 @@ def _spend_settle(info, resp):
         else:
             charge = 0.0
         if info.get("spend_held") or charge:
-            _spend().settle(key, charge)
+            charged = _spend().settle(key, charge, meta=_spend_attribution_meta(
+                info, basis if sent and basis in ("actual", "usage") else
+                "held-fallback" if sent and info.get("spend_held") else
+                "estimated" if sent else "unsent"))
+            info["charged_usd"] = charged
     except Exception as exc:
         log.warning("spend settle failed (hold expires and is charged): %s", exc)
 
@@ -2297,6 +2413,7 @@ def _telemetry_note_request(info, resp=None):
             "status": status, "stream": bool(info.get("stream")),
             "bg": bool(info.get("bg")), "tiny": bool(info.get("tiny")),
             "preview": info.get("preview"), "cost_est": req_cost, "cost_basis": cost_basis,
+            "charged_usd": info.get("charged_usd"),
             "remote_model": info.get("remote_model"), "remote_cache_hit": info.get("remote_cache_hit"),
             "cost_policy": info.get("cost_policy"), "remote_provider": info.get("remote_provider"),
             "remote_sent": bool(info.get("remote_sent")),

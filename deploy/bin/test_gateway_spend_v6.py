@@ -210,6 +210,95 @@ class Settlement(unittest.TestCase):
     def test_a_free_endpoint_releases_its_hold_at_zero(self):
         self.assertEqual(self.settle(remote_sent=True, cost_policy="free", outtok=10**6), 0.0)
 
+    def test_paid_hold_uses_wire_bytes_when_capacity_estimate_is_too_small(self):
+        request = Request("estate-remote")
+        request.body = b'{"model":"estate-remote","messages":[{"role":"user","content":"' + b'x' * 12000 + b'"}],"max_tokens":1000}'
+        info = {"spend_key": "wire-bound", "ptok": 1}
+        with patch.object(shim, "_ACTIVE", {id(request): info}):
+            refused = shim._spend_hold_for(request, request.body)
+        self.assertIsNone(refused)
+        self.assertTrue(info["spend_held"])
+        bound = shim._spend_hold_estimate(len(request.body) + 4096, 1000)
+        self.assertEqual(self.led.snapshot()["held"], bound)
+
+
+class DurableAttribution(unittest.TestCase):
+    def test_prior_ledger_total_is_explicitly_unattributed_without_resetting_cap(self):
+        path = Path(tempfile.mkdtemp(dir=_TMPDIR.name)) / "ledger.json"
+        day = shim._spend_day(DAY0)
+        path.write_text(json.dumps({"version": 1, "day": day, "spent": 3.25,
+                                    "complete_day": day, "reservations": {}, "holds": {},
+                                    "process": "old", "enforcing": True}))
+        led = shim.SpendLedger(str(path), cap=lambda: 25.0, clock=lambda: DAY0,
+                               process_token="new", importer=None, enforce=lambda: True)
+        snap = led.snapshot()
+        self.assertTrue(snap["enforce"])
+        self.assertEqual(snap["spent"], 3.25)
+        self.assertEqual(snap["attribution"]["unattributed_usd"], 3.25)
+        self.assertEqual(snap["attribution_gap_usd"], 0.0)
+
+    def test_settlement_and_orphan_are_attributed_in_the_atomic_ledger(self):
+        directory = Path(tempfile.mkdtemp(dir=_TMPDIR.name))
+        path = directory / "ledger.json"
+        clock = [DAY0]
+        make = lambda process: shim.SpendLedger(str(path), cap=lambda: 25.0,
+                         clock=lambda: clock[0], process_token=process,
+                         importer=lambda s, e: (0.0, 0, 0), enforce=lambda: True)
+        first = make("one")
+        meta = {"name": "halo", "remote_model": "deepseek-flash", "alias": "estate-remote",
+                "reason": "incident", "basis": "actual"}
+        self.assertTrue(first.hold("settled", 0.5, meta=meta)[0])
+        self.assertEqual(first.settle("settled", 0.125, meta=meta), 0.125)
+        self.assertTrue(first.hold("orphan", 0.25, meta=meta)[0])
+        second = make("two")       # process death charges the durable hold
+        snap = second.snapshot()
+        self.assertEqual(snap["spent"], 0.375)
+        self.assertEqual(sum(x["usd"] for x in snap["attribution"]["groups"]), 0.375)
+        self.assertEqual({x["basis"] for x in snap["attribution"]["groups"]},
+                         {"actual", "orphan-held"})
+        self.assertEqual(snap["attribution"]["unattributed_usd"], 0)
+        self.assertEqual(make("two").snapshot()["attribution"], snap["attribution"])
+
+    def test_replace_reconciles_attribution_to_the_authoritative_total(self):
+        led = ledger(cap=25.0)
+        led.hold("a", 0.5, meta={"name": "halo", "model": "m"})
+        led.settle("a", 0.2)
+        rev = led.snapshot()["revision"]
+        self.assertTrue(led.recover(spent=0.3, replace=True, source="provider-bill",
+                                    expected_revision=rev)[0])
+        audit = led.snapshot()["attribution"]
+        self.assertAlmostEqual(audit["groups"][0]["usd"], 0.2)
+        self.assertAlmostEqual(audit["reconciliation_usd"], 0.1)
+
+    def test_phoenix_day_roll_retains_yesterdays_breakdown(self):
+        directory = Path(tempfile.mkdtemp(dir=_TMPDIR.name))
+        clock = [DAY0]
+        led = shim.SpendLedger(str(directory / "ledger.json"), cap=lambda: 25.0,
+                               clock=lambda: clock[0], process_token="p",
+                               importer=lambda s, e: (0.0, 0, 0), enforce=lambda: True)
+        led.hold("a", 0.5, meta={"name": "halo", "model": "m"})
+        led.settle("a", 0.2)
+        yesterday = led.snapshot()["day"]
+        clock[0] += 86400
+        snap = led.snapshot()
+        self.assertNotEqual(snap["day"], yesterday)
+        self.assertEqual(snap["spent"], 0.0)
+        self.assertEqual(snap["attribution"]["groups"], [])
+        self.assertEqual(snap["previous_attribution"]["day"], yesterday)
+        self.assertAlmostEqual(sum(x["usd"] for x in
+                                   snap["previous_attribution"]["groups"]), 0.2)
+        self.assertEqual(snap["attribution_gap_usd"], 0.0)
+
+    def test_a_ledger_attribution_mismatch_refuses_new_paid_holds(self):
+        led = ledger(cap=25.0)
+        led.hold("a", 0.5, meta={"name": "halo"})
+        led.settle("a", 0.2)
+        group = next(iter(led.state["attribution"]["groups"].values()))
+        group["usd"] = 0.1
+        self.assertEqual(led.snapshot()["attribution_gap_usd"], 0.1)
+        self.assertFalse(led.hold("b", 0.1)[0])
+        self.assertFalse(led.can_hold(0.1))
+
 
 class CompareAndSetReplace(unittest.TestCase):
     def test_replace_is_bound_to_the_exact_revision_with_nothing_in_flight(self):
