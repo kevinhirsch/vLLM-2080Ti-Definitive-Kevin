@@ -33,6 +33,8 @@ class SpendOwner(unittest.TestCase):
                 owner.stdin.write("x")
                 owner.stdin.flush()
                 owner.wait(timeout=5)
+                owner.stdin.close()
+                owner.stdout.close()
             try:
                 shim._claim_spend_authority(ledger)
                 self.assertIsNotNone(shim._RUNTIME_SPEND_LOCK)
