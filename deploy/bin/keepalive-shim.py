@@ -1430,6 +1430,12 @@ SPEND_TZ = os.environ.get("SHIM_SPEND_TZ", "America/Phoenix")   # the estate hos
 SPEND_RESERVATION_TTL_MAX = int(os.environ.get("SHIM_SPEND_RESERVATION_TTL_MAX", str(4 * 3600)))
 SPEND_REQUEST_HOLD_TTL = int(os.environ.get("SHIM_SPEND_REQUEST_HOLD_TTL", "1800"))
 SPEND_DEFAULT_OUT_TOKENS = int(os.environ.get("SHIM_SPEND_DEFAULT_OUT_TOKENS", "16384"))
+# An optional verified-outcome brake for automatic overflow. The operator's
+# full-remote lease and explicit estate-remote incident tier remain deliberate
+# routes under the shared $25 hard cap. A stalled/unknown estate outcome cannot
+# silently spend a fresh day on ordinary gateway-chosen overflow.
+OUTCOME_ALARM_PATH = os.environ.get("SHIM_OUTCOME_ALARM_PATH", "")
+STALLED_AUTO_OVERFLOW_CAP_USD = float(os.environ.get("SHIM_STALLED_AUTO_OVERFLOW_CAP_USD", "2.0"))
 SPEND_KEEP_SECS = 2 * 86400          # finalized/expired reservations kept for idempotent replays
 _SPEND_RID = re.compile(r"^[0-9a-f]{32}$")
 _CFG.update({
@@ -2024,6 +2030,30 @@ def _spend_allows_overflow(ptok, maxtok):
     locally (queueing for a lane) instead of refusing it."""
     try:
         return _spend().can_hold(_spend_hold_estimate(ptok, maxtok))
+    except Exception:
+        return False
+
+
+def _automatic_remote_budget_allows(ptok, maxtok):
+    """Bound automatic paid work while accepted delivery is stalled or unknown.
+
+    This is a conservative routing brake, not the hard spend authority: every
+    paid request still passes SpendLedger's atomic $25 hold. If the configured
+    independent outcome alarm cannot be read, automatic overflow stays local.
+    Explicit incident escalation remains available through estate-remote.
+    """
+    if not OUTCOME_ALARM_PATH:
+        return True
+    try:
+        with open(OUTCOME_ALARM_PATH, encoding="utf-8") as fh:
+            outcome = json.load(fh)
+        if not isinstance(outcome, dict):
+            return False
+        if outcome.get("status") == "producing":
+            return True
+        spend = _spend().snapshot()
+        exposure = sum(float(spend.get(k) or 0) for k in ("spent", "held", "reserved"))
+        return exposure + _spend_hold_estimate(ptok, maxtok) <= STALLED_AUTO_OVERFLOW_CAP_USD
     except Exception:
         return False
 
@@ -4619,7 +4649,9 @@ async def _route_completions(request, _no_overflow=False):
     # engine serves 524K context; latency is acceptable). Only explicit remote -- the
     # estate-remote alias, route-intent remote, the forced window -- gets the 429, because those
     # callers handle refusal themselves. Local genuinely DOWN with no budget -> 503 + Retry-After.
-    overflow_ok = (not _no_overflow) and remote_ok() and _spend_allows_overflow(ptok, maxtok)
+    automatic_paid_ok = _automatic_remote_budget_allows(ptok, maxtok)
+    overflow_ok = ((not _no_overflow) and automatic_paid_ok and remote_ok()
+                   and _spend_allows_overflow(ptok, maxtok))
 
     async def _overflow_forward(reentry=True):
         """Forward an overflow; if the spend authority refuses it after all (a race with other
@@ -4714,7 +4746,7 @@ async def _route_completions(request, _no_overflow=False):
     # ROUTE-INTENT: callers can ask the gateway to treat this as overflow work (for example an
     # explicit brain escalation), but the gateway still checks overflow_ok and local-pin before
     # making the provider decision.  This keeps routing authority in one place.
-    if remote_intent and remote_ok() and not local_pin and not alias_local_only:
+    if remote_intent and automatic_paid_ok and remote_ok() and not local_pin and not alias_local_only:
         log.info("route %s gateway route intent=%s -> remote(intent)", path, route_intent)
         record_event("remote", "intent", request, units, 0, **ev)
         return await _forward_remote(request, path, body, streaming)

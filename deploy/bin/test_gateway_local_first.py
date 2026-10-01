@@ -214,6 +214,20 @@ class Helpers(Isolated):
         self.assertEqual(shim._parse_reason_set(shim._fmt_seq(frozenset({"a", "b"}), ",")),
                          frozenset({"a", "b"}))
 
+    def test_stalled_outcome_brakes_automatic_overflow_but_producing_allows_it(self):
+        alarm = Path(_TMP) / "outcome-alarm.json"
+        with patch.object(shim, "OUTCOME_ALARM_PATH", str(alarm)), \
+                patch.object(shim, "STALLED_AUTO_OVERFLOW_CAP_USD", 2.0), \
+                patch.object(shim, "_spend", lambda: type("Ledger", (), {
+                    "snapshot": lambda self: {"spent": 1.8, "held": 0.1, "reserved": 0}})()), \
+                patch.object(shim, "_spend_hold_estimate", lambda *_: 0.2):
+            self.assertFalse(shim._automatic_remote_budget_allows(1000, 1000))
+            alarm.write_text(json.dumps({"status": "stalled"}))
+            self.assertFalse(shim._automatic_remote_budget_allows(1000, 1000))
+            alarm.write_text(json.dumps({"status": "producing"}))
+            self.assertTrue(shim._automatic_remote_budget_allows(1000, 1000))
+            alarm.unlink()
+
 
 class Routing(Isolated, unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -234,6 +248,7 @@ class Routing(Isolated, unittest.IsolatedAsyncioTestCase):
                 _est_tokens=lambda body: self.ptok, estimate_units=lambda *a, **k: 1,
                 predict_computed_tokens=lambda c, b, p: 2_000, _prefix_cache_observe=lambda *a: None,
                 remote_ok=lambda: True, _spend_allows_overflow=lambda p, m: True,
+                _automatic_remote_budget_allows=lambda p, m: True,
                 local_healthy=AsyncMock(return_value=True), is_peak=lambda: False,
                 _active_set=lambda *a, **k: None, _note_payload_outcome=lambda *a, **k: None,
                 _write_flightrec=lambda *a, **k: None, perf_breaker_active=lambda: False,
@@ -326,6 +341,13 @@ class Routing(Isolated, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await self.route(), "remote")
         self.assertEqual(self.events, [("remote", "local-down")])
         self.assertEqual(dict(shim._local_first_kept), {})
+
+    async def test_stalled_outcome_keeps_automatic_overflow_and_route_intent_local(self):
+        with patch.object(shim, "_automatic_remote_budget_allows", lambda *a: False), \
+                patch.object(shim, "LOCAL_FIRST", False):
+            self.assertEqual(await self.route(), "local")
+            self.assertEqual(await self.route(headers={"X-Gateway-Route-Intent": "remote"}), "local")
+            self.assertEqual(await self.route(model="estate-remote"), "remote")
 
     async def test_kept_request_still_overflows_as_cap_if_lanes_fill_during_admission(self):
         # decision saw a free lane; admission (the saturation fallback) finds the lanes full
