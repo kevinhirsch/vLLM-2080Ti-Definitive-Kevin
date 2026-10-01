@@ -101,6 +101,16 @@ class Routing(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(resp.body)["error"]["type"], "cost_policy_missing")
         self.assertEqual(self.sent, [])
 
+    async def test_prompt_larger_than_every_provider_is_rejected_before_routing(self):
+        with patch.object(shim, "_est_tokens", lambda body: 1_500_000):
+            for model in ("estate", "estate-remote"):
+                resp = await shim.handle_completions(Request(model))
+                self.assertEqual(resp.status, 413)
+                self.assertEqual(json.loads(resp.body)["error"]["code"],
+                                 "prompt_exceeds_all_providers")
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.led.snapshot()["spent"], 0.0)
+
     async def test_an_explicitly_free_endpoint_is_never_charged(self):
         self.usage = {"remote_cache_hit": 1_000_000, "remote_cache_miss": 1_000_000, "outtok": 1_000_000}
         self.led.settle("pre", 1.0)                             # even with the cap spent

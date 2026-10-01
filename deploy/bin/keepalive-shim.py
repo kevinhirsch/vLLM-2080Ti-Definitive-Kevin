@@ -4620,6 +4620,21 @@ async def _route_completions(request, _no_overflow=False):
     units = estimate_units(body, client=client)
     streaming = wants_stream(body)
     ptok = _est_tokens(body)
+    # No configured provider can accept a prompt above this ceiling. Refuse it
+    # before cache prediction, routing, queue admission, or paid forwarding. A
+    # stale agent session once rebuilt a ~1.9M-token health probe on every retry.
+    # The caller must rotate/compact its session; retrying this body is not work.
+    provider_ceiling = max(
+        int(LOCAL_CONTEXT_LIMIT), int(REMOTE_CONTEXT_LIMIT),
+        *(int(a.get("context_limit") or 0) for a in _ALIASES.values()
+          if isinstance(a, dict) and a.get("enabled")),
+    )
+    if ptok > provider_ceiling:
+        _active_set(request, est_tokens=ptok, route="rejected", reason="prompt-exceeds-all-providers")
+        return web.json_response({"error": {"message":
+            f"prompt estimate {ptok} exceeds every configured provider context ({provider_ceiling}); "
+            "rotate or compact the client session before retrying",
+            "type": "context_length_exceeded", "code": "prompt_exceeds_all_providers"}}, status=413)
     # gw-admission-computed-token-cost: predicted UNCONDITIONALLY (not gated on
     # USE_COMPUTED_COST, which only decides whether admission COST uses this number) so the
     # card's own accuracy gate has real predicted-vs-actual data to grade from the moment this
