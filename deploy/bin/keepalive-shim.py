@@ -335,6 +335,17 @@ NONTHINK_TOP_K   = int(os.environ.get("SHIM_NONTHINK_TOP_K", "20"))
 # MASTER SWITCH: 1 = FULL REMOTE (every completion -> DeepSeek; local engine untouched —
 # for maintenance/repro/debugging), 0 = normal local-first. Toggle live from the dashboard.
 FORCE_REMOTE = 1 if os.environ.get("SHIM_FORCE_REMOTE", "0").lower() in ("1", "true", "on") else 0
+# A paid full-remote maintenance mode is a lease, not a permanent routing state.
+# An old persisted FORCE_REMOTE=1 without a lease is inert after an upgrade.
+FORCE_REMOTE_LEASE_S = 3600
+try:
+    FORCE_REMOTE_UNTIL_EPOCH = float(os.environ.get("SHIM_FORCE_REMOTE_UNTIL_EPOCH", "0"))
+except ValueError:
+    FORCE_REMOTE_UNTIL_EPOCH = 0.0
+
+
+def effective_force_remote():
+    return bool(FORCE_REMOTE and time.time() < FORCE_REMOTE_UNTIL_EPOCH)
 # The third mode (Kevin 2026-09-10: "LOCAL FIRST // FULL REMOTE // FULL LOCAL"):
 # 1 = FULL LOCAL — never overflow to the paid remote for ANY request; when every local lane is
 # busy a request QUEUES for a lane instead of spending money ($0 guaranteed, latency unbounded).
@@ -631,7 +642,7 @@ def routing_mode():
     badge can never disagree with the behaviour."""
     if LOCAL_ONLY:
         return "full_local"
-    if REMOTE_ENABLED and FORCE_REMOTE:
+    if REMOTE_ENABLED and effective_force_remote():
         return "full_remote"
     return "local_first"
 
@@ -2792,6 +2803,8 @@ def current_config(masked=True):
         elif isinstance(v, bool):
             v = 1 if v else 0
         out[field] = v
+    out["force_remote"] = int(effective_force_remote())
+    out["force_remote_lease_remaining_s"] = max(0, int(FORCE_REMOTE_UNTIL_EPOCH - time.time())) if effective_force_remote() else 0
     k = g["REMOTE_KEY"]
     out["remote_key_display"] = ("set (" + k[:5] + "\u2026" + k[-4:] + ")") if (masked and k and len(k) > 12) else ("set" if k else "")
     out["remote_key_set"] = bool(k)
@@ -2818,6 +2831,8 @@ def apply_config(fields):
             changed.append(fk)
         except Exception as e:
             log.warning("config: bad value for %s: %r (%s)", fk, val, e)
+    if "force_remote" in changed:
+        g["FORCE_REMOTE_UNTIL_EPOCH"] = time.time() + FORCE_REMOTE_LEASE_S if FORCE_REMOTE else 0.0
     g["REMOTE_ENABLED"] = bool(g["REMOTE_BASE"] and g["REMOTE_KEY"])
     if changed and _config_owner():
         _persist_config()
@@ -3017,6 +3032,7 @@ def _persist_config():
     vals = {env: (_fmt_seq(g[gname], _CFG_SEP.get(env, _CFG_SEP_DEFAULT))
                   if isinstance(g[gname], (list, tuple, set, frozenset)) else str(g[gname]))
             for env, (gname, _) in _CFG.items()}
+    vals["SHIM_FORCE_REMOTE_UNTIL_EPOCH"] = str(FORCE_REMOTE_UNTIL_EPOCH)
     try:
         lines, seen = [], set()
         if os.path.exists(SHIM_ENV_FILE):
@@ -4670,7 +4686,7 @@ async def _route_completions(request, _no_overflow=False):
 
     # MASTER SWITCH: full-remote mode (maintenance/debug) — everything -> DeepSeek.  The
     # estate-local alias is the one explicit per-request exception.
-    if remote_ok() and FORCE_REMOTE and not alias_local_only:
+    if remote_ok() and effective_force_remote() and not alias_local_only:
         # BG-LOCAL-ONLY: a maintenance window is a deliberate, operator-chosen full-remote
         # mode -- not a transient outage worth waiting out -- so background traffic is
         # REJECTED immediately (no wait, no paid remote) rather than held or forwarded.

@@ -162,6 +162,22 @@ class Decision(Isolated):
 
 
 class Helpers(Isolated):
+    def test_full_remote_requires_a_live_bounded_lease(self):
+        with patch.object(shim, "REMOTE_BASE", "https://example.invalid"), \
+                patch.object(shim, "REMOTE_KEY", "test-only"), \
+                patch.object(shim, "REMOTE_ENABLED", True), patch.object(shim, "FORCE_REMOTE", 1), \
+                patch.object(shim, "FORCE_REMOTE_UNTIL_EPOCH", 0.0), \
+                patch.object(shim, "_config_owner", lambda: False), \
+                patch.object(shim.time, "time", return_value=1000.0):
+            self.assertEqual(shim.routing_mode(), "local_first")
+            self.assertEqual(shim.current_config()["force_remote"], 0)
+            shim.apply_config({"force_remote": 1})
+            self.assertEqual(shim.routing_mode(), "full_remote")
+            self.assertEqual(shim.FORCE_REMOTE_UNTIL_EPOCH, 4600.0)
+            with patch.object(shim.time, "time", return_value=4601.0):
+                self.assertEqual(shim.routing_mode(), "local_first")
+                self.assertEqual(shim.current_config()["force_remote"], 0)
+
     def test_reservation_estimate_mirrors_the_local_output_clamp(self):
         with patch.object(shim, "LOCAL_MAX_OUT", 16384):
             self.assertEqual(shim.local_reservation_estimate(50_000, 0), 66_384)
@@ -288,7 +304,8 @@ class Routing(Isolated, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.events, [("remote", "alias")])
         self.assertEqual(await self.route(headers={"X-Gateway-Route-Intent": "remote"}), "remote")
         self.assertEqual(self.events, [("remote", "intent")])
-        with patch.object(shim, "FORCE_REMOTE", 1):
+        with patch.object(shim, "FORCE_REMOTE", 1), \
+                patch.object(shim, "FORCE_REMOTE_UNTIL_EPOCH", time.time() + 60):
             self.assertEqual(await self.route(), "remote")
         self.assertEqual(self.events, [("remote", "forced")])
         with patch.object(shim, "local_healthy", AsyncMock(return_value=False)), \

@@ -388,7 +388,8 @@ class Seam(unittest.IsolatedAsyncioTestCase):
 
     async def test_explicit_remote_routes_are_refused_with_429_when_the_cap_is_exhausted(self):
         self.led.settle("earlier", 0.99)
-        with patch.object(shim, "FORCE_REMOTE", 1):                            # forced window
+        with patch.object(shim, "FORCE_REMOTE", 1), \
+                patch.object(shim, "FORCE_REMOTE_UNTIL_EPOCH", shim.time.time() + 60):  # forced window
             resp = await shim.handle_completions(Request(model="qwen-local"))
         self.assertEqual(resp.status, 429)
         resp = await shim.handle_completions(Request(model="qwen-local",
