@@ -727,5 +727,24 @@ class Routing(unittest.IsolatedAsyncioTestCase):
             self.gates["holder"].set()
             await holder
 
+    async def test_robot_work_waits_locally_until_its_bound_then_the_valve_takes_it(self):
+        async def fwd(request, path, body, streaming, endpoint=None, model=None):
+            return "remote"
+
+        self.gates["holder"] = asyncio.Event()
+        with patch.object(shim, "remote_ok", lambda: True), patch.object(shim, "_spend_allows_overflow", lambda p, m: True), \
+                patch.object(shim, "_automatic_remote_budget_allows", lambda p, m: True), patch.object(shim, "_forward_remote", fwd), \
+                patch.object(shim, "REMOTE_ENABLED", True), patch.object(shim, "BG_WAIT_LOCAL", 0.4), patch.object(shim, "BG_WAIT", 0.0), \
+                patch.object(shim, "LOCAL_WAIT", 0):
+            holder = asyncio.create_task(self.go("holder"))
+            await asyncio.sleep(0.05)
+            t0 = time.time()
+            r = await asyncio.wait_for(self.go("overseer-refine-overflow", headers={"X-Gateway-Deadline-S": "600"}), 5)
+            self.assertEqual(r, "remote")
+            self.assertGreaterEqual(time.time() - t0, 0.35)                        # it waited for local first (not BG_WAIT=0)
+            self.assertLess(time.time() - t0, 2.0)
+            self.gates["holder"].set()
+            await holder
+
 if __name__ == "__main__":
     unittest.main()

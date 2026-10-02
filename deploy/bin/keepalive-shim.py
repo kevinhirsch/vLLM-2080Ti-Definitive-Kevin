@@ -6598,7 +6598,10 @@ async def _route_completions(request, _no_overflow=False):
     if FLOW_MODE == "enforce" and flow_cls in FLOW_REFUSABLE and flow_t.deadline_at is not None:
         # Local-first (Kevin 10-02): robot work waits for local until it would miss its own deadline (bounded by
         # BG_WAIT_LOCAL) instead of overflowing to the paid remote after a few seconds.
-        deadline = max(deadline, min(flow_t.deadline_at - flow_t.cost_s, t_admit0 + BG_WAIT_LOCAL))
+        # The flow class (not the legacy is_background() test, which does not know the overseer-* clients) owns the wait
+        # bound of robot work whenever remote is a possible valve.
+        if overflow_ok and not alias_local_only:
+            deadline = min(flow_t.deadline_at - flow_t.cost_s, t_admit0 + BG_WAIT_LOCAL)
     if FLOW_MODE != "off":
         _refusal = flow_admission_check(flow_t, bool(overflow_ok and not alias_local_only))
         _active_set(request, flow_expected_wait_s=flow_t.expected_wait_s)
