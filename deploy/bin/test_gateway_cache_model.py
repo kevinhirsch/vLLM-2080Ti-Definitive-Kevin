@@ -240,6 +240,21 @@ class Units(Base):
             self.assertAlmostEqual(shim._prefill_backlog_secs(), 30.0)
 
 
+class RemoteBreaker(Base):
+    def test_402_turns_remote_overflow_off_then_lets_a_probe_through(self):
+        with patch.object(shim, "REMOTE_ENABLED", True), patch.object(shim, "LOCAL_ONLY", 0), \
+                patch.object(shim, "_remote_dead_until", 0.0), patch.object(shim, "REMOTE_DEAD_SECS", 300.0):
+            self.assertTrue(shim.remote_ok())
+            shim._note_remote_status(shim.LOCAL, 402)                 # local 402 is not the provider
+            self.assertTrue(shim.remote_ok())
+            shim._note_remote_status("https://api.example.invalid", 500)
+            self.assertTrue(shim.remote_ok())
+            shim._note_remote_status("https://api.example.invalid", 402)
+            self.assertFalse(shim.remote_ok())
+            with patch.object(shim.time, "time", return_value=shim._remote_dead_until + 1):
+                self.assertTrue(shim.remote_ok())                      # window over: next request probes
+
+
 class Window(Base):
     def test_window_is_off_in_legacy_mode_and_for_halo_control(self):
         with patch.object(shim, "_inflight_computed", 500_000):

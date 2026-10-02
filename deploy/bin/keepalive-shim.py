@@ -671,6 +671,32 @@ _health = {"ok": False, "at": 0.0}
 REMOTE_ENABLED = bool(REMOTE_BASE and REMOTE_KEY)
 
 
+# LS lane 2026-10-02: the paid provider answered HTTP 402 "Insufficient Balance" for ~1 hour
+# (154 requests, all returned to callers as empty/failed) while the gateway kept choosing it as the
+# overflow target. A hard provider refusal is not a capacity signal: treat the remote as unavailable
+# for REMOTE_DEAD_SECS (requests wait for a local lane instead, exactly like FULL LOCAL), then let one
+# request probe it again. Explicit remote aliases still try the provider -- their callers handle refusal.
+REMOTE_DEAD_SECS = float(os.environ.get("SHIM_REMOTE_DEAD_SECS", "300"))
+_remote_dead_until = 0.0
+_remote_dead_count = 0
+
+
+def _note_remote_status(base, status):
+    """Called with every upstream HTTP status; arms the remote breaker on 402 (balance exhausted)."""
+    global _remote_dead_until, _remote_dead_count
+    try:
+        if status == 402 and str(base).rstrip("/") != str(LOCAL).rstrip("/"):
+            _remote_dead_count += 1
+            if time.time() >= _remote_dead_until:
+                log.error("remote provider refused with 402 (balance): remote overflow OFF for %ds; "
+                          "requests wait for local until it recovers", int(REMOTE_DEAD_SECS))
+            _remote_dead_until = time.time() + REMOTE_DEAD_SECS
+        elif status == 200 and str(base).rstrip("/") != str(LOCAL).rstrip("/") and _remote_dead_until:
+            _remote_dead_until = 0.0
+    except Exception:
+        pass
+
+
 def remote_ok():
     """May this request overflow to the PAID remote at all?
 
@@ -680,7 +706,7 @@ def remote_ok():
     instead (the queue-first wait loop already treats "no remote" as an unbounded deadline).
     Reading the globals live is deliberate: both flags are hot-reloadable from the dashboard,
     so the mode changes without a restart and without dropping in-flight work."""
-    return bool(REMOTE_ENABLED) and not LOCAL_ONLY
+    return bool(REMOTE_ENABLED) and not LOCAL_ONLY and time.time() >= _remote_dead_until
 
 
 def routing_mode():
@@ -4508,6 +4534,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
             data = await up.read()
             log.warning("upstream %s returned streaming %d: %s", base, up.status,
                         data[:500].decode("utf-8", "replace"))
+            _note_remote_status(base, up.status)
             ct = up.headers.get("Content-Type", "application/json").split(";")[0]
             await session.close()
             resp = web.Response(body=data, status=up.status, content_type=ct,
@@ -4525,6 +4552,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
                 # "model provider failed after retries" the client shows). 5xx already handled above.
                 log.warning("upstream %s returned %d: %s", base, up.status,
                             data[:400].decode("utf-8", "replace"))
+            _note_remote_status(base, up.status)
             ct = up.headers.get("Content-Type", "application/json").split(";")[0]
             return "ok", web.Response(body=data, status=up.status, content_type=ct,
                                        headers=_route_receipt())
@@ -5459,6 +5487,10 @@ async def _route_completions(request, _no_overflow=False):
                     return web.json_response({"error": {
                         "message": "estate-local local attempt failed; paid failover is disabled",
                         "type": "local_only_unavailable"}}, status=503)
+                if not remote_ok():
+                    record_event("held", "local-failed", request, units, 0, **ev)
+                    release_local()
+                    return _cap_exhausted_unavailable("local attempt failed and paid failover is unavailable")
                 record_event("remote", "failover", request, units, 0, **ev)
                 release_local()
                 return await _overflow_forward(reentry=False)
@@ -5616,6 +5648,10 @@ async def _route_completions(request, _no_overflow=False):
             return web.json_response({"error": {
                 "message": "estate-local local attempt failed; paid failover is disabled",
                 "type": "local_only_unavailable"}}, status=503)
+        if not remote_ok():
+            record_event("held", "local-failed", request, units, waited, **ev)
+            release_local()
+            return _cap_exhausted_unavailable("local attempt failed and paid failover is unavailable")
         record_event("remote", "failover", request, units, waited, **ev)
         release_local()
         return await _overflow_forward(reentry=False)
@@ -5739,6 +5775,8 @@ async def gateway_stats(request):
         "overflowed_after_wait": _stats["overflowed_after_wait"],
         "inflight_tokens": _inflight_tokens, "token_budget": TOKEN_BUDGET,
         "inflight_computed": _inflight_computed,
+        "remote_dead_for_s": max(0, int(_remote_dead_until - time.time())),
+        "remote_402_count": _remote_dead_count,
         "prefill_backlog_secs": round(_prefill_backlog_secs(), 1),
         "cache_model": _pm_summary(),
         "inflight_reserved_tokens": _inflight_reserved_tokens,
