@@ -679,6 +679,36 @@ REMOTE_ENABLED = bool(REMOTE_BASE and REMOTE_KEY)
 REMOTE_DEAD_SECS = float(os.environ.get("SHIM_REMOTE_DEAD_SECS", "300"))
 _remote_dead_until = 0.0
 _remote_dead_count = 0
+# RS (2026-10-02 verification of 854b51ab62): the breaker lived only in memory, so every gateway publish reset it. The first requests
+# after the 12:49 publish saw remote_ok()==True, got the SHORT first-token deadline and were aborted ('held/local-failed', 50.7 s,
+# 13k tokens of prefill thrown away) although the remote was still empty. Persist the dead-until stamp across restarts.
+_REMOTE_DEAD_FILE = os.path.expanduser(os.environ.get("SHIM_REMOTE_DEAD_FILE", "~/.local/share/vllm-qwen27b/remote-dead-until.json"))
+
+
+def _remote_dead_load():
+    global _remote_dead_until
+    try:
+        with open(_REMOTE_DEAD_FILE) as fh:
+            until = float(json.load(fh).get("until") or 0)
+        if until > time.time():
+            _remote_dead_until = max(_remote_dead_until, until)
+    except Exception:
+        pass
+
+
+def _remote_dead_save():
+    if not _REMOTE_DEAD_PERSIST:
+        return
+    try:
+        tmp = _REMOTE_DEAD_FILE + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump({"until": _remote_dead_until, "count": _remote_dead_count}, fh)
+        os.replace(tmp, _REMOTE_DEAD_FILE)
+    except Exception:
+        pass
+
+
+_REMOTE_DEAD_PERSIST = False       # armed by _on_startup only: importing the module (tests) must never read or write live state
 
 
 def _note_remote_status(base, status):
@@ -691,8 +721,10 @@ def _note_remote_status(base, status):
                 log.error("remote provider refused with 402 (balance): remote overflow OFF for %ds; "
                           "requests wait for local until it recovers", int(REMOTE_DEAD_SECS))
             _remote_dead_until = time.time() + REMOTE_DEAD_SECS
+            _remote_dead_save()
         elif status == 200 and str(base).rstrip("/") != str(LOCAL).rstrip("/") and _remote_dead_until:
             _remote_dead_until = 0.0
+            _remote_dead_save()
     except Exception:
         pass
 
@@ -1386,6 +1418,8 @@ async def _scrape_engine_metrics():
     drafted = _counter_rate(fam, prev_fam, "vllm:spec_decode_num_draft_tokens_total", dt)
     accepted = _counter_rate(fam, prev_fam, "vllm:spec_decode_num_accepted_tokens_total", dt)
     spec_rate = round(accepted / drafted, 4) if (drafted and accepted is not None and drafted > 0) else None
+    flow_meter_update(fam, prev_fam, dt, _fv(fam, "vllm:num_requests_running"), _fv(fam, "vllm:num_requests_waiting"),
+                      prefix_hit_rate, gen_tok_s)
     return {
         "ok": True, "age_s": 0.0,
         "running": _fv(fam, "vllm:num_requests_running"), "waiting": _fv(fam, "vllm:num_requests_waiting"),
@@ -1479,6 +1513,8 @@ async def _telemetry_sampler():
             _TELEM_WINDOW.append(sample)
             _update_perf_breaker(sample)
             _TELEM_TICK += 1
+            if _TELEM_TICK % 5 == 0:
+                flow_note_mode()       # CF: a capacity-mode change is an event
             if _TELEM_TICK % max(1, TELEM_SLOW_EVERY) == 0:
                 ds = _downsample(_TELEM_WINDOW)
                 if ds:
@@ -2656,6 +2692,8 @@ def _telemetry_note_request(info, resp=None):
             "computed_actual": info.get("computed_actual"),
             "cached_actual": info.get("cached_actual"),
             "pm_credit": info.get("pm_credit"), "pm_age_s": info.get("pm_age_s"),
+            "flow_class": info.get("flow_class"), "flow_expected_wait": info.get("flow_expected_wait_s"),
+            "flow_held": info.get("flow_held"), "flow_adjacent": info.get("flow_adjacent"),
         })
     except Exception as e:
         log.warning("telemetry note_request: %s", e)
@@ -3155,6 +3193,631 @@ async def _stats_saver():
     while True:
         await asyncio.sleep(10)
         _save_stats()
+
+
+# ---------------- CF: capacity-aware flow (lane CF, 2026-10-02) ----------------
+# Kevin 10-02: "it needs to be aware of how to optimize its flow for local only versus local plus
+# remote versus remote. Queuing? ... we might have to get creative here."
+#
+# MEASURED before this block (telemetry 2026-10-01 17:00 -> 10-02 12:07, 9,064 requests): the gateway's
+# admission wait was ~0 (budget 14 lanes) while engine TTFT p95 was 79-117 s per class. The queue lived
+# INSIDE the engine, FIFO: vllm request_queue_time mean 34.6 s vs prefill 8.9 s, with 7 requests
+# 'deferred'. Priority, deadlines and prefix affinity were therefore impossible -- by the time the gateway
+# had admitted a Halo call it already stood behind whatever background work had been let in earlier, and
+# the caller with the shortest timeout gave up first, discarding the prefill already done for it.
+#
+# The mechanics here (facts + ordering + a hard admission ceiling; the JUDGEMENT about shares is Halo's,
+# set through /gateway/config flow_* fields by the capacity_set_flow tool):
+#   * every request gets a WORK CLASS: kevin (interactive) > halo (mind) > runner (cards) > background.
+#   * the engine's prefill queue is kept SHORT: a class is admitted only while the uncached prefill already
+#     in the engine (seconds at the measured rate) is under that class's ceiling. The excess waits HERE,
+#     where it can be ordered, refused with Retry-After, or overflowed.
+#   * the waiters are served by start-time fair queuing over per-class shares (kevin's share is large
+#     enough to be strict priority), earliest-deadline first inside a class when slack is short, then
+#     same-prefix first (cache affinity), then FIFO.
+#   * a request whose prefix is being prefilled RIGHT NOW is held until that prefill finishes when waiting
+#     is cheaper than recomputing the shared part (it then reads the cache instead of duplicating it).
+#   * deadline-aware admission: a refusable caller (background, runner) that cannot START before its
+#     declared deadline is refused 429 + Retry-After BEFORE any prefill. Nothing prefilling is discarded.
+#   * /gateway/capacity publishes the facts: mode, measured throughput, demand and queues by class.
+# SHIM_FLOW_MODE: off | shadow | enforce.  off = the previous behaviour byte for byte; shadow = everything
+# measured and reported, nothing gated (counts what enforce would have held).
+FLOW_CLASSES = ("kevin", "halo", "runner", "background")     # priority order, highest first
+FLOW_REFUSABLE = ("runner", "background")                     # classes that may be refused for a missed deadline
+
+
+def _flow_parse_map(v, cast=float, positive=False):
+    out = {}
+    for part in str(v or "").replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        k, _, val = part.partition("=")
+        k = k.strip().lower()
+        if k not in FLOW_CLASSES:
+            raise ValueError("unknown work class %r (classes: %s)" % (k, ", ".join(FLOW_CLASSES)))
+        x = cast(val.strip())
+        if x < 0 or (positive and x <= 0):
+            raise ValueError("%s must be %s" % (k, "> 0" if positive else ">= 0"))
+        out[k] = x
+    return out
+
+
+def _flow_norm(cast=float, positive=False):
+    def f(v):
+        d = _flow_parse_map(v, cast, positive)
+        return ",".join("%s=%g" % (k, d[k]) for k in FLOW_CLASSES if k in d)
+    return f
+
+
+def _flow_parse_classmap(v):
+    out = []
+    for part in str(v or "").replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        pat, _, cls = part.rpartition("=")
+        pat, cls = pat.strip().lower(), cls.strip().lower()
+        if not pat or cls not in FLOW_CLASSES:
+            raise ValueError("bad class map entry %r (pattern=class, class in %s)" % (part, ", ".join(FLOW_CLASSES)))
+        out.append((pat, cls))
+    return out
+
+
+def _flow_norm_classmap(v):
+    return ",".join("%s=%s" % pc for pc in _flow_parse_classmap(v))
+
+
+def _flow_cast_mode(v):
+    v = str(v).strip().lower()
+    if v not in ("off", "shadow", "enforce"):
+        raise ValueError("flow_mode must be off|shadow|enforce")
+    return v
+
+
+FLOW_MODE = os.environ.get("SHIM_FLOW_MODE", "enforce").strip().lower()
+FLOW_SHARES = os.environ.get("SHIM_FLOW_SHARES", "kevin=1000,halo=60,runner=25,background=10")
+# Fraction of FLOW_BACKLOG_S of uncached prefill a class may leave queued in the engine. 0 = no ceiling.
+FLOW_CEIL = os.environ.get("SHIM_FLOW_CEIL", "kevin=0,halo=1.5,runner=1,background=0.5")
+FLOW_BACKLOG_S = float(os.environ.get("SHIM_FLOW_BACKLOG_S", "40"))
+# Default 'must START within' seconds for a caller that declared nothing (0 = never refused).
+FLOW_DEADLINES = os.environ.get("SHIM_FLOW_DEADLINES", "kevin=0,halo=0,runner=900,background=600")
+FLOW_CLASS_MAP = os.environ.get("SHIM_FLOW_CLASS_MAP", ",".join((
+    "halo-=halo", "estate-entity=halo", "card-repair=runner", "work-verifier=runner",
+    "control=kevin", "brain-passthrough=kevin", "pi /=kevin", "opencode=kevin", "openhands=kevin", "desktop=kevin",
+    "overseer-=background", "vault-dreams=background", "digester=background", "acceptance-review=background",
+    "research=background", "workflow-bg=background", "applicant=background", "m1c-probe=background",
+    "outcome-alarm=background", "cron=background", "batch=background")))
+FLOW_AFFINITY_MAX = int(os.environ.get("SHIM_FLOW_AFFINITY_MAX", "6"))      # same-prefix grants in a row before FIFO order resumes
+FLOW_STARVE_S = float(os.environ.get("SHIM_FLOW_STARVE_S", "300"))          # a waiting class unserved this long ignores its ceiling once
+FLOW_PREFIX_HOLD_MAX_S = float(os.environ.get("SHIM_FLOW_PREFIX_HOLD_MAX_S", "60"))
+FLOW_URGENT_SLACK_S = float(os.environ.get("SHIM_FLOW_URGENT_SLACK_S", "30"))   # a deadline closer than this goes first (EDF)
+_CFG.update({
+    "SHIM_FLOW_MODE":         ("FLOW_MODE", _flow_cast_mode),
+    "SHIM_FLOW_SHARES":       ("FLOW_SHARES", _flow_norm(float, positive=True)),
+    "SHIM_FLOW_CEIL":         ("FLOW_CEIL", _flow_norm(float)),
+    "SHIM_FLOW_BACKLOG_S":    ("FLOW_BACKLOG_S", float),
+    "SHIM_FLOW_DEADLINES":    ("FLOW_DEADLINES", _flow_norm(float)),
+    "SHIM_FLOW_CLASS_MAP":    ("FLOW_CLASS_MAP", _flow_norm_classmap),
+    "SHIM_FLOW_AFFINITY_MAX": ("FLOW_AFFINITY_MAX", int),
+    "SHIM_FLOW_STARVE_S":     ("FLOW_STARVE_S", float),
+    "SHIM_FLOW_PREFIX_HOLD_MAX_S": ("FLOW_PREFIX_HOLD_MAX_S", float),
+    "SHIM_FLOW_URGENT_SLACK_S": ("FLOW_URGENT_SLACK_S", float),
+})
+_FLOW_DEFAULT_SHARES = {"kevin": 1000.0, "halo": 60.0, "runner": 25.0, "background": 10.0}
+_FLOW_EVENTS_FILE = os.environ.get("SHIM_FLOW_EVENTS_FILE") or os.path.join(
+    os.path.dirname(STATS_FILE), "incidents", "capacity-mode.jsonl")
+
+_FLOW = {
+    "waiters": [],                                    # FlowTicket, arrival order
+    "vtime": {c: 0.0 for c in FLOW_CLASSES}, "vclock": 0.0,
+    "last_prefix": None, "run": 0,                    # last admitted prefix and how many in a row
+    "last_admit": {c: 0.0 for c in FLOW_CLASSES},
+    "prefilling": {},                                 # id(request) -> {keys,cum,total,est_s,t0,prefix}
+    "version": 0, "head": (-1, 0.0, None),
+    "seq": 0,
+}
+_FLOW_STATS = collections.Counter()
+_FLOW_DEMAND = collections.deque(maxlen=20000)       # (t, class, ptok, est_computed_tokens)
+_FLOW_WAITS = collections.deque(maxlen=4000)         # (t, class, waited_s) per ticket that left the queue
+_FLOW_METER = collections.deque(maxlen=900)          # (t, compute_tok_s, decode_tok_s, running, waiting, hit_rate)
+_FLOW_SERVICE = collections.deque(maxlen=400)        # (t, class, duration_s) local completions
+_FLOW_CACHE = {"adjacent": [0, 0, 0], "other": [0, 0, 0]}   # [requests, cached_tokens, prompt_tokens]
+_FLOW_MODE_STATE = {"mode": None, "since": None, "basis": None, "events": collections.deque(maxlen=200)}
+
+
+_FLOW_MEMO = {}
+
+
+def _flow_get(name, raw, base, positive=False):
+    """Parse a per-class map once per distinct configured string; a bad string falls back to the defaults."""
+    key = (name, raw)
+    hit = _FLOW_MEMO.get(key)
+    if hit is None:
+        try:
+            d = _flow_parse_map(raw, float, positive)
+        except ValueError:
+            d = {}
+        hit = {c: d.get(c, base[c]) for c in FLOW_CLASSES}
+        if len(_FLOW_MEMO) > 64:
+            _FLOW_MEMO.clear()
+        _FLOW_MEMO[key] = hit
+    return hit
+
+
+def _flow_shares():
+    return _flow_get("shares", FLOW_SHARES, _FLOW_DEFAULT_SHARES, True)
+
+
+def _flow_ceils():
+    return _flow_get("ceil", FLOW_CEIL, {"kevin": 0.0, "halo": 1.5, "runner": 1.0, "background": 0.5})
+
+
+def _flow_deadlines():
+    return _flow_get("deadlines", FLOW_DEADLINES, {"kevin": 0.0, "halo": 0.0, "runner": 900.0, "background": 600.0})
+
+
+def flow_class_of(request, body, background, halo_control):
+    """Work class: caller's X-Work-Class (valid names only) > Halo control turn > the configured
+    X-Client/friendly-name patterns > the legacy background test > interactive."""
+    h = (request.headers.get("X-Work-Class") or "").strip().lower()
+    if h in FLOW_CLASSES:
+        return h
+    if halo_control:
+        return "halo"
+    try:
+        fc = _friendly_client(request)
+        key = ("%s\n%s" % (fc.get("xclient") or "", fc.get("name") or "")).lower()
+        for pat, cls in _flow_parse_classmap(FLOW_CLASS_MAP):
+            if pat in key:
+                return cls
+    except Exception:
+        pass
+    return "background" if background else "kevin"
+
+
+class FlowTicket:
+    """One request waiting for (or holding) a place in the local engine."""
+    __slots__ = ("cls", "t_enq", "seq", "deadline_at", "declared", "pm", "prefix", "cost_s", "units", "ptok",
+                 "est_computed", "fits", "xclient", "rid", "expected_wait_s", "adjacent", "held")
+
+    def __init__(self, cls, pm, ptok, units, fits, deadline_at, declared, xclient, rid, cost_s):
+        self.cls, self.pm, self.ptok, self.units, self.fits = cls, pm, ptok, units, fits
+        self.deadline_at, self.declared, self.xclient, self.rid = deadline_at, declared, xclient, rid
+        self.est_computed = (pm or {}).get("computed", ptok)
+        chain = (pm or {}).get("chain") or []
+        self.prefix = chain[0][0].hex()[:12] if chain else None
+        self.cost_s, self.t_enq, self.seq = cost_s, time.time(), 0
+        self.expected_wait_s, self.adjacent, self.held = None, False, ""
+
+
+def flow_prefill_tps():
+    """Measured uncached-prefill rate (tok/s): median over recent samples in which the engine had a queue
+    (so it was working at capacity), else the configured PREFILL_TPS."""
+    vals = sorted(r[1] for r in list(_FLOW_METER)[-120:] if r[1] and r[1] > 0 and (r[4] or 0) > 0)
+    if len(vals) >= 5:
+        return max(50.0, vals[len(vals) // 2])
+    return PREFILL_TPS
+
+
+def flow_decode_tps():
+    vals = sorted(r[2] for r in list(_FLOW_METER)[-120:] if r[2] and r[2] > 0 and (r[3] or 0) > 0)
+    return vals[len(vals) // 2] if vals else None
+
+
+def flow_backlog_s():
+    return _inflight_computed / max(1.0, flow_prefill_tps())
+
+
+def flow_meter_update(fam, prev_fam, dt, running, waiting, hit_rate, gen_tok_s):
+    """Called by the engine scrape: the uncached-prompt rate (prompt_tokens_by_source local_compute)."""
+    try:
+        if prev_fam is None or dt <= 0:
+            return
+        def src(f):
+            for lab, val in f.get("vllm:prompt_tokens_by_source_total") or []:
+                if lab.get("source") == "local_compute":
+                    return val
+            return None
+        cur, prev = src(fam), src(prev_fam)
+        rate = max(0.0, cur - prev) / dt if cur is not None and prev is not None else None
+        _FLOW_METER.append((time.time(), rate, gen_tok_s, running, waiting, hit_rate))
+    except Exception:
+        pass
+
+
+# ---- the mode, as a fact ----
+def flow_mode_now():
+    """local-only | local+remote | remote-only | none, with the facts it was derived from. Same flags the
+    router reads, so the label can never disagree with behaviour."""
+    local_up = bool(_health.get("ok"))
+    remote_cfg = bool(REMOTE_ENABLED)
+    dead_s = max(0, int(_remote_dead_until - time.time()))
+    forced = bool(effective_force_remote())
+    budget_ok = None
+    if remote_cfg and not LOCAL_ONLY and not dead_s:
+        try:
+            budget_ok = bool(_spend_allows_overflow(20000, 2000))
+        except Exception:
+            budget_ok = None
+    remote_usable = bool(remote_cfg and not LOCAL_ONLY and not dead_s and budget_ok is not False)
+    if forced and remote_usable:
+        mode = "remote-only"
+    elif local_up and remote_usable:
+        mode = "local+remote"
+    elif local_up:
+        mode = "local-only"
+    elif remote_usable:
+        mode = "remote-only"
+    else:
+        mode = "none"
+    why = []
+    if LOCAL_ONLY:
+        why.append("SHIM_LOCAL_ONLY (full-local mode)")
+    if not remote_cfg:
+        why.append("no remote provider configured")
+    if dead_s:
+        why.append("remote provider refused (402), breaker open %ds" % dead_s)
+    if budget_ok is False:
+        why.append("daily remote spend cap has no room")
+    if forced:
+        why.append("force-remote window")
+    if not local_up:
+        why.append("local engine unhealthy")
+    return {"mode": mode, "local_up": local_up, "remote_configured": remote_cfg, "remote_usable": remote_usable,
+            "remote_dead_for_s": dead_s, "remote_budget_ok": budget_ok, "forced_remote": forced,
+            "full_local_flag": bool(LOCAL_ONLY), "why": why}
+
+
+def flow_note_mode(now=None):
+    """Record a mode change (an event for Halo/the estate to catch up from). Cheap; called by the sampler."""
+    now = time.time() if now is None else now
+    m = flow_mode_now()
+    st = _FLOW_MODE_STATE
+    if st["mode"] != m["mode"]:
+        ev = {"t": round(now, 3), "from": st["mode"], "to": m["mode"], "why": m["why"],
+              "local_up": m["local_up"], "remote_usable": m["remote_usable"]}
+        st["events"].appendleft(ev)
+        if st["mode"] is not None:           # the first observation is a baseline, not a change
+            try:
+                os.makedirs(os.path.dirname(_FLOW_EVENTS_FILE), exist_ok=True)
+                with open(_FLOW_EVENTS_FILE, "a") as fh:
+                    fh.write(json.dumps(ev, sort_keys=True) + "\n")
+            except Exception as e:
+                log.warning("flow mode event write failed: %s", e)
+            log.warning("capacity mode %s -> %s (%s)", st["mode"], m["mode"], "; ".join(m["why"]) or "-")
+        st["mode"], st["since"], st["basis"] = m["mode"], now, m
+    return m
+
+
+# ---- tickets and the queue ----
+def _flow_bump():
+    _FLOW["version"] += 1
+
+
+def flow_make_ticket(request, body, cls, pm, ptok, units, fits):
+    now = time.time()
+    declared = False
+    dl = None
+    try:
+        s = request.headers.get("X-Gateway-Deadline-S")
+        a = request.headers.get("X-Gateway-Deadline-At")
+        if s not in (None, ""):
+            dl, declared = now + max(0.0, float(s)), True
+        elif a not in (None, ""):
+            dl, declared = float(a), True
+    except (TypeError, ValueError):
+        dl, declared = None, False
+    if dl is None:
+        d = _flow_deadlines()[cls]
+        if d > 0:
+            dl = now + d
+    cost_s = max(0.5, ((pm or {}).get("computed") or ptok) / max(1.0, flow_prefill_tps()))
+    return FlowTicket(cls, pm, ptok, units, fits, dl, declared, _friendly_client(request).get("name"),
+                      id(request), cost_s)
+
+
+def flow_note_arrival(cls, ptok, est_computed):
+    _FLOW_DEMAND.append((time.time(), cls, int(ptok or 0), int(est_computed or 0)))
+
+
+def flow_enqueue(t):
+    _FLOW["seq"] += 1
+    t.seq = _FLOW["seq"]
+    if not any(w.cls == t.cls for w in _FLOW["waiters"]):
+        _FLOW["vtime"][t.cls] = max(_FLOW["vtime"][t.cls], _FLOW["vclock"])
+    _FLOW["waiters"].append(t)
+    _flow_bump()
+
+
+def flow_dequeue(t):
+    try:
+        _FLOW["waiters"].remove(t)
+    except ValueError:
+        return
+    _flow_bump()
+
+
+def _flow_prefix_hold(t, now):
+    """Hold t while a request sharing its prefix is still prefilling, iff the recompute it avoids costs more
+    than the wait (no threshold: the two are compared). Bounded by FLOW_PREFIX_HOLD_MAX_S."""
+    pm = t.pm or {}
+    chain, total, est, credit = pm.get("chain") or [], pm.get("total") or 0, pm.get("est") or 0, 0
+    if not chain or total <= 0 or est <= 0:
+        return None
+    credit = max(0, est - (pm.get("computed") or est))
+    tps = flow_prefill_tps()
+    best = None
+    for rid, p in _FLOW["prefilling"].items():
+        if rid == t.rid or now - p["t0"] >= FLOW_PREFIX_HOLD_MAX_S:
+            continue
+        pk = p["cum"]
+        deepest = None
+        for key, cum in chain:
+            if key in pk:
+                deepest = cum
+        if deepest is None:
+            continue
+        matched = deepest / total * est - PREFIX_HIT_MARGIN_TOKENS
+        saving_s = max(0.0, matched - credit) / tps
+        remaining_s = max(0.0, p["est_s"] - (now - p["t0"]))
+        if saving_s > remaining_s and (best is None or remaining_s < best[0]):
+            best = (remaining_s, saving_s)
+    return best
+
+
+def _flow_eligible(t, now, backlog):
+    """Could t be admitted right now, ignoring order? (legacy fit + class ceiling + prefix hold)"""
+    if not t.fits():
+        return False, "fits"
+    ceil = _flow_ceils()[t.cls] * FLOW_BACKLOG_S
+    if ceil > 0 and backlog > ceil and _inflight > 0 and backlog > LIGHT_PREFILL_SECS:
+        starving = (now - max(_FLOW["last_admit"][t.cls], t.t_enq)) > FLOW_STARVE_S
+        if not starving:
+            return False, "ceiling"
+    hold = _flow_prefix_hold(t, now)
+    if hold is not None:
+        return False, "prefix-hold"
+    return True, ""
+
+
+def flow_pick(now=None):
+    """The ticket that should be admitted next, or None. Cached per queue/engine state change."""
+    now = time.time() if now is None else now
+    ver, at, head = _FLOW["head"]
+    if ver == _FLOW["version"] and now - at < 0.1:
+        return head
+    backlog = flow_backlog_s()
+    by_cls = {}
+    blocked = collections.Counter()
+    for t in _FLOW["waiters"]:
+        ok, why = _flow_eligible(t, now, backlog)
+        if ok:
+            by_cls.setdefault(t.cls, []).append(t)
+        else:
+            blocked[(t.cls, why)] += 1
+            t.held = why
+    pick = None
+    if by_cls:
+        order = {c: i for i, c in enumerate(FLOW_CLASSES)}
+        cls = min(by_cls, key=lambda c: (_FLOW["vtime"][c], order[c]))
+        cand = sorted(by_cls[cls], key=lambda x: x.seq)
+        fifo = cand[0]
+        pick = fifo
+        urgent = [x for x in cand if x.deadline_at is not None and x.deadline_at - now < FLOW_URGENT_SLACK_S]
+        if urgent:
+            pick = min(urgent, key=lambda x: x.deadline_at)
+        elif _FLOW["last_prefix"] and _FLOW["run"] < FLOW_AFFINITY_MAX:
+            aff = [x for x in cand if x.prefix == _FLOW["last_prefix"]]
+            if aff:
+                pick = aff[0]
+    _FLOW["head"] = (_FLOW["version"], now, pick)
+    return pick
+
+
+def flow_turn(t):
+    """May t take the engine place now? True whenever flow is off; in shadow mode counts what enforce would hold."""
+    if FLOW_MODE == "off":
+        return True
+    head = flow_pick()
+    if FLOW_MODE == "shadow":
+        if head is not None and head is not t:
+            _FLOW_STATS["shadow_would_hold"] += 1
+        return True
+    return head is t
+
+
+def flow_on_admit(t, request=None):
+    """t just claimed its place: advance fair-queuing time, remember the prefix, start the prefill watch."""
+    now = time.time()
+    shares = _flow_shares()
+    v0 = max(_FLOW["vtime"][t.cls], _FLOW["vclock"])
+    _FLOW["vtime"][t.cls] = v0 + t.cost_s / shares[t.cls]
+    _FLOW["vclock"] = v0
+    t.adjacent = bool(t.prefix and t.prefix == _FLOW["last_prefix"])
+    if t.prefix and t.prefix == _FLOW["last_prefix"]:
+        _FLOW["run"] += 1
+        _FLOW_STATS["affinity_adjacent"] += 1
+    else:
+        _FLOW["run"] = 0
+    _FLOW["last_prefix"] = t.prefix
+    _FLOW["last_admit"][t.cls] = now
+    # affinity that actually reordered: a same-prefix ticket jumped an older one of its class
+    older = [w for w in _FLOW["waiters"] if w is not t and w.cls == t.cls and w.seq < t.seq]
+    if older and t.adjacent:
+        _FLOW_STATS["affinity_reorders"] += 1
+    _FLOW_STATS["granted_" + t.cls] += 1
+    _FLOW_WAITS.append((now, t.cls, now - t.t_enq))
+    pm = t.pm or {}
+    if pm.get("chain"):
+        _FLOW["prefilling"][t.rid] = {"cum": {k for k, _ in pm["chain"]}, "t0": now, "prefix": t.prefix,
+                                      "est_s": (pm.get("computed") or 0) / max(1.0, flow_prefill_tps())}
+    _flow_bump()
+
+
+def flow_prefill_done(rid):
+    if _FLOW["prefilling"].pop(rid, None) is not None:
+        _flow_bump()
+
+
+def flow_note_cache(info):
+    """Grade the cache outcome of back-to-back same-prefix requests against all others."""
+    try:
+        cached, ptok = info.get("cached_actual"), info.get("ptok_exact_local")
+        if cached is None or not ptok or info.get("route") != "local":
+            return
+        row = _FLOW_CACHE["adjacent" if info.get("flow_adjacent") else "other"]
+        row[0] += 1
+        row[1] += int(cached)
+        row[2] += int(ptok)
+    except Exception:
+        pass
+
+
+def flow_note_service(cls, duration_s):
+    if duration_s and duration_s > 0:
+        _FLOW_SERVICE.append((time.time(), cls or "kevin", float(duration_s)))
+
+
+# ---- expected wait and deadline-aware admission ----
+def _flow_service_p50(default=60.0):
+    v = sorted(d for _, _, d in list(_FLOW_SERVICE)[-80:])
+    return v[len(v) // 2] if v else default
+
+
+def flow_expected_wait(cls, cost_s=0.0, lane_limit=None, units=1, exclude=None):
+    """Seconds until a request of this class starts, given the engine backlog and who is ahead. An ESTIMATE:
+    the engine backlog must fall to the class ceiling after every higher-order waiter has been admitted."""
+    backlog = flow_backlog_s()
+    ceil = _flow_ceils()[cls] * FLOW_BACKLOG_S
+    vt = _FLOW["vtime"]
+    ahead = [w for w in _FLOW["waiters"] if w is not exclude and (w.cls == cls or vt[w.cls] <= vt[cls])]
+    ahead_cost = sum(w.cost_s for w in ahead)
+    prefill_term = 0.0 if ceil <= 0 else max(0.0, backlog + ahead_cost - ceil)
+    lane_term = 0.0
+    lim = lane_limit or effective_budget()
+    if _inflight + units > lim:
+        lane_term = _flow_service_p50() * (len(ahead) + 1) / max(1, lim)
+    return round(max(prefill_term, lane_term), 1)
+
+
+def flow_admission_check(t, remote_can_take):
+    """Deadline-aware admission. Returns None (go on) or a dict describing the refusal. Only refusable classes
+    that cannot START before their deadline are refused, and only when remote cannot absorb them."""
+    t.expected_wait_s = flow_expected_wait(t.cls, t.cost_s, units=t.units, exclude=t)
+    if FLOW_MODE == "off" or t.cls not in FLOW_REFUSABLE or t.deadline_at is None:
+        return None
+    budget_s = t.deadline_at - time.time()
+    need = t.expected_wait_s + t.cost_s
+    if need <= budget_s:
+        return None
+    if FLOW_MODE == "shadow":
+        _FLOW_STATS["shadow_would_refuse_" + t.cls] += 1
+        return None
+    if remote_can_take:
+        return None            # local+remote: the existing overflow path absorbs it after its short wait
+    return {"class": t.cls, "expected_wait_s": t.expected_wait_s, "own_prefill_s": round(t.cost_s, 1),
+            "deadline_in_s": round(budget_s, 1), "retry_after": int(max(5, min(900, t.expected_wait_s)))}
+
+
+def _flow_refusal_response(r):
+    payload = json.dumps({"error": {
+        "message": ("local capacity: this %s request cannot start before its deadline (expected wait %ss + "
+                    "prefill %ss > %ss left); nothing was prefilled. Retry after %ss." %
+                    (r["class"], r["expected_wait_s"], r["own_prefill_s"], r["deadline_in_s"], r["retry_after"])),
+        "type": "capacity_deadline", "code": "flow_deadline", **r}}).encode()
+    return web.Response(body=payload, status=429, content_type="application/json",
+                        headers={"Retry-After": str(r["retry_after"]), "X-Gateway-Refused": "flow-deadline",
+                                 "X-Gateway-Expected-Wait": str(r["expected_wait_s"])})
+
+
+# ---- the facts endpoint ----
+def _pct(vals, q):
+    vals = sorted(vals)
+    return round(vals[min(len(vals) - 1, int(q * len(vals)))], 1) if vals else None
+
+
+def flow_capacity_facts(now=None, cls=None, ptok=None):
+    now = time.time() if now is None else now
+    m = flow_note_mode(now)
+    tps, dtps = flow_prefill_tps(), flow_decode_tps()
+    meter = [r for r in list(_FLOW_METER) if now - r[0] <= 300]
+    eng = _ENGINE_METRICS.get("ok")
+    last = meter[-1] if meter else None
+    shares, ceils, dls = _flow_shares(), _flow_ceils(), _flow_deadlines()
+    demand, queue = {}, {}
+    win5 = [d for d in _FLOW_DEMAND if now - d[0] <= 300]
+    win60 = [d for d in _FLOW_DEMAND if now - d[0] <= 3600]
+    tot_s5 = 0.0
+    for c in FLOW_CLASSES:
+        r5 = [d for d in win5 if d[1] == c]
+        r60 = [d for d in win60 if d[1] == c]
+        s5 = sum(d[3] for d in r5) / max(1.0, tps)
+        tot_s5 += s5
+        demand[c] = {"req_per_min_5m": round(len(r5) / 5.0, 2), "req_per_min_60m": round(len(r60) / 60.0, 2),
+                     "prompt_tok_per_min_5m": int(sum(d[2] for d in r5) / 5.0),
+                     "uncached_prefill_s_per_min_5m": round(s5 / 5.0, 1),
+                     "uncached_prefill_s_per_min_60m": round(sum(d[3] for d in r60) / max(1.0, tps) / 60.0, 1)}
+        ws = [w for (t_, c_, w) in _FLOW_WAITS if c_ == c and now - t_ <= 900]
+        waiting = [t for t in _FLOW["waiters"] if t.cls == c]
+        queue[c] = {"waiting": len(waiting),
+                    "oldest_wait_s": round(max((now - t.t_enq for t in waiting), default=0.0), 1),
+                    "expected_wait_s": flow_expected_wait(c),
+                    "wait_p50_s_15m": _pct(ws, .5), "wait_p95_s_15m": _pct(ws, .95), "admitted_15m": len(ws),
+                    "held_by": dict(collections.Counter(t.held for t in waiting if t.held)),
+                    "refused_total": _FLOW_STATS.get("refused_" + c, 0),
+                    "share": shares[c], "ceiling_backlog_s": round(ceils[c] * FLOW_BACKLOG_S, 1) or None,
+                    "default_deadline_s": dls[c] or None}
+    out = {
+        "as_of": datetime_iso(now), "flow_mode": FLOW_MODE,
+        **m,
+        "mode_since": _FLOW_MODE_STATE["since"], "mode_changes": list(_FLOW_MODE_STATE["events"])[:20],
+        "throughput": {
+            "prefill_uncached_tok_s": round(tps, 1),
+            "prefill_basis": "measured" if len([r for r in list(_FLOW_METER)[-120:] if r[1] and (r[4] or 0) > 0]) >= 5
+                             else "configured SHIM_PREFILL_TPS (too few busy samples yet)",
+            "decode_tok_s_aggregate": None if dtps is None else round(dtps, 1),
+            "decode_tok_s_per_stream": None if (dtps is None or not last or not (last[3] or 0)) else round(dtps / max(1.0, last[3]), 1),
+            "engine_running": last[3] if last else None, "engine_waiting": last[4] if last else None,
+            "prefix_cache_hit_rate_now": last[5] if last else None, "engine_metrics_ok": bool(eng)},
+        "pressure": {
+            "engine_prefill_backlog_s": round(flow_backlog_s(), 1), "backlog_target_s": FLOW_BACKLOG_S,
+            "demand_over_capacity_5m": round(tot_s5 / 300.0, 2),
+            "meaning": ">1 means uncached prefill is arriving faster than the engine can compute it; queues grow without bound "
+                       "unless demand is shed, delayed or sent remote",
+            "inflight": _inflight, "lane_budget": effective_budget()},
+        "demand": demand, "queue": queue,
+        "affinity": {"adjacent_grants": _FLOW_STATS.get("affinity_adjacent", 0),
+                     "reorders": _FLOW_STATS.get("affinity_reorders", 0),
+                     "prefix_holds_now": sum(1 for t in _FLOW["waiters"] if t.held == "prefix-hold"),
+                     "hit_rate_adjacent": (round(_FLOW_CACHE["adjacent"][1] / _FLOW_CACHE["adjacent"][2], 3)
+                                           if _FLOW_CACHE["adjacent"][2] else None),
+                     "hit_rate_other": (round(_FLOW_CACHE["other"][1] / _FLOW_CACHE["other"][2], 3)
+                                        if _FLOW_CACHE["other"][2] else None),
+                     "graded": [_FLOW_CACHE["adjacent"][0], _FLOW_CACHE["other"][0]]},
+        "config": {"shares": shares, "ceilings": {c: ceils[c] for c in FLOW_CLASSES}, "default_deadlines_s": dls,
+                   "backlog_target_s": FLOW_BACKLOG_S, "class_map": FLOW_CLASS_MAP,
+                   "set_with": "POST /gateway/config {flow_shares, flow_ceil, flow_deadlines, flow_backlog_s, flow_class_map, flow_mode}"},
+        "counters": dict(_FLOW_STATS),
+        "cannot_measure": ([] if eng else ["engine /metrics scrape failing: throughput and engine queue unknown"]),
+    }
+    if cls in FLOW_CLASSES:
+        c0 = max(0, int(ptok or 0))
+        out["estimate"] = {"class": cls, "ptok": c0, "expected_wait_s": flow_expected_wait(cls, c0 / max(1.0, tps))}
+    return out
+
+
+def datetime_iso(now):
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now))
+
+
+async def gateway_capacity(request):
+    cls = (request.query.get("class") or "").strip().lower() or None
+    try:
+        ptok = int(request.query.get("ptok") or 0)
+    except ValueError:
+        ptok = 0
+    return web.json_response(flow_capacity_facts(cls=cls, ptok=ptok))
 
 
 # form-field key <-> env-var (what the dashboard sends)
@@ -3762,6 +4425,7 @@ def _pm_prefill_done(request):
     cache and (b) it no longer occupies the engine's prefill queue -- only its decode remains."""
     global _inflight_computed
     pm = _PM_INFLIGHT.get(id(request)) or {}
+    flow_prefill_done(id(request))      # CF: its prefix is cached now -- held same-prefix waiters may go
     _pm_ready(pm.get("chain") or [])
     held = pm.pop("backlog_held", 0)
     if held:
@@ -3790,6 +4454,7 @@ def _pm_feedback(info):
     unlearn prefixes the engine did not in fact have (over-prediction), so a stale or evicted node
     costs at most one mis-admitted request, not a run of them. Never raises."""
     try:
+        flow_note_cache(info)
         pm = _PM_INFLIGHT.pop(info.get("pm_ref"), None) or {}
         credit, cached = info.get("pm_credit"), info.get("cached_actual")
         ptok_exact = info.get("ptok_exact_local")
@@ -4586,6 +5251,8 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
             "X-Gateway-Provider": str(provider),
             "X-Gateway-Reason": str(info.get("reason") or "admitted"),
             "X-Gateway-Queue-Wait": str(round(info.get("waited") or 0.0, 3)),
+            "X-Gateway-Work-Class": str(info.get("flow_class") or ""),
+            "X-Gateway-Expected-Wait": str(info.get("flow_expected_wait_s") if info.get("flow_expected_wait_s") is not None else ""),
             "X-Gateway-Predicted-Occupancy": str(info.get("predicted_occupancy_s") or ""),
             "X-Gateway-Context-Provider": str(info.get("context_provider") or provider),
             "X-Gateway-Context-Limit": str(info.get("context_limit") or ""),
@@ -5529,6 +6196,10 @@ async def _route_completions(request, _no_overflow=False):
             return await _overflow_forward()
         return web.json_response({"error": "request exceeds local token reservation budget"}, status=503)
     units *= sequences
+    flow_cls = flow_class_of(request, body, background, halo_control)       # CF: work class
+    if FLOW_MODE != "off":
+        flow_note_arrival(flow_cls, ptok, est_computed)
+        _active_set(request, flow_class=flow_cls)
     if halo_control:
         # Units estimate scheduler pressure from prompt size. Halo's one
         # control sequence must fit the protected place even with a long
@@ -5536,10 +6207,13 @@ async def _route_completions(request, _no_overflow=False):
         # remains charged and guarded independently.
         units = sequences
     reserved = False
+    claimed_at = 0.0
 
     def claim_local():
-        nonlocal reserved
+        nonlocal reserved, claimed_at
         global _inflight, _inflight_tokens, _inflight_reserved_tokens, _inflight_computed
+        claimed_at = time.time()
+        _flow_bump()
         _inflight += units
         _inflight_tokens += ptok
         _inflight_reserved_tokens += reservation
@@ -5559,6 +6233,9 @@ async def _route_completions(request, _no_overflow=False):
             _inflight_reserved_tokens -= reservation
             _inflight_computed = max(0, _inflight_computed - _pm.pop("backlog_held", 0))
             reserved = False
+            flow_note_service(flow_cls, time.time() - claimed_at)
+            flow_prefill_done(id(request))
+            _flow_bump()
 
     # TINY fast-lane: small calls skip the queue, but never the KV memory limit.
     # The final extra place belongs to Halo control, even when routine tiny
@@ -5625,12 +6302,39 @@ async def _route_completions(request, _no_overflow=False):
         background, overflow_ok, is_peak(), LOCAL_WAIT, BG_WAIT, INTERACTIVE_NEVER_OVERFLOW)
     admitted = False
     t_admit0 = time.time()
+    queued = False
+    # The size-implied unit cost does not change while we wait (est_computed is fixed at arrival), so
+    # compute it once rather than re-hashing the body on every 50 ms poll.
+    _desired_const = _desired_units(body, client, est_computed) * sequences
+
+    def _legacy_fits():
+        """The admission predicate exactly as it was before CF (lanes, bg-idle bypass, KV reservation, prefill
+        window). The flow ticket asks it too, so the ticket chosen to go next is always one that CAN go."""
+        bg_big_idle = (background and BG_BIG_LOCAL_WHEN_IDLE and _desired_const > lane_limit
+                       and _inflight == 0 and _waiting <= (1 if queued else 0))
+        admit_units = min(effective_budget(), _desired_const) if bg_big_idle else units
+        win_ok = bg_big_idle or prefill_window_ok(est_computed, halo_control)
+        ok = bool(_health["ok"] and admit_units >= sequences
+                  and ((_inflight + admit_units) <= lane_limit or bg_big_idle)
+                  and _memory_available(reservation, halo_control=halo_control) and win_ok)
+        return ok, admit_units, bg_big_idle, win_ok
+
+    flow_t = flow_make_ticket(request, body, flow_cls, _pm, ptok, units, lambda: _legacy_fits()[0])
+    if FLOW_MODE != "off":
+        _refusal = flow_admission_check(flow_t, bool(overflow_ok and not alias_local_only))
+        _active_set(request, flow_expected_wait_s=flow_t.expected_wait_s)
+        if _refusal:
+            _FLOW_STATS["refused_" + flow_cls] += 1
+            log.info("route %s %s refused before prefill: expected wait %.1fs + prefill %.1fs > %.1fs left",
+                     path, flow_cls, _refusal["expected_wait_s"], _refusal["own_prefill_s"], _refusal["deadline_in_s"])
+            record_event("rejected-bg", "flow-deadline", request, units, 0, **ev)
+            return _flow_refusal_response(_refusal)
+    flow_enqueue(flow_t)
     _local_reason = "-"      # "bg-big-idle" when the idle-engine rule admitted a big background request
     if _lf_kept:             # LOCAL-FIRST: telemetry shows which predictive reason was overridden
         _local_reason = "lf-" + _lf_kept[0]
     admitted_conc = 1        # local concurrency at admission -> scales the first-token deadline
     waited = 0.0
-    queued = False
     try:
         while True:
             # big background request + idle engine: nothing in flight and nobody else queued
@@ -5641,13 +6345,10 @@ async def _route_completions(request, _no_overflow=False):
             # most big bg requests fit under lane_limit without ever needing this bypass; it
             # only fires for requests so large that even the proportional estimate would still
             # exceed budget-FG_RESERVED.
-            _desired = _desired_units(body, client, est_computed) * sequences
-            _bg_big_idle = (background and BG_BIG_LOCAL_WHEN_IDLE and _desired > lane_limit
-                            and _inflight == 0 and _waiting <= (1 if queued else 0))
-            _admit_units = min(effective_budget(), _desired) if _bg_big_idle else units
-            _win_ok = _bg_big_idle or prefill_window_ok(est_computed, halo_control)
-            if _health["ok"] and _admit_units >= sequences and ((_inflight + _admit_units) <= lane_limit or _bg_big_idle) \
-                    and _memory_available(reservation, halo_control=halo_control) and _win_ok:
+            _fits, _admit_units, _bg_big_idle, _win_ok = _legacy_fits()
+            if _fits and flow_turn(flow_t):
+                flow_on_admit(flow_t)
+                _active_set(request, flow_adjacent=flow_t.adjacent, flow_held=flow_t.held or None)
                 if _bg_big_idle and (_inflight + _admit_units) > lane_limit:
                     _stats["bg_big_idle_local"] = _stats.get("bg_big_idle_local", 0) + 1
                     _local_reason = "bg-big-idle"
@@ -5676,6 +6377,7 @@ async def _route_completions(request, _no_overflow=False):
             waited += SLOT_POLL
             await local_healthy()  # refresh cached health while waiting
     finally:
+        flow_dequeue(flow_t)
         if queued:
             _waiting -= 1
             _waiting_by_class["background" if background else "interactive"] -= 1
@@ -5881,6 +6583,7 @@ async def gateway_stats(request):
         # a per-class split that record_event() does not actually track. See
         # gw-ttft-decomposition-telemetry for the real per-class latency breakdown this wants.
         "waiting_by_class": dict(_waiting_by_class),
+        "flow_mode": FLOW_MODE, "flow_waiting_by_work_class": {c: sum(1 for w in _FLOW["waiters"] if w.cls == c) for c in FLOW_CLASSES},
         "overflowed_after_wait": _stats["overflowed_after_wait"],
         "inflight_tokens": _inflight_tokens, "token_budget": TOKEN_BUDGET,
         "inflight_computed": _inflight_computed,
@@ -8274,7 +8977,10 @@ $('form').onsubmit=async e=>{e.preventDefault();const d={name:$('name').value,ba
 </script></div></body></html>"""
 
 async def _on_startup(app):
+    global _REMOTE_DEAD_PERSIST
     _drain_startup_recover()
+    _REMOTE_DEAD_PERSIST = True
+    _remote_dead_load()
     _load_stats()
     _spend()   # R2: load (and, for a mid-day ledger, import today's recorded spend) before serving
     app["saver"] = asyncio.create_task(_stats_saver())
@@ -8318,6 +9024,7 @@ def make_app():
     app.router.add_post("/v1/chat/completions", handle_completions)
     app.router.add_post("/v1/completions", handle_completions)
     app.router.add_get("/gateway/stats", gateway_stats)
+    app.router.add_get("/gateway/capacity", gateway_capacity)                 # CF: capacity-aware flow facts
     app.router.add_get("/gateway/drain", gateway_drain)
     app.router.add_post("/gateway/drain", gateway_drain)
     app.router.add_delete("/gateway/drain", gateway_drain)

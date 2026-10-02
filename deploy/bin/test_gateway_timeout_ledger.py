@@ -37,5 +37,26 @@ class TimeoutLedger(unittest.TestCase):
             shim._TIMEOUT_LEDGER = old
 
 
+class RemoteBreakerPersistence(unittest.TestCase):
+    def test_402_breaker_survives_a_gateway_restart(self):
+        import time
+        old = (shim._REMOTE_DEAD_FILE, shim._REMOTE_DEAD_PERSIST, shim._remote_dead_until)
+        shim._REMOTE_DEAD_FILE = tempfile.mkdtemp() + "/dead.json"
+        shim._REMOTE_DEAD_PERSIST = True
+        try:
+            shim._remote_dead_until = 0.0
+            shim._note_remote_status("https://api.remote.example", 402)
+            self.assertGreater(shim._remote_dead_until, time.time())
+            shim._remote_dead_until = 0.0            # "restart": memory gone
+            shim._remote_dead_load()
+            self.assertGreater(shim._remote_dead_until, time.time())
+            shim._note_remote_status("https://api.remote.example", 200)   # remote recovered: cleared and persisted
+            shim._remote_dead_until = 99.0
+            shim._remote_dead_load()
+            self.assertEqual(shim._remote_dead_until, 99.0)               # stale/cleared file does not re-arm
+        finally:
+            shim._REMOTE_DEAD_FILE, shim._REMOTE_DEAD_PERSIST, shim._remote_dead_until = old
+
+
 if __name__ == "__main__":
     unittest.main()
