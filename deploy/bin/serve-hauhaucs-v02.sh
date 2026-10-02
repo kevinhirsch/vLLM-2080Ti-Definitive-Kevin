@@ -60,6 +60,12 @@ ARGS=(
   --enable-auto-tool-choice
   --additional-config '{"gdn_prefill_backend":"flashqla_legacy"}'
 )
+# Optional upstream #243 SSD prefix-KV persistence (experimental, opt-in): V02_SSD_KV_DIR=/path V02_SSD_KV_CPU_BYTES=N
+if [ -n "${V02_SSD_KV_DIR:-}" ]; then
+  export PYTHONHASHSEED=0
+  FP=$("$V02_ROOT/.venv/bin/python" "$V02_ROOT/tools/checkpoint_fingerprint.py" /home/kevin/Desktop/models/Qwen3.8-27B-HauhauCS-Aggressive-W4A16-twolven "")
+  ARGS+=( --kv-transfer-config "$(python3 -c 'import json,os,sys;print(json.dumps({"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":int(sys.argv[2]),"spec_name":"TieringOffloadingSpec","secondary_tiers":[{"type":"fs","root_dir":os.path.join(sys.argv[1],"checkpoint-"+sys.argv[3])}]}},separators=(",",":")))' "$V02_SSD_KV_DIR" "${V02_SSD_KV_CPU_BYTES:-8589934592}" "$FP")" )
+fi
 if [ -n "${VLLM_SERVE_EXTRA_ARGS:-}" ]; then
   # shellcheck disable=SC2206
   ARGS+=( ${VLLM_SERVE_EXTRA_ARGS} )
