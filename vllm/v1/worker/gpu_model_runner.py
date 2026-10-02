@@ -1978,6 +1978,14 @@ class GPUModelRunner(
         # so convert draft_token_ids to torch.int32 here.
         draft_token_ids = self._draft_token_ids.to(dtype=torch.int32)
 
+        # [FORK] -1 is the "no token" sentinel in the spec-decode path; scattered
+        # into input_ids it becomes a NEGATIVE embedding index = illegal memory
+        # access under CUDA-graph replay (observed 2026-08-14, FULL graphs + MTP
+        # died with scheduled_spec_decode_tokens=[-1,-1]). Clamping is safe: these
+        # speculative positions are verified/rejected by the target model anyway.
+        # Not in-place: `.to()` returns self when the dtype already matches.
+        draft_token_ids = torch.clamp(draft_token_ids, min=0)
+
         self.input_ids.gpu.scatter_(
             dim=0,
             index=draft_tokens_index_tensor,
