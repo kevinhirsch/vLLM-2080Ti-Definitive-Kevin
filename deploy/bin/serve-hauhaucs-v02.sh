@@ -17,7 +17,8 @@ export CUDA_HOME=/usr/local/cuda-13 CUDA_PATH=/usr/local/cuda-13
 export CC=/usr/bin/gcc-15 CXX=/usr/bin/g++-15 CUDAHOSTCXX=/usr/bin/g++-15 NVCC_CCBIN=/usr/bin/g++-15
 export TORCH_EXTENSIONS_DIR="$V02_ROOT/.deps/FlashQLA-SM70-SM75/.torch_extensions_vllm_flashqla_legacy"
 export TORCHINDUCTOR_CACHE_DIR="$V02_ROOT/torchinductor-cache"
-export PYTHONPATH="$V02_ROOT"
+export FLASHQLA_ROOT="$V02_ROOT/.deps/FlashQLA-SM70-SM75"
+export PYTHONPATH="$V02_ROOT:$FLASHQLA_ROOT"
 # retired 0.1.x-only knobs: make sure a stale env file cannot leak them into the new tree
 unset VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK VLLM_PREFIX_CACHE_USE_RETAINED_MTP_BLOCK VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS || true
 ARGS=(
