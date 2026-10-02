@@ -3133,6 +3133,8 @@ def record_event(decision, reason, request, units, waited, ptok=0, maxtok=0, str
         _stats["held"] += 1
     elif decision == "rejected-bg":
         _stats["rejected_bg"] += 1
+    elif decision == "gone":
+        _stats["client_gone"] = _stats.get("client_gone", 0) + 1
     else:
         _stats["remote"] += 1
         _remote_reasons[reason] += 1
@@ -3293,6 +3295,7 @@ FLOW_CLASS_MAP = os.environ.get("SHIM_FLOW_CLASS_MAP", ",".join((
 # Phrases (first 500 chars of the first two messages) that mark a class when the client name cannot: the card
 # runner's pi sessions arrive from the same host/provider as Kevin's own pi, 100% of them opening with this line.
 FLOW_MARKERS = os.environ.get("SHIM_FLOW_MARKERS", "local-lane-runner batch job=runner")
+FLOW_DEMAND_WINDOW_S = float(os.environ.get("SHIM_FLOW_DEMAND_WINDOW_S", "300"))      # window of the demand_5m facts (env only; the drill shortens it)
 FLOW_AFFINITY_MAX = int(os.environ.get("SHIM_FLOW_AFFINITY_MAX", "6"))      # same-prefix grants in a row before FIFO order resumes
 FLOW_STARVE_S = float(os.environ.get("SHIM_FLOW_STARVE_S", "300"))          # a waiting class unserved this long ignores its ceiling once
 FLOW_PREFIX_HOLD_MAX_S = float(os.environ.get("SHIM_FLOW_PREFIX_HOLD_MAX_S", "60"))
@@ -3950,7 +3953,8 @@ def flow_capacity_facts(now=None, cls=None, ptok=None):
     last = meter[-1] if meter else None
     shares, ceils, dls = _flow_shares(), _flow_ceils(), _flow_deadlines()
     demand, queue = {}, {}
-    win5 = [d for d in _FLOW_DEMAND if now - d[0] <= 300]
+    wsec = max(10.0, FLOW_DEMAND_WINDOW_S)
+    win5 = [d for d in _FLOW_DEMAND if now - d[0] <= wsec]
     win60 = [d for d in _FLOW_DEMAND if now - d[0] <= 3600]
     tot_s5 = 0.0
     for c in FLOW_CLASSES:
@@ -3958,9 +3962,9 @@ def flow_capacity_facts(now=None, cls=None, ptok=None):
         r60 = [d for d in win60 if d[1] == c]
         s5 = sum(d[3] for d in r5) / max(1.0, tps)
         tot_s5 += s5
-        demand[c] = {"req_per_min_5m": round(len(r5) / 5.0, 2), "req_per_min_60m": round(len(r60) / 60.0, 2),
-                     "prompt_tok_per_min_5m": int(sum(d[2] for d in r5) / 5.0),
-                     "uncached_prefill_s_per_min_5m": round(s5 / 5.0, 1),
+        demand[c] = {"req_per_min_5m": round(len(r5) / (wsec / 60.0), 2), "req_per_min_60m": round(len(r60) / 60.0, 2),
+                     "prompt_tok_per_min_5m": int(sum(d[2] for d in r5) / (wsec / 60.0)),
+                     "uncached_prefill_s_per_min_5m": round(s5 / (wsec / 60.0), 1),
                      "uncached_prefill_s_per_min_60m": round(sum(d[3] for d in r60) / max(1.0, tps) / 60.0, 1)}
         ws = [w for (t_, c_, w) in _FLOW_WAITS if c_ == c and now - t_ <= 900]
         waiting = [t for t in _FLOW["waiters"] if t.cls == c]
@@ -3986,7 +3990,7 @@ def flow_capacity_facts(now=None, cls=None, ptok=None):
             "prefix_cache_hit_rate_now": last[5] if last else None, "engine_metrics_ok": bool(eng)},
         "pressure": {
             "engine_prefill_backlog_s": round(flow_backlog_s(), 1), "backlog_target_s": FLOW_BACKLOG_S,
-            "demand_over_capacity_5m": round(tot_s5 / 300.0, 2),
+            "demand_over_capacity_5m": round(tot_s5 / wsec, 2),
             "meaning": ">1 means uncached prefill is arriving faster than the engine can compute it; queues grow without bound "
                        "unless demand is shed, delayed or sent remote",
             "inflight": _inflight, "lane_budget": effective_budget()},
@@ -5437,6 +5441,50 @@ def _timeout_note(request, layer, deadline_s, base, body, **extra):
         pass
 
 
+class _ClientGone(Exception):
+    pass
+
+
+def _client_gone(request):
+    """Has the caller hung up? aiohttp does NOT cancel a handler when the client disconnects (handler_cancellation is
+    off), so before CF a queued or prefilling request of a caller that had already timed out was still admitted, still
+    prefilled by the engine, and only discovered dead at the first write -- the engine's work thrown away."""
+    tr = getattr(request, "transport", "absent")
+    if tr == "absent":
+        return False                      # a test double with no connection
+    return tr is None or tr.is_closing()
+
+
+async def _await_unless_gone(request, awaitable, timeout=None, poll=0.5):
+    """Await `awaitable` (an upstream call) but give up -- and cancel it, which closes the upstream connection and so
+    aborts the engine's prefill -- as soon as the caller hangs up. Same TimeoutError contract as asyncio.wait_for."""
+    task = asyncio.ensure_future(awaitable)
+    t_end = None if timeout is None else time.time() + timeout
+    try:
+        while True:
+            wait = poll if t_end is None else max(0.01, min(poll, t_end - time.time()))
+            done, _ = await asyncio.wait({task}, timeout=wait)
+            if done:
+                return task.result()
+            if _client_gone(request):
+                raise _ClientGone()
+            if t_end is not None and time.time() >= t_end:
+                raise asyncio.TimeoutError()
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except BaseException:       # noqa: BLE001 -- the cancelled upstream call
+                pass
+
+
+def _gone_response(request):
+    _active_set(request, client_disconnected=True, flow_held="client-gone")
+    _FLOW_STATS["client_gone"] += 1
+    return web.Response(status=499, text="client closed request")
+
+
 async def _relay(request, base, path, body, key, streaming, concurrency=1, provider_name=None):
     """
     Forward to (base) and relay the response to the client.
@@ -5470,10 +5518,13 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
         if streaming:
             # bound time-to-response-headers for streaming so a backend that accepts the
             # connection but never responds (a wedge) fails over instead of hanging.
-            up = await asyncio.wait_for(_open(session, base, path, body, key, streaming),
-                                        timeout=first_token_timeout(body, concurrency, local=(base == LOCAL)))
+            up = await _await_unless_gone(request, _open(session, base, path, body, key, streaming),
+                                          timeout=first_token_timeout(body, concurrency, local=(base == LOCAL)))
         else:
-            up = await _open(session, base, path, body, key, streaming)
+            up = await _await_unless_gone(request, _open(session, base, path, body, key, streaming))
+    except _ClientGone:
+        await session.close()
+        return "ok", _gone_response(request)
     except asyncio.TimeoutError:
         await session.close()
         _timeout_note(request, "gateway:response-headers", first_token_timeout(body, concurrency, local=(base == LOCAL)), base, body,
@@ -5645,7 +5696,10 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
     # allowing a legit big-context prefill the time it actually needs (scaled by concurrency).
     deadline = first_token_timeout(body, concurrency, local=(base == LOCAL))
     try:
-        phase = await asyncio.wait_for(_read_until_commit(), timeout=deadline)
+        phase = await _await_unless_gone(request, _read_until_commit(), timeout=deadline)
+    except _ClientGone:
+        await session.close()
+        return "ok", _gone_response(request)
     except asyncio.TimeoutError:
         await session.close()
         _timeout_note(request, "gateway:first-token", deadline, base, body, concurrency=concurrency, outcome="failover",
@@ -6567,6 +6621,7 @@ async def _route_completions(request, _no_overflow=False):
         _local_reason = "lf-" + _lf_kept[0]
     admitted_conc = 1        # local concurrency at admission -> scales the first-token deadline
     waited = 0.0
+    client_gone_queued = False
     try:
         while True:
             # big background request + idle engine: nothing in flight and nobody else queued
@@ -6577,8 +6632,12 @@ async def _route_completions(request, _no_overflow=False):
             # most big bg requests fit under lane_limit without ever needing this bypass; it
             # only fires for requests so large that even the proportional estimate would still
             # exceed budget-FG_RESERVED.
-            if _local_offline() and overflow_ok and not alias_local_only and not local_pin:
-                break           # a planned local-offline window opened while this waited: the valve takes it
+            if _client_gone(request):
+                client_gone_queued = True
+                break           # the caller hung up while queued: admit nothing, prefill nothing
+            if ((_local_offline() or not _health["ok"]) and overflow_ok and not alias_local_only and not local_pin
+                    and not (background and BG_LOCAL_ONLY and not _local_offline())):
+                break           # a planned offline window opened, or local died, under a waiter: the valve takes it
             _fits, _admit_units, _bg_big_idle, _win_ok = _legacy_fits()
             if _fits and flow_turn(flow_t):
                 flow_on_admit(flow_t)
@@ -6617,10 +6676,17 @@ async def _route_completions(request, _no_overflow=False):
             _waiting_by_class["background" if background else "interactive"] -= 1
         _note_admission_wait(waited)   # LOCAL-FIRST queue-wait signal (admitted or overflowed)
 
+    if client_gone_queued:
+        log.info("route %s caller hung up after %.1fs queued -> dropped before any prefill", path, waited)
+        record_event("gone", "queued", request, units, waited, **ev)
+        return _gone_response(request)
+
     if not admitted:
         # distinguish WHY we couldn't admit: lane-count vs total-context (size-aware) cap
         if _local_offline():
             reason = "local-offline"
+        elif not _health["ok"]:
+            reason = "local-down"
         elif (_inflight + units) <= lane_limit and not prefill_window_ok(est_computed, halo_control):
             reason = "prefill"
         elif (_inflight + units) <= lane_limit:

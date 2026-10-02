@@ -48,6 +48,8 @@ class Request:
     method = "POST"
 
     def __init__(self, xclient="test-interactive", headers=None, content="review", **fields):
+        if "transport" in fields:
+            self.transport = fields.pop("transport")
         self.headers = {"X-Client": xclient, "User-Agent": "offline-test", **(headers or {})}
         self.body = json.dumps({"model": "qwen-local", "messages": [{"role": "user", "content": content}],
                                 "max_tokens": 1000, **fields}).encode()
@@ -500,6 +502,49 @@ class OfflineWindow(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(u["remote_share"], 0.6)
 
 
+
+class Transport:
+    def __init__(self):
+        self.closing = False
+
+    def is_closing(self):
+        return self.closing
+
+
+class ClientGone(unittest.IsolatedAsyncioTestCase):
+    """aiohttp does not cancel a handler when the caller hangs up: a queued request of a caller that already timed out
+    used to be admitted and prefilled for nobody."""
+
+    async def test_await_unless_gone_returns_the_result_or_cancels_the_upstream_call(self):
+        tr = Transport()
+        req = Request(transport=tr)
+
+        async def quick():
+            return 7
+        self.assertEqual(await shim._await_unless_gone(req, quick(), poll=0.01), 7)
+        cancelled = []
+
+        async def slow():
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                cancelled.append(1)
+                raise
+        asyncio.get_running_loop().call_later(0.05, lambda: setattr(tr, "closing", True))
+        with self.assertRaises(shim._ClientGone):
+            await shim._await_unless_gone(req, slow(), poll=0.01)
+        self.assertEqual(cancelled, [1])                                           # the upstream call was aborted
+        with self.assertRaises(asyncio.TimeoutError):
+            await shim._await_unless_gone(Request(transport=Transport()), slow(), timeout=0.05, poll=0.01)
+
+    def test_a_double_without_a_connection_is_never_gone(self):
+        self.assertFalse(shim._client_gone(Request()))
+        tr = Transport()
+        self.assertFalse(shim._client_gone(Request(transport=tr)))
+        tr.closing = True
+        self.assertTrue(shim._client_gone(Request(transport=tr)))
+
+
 class Routing(unittest.IsolatedAsyncioTestCase):
     """End to end through _route_completions: with one engine place, waiters are admitted by class, not by luck."""
 
@@ -646,6 +691,41 @@ class Routing(unittest.IsolatedAsyncioTestCase):
         self.gates["holder"].set()
         await asyncio.wait_for(asyncio.gather(holder, *waiters), 10)
 
+    async def test_a_caller_who_hung_up_while_queued_is_dropped_before_any_prefill(self):
+        self.gates["holder"] = asyncio.Event()
+        holder = asyncio.create_task(self.go("holder"))
+        await asyncio.sleep(0.05)
+        tr = Transport()
+        waiter = asyncio.create_task(shim._route_completions(Request("halo-hermes", content="w", transport=tr)))
+        await asyncio.sleep(0.05)
+        self.assertEqual(len(shim._FLOW["waiters"]), 1)
+        tr.closing = True                                                          # the caller timed out and left
+        resp = await asyncio.wait_for(waiter, 5)
+        self.assertEqual(resp.status, 499)
+        self.assertEqual(shim._FLOW["waiters"], [])
+        self.assertNotIn("halo-hermes", self.admitted)                             # nothing was sent to the engine
+        self.assertEqual(self.events[-1], ("gone", "queued"))
+        self.gates["holder"].set()
+        await holder
+
+    async def test_queued_work_goes_to_the_valve_when_local_dies_under_it(self):
+        async def fwd(request, path, body, streaming, endpoint=None, model=None):
+            return "remote"
+
+        self.gates["holder"] = asyncio.Event()
+        with patch.object(shim, "remote_ok", lambda: True), patch.object(shim, "_spend_allows_overflow", lambda p, m: True), \
+                patch.object(shim, "_automatic_remote_budget_allows", lambda p, m: True), patch.object(shim, "_forward_remote", fwd), \
+                patch.object(shim, "REMOTE_ENABLED", True), patch.object(shim, "LOCAL_WAIT", 30), patch.object(shim, "BG_WAIT", 30):
+            holder = asyncio.create_task(self.go("holder"))
+            await asyncio.sleep(0.05)
+            waiter = asyncio.create_task(self.go("halo-hermes", content="w"))
+            await asyncio.sleep(0.05)
+            self.assertFalse(waiter.done())
+            with patch.object(shim, "_health", {"ok": False}):                     # the engine died; the waiter was queued
+                self.assertEqual(await asyncio.wait_for(waiter, 5), "remote")
+            self.assertEqual(self.events[-1], ("remote", "local-down"))
+            self.gates["holder"].set()
+            await holder
 
 if __name__ == "__main__":
     unittest.main()

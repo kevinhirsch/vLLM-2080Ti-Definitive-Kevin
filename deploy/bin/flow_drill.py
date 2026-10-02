@@ -241,7 +241,40 @@ async def poisson(sess, base, cls, rate, stop, stats, rng, declare, tag):
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def load(base, secs, seed, stats, declare=True, mix=None):
+async def capacity_scale(sess, base, cls="background"):
+    """The estate's capacity_flow.scale_from() arithmetic, inline: the share of local prefill capacity the higher classes
+    leave free, damped when this class already queues past the deadline it is allowed."""
+    try:
+        async with sess.get(base + "/gateway/capacity") as r:
+            f = await r.json()
+    except Exception:
+        return 1.0
+    order = ["kevin", "halo", "runner", "background"]
+    above = order[:order.index(cls)]
+    util = sum(f["demand"][c]["uncached_prefill_s_per_min_5m"] for c in above) / 60.0
+    spare = max(0.0, min(1.0, 1.0 - util))
+    q = f["queue"][cls]
+    dl, wait = q.get("default_deadline_s"), q.get("expected_wait_s")
+    damp = 1.0 if (not dl or wait is None or wait <= dl) else dl / wait
+    return spare * damp
+
+
+async def poisson_follow(sess, base, cls, rate, stop, stats, rng, declare, tag):
+    """Open-loop arrivals scaled by capacity_scale (refreshed every 3 s): the producer follows measured capacity."""
+    tasks, n, scale, last = [], 0, 1.0, 0.0
+    while time.time() < stop:
+        if time.time() - last > 3:
+            scale, last = await capacity_scale(sess, base, cls), time.time()
+        await asyncio.sleep(rng.expovariate(max(rate * max(scale, 0.05), 1e-6)))
+        if rng.random() > scale:                   # time-shift: this arrival is not produced now
+            stats.deferred = getattr(stats, "deferred", 0) + 1
+            continue
+        n += 1
+        tasks.append(asyncio.create_task(one_call(sess, base, cls, "%s%d" % (tag, n % 3), n, rng, stats, declare)))
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def load(base, secs, seed, stats, declare=True, mix=None, follow=False):
     rng = random.Random(seed)
     stop = time.time() + secs
     mix = mix or {"halo": 3, "runner": 2, "bg_rate": 0.3, "kevin_rate": 0.06}
@@ -251,7 +284,8 @@ async def load(base, secs, seed, stats, declare=True, mix=None):
                  for i in range(mix["halo"])]
         tasks += [asyncio.create_task(runner_worker(sess, base, i, stop, stats, random.Random(seed * 100 + i), declare))
                   for i in range(mix["runner"])]
-        tasks.append(asyncio.create_task(poisson(sess, base, "background", mix["bg_rate"], stop, stats, random.Random(seed + 1), declare, "b")))
+        bg = poisson_follow if follow else poisson
+        tasks.append(asyncio.create_task(bg(sess, base, "background", mix["bg_rate"], stop, stats, random.Random(seed + 1), declare, "b")))
         tasks.append(asyncio.create_task(poisson(sess, base, "kevin", mix["kevin_rate"], stop, stats, random.Random(seed + 2), declare, "k")))
         await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -298,7 +332,7 @@ class Rig:
             "SHIM_PERF_BREAKER_ENABLED": "0", "SHIM_PREDICTED_OCCUPANCY_SECS": "0", "SHIM_TELEM_SAMPLE_SECS": "1",
             "SHIM_LOCAL_WAIT_SECS": "4", "SHIM_BG_WAIT_SECS": "3", "SHIM_BG_WAIT_LOCAL_SECS": "25", "SHIM_FG_RESERVED": "2",
             "SHIM_TINY_TOKENS": "0", "SHIM_BG_LOCAL_ONLY": "0", "SHIM_INTERACTIVE_NEVER_OVERFLOW": "1",
-            "SHIM_FLOW_MODE": self.flow_mode, "SHIM_FLOW_BACKLOG_S": "5", "SHIM_FLOW_DEADLINES": "kevin=0,halo=0,runner=70,background=40",
+            "SHIM_FLOW_MODE": self.flow_mode, "SHIM_FLOW_DEMAND_WINDOW_S": "40", "SHIM_FLOW_BACKLOG_S": "5", "SHIM_FLOW_DEADLINES": "kevin=0,halo=0,runner=70,background=40",
             "SHIM_FLOW_PREFIX_HOLD_MAX_S": "8", "SHIM_FLOW_STARVE_S": "30", "SHIM_FLOW_URGENT_SLACK_S": "4",
             "SHIM_FIRST_TOKEN_MAX": "600", "SHIM_LOCAL_FIRST_FIRST_TOKEN_MAX": "600", "SHIM_STREAM_IDLE_TIMEOUT_SECS": "600",
             "PYTHONUNBUFFERED": "1", "CUDA_VISIBLE_DEVICES": "",
@@ -355,17 +389,17 @@ def summarize(stats, rig, secs):
     out["_engine"] = {"computed_tok": e.computed, "cached_tok": e.cached, "wasted_prefill_tok": e.wasted,
                       "cache_hit_share": round(e.cached / max(1, e.cached + e.computed), 3),
                       "wasted_share": round(e.wasted / max(1, e.computed), 3)}
-    out["_flow"] = {"halo_cycles": stats.cycles, "remote_calls": rig.rem.calls, "completed_per_min": round(60 * sum(out[c]["ok"] for c in CLASSES) / secs, 1),
+    out["_flow"] = {"bg_deferred": getattr(stats, "deferred", 0), "halo_cycles": stats.cycles, "remote_calls": rig.rem.calls, "completed_per_min": round(60 * sum(out[c]["ok"] for c in CLASSES) / secs, 1),
                     "timeouts_per_hr": round(3600 * sum(out[c]["timeout"] for c in CLASSES) / secs)}
     return out
 
 
-async def run_once(flow_mode, secs, seed, remote=False, declare=True):
+async def run_once(flow_mode, secs, seed, remote=False, declare=True, follow=False):
     rig = Rig(flow_mode, remote=remote)
     await rig.start()
     stats = Stats()
     try:
-        await load(rig.base, secs, seed, stats, declare=declare)
+        await load(rig.base, secs, seed, stats, declare=declare, follow=follow)
         cap = await rig.get("/gateway/capacity")
         res = summarize(stats, rig, secs)
         res["_gateway"] = {"mode": cap.get("mode"), "refused": {c: cap["queue"][c]["refused_total"] for c in CLASSES},
@@ -385,31 +419,35 @@ def fmt(res):
     return "\n".join(lines)
 
 
-async def compare(reps, secs):
-    allr = {"off": [], "enforce": []}
+ARMS = (("off", "off", False), ("enforce", "enforce", False), ("enforce+follow", "enforce", True))
+
+
+async def compare(reps, secs, arms=None):
+    arms = [a for a in ARMS if (not arms or a[0] in arms)]
+    allr = {a[0]: [] for a in arms}
     for rep in range(reps):
-        for mode in ("off", "enforce"):
+        for name, mode, follow in arms:
             t = time.time()
-            r = await run_once(mode, secs, seed=100 + rep)
-            allr[mode].append(r)
-            print("== rep %d  FLOW=%s  (%.0fs)" % (rep + 1, mode, time.time() - t))
+            r = await run_once(mode, secs, seed=100 + rep, follow=follow)
+            allr[name].append(r)
+            print("== rep %d  ARM=%s  (%.0fs)" % (rep + 1, name, time.time() - t))
             print(fmt(r), flush=True)
     print("\n== MEDIAN OVER %d REPS (min..max)" % reps)
-    def med(mode, getter):
-        v = [getter(r) for r in allr[mode] if getter(r) is not None]
+    def med(name, getter):
+        v = [getter(r) for r in allr[name] if getter(r) is not None]
         return (statistics.median(v), min(v), max(v)) if v else (None, None, None)
-    rows = []
+    keys = []
     for c in CLASSES:
         for key in ("ttft_p50", "ttft_p95", "ok", "timeout", "refused"):
-            rows.append(("%s %s" % (c, key), med("off", lambda r: r[c][key]), med("enforce", lambda r: r[c][key])))
-    for key in ("wasted_prefill_tok", "cache_hit_share", "wasted_share"):
-        rows.append(("engine " + key, med("off", lambda r: r["_engine"][key]), med("enforce", lambda r: r["_engine"][key])))
-    for key in ("halo_cycles", "completed_per_min", "timeouts_per_hr"):
-        rows.append(("flow " + key, med("off", lambda r: r["_flow"][key]), med("enforce", lambda r: r["_flow"][key])))
-    print("%-28s %-22s %-22s" % ("metric", "off (median min..max)", "enforce (median min..max)"))
-    for name, a, b in rows:
-        f = lambda x: "-" if x[0] is None else "%s (%s..%s)" % tuple(round(y, 2) for y in x)
-        print("%-28s %-22s %-22s" % (name, f(a), f(b)))
+            keys.append(("%s %s" % (c, key), (lambda c, key: lambda r: r[c][key])(c, key)))
+    for key in ("wasted_prefill_tok", "cache_hit_share"):
+        keys.append(("engine " + key, (lambda key: lambda r: r["_engine"][key])(key)))
+    for key in ("halo_cycles", "completed_per_min", "timeouts_per_hr", "bg_deferred"):
+        keys.append(("flow " + key, (lambda key: lambda r: r["_flow"][key])(key)))
+    f = lambda x: "-" if x[0] is None else "%s (%s..%s)" % tuple(round(y, 2) for y in x)
+    print("%-26s" % "metric" + "".join("%-26s" % a[0] for a in arms))
+    for name, g in keys:
+        print("%-26s" % name + "".join("%-26s" % f(med(a[0], g)) for a in arms))
     return allr
 
 
@@ -472,8 +510,9 @@ def main():
     ap.add_argument("cmd", choices=["compare", "modes"])
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--secs", type=int, default=120)
+    ap.add_argument("--arms", default="", help="comma list of: off, enforce, enforce+follow (default all)")
     a = ap.parse_args()
-    asyncio.run(compare(a.reps, a.secs) if a.cmd == "compare" else modes(a.secs))
+    asyncio.run(compare(a.reps, a.secs, [x for x in a.arms.split(",") if x]) if a.cmd == "compare" else modes(a.secs))
 
 
 if __name__ == "__main__":
