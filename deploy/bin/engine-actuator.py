@@ -276,8 +276,48 @@ def drain_and_wait(deadline_s, reason, token, by=None):
     return facts, lease
 
 
+def offline_and_wait(deadline_s, reason, token, by=None):
+    """CF (2026-10-02): open a PLANNED LOCAL-OFFLINE window instead of a drain fence. The gateway routes new work to the
+    remote valve (inside the daily cap) rather than refusing it, lets accepted local work finish, and the estate keeps
+    flowing during the restart. Returns (facts, lease) or None when the gateway has no such endpoint (older gateway,
+    or the window cannot be taken): the caller then falls back to the drain fence."""
+    facts = {"fence": False, "strategy": "offline-window", "waited_s": 0, "active_at_start": None, "active_at_end": None}
+    try:
+        cur = http(f"{GATEWAY}/gateway/offline", token=token)
+        if "offline" not in cur or cur.get("offline"):
+            return None
+        opened = http(f"{GATEWAY}/gateway/offline", "POST", {"ttl_s": min(3600, int(deadline_s) + 1200),
+                      "reason": f"engine planned restart: {reason}"[:120], "by": by or "engine-actuator"}, token)
+        lease = opened.get("lease")
+        if not lease:
+            return None
+        facts["fence"] = True
+        facts["active_at_start"] = opened.get("local_active")
+    except Exception:  # noqa: BLE001
+        return None
+    t0 = time.time()
+    active = facts["active_at_start"]
+    while time.time() - t0 < deadline_s:
+        try:
+            active = int(http(f"{GATEWAY}/gateway/offline", token=token).get("local_active") or 0)
+            if active == 0:
+                break
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(2)
+    facts["waited_s"] = round(time.time() - t0)
+    facts["active_at_end"] = active
+    return facts, ("offline", lease)
+
+
 def release_lease(lease, token):
     if not lease:
+        return
+    if isinstance(lease, tuple) and lease[0] == "offline":
+        try:
+            http(f"{GATEWAY}/gateway/offline", "DELETE", {"lease": lease[1]}, token)
+        except Exception:  # noqa: BLE001
+            pass  # the lease expires on its own
         return
     try:
         if http(f"{GATEWAY}/gateway/drain", token=token).get("draining"):
@@ -331,7 +371,8 @@ def do_restart(a):
     drain_facts, lease = ({"skipped": "engine unhealthy; nothing to drain"}, None)
     if healthy and not a.no_drain:
         write_job(state="draining")
-        drain_facts, lease = drain_and_wait(a.drain_s, reason, token, by)
+        got = None if os.environ.get("ENGINE_ACTUATOR_FORCE_DRAIN") else offline_and_wait(a.drain_s, reason, token, by)
+        drain_facts, lease = got if got else drain_and_wait(a.drain_s, reason, token, by)
     write_job(state="stopping", drain=drain_facts)
     json.dump({"ts": now_iso(), "by": by, "reason": reason, "drain": drain_facts, "active_at_stop": drain_facts.get("active_at_end")},
               open(PLANNED, "w"))
