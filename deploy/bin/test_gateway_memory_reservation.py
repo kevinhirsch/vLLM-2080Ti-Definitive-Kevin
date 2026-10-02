@@ -42,7 +42,8 @@ class ReservationRouting(unittest.IsolatedAsyncioTestCase):
                       FORCE_REMOTE=0, BIG_OUTPUT=0, BIG_PROMPT=0, MONSTER_INFLIGHT=0,
                       FOREIGN_LOAD_GUARD=0, TINY_TOKENS=0, LOCAL_WAIT=0, BG_WAIT=0,
                       BG_LOCAL_ONLY=0, FG_RESERVED=0, BG_BIG_LOCAL_WHEN_IDLE=0,
-                      LOG_REQUESTS=0, CRASH_ADAPTIVE=0, EMPTY_RETRY=0)
+                      LOG_REQUESTS=0, CRASH_ADAPTIVE=0, EMPTY_RETRY=0,
+                      FLOW_MODE="off")   # these tests pin the pre-CF admission semantics (CF has its own: test_gateway_flow.py)
         for name, value in values.items():
             self.stack.enter_context(patch.object(shim, name, value))
         mocks = dict(_est_tokens=lambda body: 100, estimate_units=lambda *a, **k: 1,

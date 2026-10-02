@@ -1514,6 +1514,7 @@ async def _telemetry_sampler():
             _update_perf_breaker(sample)
             _TELEM_TICK += 1
             if _TELEM_TICK % 5 == 0:
+                _offline_reap()
                 flow_note_mode()       # CF: a capacity-mode change is an event
             if _TELEM_TICK % max(1, TELEM_SLOW_EVERY) == 0:
                 ds = _downsample(_TELEM_WINDOW)
@@ -3139,6 +3140,7 @@ def record_event(decision, reason, request, units, waited, ptok=0, maxtok=0, str
         _stats["waited_total"] += waited
         _stats["waited_n"] += 1
     _stats["peak_inflight"] = max(_stats["peak_inflight"], _inflight)
+    flow_note_route(decision, final_reason, request)
     # TELEMETRY: pull whatever _relay()/_forward_remote()/the local-success branches have
     # already stashed on this request's live-registry entry (ttft/outtok are None for the
     # "record-before-forward" remote branches -- see DESIGN.md (c) for exactly why, and where
@@ -3288,6 +3290,9 @@ FLOW_CLASS_MAP = os.environ.get("SHIM_FLOW_CLASS_MAP", ",".join((
     "overseer-=background", "vault-dreams=background", "digester=background", "acceptance-review=background",
     "research=background", "workflow-bg=background", "applicant=background", "m1c-probe=background",
     "outcome-alarm=background", "cron=background", "batch=background")))
+# Phrases (first 500 chars of the first two messages) that mark a class when the client name cannot: the card
+# runner's pi sessions arrive from the same host/provider as Kevin's own pi, 100% of them opening with this line.
+FLOW_MARKERS = os.environ.get("SHIM_FLOW_MARKERS", "local-lane-runner batch job=runner")
 FLOW_AFFINITY_MAX = int(os.environ.get("SHIM_FLOW_AFFINITY_MAX", "6"))      # same-prefix grants in a row before FIFO order resumes
 FLOW_STARVE_S = float(os.environ.get("SHIM_FLOW_STARVE_S", "300"))          # a waiting class unserved this long ignores its ceiling once
 FLOW_PREFIX_HOLD_MAX_S = float(os.environ.get("SHIM_FLOW_PREFIX_HOLD_MAX_S", "60"))
@@ -3299,6 +3304,7 @@ _CFG.update({
     "SHIM_FLOW_BACKLOG_S":    ("FLOW_BACKLOG_S", float),
     "SHIM_FLOW_DEADLINES":    ("FLOW_DEADLINES", _flow_norm(float)),
     "SHIM_FLOW_CLASS_MAP":    ("FLOW_CLASS_MAP", _flow_norm_classmap),
+    "SHIM_FLOW_MARKERS":      ("FLOW_MARKERS", _flow_norm_classmap),
     "SHIM_FLOW_AFFINITY_MAX": ("FLOW_AFFINITY_MAX", int),
     "SHIM_FLOW_STARVE_S":     ("FLOW_STARVE_S", float),
     "SHIM_FLOW_PREFIX_HOLD_MAX_S": ("FLOW_PREFIX_HOLD_MAX_S", float),
@@ -3365,6 +3371,19 @@ def flow_class_of(request, body, background, halo_control):
         return h
     if halo_control:
         return "halo"
+    try:
+        marks = _flow_parse_classmap(FLOW_MARKERS)
+        if marks:
+            msgs = (json.loads(body).get("messages") or [])[:2]
+            for m in msgs:
+                c = m.get("content")
+                text = c if isinstance(c, str) else " ".join(b.get("text", "") for b in (c or [])[:2] if isinstance(b, dict))
+                head = (text or "")[:500].lower()
+                for pat, cls in marks:
+                    if pat in head:
+                        return cls
+    except Exception:
+        pass
     try:
         fc = _friendly_client(request)
         key = ("%s\n%s" % (fc.get("xclient") or "", fc.get("name") or "")).lower()
@@ -3441,7 +3460,10 @@ def flow_mode_now():
         except Exception:
             budget_ok = None
     remote_usable = bool(remote_cfg and not LOCAL_ONLY and not dead_s and budget_ok is not False)
-    if forced and remote_usable:
+    offline = _local_offline()
+    if offline:
+        mode = "remote-only" if remote_usable else "none"
+    elif forced and remote_usable:
         mode = "remote-only"
     elif local_up and remote_usable:
         mode = "local+remote"
@@ -3462,9 +3484,12 @@ def flow_mode_now():
         why.append("daily remote spend cap has no room")
     if forced:
         why.append("force-remote window")
+    if offline:
+        why.append("planned local-offline window: %s (by %s, %ds left)" % (
+            _OFFLINE["reason"], _OFFLINE["by"], max(0, int(_OFFLINE["until"] - time.time()))))
     if not local_up:
         why.append("local engine unhealthy")
-    return {"mode": mode, "local_up": local_up, "remote_configured": remote_cfg, "remote_usable": remote_usable,
+    return {"planned_offline": offline, "mode": mode, "local_up": local_up, "remote_configured": remote_cfg, "remote_usable": remote_usable,
             "remote_dead_for_s": dead_s, "remote_budget_ok": budget_ok, "forced_remote": forced,
             "full_local_flag": bool(LOCAL_ONLY), "why": why}
 
@@ -3525,7 +3550,10 @@ def flow_enqueue(t):
     _FLOW["seq"] += 1
     t.seq = _FLOW["seq"]
     if not any(w.cls == t.cls for w in _FLOW["waiters"]):
-        _FLOW["vtime"][t.cls] = max(_FLOW["vtime"][t.cls], _FLOW["vclock"])
+        # a class that was idle starts level with the classes already waiting: no banked credit, no debt
+        others = [_FLOW["vtime"][w.cls] for w in _FLOW["waiters"]]
+        if others:
+            _FLOW["vtime"][t.cls] = max(_FLOW["vtime"][t.cls], min(others))
     _FLOW["waiters"].append(t)
     _flow_bump()
 
@@ -3600,17 +3628,23 @@ def flow_pick(now=None):
     pick = None
     if by_cls:
         order = {c: i for i, c in enumerate(FLOW_CLASSES)}
-        cls = min(by_cls, key=lambda c: (_FLOW["vtime"][c], order[c]))
-        cand = sorted(by_cls[cls], key=lambda x: x.seq)
-        fifo = cand[0]
-        pick = fifo
-        urgent = [x for x in cand if x.deadline_at is not None and x.deadline_at - now < FLOW_URGENT_SLACK_S]
-        if urgent:
-            pick = min(urgent, key=lambda x: x.deadline_at)
-        elif _FLOW["last_prefix"] and _FLOW["run"] < FLOW_AFFINITY_MAX:
-            aff = [x for x in cand if x.prefix == _FLOW["last_prefix"]]
-            if aff:
-                pick = aff[0]
+        shares = _flow_shares()
+        best_key = None
+        for cls, cand in by_cls.items():
+            cand.sort(key=lambda x: x.seq)
+            choice = cand[0]                                    # FIFO ...
+            urgent = [x for x in cand if x.deadline_at is not None and x.deadline_at - now < FLOW_URGENT_SLACK_S]
+            if urgent:                                          # ... unless a deadline is close (EDF) ...
+                choice = min(urgent, key=lambda x: x.deadline_at)
+            elif _FLOW["last_prefix"] and _FLOW["run"] < FLOW_AFFINITY_MAX:
+                aff = [x for x in cand if x.prefix == _FLOW["last_prefix"]]
+                if aff:                                         # ... or a warm prefix is waiting (affinity)
+                    choice = aff[0]
+            # weighted fair queuing on FINISH tags: a heavy class wins a near-tie, light classes still
+            # get their share (the heavier the weight, the sooner a class's next request finishes)
+            key = (_FLOW["vtime"][cls] + choice.cost_s / shares[cls], order[cls])
+            if best_key is None or key < best_key:
+                best_key, pick = key, choice
     _FLOW["head"] = (_FLOW["version"], now, pick)
     return pick
 
@@ -3631,9 +3665,7 @@ def flow_on_admit(t, request=None):
     """t just claimed its place: advance fair-queuing time, remember the prefix, start the prefill watch."""
     now = time.time()
     shares = _flow_shares()
-    v0 = max(_FLOW["vtime"][t.cls], _FLOW["vclock"])
-    _FLOW["vtime"][t.cls] = v0 + t.cost_s / shares[t.cls]
-    _FLOW["vclock"] = v0
+    _FLOW["vtime"][t.cls] += t.cost_s / shares[t.cls]
     t.adjacent = bool(t.prefix and t.prefix == _FLOW["last_prefix"])
     if t.prefix and t.prefix == _FLOW["last_prefix"]:
         _FLOW["run"] += 1
@@ -3715,7 +3747,10 @@ def flow_admission_check(t, remote_can_take):
         _FLOW_STATS["shadow_would_refuse_" + t.cls] += 1
         return None
     if remote_can_take:
-        return None            # local+remote: the existing overflow path absorbs it after its short wait
+        # local+remote: this is the abnormal-spike case the remote valve exists for -- cannot start in time
+        # locally. Send it now instead of letting it age in the queue.
+        return {"overflow": True, "class": t.cls, "expected_wait_s": t.expected_wait_s,
+                "own_prefill_s": round(t.cost_s, 1), "deadline_in_s": round(budget_s, 1)}
     return {"class": t.cls, "expected_wait_s": t.expected_wait_s, "own_prefill_s": round(t.cost_s, 1),
             "deadline_in_s": round(budget_s, 1), "retry_after": int(max(5, min(900, t.expected_wait_s)))}
 
@@ -3729,6 +3764,133 @@ def _flow_refusal_response(r):
     return web.Response(body=payload, status=429, content_type="application/json",
                         headers={"Retry-After": str(r["retry_after"]), "X-Gateway-Refused": "flow-deadline",
                                  "X-Gateway-Expected-Wait": str(r["expected_wait_s"])})
+
+
+# ---- planned local-offline window (Kevin 10-02: benchmarks and engine upgrades must not be outages) ----
+# MEASURED 2026-10-02: ~85% of the day's fenced time was lane benchmark/restart drain fences that refused ALL
+# traffic (503), although DeepSeek could have carried the estate. A planned local-offline window does not
+# refuse: it routes new work to the remote valve (inside the daily cap), keeps pinned-local callers waiting
+# with Retry-After, lets accepted local work finish, and ends by itself (lease) or by DELETE. The admission
+# FENCE (/gateway/drain) stays for the instant of a gateway code swap only.
+_OFFLINE = {"until": 0.0, "lease": None, "reason": None, "by": None, "t0": None, "ttl_s": None, "refused": 0}
+OFFLINE_MAX_TTL_S = 3600
+
+
+def _local_offline(now=None):
+    return (time.time() if now is None else now) < _OFFLINE["until"]
+
+
+def _flow_event(row):
+    try:
+        os.makedirs(os.path.dirname(_FLOW_EVENTS_FILE), exist_ok=True)
+        with open(_FLOW_EVENTS_FILE, "a") as fh:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+    except Exception as e:
+        log.warning("flow event write failed: %s", e)
+
+
+def _offline_reap(now=None):
+    """Write the close row of a window whose lease ran out (a crashed benchmark must not leave local off forever)."""
+    now = time.time() if now is None else now
+    if _OFFLINE["t0"] and not _local_offline(now):
+        _flow_event({"event": "offline-close", "how": "expired", "t": round(min(now, _OFFLINE["until"]), 3),
+                     "t0": round(_OFFLINE["t0"], 3), "reason": _OFFLINE["reason"], "by": _OFFLINE["by"],
+                     "refused": _OFFLINE["refused"]})
+        _OFFLINE.update(t0=None, lease=None, reason=None, by=None, ttl_s=None, refused=0)
+        flow_note_mode(now)
+
+
+def _offline_status():
+    _offline_reap()
+    on = _local_offline()
+    return {"offline": on, "until": _OFFLINE["until"] if on else None, "reason": _OFFLINE["reason"] if on else None,
+            "by": _OFFLINE["by"] if on else None, "since": _OFFLINE["t0"] if on else None,
+            "remaining_s": max(0, int(_OFFLINE["until"] - time.time())) if on else 0,
+            "local_active": sum(1 for a in _ACTIVE.values() if a.get("phase") == "local"),
+            "local_inflight_units": _inflight, "active": len(_ACTIVE), "mode": flow_mode_now()["mode"]}
+
+
+async def gateway_offline(request):
+    """GET status; POST {ttl_s, reason, by} opens (or, with {lease}, extends) a window; DELETE {lease} closes it."""
+    if request.method == "GET":
+        return web.json_response(_offline_status())
+    if not _admin_ok(request):
+        return web.json_response({"error": "admin token required"}, status=401)
+    try:
+        body = await request.json()
+    except (ValueError, TypeError):
+        body = None
+    if not isinstance(body, dict):
+        return web.json_response({"error": "JSON body required"}, status=400)
+    now = time.time()
+    _offline_reap(now)
+    if request.method == "DELETE":
+        if not _OFFLINE["lease"] or body.get("lease") != _OFFLINE["lease"]:
+            return web.json_response({"error": "offline lease mismatch"}, status=409)
+        _flow_event({"event": "offline-close", "how": "delete", "t": round(now, 3), "t0": round(_OFFLINE["t0"] or now, 3),
+                     "reason": _OFFLINE["reason"], "by": _OFFLINE["by"], "refused": _OFFLINE["refused"]})
+        _OFFLINE.update(until=0.0, t0=None, lease=None, reason=None, by=None, ttl_s=None, refused=0)
+        flow_note_mode(now)
+        return web.json_response(_offline_status())
+    try:
+        ttl = int(body.get("ttl_s") or 900)
+        if not 30 <= ttl <= OFFLINE_MAX_TTL_S:
+            raise ValueError
+    except (ValueError, TypeError):
+        return web.json_response({"error": "ttl_s must be 30..%d seconds" % OFFLINE_MAX_TTL_S}, status=400)
+    if _local_offline(now):
+        if body.get("lease") and body.get("lease") == _OFFLINE["lease"]:           # extend
+            _OFFLINE["until"] = now + ttl
+            return web.json_response({**_offline_status(), "lease": _OFFLINE["lease"]})
+        return web.json_response({"error": "another offline window is open", **_offline_status()}, status=409)
+    by = str(body.get("by") or request.headers.get("X-Client") or request.headers.get("User-Agent") or "?")[:80]
+    reason = str(body.get("reason") or "planned local work")[:120]
+    _OFFLINE.update(until=now + ttl, lease=os.urandom(16).hex(), reason=reason, by=by, t0=now, ttl_s=ttl, refused=0)
+    _flow_event({"event": "offline-open", "t": round(now, 3), "reason": reason, "by": by, "ttl_s": ttl,
+                 "local_active": _offline_status()["local_active"]})
+    flow_note_mode(now)
+    return web.json_response({**_offline_status(), "lease": _OFFLINE["lease"]})
+
+
+_FLOW_ROUTES = collections.deque(maxlen=30000)       # (t, decision, reason, class, local_had_headroom)
+_FLOW_EXPLICIT = frozenset({"alias", "intent", "forced", "local-down", "local-offline", "failover", "full-local-remote-alias"})
+
+
+def flow_note_route(decision, reason, request):
+    """Remote-as-a-valve accounting (Kevin 10-02: remote is for abnormal spikes, never the normal path)."""
+    try:
+        info = _ACTIVE.get(id(request)) or {}
+        headroom = bool(_health.get("ok") and not _local_offline() and _inflight < effective_budget()
+                        and flow_backlog_s() <= LIGHT_PREFILL_SECS)
+        _FLOW_ROUTES.append((time.time(), decision, reason, info.get("flow_class"), headroom))
+    except Exception:
+        pass
+
+
+def flow_remote_use(now=None):
+    now = time.time() if now is None else now
+    out = {}
+    for label, secs in (("15m", 900), ("1h", 3600), ("24h", 86400)):
+        rows = [r for r in _FLOW_ROUTES if now - r[0] <= secs]
+        remote = [r for r in rows if r[1] == "remote"]
+        avoidable = [r for r in remote if r[2] not in _FLOW_EXPLICIT]
+        out[label] = {"requests": len(rows), "remote": len(remote),
+                      "remote_share": round(len(remote) / len(rows), 3) if rows else None,
+                      "by_reason": dict(collections.Counter(r[2] for r in remote).most_common(8)),
+                      "by_class": dict(collections.Counter(r[3] or "?" for r in remote)),
+                      "gateway_chosen_remote": len(avoidable),
+                      "remote_while_local_had_headroom": sum(1 for r in avoidable if r[4])}
+    spend = None
+    try:
+        snap = _spend().snapshot()
+        spend = {k: snap.get(k) for k in ("spent", "held", "reserved", "cap", "remaining") if k in snap}
+    except Exception:
+        pass
+    return {"principle": "local-first: remote is a valve for abnormal spikes and planned local-offline windows, not the "
+                         "normal path. gateway_chosen_remote counts routes the gateway chose (not forced/aliased/"
+                         "local-down/offline); remote_while_local_had_headroom is the defect signal: remote used although "
+                         "the engine had a free place and no prefill queue.",
+            "windows": out, "spend_today": spend}
 
 
 # ---- the facts endpoint ----
@@ -3798,6 +3960,8 @@ def flow_capacity_facts(now=None, cls=None, ptok=None):
         "config": {"shares": shares, "ceilings": {c: ceils[c] for c in FLOW_CLASSES}, "default_deadlines_s": dls,
                    "backlog_target_s": FLOW_BACKLOG_S, "class_map": FLOW_CLASS_MAP,
                    "set_with": "POST /gateway/config {flow_shares, flow_ceil, flow_deadlines, flow_backlog_s, flow_class_map, flow_mode}"},
+        "remote_use": flow_remote_use(now),
+        "offline_window": _offline_status(),
         "counters": dict(_FLOW_STATS),
         "cannot_measure": ([] if eng else ["engine /metrics scrape failing: throughput and engine queue unknown"]),
     }
@@ -6098,6 +6262,21 @@ async def _route_completions(request, _no_overflow=False):
         record_event("remote", "big-prompt", request, units, 0, **ev)
         return await _overflow_forward()
 
+    # CF: PLANNED local-offline window (benchmark / engine upgrade): the remote valve carries the estate inside
+    # the daily cap; callers that must stay local (pinned, estate-local) and everything when no remote can take
+    # work are told to retry -- the engine is being worked on, so nothing is admitted to it.
+    if _local_offline():
+        if overflow_ok and not alias_local_only and not local_pin:
+            log.info("route %s planned local-offline window (%s) -> remote(local-offline)", path, _OFFLINE["reason"])
+            record_event("remote", "local-offline", request, units, 0, **ev)
+            return await _overflow_forward()
+        _OFFLINE["refused"] += 1
+        record_event("rejected-bg", "local-offline", request, units, 0, **ev)
+        left = max(5, min(60, int(_OFFLINE["until"] - time.time())))
+        return web.json_response({"error": {"message": "local engine is offline for planned work (%s); retry after %ds" % (
+            _OFFLINE["reason"], left), "type": "local_offline_window"}}, status=503,
+            headers={"Retry-After": str(left), "X-Gateway-Offline": "active"})
+
     # local DOWN -> overflow immediately (waiting for a slot won't help a dead engine) --
     # UNLESS this is background traffic under BG_LOCAL_ONLY: hold it and poll for recovery
     # instead (background can wait; it must never pay for remote to cover an engine restart).
@@ -6314,15 +6493,26 @@ async def _route_completions(request, _no_overflow=False):
                        and _inflight == 0 and _waiting <= (1 if queued else 0))
         admit_units = min(effective_budget(), _desired_const) if bg_big_idle else units
         win_ok = bg_big_idle or prefill_window_ok(est_computed, halo_control)
-        ok = bool(_health["ok"] and admit_units >= sequences
+        ok = bool(_health["ok"] and not _local_offline() and admit_units >= sequences
                   and ((_inflight + admit_units) <= lane_limit or bg_big_idle)
                   and _memory_available(reservation, halo_control=halo_control) and win_ok)
         return ok, admit_units, bg_big_idle, win_ok
 
     flow_t = flow_make_ticket(request, body, flow_cls, _pm, ptok, units, lambda: _legacy_fits()[0])
+    if FLOW_MODE == "enforce" and flow_cls in FLOW_REFUSABLE and flow_t.deadline_at is not None:
+        # Local-first (Kevin 10-02): robot work waits for local until it would miss its own deadline (bounded by
+        # BG_WAIT_LOCAL) instead of overflowing to the paid remote after a few seconds.
+        deadline = max(deadline, min(flow_t.deadline_at - flow_t.cost_s, t_admit0 + BG_WAIT_LOCAL))
     if FLOW_MODE != "off":
         _refusal = flow_admission_check(flow_t, bool(overflow_ok and not alias_local_only))
         _active_set(request, flow_expected_wait_s=flow_t.expected_wait_s)
+        if _refusal and _refusal.get("overflow"):
+            _FLOW_STATS["valve_" + flow_cls] += 1
+            log.info("route %s %s cannot start locally in time (wait %.1fs + prefill %.1fs > %.1fs) -> remote(flow-deadline)",
+                     path, flow_cls, _refusal["expected_wait_s"], _refusal["own_prefill_s"], _refusal["deadline_in_s"])
+            flow_dequeue(flow_t)
+            record_event("remote", "flow-deadline", request, units, 0, **ev)
+            return await _overflow_forward()
         if _refusal:
             _FLOW_STATS["refused_" + flow_cls] += 1
             log.info("route %s %s refused before prefill: expected wait %.1fs + prefill %.1fs > %.1fs left",
@@ -6345,6 +6535,8 @@ async def _route_completions(request, _no_overflow=False):
             # most big bg requests fit under lane_limit without ever needing this bypass; it
             # only fires for requests so large that even the proportional estimate would still
             # exceed budget-FG_RESERVED.
+            if _local_offline() and overflow_ok and not alias_local_only and not local_pin:
+                break           # a planned local-offline window opened while this waited: the valve takes it
             _fits, _admit_units, _bg_big_idle, _win_ok = _legacy_fits()
             if _fits and flow_turn(flow_t):
                 flow_on_admit(flow_t)
@@ -6385,7 +6577,9 @@ async def _route_completions(request, _no_overflow=False):
 
     if not admitted:
         # distinguish WHY we couldn't admit: lane-count vs total-context (size-aware) cap
-        if (_inflight + units) <= lane_limit and not prefill_window_ok(est_computed, halo_control):
+        if _local_offline():
+            reason = "local-offline"
+        elif (_inflight + units) <= lane_limit and not prefill_window_ok(est_computed, halo_control):
             reason = "prefill"
         elif (_inflight + units) <= lane_limit:
             reason = "tokens"
@@ -9025,6 +9219,9 @@ def make_app():
     app.router.add_post("/v1/completions", handle_completions)
     app.router.add_get("/gateway/stats", gateway_stats)
     app.router.add_get("/gateway/capacity", gateway_capacity)                 # CF: capacity-aware flow facts
+    app.router.add_get("/gateway/offline", gateway_offline)                   # CF: planned local-offline window
+    app.router.add_post("/gateway/offline", gateway_offline)
+    app.router.add_delete("/gateway/offline", gateway_offline)
     app.router.add_get("/gateway/drain", gateway_drain)
     app.router.add_post("/gateway/drain", gateway_drain)
     app.router.add_delete("/gateway/drain", gateway_drain)
