@@ -307,6 +307,17 @@ def do_restart(a):
         return 3
     by, reason = a.by, a.reason
     token = admin_token()
+    # RS: a restart whose only purpose is to apply flags the RUNNING engine already has is a pure no-op that still costs a full
+    # outage (drain + ~4 min boot, every request refused). Refuse it unless --force; Halo can still restart for any other reason.
+    if (a.flags is not None or a.clear_diag) and not getattr(a, "force", False) and engine_healthy():
+        want = sorted([] if a.clear_diag else [x for x in (a.flags or "").split(",") if x])
+        have = active_flags()
+        if want and have is not None and sorted(have) == want:  # non-empty only: '--flags ""' / --clear-diag may accompany a non-DIAG change
+            skipped = {"refused": "no-op restart: the running engine already has exactly these diag flags", "flags": want,
+                       "hint": "pass --force to restart anyway (e.g. to clear engine state)"}
+            emit("observation", f"planned engine restart by {by} skipped: flags {want or 'none'} already active", {"action": "restart-skipped-noop", "by": by, "reason": reason, **skipped})
+            print(json.dumps(skipped))
+            return 0
     write_job(state="starting", by=by, reason=reason, started=now_iso(), finished=None, drain=None, result=None)
     if a.flags is not None or a.clear_diag:
         names = [] if a.clear_diag else [x for x in (a.flags or "").split(",") if x]
@@ -353,6 +364,8 @@ def spawn_detached(a):
         cmd += ["--clear-diag"]
     if a.no_drain:
         cmd += ["--no-drain"]
+    if getattr(a, "force", False):
+        cmd += ["--force"]
     # refuse early (and visibly) if one is running
     try:
         j = json.load(open(JOB))
@@ -381,6 +394,11 @@ def announce_start(_a):
     m = re.findall(r"GPU KV cache size: ([\d,]+) tokens", sh(["journalctl", "-u", UNIT, "--no-pager", "-n", "4000", "-o", "cat"], 60))
     if m:
         pool = int(m[-1].replace(",", ""))
+    try:  # RS: heal any engine death the ExecStopPost collector lost (idempotent, no new cron)
+        subprocess.Popen([sys.executable, f"{BASE}/engine-fault-collector.py", "--reconcile", "--hours", "3"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception:  # noqa: BLE001
+        pass
     flags = active_flags()
     emit("observation", f"engine is back and healthy (flags active: {flags or 'none'}; KV pool {pool}); "
          f"faults in last 24h: {faults_summary(24)['faults']}",
@@ -402,6 +420,7 @@ def main():
     p.add_argument("--flags", default=None, help="comma list of DIAG names to stage before restarting")
     p.add_argument("--clear-diag", action="store_true"); p.add_argument("--drain-s", type=int, default=120)
     p.add_argument("--no-drain", action="store_true"); p.add_argument("--foreground", action="store_true")
+    p.add_argument("--force", action="store_true", help="restart even when the requested diag flags are already active")
     sp.add_parser("announce-start"); sp.add_parser("restart-status")
     a = ap.parse_args()
     if a.cmd == "status":

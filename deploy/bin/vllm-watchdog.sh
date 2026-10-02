@@ -246,6 +246,13 @@ sudo -n systemctl reset-failed "$SERVICE" >> "$ACTION_LOG" 2>&1 || true
 # 2026-09-05 both sat out the full TimeoutStopSec=180 before systemd's SIGKILL). Kill the whole
 # control group up front so the restart starts immediately; the 180 s grace stays for operator
 # restarts, where a clean TP=2 teardown is worth waiting for.
+# EF2: tell the fault collector this death is a confirmed generation wedge (a FAULT for Halo, not a planned stop).
+printf '{"ts":"%s","by":"watchdog","wedge":true,"consecutive_failures":%s}\n' "$(date -Is)" "${new_failures}" > "$(dirname "$STATE_FILE")/wedge-restart.json" 2>/dev/null || true
+# RS (2026-10-02): record the death BEFORE killing. Two wedge kills (10:39, 12:05) never reached the fault ledger: the
+# ExecStopPost collector raced the `systemctl restart` issued 3 s after this kill and its record was lost. --pre-kill writes
+# ledger + incident dir + Halo hand-off now, with the journal still intact, and drops a dedupe marker so the later ExecStopPost
+# does not double-count. Bounded (timeout) and best-effort: a collector failure never delays recovery beyond the bound.
+timeout 60 /usr/bin/python3 "$(dirname "$STATE_FILE")/engine-fault-collector.py" --pre-kill >> "$ACTION_LOG" 2>&1 || true
 sudo -n systemctl kill -s KILL "$SERVICE" >> "$ACTION_LOG" 2>&1 || true
 sleep 3
 log "ACTION SIGKILL sent to ${SERVICE} control group (wedged engines never exit on SIGTERM); restarting now"
