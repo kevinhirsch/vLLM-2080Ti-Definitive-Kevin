@@ -62,6 +62,8 @@ MODEL="${WATCHDOG_MODEL:-$(curl -s -m 5 "$ENDPOINT_URL/v1/models" 2>/dev/null | 
 MODELS_TIMEOUT="${WATCHDOG_MODELS_TIMEOUT:-5}"       # seconds, GET /v1/models budget
 GEN_TIMEOUT="${WATCHDOG_GEN_TIMEOUT:-20}"            # seconds, hard timeout for the generation probe
 CONSEC_FAIL_THRESHOLD="${WATCHDOG_CONSEC_FAIL_THRESHOLD:-5}"   # consecutive gen failures required
+XID_FAST_THRESHOLD="${WATCHDOG_XID_FAST_THRESHOLD:-2}"   # RS: consecutive gen failures required when a kernel Xid corroborates
+XID_WINDOW_MIN="${WATCHDOG_XID_WINDOW_MIN:-8}"           # RS: how recent the Xid must be
 COOLDOWN_SEC="${WATCHDOG_COOLDOWN_SEC:-1800}"        # 30 min minimum between automated restarts
 MAX_RESTARTS_PER_HOUR="${WATCHDOG_MAX_RESTARTS_PER_HOUR:-2}"
 SERVICE="${WATCHDOG_SERVICE:-vllm-qwen27b.service}"
@@ -209,8 +211,18 @@ new_failures=$((prev_failures + 1))
 state_set_consecutive_failures "$new_failures"
 log "PROBE fail models=${models_code}(${models_time}s) gen=${gen_code}(${gen_time}s) -> generation-wedge signature, consecutive_failures=${new_failures}/${CONSEC_FAIL_THRESHOLD}"
 
-if [ "$new_failures" -lt "$CONSEC_FAIL_THRESHOLD" ]; then
-  log "DECISION below threshold (${new_failures}/${CONSEC_FAIL_THRESHOLD}), no action"
+# RS (2026-10-02): a kernel Xid (13/31/43/45/79) in the last XID_WINDOW_MIN minutes corroborates a generation failure: the
+# 10:34:40 and 12:00:30 CUDA faults each left a zombie engine (API up, workers dead) that sat out ALL 5 probes = 4 min 52 s of
+# full outage (local-only: nothing else can serve) before the kill. With an Xid on record the wedge is CONFIRMED by 2 probes
+# (still two consecutive failures, so a transient is not killed). The cooldown and restarts/hour rails below still apply.
+CONSEC_EFFECTIVE="$CONSEC_FAIL_THRESHOLD"
+xid_recent=$(journalctl -k --since "-${XID_WINDOW_MIN} min" --no-pager 2>/dev/null | grep -cE 'NVRM: Xid .*: (13|31|43|45|79),' || true)
+if [ "${xid_recent:-0}" -gt 0 ] && [ "$XID_FAST_THRESHOLD" -lt "$CONSEC_EFFECTIVE" ]; then
+  CONSEC_EFFECTIVE="$XID_FAST_THRESHOLD"
+  log "XID-CORROBORATED ${xid_recent} kernel Xid line(s) in the last ${XID_WINDOW_MIN} min -> wedge threshold ${CONSEC_EFFECTIVE} (instead of ${CONSEC_FAIL_THRESHOLD})"
+fi
+if [ "$new_failures" -lt "$CONSEC_EFFECTIVE" ]; then
+  log "DECISION below threshold (${new_failures}/${CONSEC_EFFECTIVE}), no action"
   exit 0
 fi
 
