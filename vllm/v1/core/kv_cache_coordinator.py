@@ -884,10 +884,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             spec.mamba_cache_mode == "align"
             and spec.supports_fine_grained_prefix_cache
             and (
-                # Keep partial-hash alignment when the Mamba block is exactly
-                # the hash unit too.  This is required when the scheduler's
-                # chunk budget is larger than both hybrid group blocks.
-                (dcp_world_size == 1 and spec.block_size >= hash_block_size)
+                # TP=1 uses partial hashes only when the Mamba block is
+                # larger than the hash unit; equality stays scheduler-aligned
+                # (weicj/vLLM-2080Ti-Definitive#238). DCP retains equality
+                # because it scales the effective full-attention block.
+                (dcp_world_size == 1 and spec.block_size > hash_block_size)
                 or (
                     dcp_world_size > 1 and spec.block_size >= hash_block_size
                 )
