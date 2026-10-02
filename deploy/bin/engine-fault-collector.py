@@ -110,6 +110,7 @@ def main():
     ap.add_argument("--at", help="fault time 'YYYY-mm-dd HH:MM:SS' (local) for backfill")
     ap.add_argument("--window", type=int, default=240, help="journal seconds before the fault to read")
     ap.add_argument("--no-vault", action="store_true")
+    ap.add_argument("--drill", action="store_true", help="with --at: replay a past fault AND emit its hand-off (tagged drill)")
     a = ap.parse_args()
     if os.path.exists(f"{BASE}/NO_FAULT_COLLECTOR"):
         return
@@ -121,6 +122,26 @@ def main():
     result = os.environ.get("SERVICE_RESULT", "") or "backfill"
     sig, detail = classify(journal, kernel)
     planned = (sig == "unknown-exit" and not a.at and result in ("success", "") and "Traceback" not in journal)
+    # EF2: a stop that SOMEONE REQUESTED (systemctl stop/restart logs "Stopping <unit description>") is planned even when it
+    # ended in a SIGKILL after the stop timeout -- 03:45 and 03:55 on 2026-10-02 were EF's own restarts mislabelled FAULT.
+    marker = None
+    try:
+        marker = json.load(open(f"{BASE}/planned-restart.json"))
+        os.rename(f"{BASE}/planned-restart.json", f"{BASE}/planned-restart.last.json")
+    except Exception:  # noqa: BLE001
+        pass
+    requested_stop = bool(re.search(r"systemd\[1\]: Stopping vLLM", journal)) and sig in ("unknown-exit",) and not a.at
+    killed_after_timeout = result == "timeout" and (os.environ.get("EXIT_STATUS") in ("KILL", "9"))
+    wedge = None
+    try:
+        wedge = json.load(open(f"{BASE}/wedge-restart.json"))
+        os.rename(f"{BASE}/wedge-restart.json", f"{BASE}/wedge-restart.last.json")
+    except Exception:  # noqa: BLE001
+        pass
+    if wedge:
+        sig, detail, planned = "generation-wedge", "watchdog-confirmed (models healthy, generation probes timed out)", False
+    elif marker or (requested_stop and "Traceback" not in journal):
+        planned = True
     kind = "planned-stop" if planned else "FAULT"
     ts_s = datetime.fromtimestamp(now).strftime("%Y%m%d-%H%M%S")
     shape = scheduler_dump_shape(journal)
@@ -131,6 +152,11 @@ def main():
            "uptime_s": uptime_before(now) if not a.at else None, "dump": shape,
            "in_flight": {"n": len(live), "ptok": [r["ptok"] for r in live], "clients": sorted({str(r["client"]) for r in live})},
            "incident_dir": inc if kind == "FAULT" else None}
+    if planned:
+        row["planned_by"] = (marker or {}).get("by") or "systemctl"
+        row["planned_reason"] = (marker or {}).get("reason")
+        row["killed_after_stop_timeout"] = killed_after_timeout  # in-flight work was cut at the stop timeout (drain didn't finish)
+        row["drain"] = (marker or {}).get("drain")
     os.makedirs(INC, exist_ok=True)
     if kind == "FAULT":
         os.makedirs(f"{inc}/flightrec", exist_ok=True)
@@ -144,8 +170,9 @@ def main():
                 shutil.copy2(p, f"{inc}/flightrec/")
             except Exception:  # noqa: BLE001
                 pass
-    with open(LEDGER, "a") as f:
-        f.write(json.dumps(row) + "\n")
+    if not a.drill:
+        with open(LEDGER, "a") as f:
+            f.write(json.dumps(row) + "\n")
     if kind == "FAULT" and not a.no_vault:
         try:
             if not os.path.exists(VAULT_NOTE):
@@ -157,7 +184,38 @@ def main():
                 f.write(line)
         except Exception:  # noqa: BLE001
             pass
+    if kind == "FAULT" and (not a.at or a.drill):
+        handoff_to_halo(row, sig, detail, shape, live, inc, drill=a.drill)
     print(json.dumps(row))
+
+
+def handoff_to_halo(row, sig, detail, shape, live, inc, drill=False):
+    """Fault -> Halo hand-off (EF2). FACTS only; deciding what to do is Halo's (no thresholds here).
+    Goes through the estate's hand-off queue (idempotent per distinct fault) so it appears in list_handoffs and the
+    gap-free event log; Halo's catch-up sees it at the start of its next cycle."""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("engine_actuator", f"{BASE}/engine-actuator.py")
+        ea = importlib.util.module_from_spec(spec); spec.loader.exec_module(ea)
+        recent = ea.faults_summary(24)
+        facts = {"action": "engine-fault", "signature": sig, "detail": detail, "service_result": row.get("service_result"),
+                 "exit_status": row.get("exit_status"), "uptime_s": row.get("uptime_s"),
+                 "batch_shape": shape, "requests_in_flight": row["in_flight"], "incident_dir": inc,
+                 "faults_in_last_24h": recent["faults"], "by_signature_24h": recent["by_signature"],
+                 "diag_flags_staged": ea.staged_flags(),
+                 "engine_state": "systemd restarts the unit automatically (Restart=always, 15 s); warm-up follows",
+                 "actuators_you_have": ["engine_status", "engine_faults", "engine_flags", "engine_stage_diag", "engine_restart"],
+                 "evidence": [f"{inc}/engine-journal.txt", f"{inc}/META.json", f"{inc}/in-flight.json", "vault: Memory/Engine Fault Ledger.md"]}
+        if drill:
+            facts["drill"] = True
+        summ = ((" [DRILL: replay of a past fault] " if drill else "") + f"vLLM engine died ({sig}{' ' + detail if detail else ''}) after {row.get('uptime_s')}s up; "
+                f"batch rows={shape.get('rows')} prefill_rows={shape.get('prefill_rows')} spec_rows={shape.get('spec_rows')}; "
+                f"{row['in_flight']['n']} request(s) in flight (ptok {row['in_flight']['ptok']}); "
+                f"{recent['faults']} fault(s) in the last 24 h")
+        r = ea.emit("handoff", summ, facts, handoff=True, action="engine-fault", fingerprint=f"{'drill-' if drill else ''}fault-{row['ts']}-{sig}")
+        row["handoff_seq"] = r
+    except Exception as e:  # noqa: BLE001
+        print("handoff error", repr(e), file=sys.stderr)
 
 
 if __name__ == "__main__":
