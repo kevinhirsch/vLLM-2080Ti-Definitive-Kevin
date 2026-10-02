@@ -186,7 +186,7 @@ class Helpers(Isolated):
 
     def test_first_token_cap_widens_only_for_big_local_prompts(self):
         big = json.dumps({"messages": [{"role": "user", "content": "x"}]}).encode()
-        with patch.object(shim, "FIRST_TOKEN_MAX", 60.0), patch.object(shim, "FIRST_TOKEN_BASE", 15.0), \
+        with patch.object(shim, "remote_ok", lambda: True), patch.object(shim, "FIRST_TOKEN_MAX", 60.0), patch.object(shim, "FIRST_TOKEN_BASE", 15.0), \
                 patch.object(shim, "BIG_PROMPT", 24_000), patch.object(shim, "_est_tokens", lambda b: 100_000):
             self.assertAlmostEqual(shim.first_token_timeout(big, 1, local=True), 15.0 + 100_000 / 850.0)
             self.assertEqual(shim.first_token_timeout(big, 1, local=False), 60.0)
@@ -194,9 +194,22 @@ class Helpers(Isolated):
             self.assertEqual(shim.first_token_timeout(big, 4, local=True), 300.0)
             with patch.object(shim, "LOCAL_FIRST", False):
                 self.assertEqual(shim.first_token_timeout(big, 1, local=True), 60.0)
-        with patch.object(shim, "FIRST_TOKEN_MAX", 60.0), patch.object(shim, "BIG_PROMPT", 24_000), \
-                patch.object(shim, "_est_tokens", lambda b: 1_000):
+        with patch.object(shim, "remote_ok", lambda: True), patch.object(shim, "FIRST_TOKEN_MAX", 60.0), \
+                patch.object(shim, "BIG_PROMPT", 24_000), patch.object(shim, "_est_tokens", lambda b: 1_000):
             self.assertEqual(shim.first_token_timeout(big, 1, local=True), shim.first_token_timeout(big, 1))
+
+    def test_no_remote_means_no_first_token_abort_of_local_work(self):
+        # 2026-10-02: DeepSeek empty -> a 60 s first-token deadline failed ~50% of requests to a
+        # remote that could not serve them (503 'held/local-failed'), discarding local prefill.
+        body = json.dumps({"messages": [{"role": "user", "content": "x"}]}).encode()
+        with patch.object(shim, "remote_ok", lambda: False), patch.object(shim, "FIRST_TOKEN_MAX", 60.0), \
+                patch.object(shim, "LOCAL_FIRST_FIRST_TOKEN_MAX", 300.0), patch.object(shim, "BIG_PROMPT", 24_000), \
+                patch.object(shim, "_est_tokens", lambda b: 3_000):
+            self.assertGreaterEqual(shim.first_token_timeout(body, 1, local=True), 300.0)
+            self.assertLessEqual(shim.first_token_timeout(body, 1, local=False), 60.0)   # remote relays unchanged
+        with patch.object(shim, "remote_ok", lambda: True), patch.object(shim, "FIRST_TOKEN_MAX", 60.0), \
+                patch.object(shim, "BIG_PROMPT", 24_000), patch.object(shim, "_est_tokens", lambda b: 3_000):
+            self.assertLessEqual(shim.first_token_timeout(body, 1, local=True), 60.0)  # remote available: unchanged
 
     def test_knobs_round_trip_through_the_dashboard_config(self):
         cfg = shim.current_config()
