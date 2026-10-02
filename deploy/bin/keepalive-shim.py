@@ -3841,6 +3841,13 @@ def first_token_timeout(body, concurrency=1, local=False):
     cap = FIRST_TOKEN_MAX
     if local and LOCAL_FIRST and BIG_PROMPT > 0 and est >= BIG_PROMPT:
         cap = max(FIRST_TOKEN_MAX, LOCAL_FIRST_FIRST_TOKEN_MAX)
+    if local and not remote_ok():
+        # No remote to fail over to (FULL LOCAL, or the 402 breaker is open): a first-token
+        # deadline would only abort local work already in prefill and return a 503 the caller
+        # retries from scratch. Measured 2026-10-02 10:39-12:03: ~50% of requests ended
+        # 'held/local-failed' 503 after ~60 s this way while DeepSeek was empty by Kevin's choice.
+        # Give local the long cap instead; a truly wedged engine is the engine watchdog's job.
+        return max(cap, LOCAL_FIRST_FIRST_TOKEN_MAX, FIRST_TOKEN_BASE + (est / PREFILL_TPS) * factor)
     return min(cap, FIRST_TOKEN_BASE + (est / PREFILL_TPS) * factor)
 
 
