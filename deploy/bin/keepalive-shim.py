@@ -278,7 +278,34 @@ TOKENS_PER_UNIT = int(os.environ.get("SHIM_TOKENS_PER_UNIT", "12000"))
 # -- it only changes how many LANES a correctly-predicted-cheap request is charged.
 PREFIX_HIT_MARGIN_TOKENS = int(os.environ.get("SHIM_PREFIX_HIT_MARGIN_TOKENS", "512"))
 USE_COMPUTED_COST = int(os.environ.get("SHIM_USE_COMPUTED_COST", "0"))
-PREFIX_CACHE_MAX_CLIENTS = 200   # bound on _prefix_seen's size; not a tuning knob, not hot-reloadable
+PREFIX_CACHE_MAX_CLIENTS = 200   # (legacy one-deep model bound; the model below is content-addressed)
+# 2026-10-01 (LS lane, local-serving quick wins): CACHE-AWARE PREFILL COST MODEL.
+# Measured today: Halo (58% of requests) resends a 40-120K-token prompt on every tool-loop turn, and
+# ~95% of it is the previous turn's prompt. The engine's prefix cache serves that prefix when it
+# was prefilled LOCALLY (probe: 50K prompt, 92% cached, TTFT 3.9s vs 48s cold), but the old
+# one-deep per-CLIENT predictor lost the thread as soon as Halo interleaved >1 conversation, and it
+# recorded requests that went REMOTE (which never warm the local cache). Result: every turn was
+# costed at its raw size (a 58K turn = 5 lanes), lanes read "saturated" with 4-5 requests actually
+# running and KV at ~40%, and Halo went to the paid remote while the engine's prefill queue was
+# in fact the real constraint. The model below is content-addressed (a rolling hash over
+# tools+messages, one node per message boundary), global (the cache is global), learns ONLY from
+# requests actually admitted to the local engine, expires on a TTL, clears on engine restart and
+# self-corrects from the engine's own usage.prompt_tokens_details.cached_tokens. The engine only
+# caches whole attention blocks (3568 tokens on this build: "attention block size 3568"), so the
+# credit is rounded DOWN to PREFIX_ALIGN_TOKENS. USE_COMPUTED_COST above decides whether
+# admission/routing USES it (default off); prediction + telemetry always run.
+PREFIX_ALIGN_TOKENS = int(os.environ.get("SHIM_PREFIX_ALIGN_TOKENS", "3568"))
+PREFIX_MODEL_TTL_SECS = float(os.environ.get("SHIM_PREFIX_MODEL_TTL_SECS", "900"))
+PREFIX_MODEL_MAX_NODES = int(os.environ.get("SHIM_PREFIX_MODEL_MAX_NODES", "60000"))
+# Prefill is the engine's scarce resource (one cold 50K prompt = ~45s of chunk steps that every
+# younger request waits behind). These express the guards in SECONDS OF PREFILL at PREFILL_TPS
+# (so they follow the measured rate instead of a hard-coded token count):
+#   monster       -- uncached prefill already in flight >= this many seconds: new arrivals go remote
+#   heavy         -- a request whose OWN uncached prefill is >= this many seconds
+#   heavy backlog -- a heavy request runs locally only if the in-flight backlog is <= this
+MONSTER_PREFILL_SECS = float(os.environ.get("SHIM_MONSTER_PREFILL_SECS", "30"))
+HEAVY_PREFILL_SECS = float(os.environ.get("SHIM_HEAVY_PREFILL_SECS", "20"))
+HEAVY_ADMIT_BACKLOG_SECS = float(os.environ.get("SHIM_HEAVY_ADMIT_BACKLOG_SECS", "15"))
 # 2026-09-05 (evalkit run-2 forensics): background classification by X-Client only matched the
 # substrings "cron"/"batch", so the research service ("workflow-bg"), the research feeder and the
 # local digester all ran as FOREGROUND and could fill every lane, queueing genuinely interactive
@@ -417,6 +444,11 @@ _CFG = {
     "SHIM_INTERACTIVE_NEVER_OVERFLOW": ("INTERACTIVE_NEVER_OVERFLOW", int),
     "SHIM_PREFIX_HIT_MARGIN_TOKENS": ("PREFIX_HIT_MARGIN_TOKENS", int),
     "SHIM_USE_COMPUTED_COST": ("USE_COMPUTED_COST", int),
+    "SHIM_PREFIX_ALIGN_TOKENS": ("PREFIX_ALIGN_TOKENS", int),
+    "SHIM_PREFIX_MODEL_TTL_SECS": ("PREFIX_MODEL_TTL_SECS", float),
+    "SHIM_MONSTER_PREFILL_SECS": ("MONSTER_PREFILL_SECS", float),
+    "SHIM_HEAVY_PREFILL_SECS": ("HEAVY_PREFILL_SECS", float),
+    "SHIM_HEAVY_ADMIT_BACKLOG_SECS": ("HEAVY_ADMIT_BACKLOG_SECS", float),
     "SHIM_BG_XCLIENTS":      ("BG_XCLIENTS", lambda v: [m.lower() for m in _parse_seq(v, _CFG_SEP["SHIM_BG_XCLIENTS"])]),
     "SHIM_POOL_TOKENS":      ("POOL_TOKENS",      int),
     "SHIM_BG_WAIT_SECS":     ("BG_WAIT",          float),
@@ -604,6 +636,7 @@ def _admin_ok(request):
 _inflight = 0            # local capacity units currently in flight
 _inflight_tokens = 0    # sum of est prompt tokens of in-flight local requests (size-aware cap)
 _inflight_reserved_tokens = 0  # prompt + maximum bounded generation, across all local lanes
+_inflight_computed = 0   # sum of PREDICTED UNCACHED prefill tokens of in-flight local requests
 _waiting  = 0           # requests currently blocked in the queue-first wait loop (backlog)
 # 2026-09-11 (gw-queue-position-header): per-class split of the SAME count above. Kevin's
 # dashboard showed one aggregate "waiting" number with no way to tell "am I, personally,
@@ -971,7 +1004,19 @@ def local_first_decision(reason, *, background, units, reservation, est_computed
         return False, "policy-off"
     if not _health.get("ok", False):
         return False, "local-unhealthy"
+    if USE_COMPUTED_COST and reason == "monster":
+        # Cache-aware mode: "monster" means a real uncached prefill is already chewing the engine's
+        # chunk steps, and every younger request queues behind it (vLLM schedules in arrival order).
+        # That is not a capacity question local-first can answer with free lanes: stay remote.
+        return False, "prefill-backlog"
     sat = local_saturation(background, units, reservation, now)
+    if USE_COMPUTED_COST and PREFILL_TPS > 0 and HEAVY_PREFILL_SECS > 0:
+        # A HEAVY cold prefill (many seconds of the engine's chunk steps) runs locally only when it
+        # will not queue behind another one; otherwise the engine serializes them and everything
+        # younger waits on both. The bound is in seconds at the measured prefill rate.
+        if (max(0, est_computed or 0) / PREFILL_TPS >= HEAVY_PREFILL_SECS
+                and _prefill_backlog_secs() > HEAVY_ADMIT_BACKLOG_SECS):
+            sat = list(sat) + ["prefill-backlog"]
     if sat:
         return False, "saturated:" + "+".join(sat)
     if LOCAL_FIRST_INTERACTIVE_TTFT_SECS > 0 and not background:
@@ -2379,6 +2424,11 @@ def _note_payload_outcome(request, payload, stream):
                 u = (json.loads(body).get("usage") or {})
                 if "completion_tokens" in u:
                     kw["outtok"] = int(u["completion_tokens"])
+                if (_ACTIVE.get(id(request)) or {}).get("route") == "local" and "prompt_tokens" in u:
+                    cached = int(((u.get("prompt_tokens_details") or {}).get("cached_tokens")) or 0)
+                    kw["computed_actual"] = max(0, int(u["prompt_tokens"]) - cached)
+                    kw["cached_actual"] = cached
+                    kw["ptok_exact_local"] = int(u["prompt_tokens"])
         _active_set(request, **kw)
     except Exception:
         pass
@@ -2438,6 +2488,7 @@ def _telemetry_note_request(info, resp=None):
                         name, est_computed, computed_actual, computed_actual / max(1, est_computed))
             _MISESTIMATE_FEED.appendleft({"t": round(now, 1), "client": name,
                                           "est_computed": est_computed, "computed_actual": computed_actual})
+        _pm_feedback(info)        # LS lane: grade + self-correct the cache-aware cost model
         # (e) append-only JSONL request log -- see DESIGN.md (e) / REPORT.md. Never write on the
         # request path: this only appends a small dict to a bounded in-memory list;
         # _jsonl_flusher() (sibling to _stats_saver()) does the actual blocking file I/O off the
@@ -2501,6 +2552,8 @@ def _telemetry_note_request(info, resp=None):
             # decompose_timing() -- a null here must never be mistaken for "0 tokens computed".
             "est_tokens": info.get("est_tokens"), "est_computed": info.get("est_computed"),
             "computed_actual": info.get("computed_actual"),
+            "cached_actual": info.get("cached_actual"),
+            "pm_credit": info.get("pm_credit"), "pm_age_s": info.get("pm_age_s"),
         })
     except Exception as e:
         log.warning("telemetry note_request: %s", e)
@@ -3280,6 +3333,7 @@ def trigger_backoff(reason):
     global _backoff_until
     _backoff_until = time.time() + OOM_BACKOFF
     log.warning("LOCAL backoff -> budget=1 for %ss (%s)", OOM_BACKOFF, reason)
+    _pm_reset("local fault: " + str(reason)[:60])
     # CRASH-ADAPTIVE big_prompt guard: trigger_backoff() only fires on a real detected local
     # crash (OOM/EngineDead/503 -- see _is_oom()), never on a routine busy/wedged failover, so
     # it's the correct single hook for "a local crash just happened".
@@ -3500,38 +3554,169 @@ def _is_prefix_of(prev_hashes, this_hashes):
     return all(a is not None and a == b for a, b in zip(prev_hashes, this_hashes))
 
 
+# ---------------- CACHE-AWARE PREFILL COST MODEL (see PREFIX_ALIGN_TOKENS) ----------------
+_PM_NODES = collections.OrderedDict()      # rolling chain key -> last-touch epoch seconds
+_PM_STATS = collections.Counter()
+_PM_PAIRS = collections.deque(maxlen=500)  # (predicted_credit, actual_cached, ptok) for local requests
+_PM_INFLIGHT = {}                          # id(request) -> prediction dict (chain etc.) until the request ends
+
+
+def _pm_chain(body):
+    """[(chain_key, cumulative_serialized_chars)] -- one entry per message boundary of the request,
+    plus the grand total. The root folds in everything that changes the rendered PREFIX before the
+    first message: the tool list and the template switches that put text ahead of it (thinking
+    on/off, reasoning effort). Two requests share a chain node iff their rendered prompts share
+    that whole prefix. Never raises; an unparsable body has an empty chain."""
+    try:
+        j = json.loads(body)
+    except Exception:
+        return [], 0
+    msgs = j.get("messages") or []
+    if not isinstance(msgs, list) or not msgs:
+        return [], 0
+    ctk = j.get("chat_template_kwargs")
+    root = [j.get("tools"), ctk.get("enable_thinking") if isinstance(ctk, dict) else None,
+            j.get("reasoning_effort")]
+    try:
+        root_s = json.dumps(root, sort_keys=True, default=str)
+    except Exception:
+        return [], 0
+    h = hashlib.sha256(root_s.encode("utf-8", "replace")).digest()
+    cum = len(root_s)
+    out = []
+    for m in msgs:
+        try:
+            ms = json.dumps(m, sort_keys=True, default=str)
+        except Exception:
+            break
+        h = hashlib.sha256(h + ms.encode("utf-8", "replace")).digest()
+        cum += len(ms)
+        out.append((h, cum))
+    return out, cum
+
+
+def _pm_predict(body, est_tokens, now=None):
+    """Predict the UNCACHED prefill tokens of this request against what the local engine has been
+    fed recently. Returns a dict: computed (never < 1), credit (tokens predicted cached), best
+    (deepest matched chain index or -1), age (s since that node was written), chain."""
+    now = time.time() if now is None else now
+    chain, total = _pm_chain(body)
+    est = max(1, int(est_tokens or 0))
+    best, age = -1, None
+    for i, (k, _) in enumerate(chain):
+        t = _PM_NODES.get(k)
+        if t is None or now - t > PREFIX_MODEL_TTL_SECS:
+            break
+        best, age = i, now - t
+    credit = 0
+    if best >= 0 and total > 0:
+        # chars->tokens is not uniform (tool-schema JSON vs prose), so the matched fraction is an
+        # estimate: pad it by the fixed margin plus 3%, shave it by how well past predictions held
+        # up against the engine's own cached_tokens, then round DOWN to whole attention blocks.
+        matched = chain[best][1] / total * est
+        a = max(1, PREFIX_ALIGN_TOKENS)
+        credit = (int(max(0.0, (matched - PREFIX_HIT_MARGIN_TOKENS - 0.03 * matched) * _pm_trust())) // a) * a
+    return {"computed": max(1, est - credit), "credit": credit, "best": best,
+            "age": age, "chain": chain, "total": total, "est": est}
+
+
+def _pm_trust():
+    """Fraction of predicted credit the engine has actually delivered lately (1.0 with no history,
+    never below 0.3): the model's own eviction/staleness error, measured, not assumed."""
+    c = d = 0
+    for credit, cached, _ in _PM_PAIRS:
+        if credit > 0:
+            c += credit
+            d += min(cached, credit)
+    if c < 4 * max(1, PREFIX_ALIGN_TOKENS):
+        return 1.0
+    return max(0.3, min(1.0, d / c))
+
+
 def predict_computed_tokens(client, body, est_tokens):
-    """Predict how many tokens the engine will actually have to compute fresh for THIS request,
-    using the previous request from the SAME client as a one-deep prefix-cache model
-    (gw-admission-computed-token-cost). Falls back to full cost (est_tokens) whenever there is
-    nothing to predict FROM: no prior request for this client, fewer than 2 messages (nothing
-    could be a carried-over prefix), or -- the common non-hit case -- the previous request's
-    messages aren't a prefix of this one (first turn, edited/branched history, a different
-    conversation entirely). Never returns less than 1."""
-    msgs = _parse_messages(body)
-    if len(msgs) < 2:
-        return max(1, est_tokens)
-    prev = _prefix_seen.get(client)
-    if prev is None or not _is_prefix_of(prev.get("hashes"), _message_hashes(msgs)):
-        return max(1, est_tokens)
-    delta = max(0, est_tokens - prev.get("prompt_tokens", 0))
-    return max(1, delta + PREFIX_HIT_MARGIN_TOKENS)
+    """Predicted uncached prefill tokens (>= 1) for this request. `client` is accepted for API
+    compatibility only: the engine's cache is global, not per client."""
+    return _pm_predict(body, est_tokens)["computed"]
+
+
+def _pm_commit(chain, now=None):
+    """Record that these prefixes are being prefilled on the local engine. Deepest key first so the
+    SHALLOW nodes are the freshest and an LRU eviction can never cut the middle out of a chain."""
+    if not chain:
+        return
+    now = time.time() if now is None else now
+    for k, _ in reversed(chain):
+        _PM_NODES[k] = now
+        _PM_NODES.move_to_end(k)
+    while len(_PM_NODES) > max(1000, PREFIX_MODEL_MAX_NODES):
+        _PM_NODES.popitem(last=False)
+
+
+def _pm_reset(reason):
+    """The engine's cache is gone (restart / crash / model switch): forget everything."""
+    if _PM_NODES:
+        log.info("prefix model reset (%s): %d nodes dropped", reason, len(_PM_NODES))
+    _PM_NODES.clear()
+    _PM_STATS["resets"] += 1
+
+
+def _pm_feedback(info):
+    """Grade one finished LOCAL request's prediction against the engine's own cached_tokens and
+    unlearn prefixes the engine did not in fact have (over-prediction), so a stale or evicted node
+    costs at most one mis-admitted request, not a run of them. Never raises."""
+    try:
+        pm = _PM_INFLIGHT.pop(info.get("pm_ref"), None) or {}
+        credit, cached = info.get("pm_credit"), info.get("cached_actual")
+        ptok_exact = info.get("ptok_exact_local")
+        if credit is None or cached is None or info.get("route") != "local":
+            return
+        _PM_PAIRS.append((int(credit), int(cached), int(ptok_exact or 0)))
+        a = max(1, PREFIX_ALIGN_TOKENS)
+        if credit - cached > 2 * a:
+            _PM_STATS["overpredict"] += 1
+            chain, best, total = pm.get("chain") or [], pm.get("best", -1), pm.get("total") or 0
+            est = info.get("est_tokens") or 0
+            if chain and best >= 0 and total > 0 and est > 0:
+                for i in range(best, -1, -1):
+                    if chain[i][1] / total * est <= cached + a:
+                        break
+                    _PM_NODES.pop(chain[i][0], None)
+        elif cached - credit > 2 * a:
+            _PM_STATS["underpredict"] += 1
+        else:
+            _PM_STATS["accurate"] += 1
+    except Exception:
+        pass
+
+
+def _pm_summary():
+    pairs = list(_PM_PAIRS)
+    n = len(pairs)
+    out = {"nodes": len(_PM_NODES), "ttl_secs": PREFIX_MODEL_TTL_SECS, "align": PREFIX_ALIGN_TOKENS,
+           "trust": round(_pm_trust(), 3), "graded": n, **{k: v for k, v in _PM_STATS.items()}}
+    if n:
+        err = sorted(abs(c - a) for c, a, _ in pairs)
+        out["abs_err_p50"] = err[n // 2]
+        out["abs_err_p90"] = err[min(n - 1, int(n * 0.9))]
+        out["credit_sum"] = sum(c for c, _, _ in pairs)
+        out["cached_sum"] = sum(a for _, a, _ in pairs)
+        out["ptok_sum"] = sum(p for _, _, p in pairs)
+    return out
 
 
 def _prefix_cache_observe(client, body, prompt_tokens):
-    """Record this request's per-message hashes + size so the NEXT turn from the same client can
-    predict against it. Called once per request, regardless of hit/miss/route -- observation is
-    unconditional so a miss this turn can still become a hit next turn."""
-    msgs = _parse_messages(body)
-    if not msgs:
-        return
-    if len(_prefix_seen) >= PREFIX_CACHE_MAX_CLIENTS and client not in _prefix_seen:
-        _prefix_seen.pop(next(iter(_prefix_seen)), None)   # oldest-inserted, dict preserves order
-    _prefix_seen[client] = {"hashes": _message_hashes(msgs), "prompt_tokens": prompt_tokens,
-                             "ts": time.time()}
+    """Legacy hook, now a no-op. The old model learned from EVERY request regardless of route
+    (a remote-served turn does not warm the local cache); learning now happens in _pm_commit(),
+    called only when a request is admitted to the local engine."""
+    return None
 
 
-def _desired_units(body, client=None):
+def _prefill_backlog_secs():
+    """Seconds of uncached prefill already admitted to the local engine, at the measured rate."""
+    return _inflight_computed / max(1.0, PREFILL_TPS)
+
+
+def _desired_units(body, client=None, computed=None):
     """The size-implied unit cost with NO ceiling applied -- how many lanes this request would
     take if it could have as many as it wants. Used two ways: estimate_units() clamps it to
     the normal reserved cap; the bg-idle-bypass below reads it directly to decide whether a
@@ -3541,18 +3726,19 @@ def _desired_units(body, client=None):
     `client` is optional and, while USE_COMPUTED_COST stays at its default (0), unused --
     existing callers/tests that don't pass it see byte-identical behaviour. When flipped on,
     a request at or above BIG_TOKENS is costed by its PREDICTED computed tokens instead of its
-    raw size (see predict_computed_tokens())."""
+    raw size (see _pm_predict()). `computed` lets the caller pass the prediction it already
+    made, so the admission wait loop does not re-hash a 300 KB body on every poll."""
     tokens = _est_tokens(body)
     if tokens < BIG_TOKENS:
         return 1
-    if USE_COMPUTED_COST and client is not None:
-        tokens = predict_computed_tokens(client, body, tokens)
+    if USE_COMPUTED_COST and (client is not None or computed is not None):
+        tokens = computed if computed is not None else predict_computed_tokens(client, body, tokens)
         if tokens < BIG_TOKENS:
             return 1
     return max(1, math.ceil(tokens / max(1, TOKENS_PER_UNIT)))
 
 
-def estimate_units(body, budget=None, allow_full_budget=False, client=None):
+def estimate_units(body, budget=None, allow_full_budget=False, client=None, computed=None):
     """How many of the `budget` lane-slots this request should claim.
 
     2026-09-11 (gw-admission-proportional-units): proportional to estimated size, not
@@ -3568,7 +3754,7 @@ def estimate_units(body, budget=None, allow_full_budget=False, client=None):
     """
     budget = effective_budget() if budget is None else budget
     ceiling = max(1, budget if allow_full_budget else budget - FG_RESERVED)
-    return min(ceiling, _desired_units(body, client))
+    return min(ceiling, _desired_units(body, client, computed))
 
 
 def first_token_timeout(body, concurrency=1, local=False):
@@ -4106,6 +4292,8 @@ async def local_healthy():
                     foreign_heavy = False
     except Exception:
         ok = False
+    if ok and not _health.get("ok", False) and _health.get("at", 0.0) > 0:
+        _pm_reset("engine back after being down")      # its prefix cache did not survive the outage
     _health.update(ok=ok, at=now, foreign=foreign, foreign_tokens=foreign_tokens, foreign_heavy=foreign_heavy)
     return ok
 
@@ -4449,6 +4637,8 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
         # concept, and remote's own cache accounting (if any) isn't comparable to it.
         if not _is_remote_relay and _exact_ptok[0] is not None:
             _outkw["computed_actual"] = max(0, _exact_ptok[0] - (_exact_cached[0] or 0))
+            _outkw["cached_actual"] = int(_exact_cached[0] or 0)
+            _outkw["ptok_exact_local"] = _exact_ptok[0]
         if _is_remote_relay:
             _outkw.update(_remote_usage_kw(_exact_ptok[0], _exact_hit[0], _exact_miss[0]))
         _active_set(request, **_outkw)
@@ -4504,6 +4694,13 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
         _outkw["outtok"] = _exact_outtok[0]
     if _is_remote_relay and _exact_finish[0] is not None:
         _outkw["finish_reason"] = _exact_finish[0]
+    # LS lane 2026-10-01: this committed-stream path (every response longer than the first-token
+    # gate -- i.e. nearly all real traffic) never recorded computed_actual, so the cost model's
+    # predicted-vs-actual gate had no data (0 of 40,000 local rows). Same local-only rule as above.
+    if not _is_remote_relay and _exact_ptok[0] is not None:
+        _outkw["computed_actual"] = max(0, _exact_ptok[0] - (_exact_cached[0] or 0))
+        _outkw["cached_actual"] = int(_exact_cached[0] or 0)
+        _outkw["ptok_exact_local"] = _exact_ptok[0]
     if _is_remote_relay:
         _outkw.update(_remote_usage_kw(_exact_ptok[0], _exact_hit[0], _exact_miss[0]))
     _active_set(request, **_outkw)
@@ -4818,6 +5015,7 @@ async def handle_completions(request):
         if _info is not None:
             _spend_settle(_info, _resp)             # R2: price what went remote, release its hold
             _telemetry_note_request(_info, _resp)   # TELEMETRY: per-client rollups + error feed
+            _PM_INFLIGHT.pop(id(request), None)     # cost-model side table: never outlive the request
 
 
 def _write_flightrec(fr, fn, body):
@@ -4858,11 +5056,10 @@ def _bg_reject_response():
 
 
 async def _route_completions(request, _no_overflow=False):
-    global _inflight, _waiting, _inflight_tokens, _inflight_reserved_tokens
+    global _inflight, _waiting, _inflight_tokens, _inflight_reserved_tokens, _inflight_computed
     path = request.path
     body = await request.read()
     client = _friendly_client(request)["name"]
-    units = estimate_units(body, client=client)
     streaming = wants_stream(body)
     ptok = _est_tokens(body)
     # No configured provider can accept a prompt above this ceiling. Refuse it
@@ -4885,9 +5082,18 @@ async def _route_completions(request, _no_overflow=False):
     # card's own accuracy gate has real predicted-vs-actual data to grade from the moment this
     # deploys, before that switch is ever flipped on. Observe must run AFTER predict, against
     # the prefix state predict just read -- a miss this turn still becomes next turn's hit.
-    est_computed = predict_computed_tokens(client, body, ptok)
-    _active_set(request, est_tokens=ptok, est_computed=est_computed)
+    _pm = _pm_predict(body, ptok)
+    est_computed = _pm["computed"]
+    units = estimate_units(body, client=client, computed=est_computed)
+    # The chain holds raw digests (not JSON-serialisable), so it lives in a side table keyed by the
+    # request and is released by _telemetry_note_request(); _ACTIVE only carries scalars.
+    _PM_INFLIGHT[id(request)] = _pm
+    _active_set(request, est_tokens=ptok, est_computed=est_computed, pm_credit=_pm["credit"],
+                pm_age_s=None if _pm["age"] is None else round(_pm["age"], 1), pm_ref=id(request))
     _prefix_cache_observe(client, body, ptok)
+    # What the routing guards below treat as this request's "size": the predicted UNCACHED prefill
+    # when the cache-aware cost model is on, else the raw prompt (previous behaviour, byte for byte).
+    _cost_tokens = est_computed if USE_COMPUTED_COST else ptok
     try:
         maxtok = int(json.loads(body).get("max_tokens") or 0)
     except Exception:
@@ -5028,9 +5234,9 @@ async def _route_completions(request, _no_overflow=False):
 
     # big-PROMPT requests (e.g. a pi session whose context has grown huge): can't prefill within the
     # first-token cap on this slow box and would saturate/OOM local -> straight to remote up front.
-    if (overflow_ok and not local_pin and not alias_local_only and BIG_PROMPT > 0 and ptok >= BIG_PROMPT
+    if (overflow_ok and not local_pin and not alias_local_only and BIG_PROMPT > 0 and _cost_tokens >= BIG_PROMPT
             and not _lf_keep("big-prompt")):
-        log.info("route %s ptok=%d >= %d -> remote(big-prompt)", path, ptok, BIG_PROMPT)
+        log.info("route %s ptok=%d cost_tokens=%d >= %d -> remote(big-prompt)", path, ptok, _cost_tokens, BIG_PROMPT)
         record_event("remote", "big-prompt", request, units, 0, **ev)
         return await _overflow_forward()
 
@@ -5072,9 +5278,13 @@ async def _route_completions(request, _no_overflow=False):
     # now would crawl (~1 tok per chunk-step). Route new arrivals remote until it drains.
     _foreign = _health.get("foreign", 0) if FOREIGN_LOAD_GUARD else 0
     _foreign_heavy = bool(_health.get("foreign_heavy", False)) if FOREIGN_LOAD_GUARD else False
+    # Cache-aware mode measures the monster in UNCACHED prefill seconds at the measured rate (warm
+    # multi-turn prompts, which share their KV with the cache, no longer count as a monster);
+    # legacy mode keeps the raw in-flight prompt-token threshold.
+    _monster_now = ((MONSTER_PREFILL_SECS > 0 and _prefill_backlog_secs() >= MONSTER_PREFILL_SECS)
+                    if USE_COMPUTED_COST else (MONSTER_INFLIGHT > 0 and _inflight_tokens >= MONSTER_INFLIGHT))
     if overflow_ok and not local_pin and not alias_local_only and (
-            (MONSTER_INFLIGHT > 0 and _inflight_tokens >= MONSTER_INFLIGHT)
-            or _foreign_heavy
+            _monster_now or _foreign_heavy
     ) and not _lf_keep("monster"):
         log.info("route %s monster/foreign inflight tok=%d foreign=%d foreign_tok=%d -> remote(monster)",
                  path, _inflight_tokens, _foreign, int(_health.get("foreign_tokens", 0) or 0))
@@ -5090,7 +5300,7 @@ async def _route_completions(request, _no_overflow=False):
         record_event("remote", "perf", request, units, 0, **ev)
         return await _overflow_forward()
 
-    predicted = predicted_occupancy_seconds(ptok, maxtok, max(1, _inflight + 1))
+    predicted = predicted_occupancy_seconds(_cost_tokens, maxtok, max(1, _inflight + 1))
     _active_set(request, predicted_occupancy_s=predicted)
     if (overflow_ok and not local_pin and not alias_local_only and predicted is not None
             and predicted >= PREDICTED_OCCUPANCY_SECS and not _lf_keep("predicted")):
@@ -5138,19 +5348,24 @@ async def _route_completions(request, _no_overflow=False):
 
     def claim_local():
         nonlocal reserved
-        global _inflight, _inflight_tokens, _inflight_reserved_tokens
+        global _inflight, _inflight_tokens, _inflight_reserved_tokens, _inflight_computed
         _inflight += units
         _inflight_tokens += ptok
         _inflight_reserved_tokens += reservation
+        _inflight_computed += est_computed
         reserved = True
+        # The engine will now prefill this prompt: from here on its prefix is (being) cached, so
+        # the next turn of this conversation is cheap. Learn ONLY from requests that go local.
+        _pm_commit(_pm["chain"])
 
     def release_local():
         nonlocal reserved
-        global _inflight, _inflight_tokens, _inflight_reserved_tokens
+        global _inflight, _inflight_tokens, _inflight_reserved_tokens, _inflight_computed
         if reserved:
             _inflight -= units
             _inflight_tokens -= ptok
             _inflight_reserved_tokens -= reservation
+            _inflight_computed = max(0, _inflight_computed - est_computed)
             reserved = False
 
     # TINY fast-lane: small calls skip the queue, but never the KV memory limit.
@@ -5229,7 +5444,7 @@ async def _route_completions(request, _no_overflow=False):
             # most big bg requests fit under lane_limit without ever needing this bypass; it
             # only fires for requests so large that even the proportional estimate would still
             # exceed budget-FG_RESERVED.
-            _desired = _desired_units(body, client) * sequences
+            _desired = _desired_units(body, client, est_computed) * sequences
             _bg_big_idle = (background and BG_BIG_LOCAL_WHEN_IDLE and _desired > lane_limit
                             and _inflight == 0 and _waiting <= (1 if queued else 0))
             _admit_units = min(effective_budget(), _desired) if _bg_big_idle else units
@@ -5459,6 +5674,9 @@ async def gateway_stats(request):
         "waiting_by_class": dict(_waiting_by_class),
         "overflowed_after_wait": _stats["overflowed_after_wait"],
         "inflight_tokens": _inflight_tokens, "token_budget": TOKEN_BUDGET,
+        "inflight_computed": _inflight_computed,
+        "prefill_backlog_secs": round(_prefill_backlog_secs(), 1),
+        "cache_model": _pm_summary(),
         "inflight_reserved_tokens": _inflight_reserved_tokens,
         "halo_control_lane_limit": admission_lane_limit(
             False, effective_budget(), FG_RESERVED, halo_control=True,
