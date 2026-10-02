@@ -244,7 +244,7 @@ def write_diag(names, by, reason):
     return {"staged": names, "previous": prev, "event_seq": seq}
 
 
-def drain_and_wait(deadline_s, reason, token):
+def drain_and_wait(deadline_s, reason, token, by=None):
     """Raise the gateway admission fence and wait for accepted requests to finish. Returns facts."""
     facts = {"fence": False, "waited_s": 0, "active_at_start": None, "active_at_end": None}
     try:
@@ -253,7 +253,7 @@ def drain_and_wait(deadline_s, reason, token):
             facts["note"] = "another drain lease is already held (a gateway publish?); not taking it"
             facts["active_at_start"] = cur.get("active")
             return facts, None
-        opened = http(f"{GATEWAY}/gateway/drain", "POST", {"ttl_s": int(deadline_s) + 1200, "reason": f"engine planned restart: {reason}"[:120]}, token)
+        opened = http(f"{GATEWAY}/gateway/drain", "POST", {"ttl_s": int(deadline_s) + 1200, "reason": f"engine planned restart: {reason}"[:120], "by": by or "engine-actuator"}, token)
         lease = opened.get("lease")
         facts["fence"] = bool(lease)
         facts["active_at_start"] = opened.get("active")
@@ -276,8 +276,48 @@ def drain_and_wait(deadline_s, reason, token):
     return facts, lease
 
 
+def offline_and_wait(deadline_s, reason, token, by=None):
+    """CF (2026-10-02): open a PLANNED LOCAL-OFFLINE window instead of a drain fence. The gateway routes new work to the
+    remote valve (inside the daily cap) rather than refusing it, lets accepted local work finish, and the estate keeps
+    flowing during the restart. Returns (facts, lease) or None when the gateway has no such endpoint (older gateway,
+    or the window cannot be taken): the caller then falls back to the drain fence."""
+    facts = {"fence": False, "strategy": "offline-window", "waited_s": 0, "active_at_start": None, "active_at_end": None}
+    try:
+        cur = http(f"{GATEWAY}/gateway/offline", token=token)
+        if "offline" not in cur or cur.get("offline"):
+            return None
+        opened = http(f"{GATEWAY}/gateway/offline", "POST", {"ttl_s": min(3600, int(deadline_s) + 1200),
+                      "reason": f"engine planned restart: {reason}"[:120], "by": by or "engine-actuator"}, token)
+        lease = opened.get("lease")
+        if not lease:
+            return None
+        facts["fence"] = True
+        facts["active_at_start"] = opened.get("local_active")
+    except Exception:  # noqa: BLE001
+        return None
+    t0 = time.time()
+    active = facts["active_at_start"]
+    while time.time() - t0 < deadline_s:
+        try:
+            active = int(http(f"{GATEWAY}/gateway/offline", token=token).get("local_active") or 0)
+            if active == 0:
+                break
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(2)
+    facts["waited_s"] = round(time.time() - t0)
+    facts["active_at_end"] = active
+    return facts, ("offline", lease)
+
+
 def release_lease(lease, token):
     if not lease:
+        return
+    if isinstance(lease, tuple) and lease[0] == "offline":
+        try:
+            http(f"{GATEWAY}/gateway/offline", "DELETE", {"lease": lease[1]}, token)
+        except Exception:  # noqa: BLE001
+            pass  # the lease expires on its own
         return
     try:
         if http(f"{GATEWAY}/gateway/drain", token=token).get("draining"):
@@ -307,6 +347,17 @@ def do_restart(a):
         return 3
     by, reason = a.by, a.reason
     token = admin_token()
+    # RS: a restart whose only purpose is to apply flags the RUNNING engine already has is a pure no-op that still costs a full
+    # outage (drain + ~4 min boot, every request refused). Refuse it unless --force; Halo can still restart for any other reason.
+    if (a.flags is not None or a.clear_diag) and not getattr(a, "force", False) and engine_healthy():
+        want = sorted([] if a.clear_diag else [x for x in (a.flags or "").split(",") if x])
+        have = active_flags()
+        if want and have is not None and sorted(have) == want:  # non-empty only: '--flags ""' / --clear-diag may accompany a non-DIAG change
+            skipped = {"refused": "no-op restart: the running engine already has exactly these diag flags", "flags": want,
+                       "hint": "pass --force to restart anyway (e.g. to clear engine state)"}
+            emit("observation", f"planned engine restart by {by} skipped: flags {want or 'none'} already active", {"action": "restart-skipped-noop", "by": by, "reason": reason, **skipped})
+            print(json.dumps(skipped))
+            return 0
     write_job(state="starting", by=by, reason=reason, started=now_iso(), finished=None, drain=None, result=None)
     if a.flags is not None or a.clear_diag:
         names = [] if a.clear_diag else [x for x in (a.flags or "").split(",") if x]
@@ -320,7 +371,8 @@ def do_restart(a):
     drain_facts, lease = ({"skipped": "engine unhealthy; nothing to drain"}, None)
     if healthy and not a.no_drain:
         write_job(state="draining")
-        drain_facts, lease = drain_and_wait(a.drain_s, reason, token)
+        got = None if os.environ.get("ENGINE_ACTUATOR_FORCE_DRAIN") else offline_and_wait(a.drain_s, reason, token, by)
+        drain_facts, lease = got if got else drain_and_wait(a.drain_s, reason, token, by)
     write_job(state="stopping", drain=drain_facts)
     json.dump({"ts": now_iso(), "by": by, "reason": reason, "drain": drain_facts, "active_at_stop": drain_facts.get("active_at_end")},
               open(PLANNED, "w"))
@@ -353,6 +405,8 @@ def spawn_detached(a):
         cmd += ["--clear-diag"]
     if a.no_drain:
         cmd += ["--no-drain"]
+    if getattr(a, "force", False):
+        cmd += ["--force"]
     # refuse early (and visibly) if one is running
     try:
         j = json.load(open(JOB))
@@ -381,6 +435,11 @@ def announce_start(_a):
     m = re.findall(r"GPU KV cache size: ([\d,]+) tokens", sh(["journalctl", "-u", UNIT, "--no-pager", "-n", "4000", "-o", "cat"], 60))
     if m:
         pool = int(m[-1].replace(",", ""))
+    try:  # RS: heal any engine death the ExecStopPost collector lost (idempotent, no new cron)
+        subprocess.Popen([sys.executable, f"{BASE}/engine-fault-collector.py", "--reconcile", "--hours", "3"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception:  # noqa: BLE001
+        pass
     flags = active_flags()
     emit("observation", f"engine is back and healthy (flags active: {flags or 'none'}; KV pool {pool}); "
          f"faults in last 24h: {faults_summary(24)['faults']}",
@@ -402,6 +461,7 @@ def main():
     p.add_argument("--flags", default=None, help="comma list of DIAG names to stage before restarting")
     p.add_argument("--clear-diag", action="store_true"); p.add_argument("--drain-s", type=int, default=120)
     p.add_argument("--no-drain", action="store_true"); p.add_argument("--foreground", action="store_true")
+    p.add_argument("--force", action="store_true", help="restart even when the requested diag flags are already active")
     sp.add_parser("announce-start"); sp.add_parser("restart-status")
     a = ap.parse_args()
     if a.cmd == "status":

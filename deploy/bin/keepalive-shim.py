@@ -679,6 +679,36 @@ REMOTE_ENABLED = bool(REMOTE_BASE and REMOTE_KEY)
 REMOTE_DEAD_SECS = float(os.environ.get("SHIM_REMOTE_DEAD_SECS", "300"))
 _remote_dead_until = 0.0
 _remote_dead_count = 0
+# RS (2026-10-02 verification of 854b51ab62): the breaker lived only in memory, so every gateway publish reset it. The first requests
+# after the 12:49 publish saw remote_ok()==True, got the SHORT first-token deadline and were aborted ('held/local-failed', 50.7 s,
+# 13k tokens of prefill thrown away) although the remote was still empty. Persist the dead-until stamp across restarts.
+_REMOTE_DEAD_FILE = os.path.expanduser(os.environ.get("SHIM_REMOTE_DEAD_FILE", "~/.local/share/vllm-qwen27b/remote-dead-until.json"))
+
+
+def _remote_dead_load():
+    global _remote_dead_until
+    try:
+        with open(_REMOTE_DEAD_FILE) as fh:
+            until = float(json.load(fh).get("until") or 0)
+        if until > time.time():
+            _remote_dead_until = max(_remote_dead_until, until)
+    except Exception:
+        pass
+
+
+def _remote_dead_save():
+    if not _REMOTE_DEAD_PERSIST:
+        return
+    try:
+        tmp = _REMOTE_DEAD_FILE + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump({"until": _remote_dead_until, "count": _remote_dead_count}, fh)
+        os.replace(tmp, _REMOTE_DEAD_FILE)
+    except Exception:
+        pass
+
+
+_REMOTE_DEAD_PERSIST = False       # armed by _on_startup only: importing the module (tests) must never read or write live state
 
 
 def _note_remote_status(base, status):
@@ -691,8 +721,10 @@ def _note_remote_status(base, status):
                 log.error("remote provider refused with 402 (balance): remote overflow OFF for %ds; "
                           "requests wait for local until it recovers", int(REMOTE_DEAD_SECS))
             _remote_dead_until = time.time() + REMOTE_DEAD_SECS
+            _remote_dead_save()
         elif status == 200 and str(base).rstrip("/") != str(LOCAL).rstrip("/") and _remote_dead_until:
             _remote_dead_until = 0.0
+            _remote_dead_save()
     except Exception:
         pass
 
@@ -746,6 +778,58 @@ _ACTIVE = {}          # id(request) -> {name, ip, ua, ep, model, ptok, maxtok, s
 _DRAIN_UNTIL = 0.0
 _DRAIN_LEASE = None
 _DRAIN_REASON = None
+# RS (2026-10-02): every drain is one durable record. Before this a drain left NO trace of who raised it, why, how long it held,
+# or how many requests it refused (the 503 reason text was a constant), so "why was the estate down 20 min?" was unanswerable.
+# Events are append-only JSONL: {"event":"open"|"close", ...}; `close.how` is delete | expired | gateway-restart.
+_DRAIN_LEDGER = os.path.expanduser(os.environ.get("GATEWAY_DRAIN_LEDGER", "~/.local/share/vllm-qwen27b/incidents/drains.jsonl"))
+_DRAIN_REC = None    # live record of the open drain: {t0, reason, by, ttl_s, active_at_open, refused, refused_by_client{}}
+
+
+def _drain_ledger_write(row):
+    try:
+        os.makedirs(os.path.dirname(_DRAIN_LEDGER), exist_ok=True)
+        with open(_DRAIN_LEDGER, "a") as fh:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+    except Exception:       # never let bookkeeping affect admission
+        pass
+
+
+def _drain_close_record(how, now=None):
+    """Write the close event for the open drain record (idempotent)."""
+    global _DRAIN_REC
+    rec, _DRAIN_REC = _DRAIN_REC, None
+    if not rec:
+        return
+    now = time.time() if now is None else now
+    end = min(now, rec["t0"] + rec["ttl_s"]) if how == "expired" else now
+    _drain_ledger_write({"event": "close", "how": how, "t": round(end, 3), "t0": round(rec["t0"], 3), "duration_s": round(end - rec["t0"], 1),
+                         "reason": rec["reason"], "by": rec["by"], "ttl_s": rec["ttl_s"], "active_at_open": rec["active_at_open"],
+                         "active_at_close": len(_ACTIVE), "refused": rec["refused"],
+                         "refused_by_client": dict(sorted(rec["refused_by_client"].items(), key=lambda kv: -kv[1])[:12])})
+
+
+def _drain_reap(now=None):
+    """Close the record of a lease that expired without a DELETE (a crashed deployer)."""
+    if _DRAIN_REC and not _draining(now):
+        _drain_close_record("expired", now)
+
+
+def _drain_startup_recover():
+    """A previous gateway process may have died/been replaced while a drain was open (every publish does exactly that):
+    close it in the ledger as `gateway-restart` so open/close always pair."""
+    try:
+        last = None
+        with open(_DRAIN_LEDGER) as fh:
+            for ln in fh:
+                if ln.strip():
+                    last = json.loads(ln)
+        if last and last.get("event") == "open":
+            _drain_ledger_write({"event": "close", "how": "gateway-restart", "t": round(time.time(), 3), "t0": last.get("t"),
+                                 "duration_s": round(time.time() - float(last.get("t") or time.time()), 1), "reason": last.get("reason"),
+                                 "by": last.get("by"), "ttl_s": last.get("ttl_s"), "active_at_open": last.get("active"),
+                                 "refused": None, "note": "refused count unknown: the process that held the fence is gone"})
+    except Exception:
+        pass
 
 
 def _draining(now=None):
@@ -754,11 +838,15 @@ def _draining(now=None):
 
 async def gateway_drain(request):
     """Admin-controlled, leased admission fence for lossless gateway publication."""
-    global _DRAIN_UNTIL, _DRAIN_LEASE, _DRAIN_REASON
+    global _DRAIN_UNTIL, _DRAIN_LEASE, _DRAIN_REASON, _DRAIN_REC
     if request.method == "GET":
+        _drain_reap()
         return web.json_response({"draining": _draining(), "active": len(_ACTIVE),
                                   "until": _DRAIN_UNTIL if _draining() else None,
-                                  "reason": _DRAIN_REASON if _draining() else None})
+                                  "reason": _DRAIN_REASON if _draining() else None,
+                                  "by": _DRAIN_REC["by"] if _DRAIN_REC else None,
+                                  "since": _DRAIN_REC["t0"] if _DRAIN_REC else None,
+                                  "refused": _DRAIN_REC["refused"] if _DRAIN_REC else None})
     if not _admin_ok(request):
         return web.json_response({"error": "admin token required"}, status=401)
     if request.method == "DELETE":
@@ -769,6 +857,7 @@ async def gateway_drain(request):
         if not isinstance(body, dict) or body.get("lease") != _DRAIN_LEASE or not _DRAIN_LEASE:
             return web.json_response({"error": "drain lease mismatch"}, status=409)
         _DRAIN_UNTIL, _DRAIN_LEASE, _DRAIN_REASON = 0.0, None, None
+        _drain_close_record("delete")
         return web.json_response({"draining": False, "active": len(_ACTIVE)})
     try:
         body = await request.json()
@@ -777,12 +866,19 @@ async def gateway_drain(request):
             raise ValueError("ttl_s outside [30, 1800]")
     except (ValueError, TypeError, AttributeError):
         return web.json_response({"error": "ttl_s must be 30..1800 seconds"}, status=400)
+    _drain_reap()
     if _draining():
         return web.json_response({"error": "another drain lease is active", "active": len(_ACTIVE),
-                                  "until": _DRAIN_UNTIL}, status=409)
+                                  "until": _DRAIN_UNTIL, "reason": _DRAIN_REASON,
+                                  "by": _DRAIN_REC["by"] if _DRAIN_REC else None}, status=409)
     _DRAIN_LEASE = os.urandom(16).hex()
     _DRAIN_UNTIL = time.time() + ttl
-    _DRAIN_REASON = str(body.get("reason") or "deployment")[:80]
+    _DRAIN_REASON = str(body.get("reason") or "deployment")[:120]
+    by = str(body.get("by") or request.headers.get("X-Client") or request.headers.get("User-Agent") or "?")[:80]
+    _DRAIN_REC = {"t0": time.time(), "reason": _DRAIN_REASON, "by": by, "ttl_s": ttl, "active_at_open": len(_ACTIVE),
+                  "refused": 0, "refused_by_client": {}}
+    _drain_ledger_write({"event": "open", "t": round(_DRAIN_REC["t0"], 3), "reason": _DRAIN_REASON, "by": by, "ttl_s": ttl,
+                         "active": len(_ACTIVE)})
     return web.json_response({"draining": True, "active": len(_ACTIVE),
                               "until": _DRAIN_UNTIL, "lease": _DRAIN_LEASE})
 _CLIENT_NAMES_FILE = "/home/kevin/.local/share/vllm-qwen27b/clients.map"   # "<ip or X-Client> = <friendly name>"
@@ -1322,6 +1418,8 @@ async def _scrape_engine_metrics():
     drafted = _counter_rate(fam, prev_fam, "vllm:spec_decode_num_draft_tokens_total", dt)
     accepted = _counter_rate(fam, prev_fam, "vllm:spec_decode_num_accepted_tokens_total", dt)
     spec_rate = round(accepted / drafted, 4) if (drafted and accepted is not None and drafted > 0) else None
+    flow_meter_update(fam, prev_fam, dt, _fv(fam, "vllm:num_requests_running"), _fv(fam, "vllm:num_requests_waiting"),
+                      prefix_hit_rate, gen_tok_s)
     return {
         "ok": True, "age_s": 0.0,
         "running": _fv(fam, "vllm:num_requests_running"), "waiting": _fv(fam, "vllm:num_requests_waiting"),
@@ -1415,6 +1513,9 @@ async def _telemetry_sampler():
             _TELEM_WINDOW.append(sample)
             _update_perf_breaker(sample)
             _TELEM_TICK += 1
+            if _TELEM_TICK % 5 == 0:
+                _offline_reap()
+                flow_note_mode()       # CF: a capacity-mode change is an event
             if _TELEM_TICK % max(1, TELEM_SLOW_EVERY) == 0:
                 ds = _downsample(_TELEM_WINDOW)
                 if ds:
@@ -2592,6 +2693,8 @@ def _telemetry_note_request(info, resp=None):
             "computed_actual": info.get("computed_actual"),
             "cached_actual": info.get("cached_actual"),
             "pm_credit": info.get("pm_credit"), "pm_age_s": info.get("pm_age_s"),
+            "flow_class": info.get("flow_class"), "flow_expected_wait": info.get("flow_expected_wait_s"),
+            "flow_held": info.get("flow_held"), "flow_adjacent": info.get("flow_adjacent"),
         })
     except Exception as e:
         log.warning("telemetry note_request: %s", e)
@@ -3030,6 +3133,8 @@ def record_event(decision, reason, request, units, waited, ptok=0, maxtok=0, str
         _stats["held"] += 1
     elif decision == "rejected-bg":
         _stats["rejected_bg"] += 1
+    elif decision == "gone":
+        _stats["client_gone"] = _stats.get("client_gone", 0) + 1
     else:
         _stats["remote"] += 1
         _remote_reasons[reason] += 1
@@ -3037,6 +3142,7 @@ def record_event(decision, reason, request, units, waited, ptok=0, maxtok=0, str
         _stats["waited_total"] += waited
         _stats["waited_n"] += 1
     _stats["peak_inflight"] = max(_stats["peak_inflight"], _inflight)
+    flow_note_route(decision, final_reason, request)
     # TELEMETRY: pull whatever _relay()/_forward_remote()/the local-success branches have
     # already stashed on this request's live-registry entry (ttft/outtok are None for the
     # "record-before-forward" remote branches -- see DESIGN.md (c) for exactly why, and where
@@ -3091,6 +3197,877 @@ async def _stats_saver():
     while True:
         await asyncio.sleep(10)
         _save_stats()
+
+
+# ---------------- CF: capacity-aware flow (lane CF, 2026-10-02) ----------------
+# Kevin 10-02: "it needs to be aware of how to optimize its flow for local only versus local plus
+# remote versus remote. Queuing? ... we might have to get creative here."
+#
+# MEASURED before this block (telemetry 2026-10-01 17:00 -> 10-02 12:07, 9,064 requests): the gateway's
+# admission wait was ~0 (budget 14 lanes) while engine TTFT p95 was 79-117 s per class. The queue lived
+# INSIDE the engine, FIFO: vllm request_queue_time mean 34.6 s vs prefill 8.9 s, with 7 requests
+# 'deferred'. Priority, deadlines and prefix affinity were therefore impossible -- by the time the gateway
+# had admitted a Halo call it already stood behind whatever background work had been let in earlier, and
+# the caller with the shortest timeout gave up first, discarding the prefill already done for it.
+#
+# The mechanics here (facts + ordering + a hard admission ceiling; the JUDGEMENT about shares is Halo's,
+# set through /gateway/config flow_* fields by the capacity_set_flow tool):
+#   * every request gets a WORK CLASS: kevin (interactive) > halo (mind) > runner (cards) > background.
+#   * the engine's prefill queue is kept SHORT: a class is admitted only while the uncached prefill already
+#     in the engine (seconds at the measured rate) is under that class's ceiling. The excess waits HERE,
+#     where it can be ordered, refused with Retry-After, or overflowed.
+#   * the waiters are served by start-time fair queuing over per-class shares (kevin's share is large
+#     enough to be strict priority), earliest-deadline first inside a class when slack is short, then
+#     same-prefix first (cache affinity), then FIFO.
+#   * a request whose prefix is being prefilled RIGHT NOW is held until that prefill finishes when waiting
+#     is cheaper than recomputing the shared part (it then reads the cache instead of duplicating it).
+#   * deadline-aware admission: a refusable caller (background, runner) that cannot START before its
+#     declared deadline is refused 429 + Retry-After BEFORE any prefill. Nothing prefilling is discarded.
+#   * /gateway/capacity publishes the facts: mode, measured throughput, demand and queues by class.
+# SHIM_FLOW_MODE: off | shadow | enforce.  off = the previous behaviour byte for byte; shadow = everything
+# measured and reported, nothing gated (counts what enforce would have held).
+FLOW_CLASSES = ("kevin", "halo", "runner", "background")     # priority order, highest first
+FLOW_REFUSABLE = ("runner", "background")                     # classes that may be refused for a missed deadline
+
+
+def _flow_parse_map(v, cast=float, positive=False):
+    out = {}
+    for part in str(v or "").replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        k, _, val = part.partition("=")
+        k = k.strip().lower()
+        if k not in FLOW_CLASSES:
+            raise ValueError("unknown work class %r (classes: %s)" % (k, ", ".join(FLOW_CLASSES)))
+        x = cast(val.strip())
+        if x < 0 or (positive and x <= 0):
+            raise ValueError("%s must be %s" % (k, "> 0" if positive else ">= 0"))
+        out[k] = x
+    return out
+
+
+def _flow_norm(cast=float, positive=False):
+    def f(v):
+        d = _flow_parse_map(v, cast, positive)
+        return ",".join("%s=%g" % (k, d[k]) for k in FLOW_CLASSES if k in d)
+    return f
+
+
+def _flow_parse_classmap(v):
+    out = []
+    for part in str(v or "").replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        pat, _, cls = part.rpartition("=")
+        pat, cls = pat.strip().lower(), cls.strip().lower()
+        if not pat or cls not in FLOW_CLASSES:
+            raise ValueError("bad class map entry %r (pattern=class, class in %s)" % (part, ", ".join(FLOW_CLASSES)))
+        out.append((pat, cls))
+    return out
+
+
+def _flow_norm_classmap(v):
+    return ",".join("%s=%s" % pc for pc in _flow_parse_classmap(v))
+
+
+def _flow_cast_mode(v):
+    v = str(v).strip().lower()
+    if v not in ("off", "shadow", "enforce"):
+        raise ValueError("flow_mode must be off|shadow|enforce")
+    return v
+
+
+FLOW_MODE = os.environ.get("SHIM_FLOW_MODE", "enforce").strip().lower()
+FLOW_SHARES = os.environ.get("SHIM_FLOW_SHARES", "kevin=1000,halo=60,runner=25,background=10")
+# Fraction of FLOW_BACKLOG_S of uncached prefill a class may leave queued in the engine. 0 = no ceiling.
+FLOW_CEIL = os.environ.get("SHIM_FLOW_CEIL", "kevin=0,halo=1.5,runner=1,background=0.5")
+FLOW_BACKLOG_S = float(os.environ.get("SHIM_FLOW_BACKLOG_S", "40"))
+# Default 'must START within' seconds for a caller that declared nothing (0 = never refused).
+FLOW_DEADLINES = os.environ.get("SHIM_FLOW_DEADLINES", "kevin=0,halo=0,runner=900,background=600")
+FLOW_CLASS_MAP = os.environ.get("SHIM_FLOW_CLASS_MAP", ",".join((
+    "halo-=halo", "estate-entity=halo", "card-repair=runner", "work-verifier=runner",
+    "control=kevin", "brain-passthrough=kevin", "pi /=kevin", "opencode=kevin", "openhands=kevin", "desktop=kevin",
+    "overseer-=background", "vault-dreams=background", "digester=background", "acceptance-review=background",
+    "research=background", "workflow-bg=background", "applicant=background", "m1c-probe=background",
+    "outcome-alarm=background", "cron=background", "batch=background")))
+# Phrases (first 500 chars of the first two messages) that mark a class when the client name cannot: the card
+# runner's pi sessions arrive from the same host/provider as Kevin's own pi, 100% of them opening with this line.
+FLOW_MARKERS = os.environ.get("SHIM_FLOW_MARKERS", "local-lane-runner batch job=runner")
+# Request `model` -> class, checked before the client map: lets a harness that cannot send a per-request header (Hermes,
+# LibreChat) put Kevin's own chats in a distinct model alias and so in the interactive class. Empty by default.
+FLOW_MODEL_MAP = os.environ.get("SHIM_FLOW_MODEL_MAP", "")
+FLOW_DEMAND_WINDOW_S = float(os.environ.get("SHIM_FLOW_DEMAND_WINDOW_S", "300"))      # window of the demand_5m facts (env only; the drill shortens it)
+FLOW_AFFINITY_MAX = int(os.environ.get("SHIM_FLOW_AFFINITY_MAX", "6"))      # same-prefix grants in a row before FIFO order resumes
+FLOW_STARVE_S = float(os.environ.get("SHIM_FLOW_STARVE_S", "300"))          # a waiting class unserved this long ignores its ceiling once
+FLOW_PREFIX_HOLD_MAX_S = float(os.environ.get("SHIM_FLOW_PREFIX_HOLD_MAX_S", "60"))
+FLOW_URGENT_SLACK_S = float(os.environ.get("SHIM_FLOW_URGENT_SLACK_S", "30"))   # a deadline closer than this goes first (EDF)
+_CFG.update({
+    "SHIM_FLOW_MODE":         ("FLOW_MODE", _flow_cast_mode),
+    "SHIM_FLOW_SHARES":       ("FLOW_SHARES", _flow_norm(float, positive=True)),
+    "SHIM_FLOW_CEIL":         ("FLOW_CEIL", _flow_norm(float)),
+    "SHIM_FLOW_BACKLOG_S":    ("FLOW_BACKLOG_S", float),
+    "SHIM_FLOW_DEADLINES":    ("FLOW_DEADLINES", _flow_norm(float)),
+    "SHIM_FLOW_CLASS_MAP":    ("FLOW_CLASS_MAP", _flow_norm_classmap),
+    "SHIM_FLOW_MARKERS":      ("FLOW_MARKERS", _flow_norm_classmap),
+    "SHIM_FLOW_MODEL_MAP":    ("FLOW_MODEL_MAP", _flow_norm_classmap),
+    "SHIM_FLOW_AFFINITY_MAX": ("FLOW_AFFINITY_MAX", int),
+    "SHIM_FLOW_STARVE_S":     ("FLOW_STARVE_S", float),
+    "SHIM_FLOW_PREFIX_HOLD_MAX_S": ("FLOW_PREFIX_HOLD_MAX_S", float),
+    "SHIM_FLOW_URGENT_SLACK_S": ("FLOW_URGENT_SLACK_S", float),
+})
+_FLOW_DEFAULT_SHARES = {"kevin": 1000.0, "halo": 60.0, "runner": 25.0, "background": 10.0}
+_FLOW_EVENTS_FILE = os.environ.get("SHIM_FLOW_EVENTS_FILE") or os.path.join(
+    os.path.dirname(STATS_FILE), "incidents", "capacity-mode.jsonl")
+
+_FLOW = {
+    "waiters": [],                                    # FlowTicket, arrival order
+    "vtime": {c: 0.0 for c in FLOW_CLASSES}, "vclock": 0.0,
+    "last_prefix": None, "run": 0,                    # last admitted prefix and how many in a row
+    "last_admit": {c: 0.0 for c in FLOW_CLASSES},
+    "prefilling": {},                                 # id(request) -> {keys,cum,total,est_s,t0,prefix}
+    "version": 0, "head": (-1, 0.0, None),
+    "seq": 0,
+}
+_FLOW_STATS = collections.Counter()
+_FLOW_DEMAND = collections.deque(maxlen=20000)       # (t, class, ptok, est_computed_tokens)
+_FLOW_WAITS = collections.deque(maxlen=4000)         # (t, class, waited_s) per ticket that left the queue
+_FLOW_METER = collections.deque(maxlen=900)          # (t, compute_tok_s, decode_tok_s, running, waiting, hit_rate)
+_FLOW_PURE = collections.deque(maxlen=600)           # (t, computed tokens, prefill seconds) deltas between scrapes
+_FLOW_SERVICE = collections.deque(maxlen=400)        # (t, class, duration_s) local completions
+_FLOW_CACHE = {"adjacent": [0, 0, 0], "other": [0, 0, 0]}   # [requests, cached_tokens, prompt_tokens]
+_FLOW_MODE_STATE = {"mode": None, "since": None, "basis": None, "events": collections.deque(maxlen=200)}
+
+
+_FLOW_MEMO = {}
+
+
+def _flow_get(name, raw, base, positive=False):
+    """Parse a per-class map once per distinct configured string; a bad string falls back to the defaults."""
+    key = (name, raw)
+    hit = _FLOW_MEMO.get(key)
+    if hit is None:
+        try:
+            d = _flow_parse_map(raw, float, positive)
+        except ValueError:
+            d = {}
+        hit = {c: d.get(c, base[c]) for c in FLOW_CLASSES}
+        if len(_FLOW_MEMO) > 64:
+            _FLOW_MEMO.clear()
+        _FLOW_MEMO[key] = hit
+    return hit
+
+
+def _flow_shares():
+    return _flow_get("shares", FLOW_SHARES, _FLOW_DEFAULT_SHARES, True)
+
+
+def _flow_ceils():
+    return _flow_get("ceil", FLOW_CEIL, {"kevin": 0.0, "halo": 1.5, "runner": 1.0, "background": 0.5})
+
+
+def _flow_deadlines():
+    return _flow_get("deadlines", FLOW_DEADLINES, {"kevin": 0.0, "halo": 0.0, "runner": 900.0, "background": 600.0})
+
+
+def flow_class_of(request, body, background, halo_control):
+    """Work class: caller's X-Work-Class (valid names only) > Halo control turn > the configured
+    X-Client/friendly-name patterns > the legacy background test > interactive."""
+    h = (request.headers.get("X-Work-Class") or "").strip().lower()
+    if h in FLOW_CLASSES:
+        return h
+    try:
+        models = _flow_parse_classmap(FLOW_MODEL_MAP)
+        if models:
+            mdl = str(json.loads(body).get("model") or "").strip().lower()
+            for pat, cls in models:
+                if mdl == pat:
+                    return cls
+    except Exception:
+        pass
+    if halo_control:
+        return "halo"
+    try:
+        marks = _flow_parse_classmap(FLOW_MARKERS)
+        if marks:
+            msgs = (json.loads(body).get("messages") or [])[:2]
+            for m in msgs:
+                c = m.get("content")
+                text = c if isinstance(c, str) else " ".join(b.get("text", "") for b in (c or [])[:2] if isinstance(b, dict))
+                head = (text or "")[:500].lower()
+                for pat, cls in marks:
+                    if pat in head:
+                        return cls
+    except Exception:
+        pass
+    try:
+        fc = _friendly_client(request)
+        key = ("%s\n%s" % (fc.get("xclient") or "", fc.get("name") or "")).lower()
+        for pat, cls in _flow_parse_classmap(FLOW_CLASS_MAP):
+            if pat in key:
+                return cls
+    except Exception:
+        pass
+    return "background" if background else "kevin"
+
+
+class FlowTicket:
+    """One request waiting for (or holding) a place in the local engine."""
+    __slots__ = ("cls", "t_enq", "seq", "deadline_at", "declared", "pm", "prefix", "cost_s", "units", "ptok",
+                 "est_computed", "fits", "xclient", "rid", "expected_wait_s", "adjacent", "held")
+
+    def __init__(self, cls, pm, ptok, units, fits, deadline_at, declared, xclient, rid, cost_s):
+        self.cls, self.pm, self.ptok, self.units, self.fits = cls, pm, ptok, units, fits
+        self.deadline_at, self.declared, self.xclient, self.rid = deadline_at, declared, xclient, rid
+        self.est_computed = (pm or {}).get("computed", ptok)
+        chain = (pm or {}).get("chain") or []
+        self.prefix = chain[0][0].hex()[:12] if chain else None
+        self.cost_s, self.t_enq, self.seq = cost_s, time.time(), 0
+        self.expected_wait_s, self.adjacent, self.held = None, False, ""
+
+
+_FLOW_ERR = {"n": 0, "last": 0.0}
+
+
+def _flow_failopen(default):
+    """CF can never take the gateway down: any exception inside a flow hook is logged (rate-limited) and counted, and
+    the hook answers `default` -- which is always the legacy behaviour (admit / no refusal / no-op)."""
+    def deco(fn):
+        def wrapper(*a, **k):
+            try:
+                return fn(*a, **k)
+            except Exception as e:          # noqa: BLE001
+                _FLOW_ERR["n"] += 1
+                _FLOW_STATS["failopen_" + fn.__name__] += 1
+                if time.time() - _FLOW_ERR["last"] > 60:
+                    _FLOW_ERR["last"] = time.time()
+                    log.exception("flow hook %s failed (%d so far); serving with legacy admission: %s", fn.__name__, _FLOW_ERR["n"], e)
+                return default
+        wrapper.__name__ = fn.__name__
+        wrapper.__doc__ = fn.__doc__
+        return wrapper
+    return deco
+
+
+def flow_prefill_tps():
+    """Measured uncached-prefill rate (tok/s): median over recent samples in which the engine had a queue
+    (so it was working at capacity), else the configured PREFILL_TPS."""
+    vals = sorted(r[1] for r in list(_FLOW_METER)[-120:] if r[1] and r[1] > 0 and (r[4] or 0) > 0)
+    if len(vals) >= 5:
+        return max(50.0, vals[len(vals) // 2])
+    return PREFILL_TPS
+
+
+def flow_prefill_pure_tps(now=None, window=300.0):
+    """Per-request prefill speed with queue and admission wait excluded (see flow_meter_update), or None when the last
+    `window` seconds hold too little prefill to say (< 10 prefill-seconds or < 1,000 computed tokens)."""
+    now = time.time() if now is None else now
+    rows = [r for r in _FLOW_PURE if now - r[0] <= window]
+    toks, secs = sum(r[1] for r in rows), sum(r[2] for r in rows)
+    if secs < 10.0 or toks < 1000:
+        return None
+    return toks / secs
+
+
+def flow_decode_tps():
+    vals = sorted(r[2] for r in list(_FLOW_METER)[-120:] if r[2] and r[2] > 0 and (r[3] or 0) > 0)
+    return vals[len(vals) // 2] if vals else None
+
+
+def flow_backlog_s():
+    return _inflight_computed / max(1.0, flow_prefill_tps())
+
+
+def flow_meter_update(fam, prev_fam, dt, running, waiting, hit_rate, gen_tok_s):
+    """Called by the engine scrape: the uncached-prompt rate (prompt_tokens_by_source local_compute)."""
+    try:
+        if prev_fam is None or dt <= 0:
+            return
+        def src(f):
+            for lab, val in f.get("vllm:prompt_tokens_by_source_total") or []:
+                if lab.get("source") == "local_compute":
+                    return val
+            return None
+        cur, prev = src(fam), src(prev_fam)
+        rate = max(0.0, cur - prev) / dt if cur is not None and prev is not None else None
+        _FLOW_METER.append((time.time(), rate, gen_tok_s, running, waiting, hit_rate))
+        # PURE per-request prefill speed, queue wait excluded: computed tokens / prefill seconds, both from the engine's
+        # own per-request histograms (request_prefill_kv_computed_tokens, request_prefill_time_seconds -- queue time is a
+        # separate histogram). This is what a request experiences once started; budgets should derive from THIS one.
+        def hsum(f, name):
+            return _fv(f, name + "_sum")
+        ct, pt = hsum(fam, "vllm:request_prefill_kv_computed_tokens"), hsum(fam, "vllm:request_prefill_time_seconds")
+        ct0, pt0 = hsum(prev_fam, "vllm:request_prefill_kv_computed_tokens"), hsum(prev_fam, "vllm:request_prefill_time_seconds")
+        if None not in (ct, pt, ct0, pt0) and pt >= pt0 and ct >= ct0:
+            _FLOW_PURE.append((time.time(), ct - ct0, pt - pt0))
+    except Exception:
+        pass
+
+
+# ---- the mode, as a fact ----
+def flow_mode_now():
+    """local-only | local+remote | remote-only | none, with the facts it was derived from. Same flags the
+    router reads, so the label can never disagree with behaviour."""
+    local_up = bool(_health.get("ok"))
+    remote_cfg = bool(REMOTE_ENABLED)
+    dead_s = max(0, int(_remote_dead_until - time.time()))
+    forced = bool(effective_force_remote())
+    budget_ok = None
+    if remote_cfg and not LOCAL_ONLY and not dead_s:
+        try:
+            budget_ok = bool(_spend_allows_overflow(20000, 2000))
+        except Exception:
+            budget_ok = None
+    remote_usable = bool(remote_cfg and not LOCAL_ONLY and not dead_s and budget_ok is not False)
+    offline = _local_offline()
+    if offline:
+        mode = "remote-only" if remote_usable else "none"
+    elif forced and remote_usable:
+        mode = "remote-only"
+    elif local_up and remote_usable:
+        mode = "local+remote"
+    elif local_up:
+        mode = "local-only"
+    elif remote_usable:
+        mode = "remote-only"
+    else:
+        mode = "none"
+    why = []
+    if LOCAL_ONLY:
+        why.append("SHIM_LOCAL_ONLY (full-local mode)")
+    if not remote_cfg:
+        why.append("no remote provider configured")
+    if dead_s:
+        why.append("remote provider refused (402), breaker open %ds" % dead_s)
+    if budget_ok is False:
+        why.append("daily remote spend cap has no room")
+    if forced:
+        why.append("force-remote window")
+    if offline:
+        why.append("planned local-offline window: %s (by %s, %ds left)" % (
+            _OFFLINE["reason"], _OFFLINE["by"], max(0, int(_OFFLINE["until"] - time.time()))))
+    if not local_up:
+        why.append("local engine unhealthy")
+    return {"planned_offline": offline, "mode": mode, "local_up": local_up, "remote_configured": remote_cfg, "remote_usable": remote_usable,
+            "remote_dead_for_s": dead_s, "remote_budget_ok": budget_ok, "forced_remote": forced,
+            "full_local_flag": bool(LOCAL_ONLY), "why": why}
+
+
+def flow_note_mode(now=None):
+    """Record a mode change (an event for Halo/the estate to catch up from). Cheap; called by the sampler."""
+    now = time.time() if now is None else now
+    m = flow_mode_now()
+    st = _FLOW_MODE_STATE
+    if st["mode"] != m["mode"]:
+        ev = {"t": round(now, 3), "from": st["mode"], "to": m["mode"], "why": m["why"],
+              "local_up": m["local_up"], "remote_usable": m["remote_usable"]}
+        st["events"].appendleft(ev)
+        if st["mode"] is not None:           # the first observation is a baseline, not a change
+            try:
+                os.makedirs(os.path.dirname(_FLOW_EVENTS_FILE), exist_ok=True)
+                with open(_FLOW_EVENTS_FILE, "a") as fh:
+                    fh.write(json.dumps(ev, sort_keys=True) + "\n")
+            except Exception as e:
+                log.warning("flow mode event write failed: %s", e)
+            log.warning("capacity mode %s -> %s (%s)", st["mode"], m["mode"], "; ".join(m["why"]) or "-")
+        st["mode"], st["since"], st["basis"] = m["mode"], now, m
+    return m
+
+
+# ---- tickets and the queue ----
+def _flow_bump():
+    _FLOW["version"] += 1
+
+
+def flow_make_ticket(request, body, cls, pm, ptok, units, fits):
+    now = time.time()
+    declared = False
+    dl = None
+    try:
+        s = request.headers.get("X-Gateway-Deadline-S")
+        a = request.headers.get("X-Gateway-Deadline-At")
+        if s not in (None, ""):
+            dl, declared = now + max(0.0, float(s)), True
+        elif a not in (None, ""):
+            dl, declared = float(a), True
+    except (TypeError, ValueError):
+        dl, declared = None, False
+    if dl is None:
+        d = _flow_deadlines()[cls]
+        if d > 0:
+            dl = now + d
+    cost_s = max(0.5, ((pm or {}).get("computed") or ptok) / max(1.0, flow_prefill_tps()))
+    return FlowTicket(cls, pm, ptok, units, fits, dl, declared, _friendly_client(request).get("name"),
+                      id(request), cost_s)
+
+
+@_flow_failopen(None)
+def flow_note_arrival(cls, ptok, est_computed):
+    _FLOW_DEMAND.append((time.time(), cls, int(ptok or 0), int(est_computed or 0)))
+
+
+@_flow_failopen(None)
+def flow_enqueue(t):
+    _FLOW["seq"] += 1
+    t.seq = _FLOW["seq"]
+    if not any(w.cls == t.cls for w in _FLOW["waiters"]):
+        # a class that was idle starts level with the classes already waiting: no banked credit, no debt
+        others = [_FLOW["vtime"][w.cls] for w in _FLOW["waiters"]]
+        if others:
+            _FLOW["vtime"][t.cls] = max(_FLOW["vtime"][t.cls], min(others))
+    _FLOW["waiters"].append(t)
+    _flow_bump()
+
+
+@_flow_failopen(None)
+def flow_dequeue(t):
+    try:
+        _FLOW["waiters"].remove(t)
+    except ValueError:
+        return
+    _flow_bump()
+
+
+def _flow_prefix_hold(t, now):
+    """Hold t while a request sharing its prefix is still prefilling, iff the recompute it avoids costs more
+    than the wait (no threshold: the two are compared). Bounded by FLOW_PREFIX_HOLD_MAX_S."""
+    pm = t.pm or {}
+    chain, total, est, credit = pm.get("chain") or [], pm.get("total") or 0, pm.get("est") or 0, 0
+    if not chain or total <= 0 or est <= 0:
+        return None
+    credit = max(0, est - (pm.get("computed") or est))
+    tps = flow_prefill_tps()
+    best = None
+    for rid, p in _FLOW["prefilling"].items():
+        if rid == t.rid or now - p["t0"] >= FLOW_PREFIX_HOLD_MAX_S:
+            continue
+        pk = p["cum"]
+        deepest = None
+        for key, cum in chain:
+            if key in pk:
+                deepest = cum
+        if deepest is None:
+            continue
+        matched = deepest / total * est - PREFIX_HIT_MARGIN_TOKENS
+        saving_s = max(0.0, matched - credit) / tps
+        remaining_s = max(0.0, p["est_s"] - (now - p["t0"]))
+        if saving_s > remaining_s and (best is None or remaining_s < best[0]):
+            best = (remaining_s, saving_s)
+    return best
+
+
+def _flow_eligible(t, now, backlog):
+    """Could t be admitted right now, ignoring order? (legacy fit + class ceiling + prefix hold)"""
+    if not t.fits():
+        return False, "fits"
+    ceil = _flow_ceils()[t.cls] * FLOW_BACKLOG_S
+    if ceil > 0 and backlog > ceil and _inflight > 0 and backlog > LIGHT_PREFILL_SECS:
+        starving = (now - max(_FLOW["last_admit"][t.cls], t.t_enq)) > FLOW_STARVE_S
+        if not starving:
+            return False, "ceiling"
+    hold = _flow_prefix_hold(t, now)
+    if hold is not None:
+        return False, "prefix-hold"
+    return True, ""
+
+
+def flow_pick(now=None):
+    """The ticket that should be admitted next, or None. Cached per queue/engine state change."""
+    now = time.time() if now is None else now
+    ver, at, head = _FLOW["head"]
+    if ver == _FLOW["version"] and now - at < 0.1:
+        return head
+    backlog = flow_backlog_s()
+    by_cls = {}
+    blocked = collections.Counter()
+    for t in _FLOW["waiters"]:
+        ok, why = _flow_eligible(t, now, backlog)
+        if ok:
+            by_cls.setdefault(t.cls, []).append(t)
+        else:
+            blocked[(t.cls, why)] += 1
+            t.held = why
+    pick = None
+    if by_cls:
+        order = {c: i for i, c in enumerate(FLOW_CLASSES)}
+        shares = _flow_shares()
+        best_key = None
+        for cls, cand in by_cls.items():
+            cand.sort(key=lambda x: x.seq)
+            choice = cand[0]                                    # FIFO ...
+            urgent = [x for x in cand if x.deadline_at is not None and x.deadline_at - now < FLOW_URGENT_SLACK_S]
+            if urgent:                                          # ... unless a deadline is close (EDF) ...
+                choice = min(urgent, key=lambda x: x.deadline_at)
+            elif _FLOW["last_prefix"] and _FLOW["run"] < FLOW_AFFINITY_MAX:
+                aff = [x for x in cand if x.prefix == _FLOW["last_prefix"]]
+                if aff:                                         # ... or a warm prefix is waiting (affinity)
+                    choice = aff[0]
+            # weighted fair queuing on FINISH tags: a heavy class wins a near-tie, light classes still
+            # get their share (the heavier the weight, the sooner a class's next request finishes)
+            key = (_FLOW["vtime"][cls] + choice.cost_s / shares[cls], order[cls])
+            if best_key is None or key < best_key:
+                best_key, pick = key, choice
+    _FLOW["head"] = (_FLOW["version"], now, pick)
+    return pick
+
+
+@_flow_failopen(True)
+def flow_turn(t):
+    """May t take the engine place now? True whenever flow is off; in shadow mode counts what enforce would hold."""
+    if FLOW_MODE == "off":
+        return True
+    head = flow_pick()
+    if FLOW_MODE == "shadow":
+        if head is not None and head is not t:
+            _FLOW_STATS["shadow_would_hold"] += 1
+        return True
+    return head is t
+
+
+@_flow_failopen(None)
+def flow_on_admit(t, request=None):
+    """t just claimed its place: advance fair-queuing time, remember the prefix, start the prefill watch."""
+    now = time.time()
+    shares = _flow_shares()
+    _FLOW["vtime"][t.cls] += t.cost_s / shares[t.cls]
+    t.adjacent = bool(t.prefix and t.prefix == _FLOW["last_prefix"])
+    if t.prefix and t.prefix == _FLOW["last_prefix"]:
+        _FLOW["run"] += 1
+        _FLOW_STATS["affinity_adjacent"] += 1
+    else:
+        _FLOW["run"] = 0
+    _FLOW["last_prefix"] = t.prefix
+    _FLOW["last_admit"][t.cls] = now
+    # affinity that actually reordered: a same-prefix ticket jumped an older one of its class
+    older = [w for w in _FLOW["waiters"] if w is not t and w.cls == t.cls and w.seq < t.seq]
+    if older and t.adjacent:
+        _FLOW_STATS["affinity_reorders"] += 1
+    _FLOW_STATS["granted_" + t.cls] += 1
+    _FLOW_WAITS.append((now, t.cls, now - t.t_enq))
+    pm = t.pm or {}
+    if pm.get("chain"):
+        _FLOW["prefilling"][t.rid] = {"cum": {k for k, _ in pm["chain"]}, "t0": now, "prefix": t.prefix,
+                                      "est_s": (pm.get("computed") or 0) / max(1.0, flow_prefill_tps())}
+    _flow_bump()
+
+
+@_flow_failopen(None)
+def flow_prefill_done(rid):
+    if _FLOW["prefilling"].pop(rid, None) is not None:
+        _flow_bump()
+
+
+@_flow_failopen(None)
+def flow_note_cache(info):
+    """Grade the cache outcome of back-to-back same-prefix requests against all others."""
+    try:
+        cached, ptok = info.get("cached_actual"), info.get("ptok_exact_local")
+        if cached is None or not ptok or info.get("route") != "local":
+            return
+        row = _FLOW_CACHE["adjacent" if info.get("flow_adjacent") else "other"]
+        row[0] += 1
+        row[1] += int(cached)
+        row[2] += int(ptok)
+    except Exception:
+        pass
+
+
+@_flow_failopen(None)
+def flow_note_service(cls, duration_s):
+    if duration_s and duration_s > 0:
+        _FLOW_SERVICE.append((time.time(), cls or "kevin", float(duration_s)))
+
+
+# ---- expected wait and deadline-aware admission ----
+def _flow_service_p50(default=60.0):
+    v = sorted(d for _, _, d in list(_FLOW_SERVICE)[-80:])
+    return v[len(v) // 2] if v else default
+
+
+def flow_expected_wait(cls, cost_s=0.0, lane_limit=None, units=1, exclude=None):
+    """Seconds until a request of this class starts, given the engine backlog and who is ahead. An ESTIMATE:
+    the engine backlog must fall to the class ceiling after every higher-order waiter has been admitted."""
+    backlog = flow_backlog_s()
+    ceil = _flow_ceils()[cls] * FLOW_BACKLOG_S
+    vt = _FLOW["vtime"]
+    ahead = [w for w in _FLOW["waiters"] if w is not exclude and (w.cls == cls or vt[w.cls] <= vt[cls])]
+    ahead_cost = sum(w.cost_s for w in ahead)
+    prefill_term = 0.0 if ceil <= 0 else max(0.0, backlog + ahead_cost - ceil)
+    lane_term = 0.0
+    lim = lane_limit or effective_budget()
+    if _inflight + units > lim:
+        lane_term = _flow_service_p50() * (len(ahead) + 1) / max(1, lim)
+    return round(max(prefill_term, lane_term), 1)
+
+
+def _flow_class_service_p50(cls, default=30.0):
+    v = sorted(d for _, c, d in list(_FLOW_SERVICE)[-200:] if c == cls)
+    if len(v) < 5:
+        v = sorted(d for _, _, d in list(_FLOW_SERVICE)[-200:])
+    return v[len(v) // 2] if v else default
+
+
+@_flow_failopen(None)
+def flow_admission_check(t, remote_can_take):
+    """Deadline-aware admission. Returns None (go on) or a dict describing the refusal. Only refusable classes
+    that cannot START before their deadline are refused, and only when remote cannot absorb them."""
+    t.expected_wait_s = flow_expected_wait(t.cls, t.cost_s, units=t.units, exclude=t)
+    if FLOW_MODE == "off" or t.cls not in FLOW_REFUSABLE or t.deadline_at is None:
+        return None
+    budget_s = t.deadline_at - time.time()
+    # A deadline the CALLER declared (X-Gateway-Deadline-S) is its total patience for the answer, so the typical
+    # service time of its class (prefill + decode, measured) must fit as well; a class default is a start deadline.
+    need = t.expected_wait_s + (max(t.cost_s, _flow_class_service_p50(t.cls)) if t.declared else t.cost_s)
+    if need <= budget_s:
+        return None
+    if FLOW_MODE == "shadow":
+        _FLOW_STATS["shadow_would_refuse_" + t.cls] += 1
+        return None
+    if remote_can_take:
+        # local+remote: this is the abnormal-spike case the remote valve exists for -- cannot start in time
+        # locally. Send it now instead of letting it age in the queue.
+        return {"overflow": True, "class": t.cls, "expected_wait_s": t.expected_wait_s,
+                "own_prefill_s": round(t.cost_s, 1), "deadline_in_s": round(budget_s, 1)}
+    return {"class": t.cls, "expected_wait_s": t.expected_wait_s, "own_prefill_s": round(t.cost_s, 1),
+            "deadline_in_s": round(budget_s, 1), "retry_after": int(max(5, min(900, t.expected_wait_s)))}
+
+
+def _flow_refusal_response(r):
+    payload = json.dumps({"error": {
+        "message": ("local capacity: this %s request cannot start before its deadline (expected wait %ss + "
+                    "prefill %ss > %ss left); nothing was prefilled. Retry after %ss." %
+                    (r["class"], r["expected_wait_s"], r["own_prefill_s"], r["deadline_in_s"], r["retry_after"])),
+        "type": "capacity_deadline", "code": "flow_deadline", **r}}).encode()
+    return web.Response(body=payload, status=429, content_type="application/json",
+                        headers={"Retry-After": str(r["retry_after"]), "X-Gateway-Refused": "flow-deadline",
+                                 "X-Gateway-Expected-Wait": str(r["expected_wait_s"])})
+
+
+# ---- planned local-offline window (Kevin 10-02: benchmarks and engine upgrades must not be outages) ----
+# MEASURED 2026-10-02: ~85% of the day's fenced time was lane benchmark/restart drain fences that refused ALL
+# traffic (503), although DeepSeek could have carried the estate. A planned local-offline window does not
+# refuse: it routes new work to the remote valve (inside the daily cap), keeps pinned-local callers waiting
+# with Retry-After, lets accepted local work finish, and ends by itself (lease) or by DELETE. The admission
+# FENCE (/gateway/drain) stays for the instant of a gateway code swap only.
+_OFFLINE = {"until": 0.0, "lease": None, "reason": None, "by": None, "t0": None, "ttl_s": None, "refused": 0}
+OFFLINE_MAX_TTL_S = 3600
+
+
+def _local_offline(now=None):
+    return (time.time() if now is None else now) < _OFFLINE["until"]
+
+
+def _flow_event(row):
+    try:
+        os.makedirs(os.path.dirname(_FLOW_EVENTS_FILE), exist_ok=True)
+        with open(_FLOW_EVENTS_FILE, "a") as fh:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+    except Exception as e:
+        log.warning("flow event write failed: %s", e)
+
+
+def _offline_reap(now=None):
+    """Write the close row of a window whose lease ran out (a crashed benchmark must not leave local off forever)."""
+    now = time.time() if now is None else now
+    if _OFFLINE["t0"] and not _local_offline(now):
+        _flow_event({"event": "offline-close", "how": "expired", "t": round(min(now, _OFFLINE["until"]), 3),
+                     "t0": round(_OFFLINE["t0"], 3), "reason": _OFFLINE["reason"], "by": _OFFLINE["by"],
+                     "refused": _OFFLINE["refused"]})
+        _OFFLINE.update(t0=None, lease=None, reason=None, by=None, ttl_s=None, refused=0)
+        flow_note_mode(now)
+
+
+def _offline_status():
+    _offline_reap()
+    on = _local_offline()
+    return {"offline": on, "until": _OFFLINE["until"] if on else None, "reason": _OFFLINE["reason"] if on else None,
+            "by": _OFFLINE["by"] if on else None, "since": _OFFLINE["t0"] if on else None,
+            "remaining_s": max(0, int(_OFFLINE["until"] - time.time())) if on else 0,
+            "local_active": sum(1 for a in _ACTIVE.values() if a.get("phase") == "local"),
+            "local_inflight_units": _inflight, "active": len(_ACTIVE), "mode": flow_mode_now()["mode"]}
+
+
+async def gateway_offline(request):
+    """GET status; POST {ttl_s, reason, by} opens (or, with {lease}, extends) a window; DELETE {lease} closes it."""
+    if request.method == "GET":
+        return web.json_response(_offline_status())
+    if not _admin_ok(request):
+        return web.json_response({"error": "admin token required"}, status=401)
+    try:
+        body = await request.json()
+    except (ValueError, TypeError):
+        body = None
+    if not isinstance(body, dict):
+        return web.json_response({"error": "JSON body required"}, status=400)
+    now = time.time()
+    _offline_reap(now)
+    if request.method == "DELETE":
+        if not _OFFLINE["lease"] or body.get("lease") != _OFFLINE["lease"]:
+            return web.json_response({"error": "offline lease mismatch"}, status=409)
+        _flow_event({"event": "offline-close", "how": "delete", "t": round(now, 3), "t0": round(_OFFLINE["t0"] or now, 3),
+                     "reason": _OFFLINE["reason"], "by": _OFFLINE["by"], "refused": _OFFLINE["refused"]})
+        _OFFLINE.update(until=0.0, t0=None, lease=None, reason=None, by=None, ttl_s=None, refused=0)
+        flow_note_mode(now)
+        return web.json_response(_offline_status())
+    try:
+        ttl = int(body.get("ttl_s") or 900)
+        if not 30 <= ttl <= OFFLINE_MAX_TTL_S:
+            raise ValueError
+    except (ValueError, TypeError):
+        return web.json_response({"error": "ttl_s must be 30..%d seconds" % OFFLINE_MAX_TTL_S}, status=400)
+    if _local_offline(now):
+        if body.get("lease") and body.get("lease") == _OFFLINE["lease"]:           # extend
+            _OFFLINE["until"] = now + ttl
+            return web.json_response({**_offline_status(), "lease": _OFFLINE["lease"]})
+        return web.json_response({"error": "another offline window is open", **_offline_status()}, status=409)
+    by = str(body.get("by") or request.headers.get("X-Client") or request.headers.get("User-Agent") or "?")[:80]
+    reason = str(body.get("reason") or "planned local work")[:120]
+    _OFFLINE.update(until=now + ttl, lease=os.urandom(16).hex(), reason=reason, by=by, t0=now, ttl_s=ttl, refused=0)
+    _flow_event({"event": "offline-open", "t": round(now, 3), "reason": reason, "by": by, "ttl_s": ttl,
+                 "local_active": _offline_status()["local_active"]})
+    flow_note_mode(now)
+    return web.json_response({**_offline_status(), "lease": _OFFLINE["lease"]})
+
+
+_FLOW_ROUTES = collections.deque(maxlen=30000)       # (t, decision, reason, class, local_had_headroom)
+_FLOW_EXPLICIT = frozenset({"alias", "intent", "forced", "local-down", "local-offline", "failover", "full-local-remote-alias"})
+
+
+@_flow_failopen(None)
+def flow_note_route(decision, reason, request):
+    """Remote-as-a-valve accounting (Kevin 10-02: remote is for abnormal spikes, never the normal path)."""
+    try:
+        info = _ACTIVE.get(id(request)) or {}
+        headroom = bool(_health.get("ok") and not _local_offline() and _inflight < effective_budget()
+                        and flow_backlog_s() <= LIGHT_PREFILL_SECS)
+        _FLOW_ROUTES.append((time.time(), decision, reason, info.get("flow_class"), headroom))
+    except Exception:
+        pass
+
+
+def flow_remote_use(now=None):
+    now = time.time() if now is None else now
+    out = {}
+    for label, secs in (("15m", 900), ("1h", 3600), ("24h", 86400)):
+        rows = [r for r in _FLOW_ROUTES if now - r[0] <= secs]
+        remote = [r for r in rows if r[1] == "remote"]
+        avoidable = [r for r in remote if r[2] not in _FLOW_EXPLICIT]
+        out[label] = {"requests": len(rows), "remote": len(remote),
+                      "remote_share": round(len(remote) / len(rows), 3) if rows else None,
+                      "by_reason": dict(collections.Counter(r[2] for r in remote).most_common(8)),
+                      "by_class": dict(collections.Counter(r[3] or "?" for r in remote)),
+                      "gateway_chosen_remote": len(avoidable),
+                      "remote_while_local_had_headroom": sum(1 for r in avoidable if r[4])}
+    spend = None
+    try:
+        snap = _spend().snapshot()
+        spend = {k: snap.get(k) for k in ("spent", "held", "reserved", "cap", "remaining") if k in snap}
+    except Exception:
+        pass
+    return {"principle": "local-first: remote is a valve for abnormal spikes and planned local-offline windows, not the "
+                         "normal path. gateway_chosen_remote counts routes the gateway chose (not forced/aliased/"
+                         "local-down/offline); remote_while_local_had_headroom is the defect signal: remote used although "
+                         "the engine had a free place and no prefill queue.",
+            "windows": out, "spend_today": spend}
+
+
+# ---- the facts endpoint ----
+def _pct(vals, q):
+    vals = sorted(vals)
+    return round(vals[min(len(vals) - 1, int(q * len(vals)))], 1) if vals else None
+
+
+def flow_capacity_facts(now=None, cls=None, ptok=None):
+    now = time.time() if now is None else now
+    m = flow_note_mode(now)
+    tps, dtps = flow_prefill_tps(), flow_decode_tps()
+    meter = [r for r in list(_FLOW_METER) if now - r[0] <= 300]
+    eng = _ENGINE_METRICS.get("ok")
+    last = meter[-1] if meter else None
+    shares, ceils, dls = _flow_shares(), _flow_ceils(), _flow_deadlines()
+    demand, queue = {}, {}
+    wsec = max(10.0, FLOW_DEMAND_WINDOW_S)
+    win5 = [d for d in _FLOW_DEMAND if now - d[0] <= wsec]
+    win60 = [d for d in _FLOW_DEMAND if now - d[0] <= 3600]
+    tot_s5 = 0.0
+    for c in FLOW_CLASSES:
+        r5 = [d for d in win5 if d[1] == c]
+        r60 = [d for d in win60 if d[1] == c]
+        s5 = sum(d[3] for d in r5) / max(1.0, tps)
+        tot_s5 += s5
+        demand[c] = {"req_per_min_5m": round(len(r5) / (wsec / 60.0), 2), "req_per_min_60m": round(len(r60) / 60.0, 2),
+                     "prompt_tok_per_min_5m": int(sum(d[2] for d in r5) / (wsec / 60.0)),
+                     "uncached_prefill_s_per_min_5m": round(s5 / (wsec / 60.0), 1),
+                     "uncached_prefill_s_per_min_60m": round(sum(d[3] for d in r60) / max(1.0, tps) / 60.0, 1)}
+        ws = [w for (t_, c_, w) in _FLOW_WAITS if c_ == c and now - t_ <= 900]
+        waiting = [t for t in _FLOW["waiters"] if t.cls == c]
+        queue[c] = {"waiting": len(waiting),
+                    "oldest_wait_s": round(max((now - t.t_enq for t in waiting), default=0.0), 1),
+                    "expected_wait_s": flow_expected_wait(c),
+                    "wait_p50_s_15m": _pct(ws, .5), "wait_p95_s_15m": _pct(ws, .95), "admitted_15m": len(ws),
+                    "held_by": dict(collections.Counter(t.held for t in waiting if t.held)),
+                    "refused_total": _FLOW_STATS.get("refused_" + c, 0),
+                    "share": shares[c], "ceiling_backlog_s": round(ceils[c] * FLOW_BACKLOG_S, 1) or None,
+                    "default_deadline_s": dls[c] or None}
+    out = {
+        "as_of": datetime_iso(now), "flow_mode": FLOW_MODE,
+        **m,
+        "mode_since": _FLOW_MODE_STATE["since"], "mode_changes": list(_FLOW_MODE_STATE["events"])[:20],
+        "throughput": {
+            "prefill_pure_tok_s": None if flow_prefill_pure_tps(now) is None else round(flow_prefill_pure_tps(now), 1),
+            "prefill_pure_basis": ("computed tokens / prefill seconds per request over the last 5 min (queue and admission wait "
+                                   "EXCLUDED; derive per-request budgets from this)" if flow_prefill_pure_tps(now) is not None
+                                   else "too little prefill in the last 5 min to say; use the configured SHIM_PREFILL_TPS"),
+            "prefill_uncached_tok_s": round(tps, 1),
+            "prefill_basis_note": "prefill_uncached_tok_s is the engine's AGGREGATE uncached-prompt throughput while it had a queue (it falls when "
+                                  "decode or a benchmark shares the engine); it sizes the engine backlog, not per-request budgets",
+            "prefill_basis": "measured" if len([r for r in list(_FLOW_METER)[-120:] if r[1] and (r[4] or 0) > 0]) >= 5
+                             else "configured SHIM_PREFILL_TPS (too few busy samples yet)",
+            "decode_tok_s_aggregate": None if dtps is None else round(dtps, 1),
+            "decode_tok_s_per_stream": None if (dtps is None or not last or not (last[3] or 0)) else round(dtps / max(1.0, last[3]), 1),
+            "engine_running": last[3] if last else None, "engine_waiting": last[4] if last else None,
+            "prefix_cache_hit_rate_now": last[5] if last else None, "engine_metrics_ok": bool(eng)},
+        "pressure": {
+            "engine_prefill_backlog_s": round(flow_backlog_s(), 1), "backlog_target_s": FLOW_BACKLOG_S,
+            "demand_over_capacity_5m": round(tot_s5 / wsec, 2),
+            "meaning": ">1 means uncached prefill is arriving faster than the engine can compute it; queues grow without bound "
+                       "unless demand is shed, delayed or sent remote",
+            "inflight": _inflight, "lane_budget": effective_budget()},
+        "demand": demand, "queue": queue,
+        "affinity": {"adjacent_grants": _FLOW_STATS.get("affinity_adjacent", 0),
+                     "reorders": _FLOW_STATS.get("affinity_reorders", 0),
+                     "prefix_holds_now": sum(1 for t in _FLOW["waiters"] if t.held == "prefix-hold"),
+                     "hit_rate_adjacent": (round(_FLOW_CACHE["adjacent"][1] / _FLOW_CACHE["adjacent"][2], 3)
+                                           if _FLOW_CACHE["adjacent"][2] else None),
+                     "hit_rate_other": (round(_FLOW_CACHE["other"][1] / _FLOW_CACHE["other"][2], 3)
+                                        if _FLOW_CACHE["other"][2] else None),
+                     "graded": [_FLOW_CACHE["adjacent"][0], _FLOW_CACHE["other"][0]]},
+        "config": {"shares": shares, "ceilings": {c: ceils[c] for c in FLOW_CLASSES}, "default_deadlines_s": dls,
+                   "backlog_target_s": FLOW_BACKLOG_S, "class_map": FLOW_CLASS_MAP,
+                   "set_with": "POST /gateway/config {flow_shares, flow_ceil, flow_deadlines, flow_backlog_s, flow_class_map, flow_mode}"},
+        "remote_use": flow_remote_use(now),
+        "offline_window": _offline_status(),
+        "counters": dict(_FLOW_STATS),
+        "cannot_measure": ([] if eng else ["engine /metrics scrape failing: throughput and engine queue unknown"]),
+    }
+    if cls in FLOW_CLASSES:
+        c0 = max(0, int(ptok or 0))
+        out["estimate"] = {"class": cls, "ptok": c0, "expected_wait_s": flow_expected_wait(cls, c0 / max(1.0, tps))}
+    return out
+
+
+def datetime_iso(now):
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now))
+
+
+async def gateway_capacity(request):
+    cls = (request.query.get("class") or "").strip().lower() or None
+    try:
+        ptok = int(request.query.get("ptok") or 0)
+    except ValueError:
+        ptok = 0
+    return web.json_response(flow_capacity_facts(cls=cls, ptok=ptok))
 
 
 # form-field key <-> env-var (what the dashboard sends)
@@ -3698,6 +4675,7 @@ def _pm_prefill_done(request):
     cache and (b) it no longer occupies the engine's prefill queue -- only its decode remains."""
     global _inflight_computed
     pm = _PM_INFLIGHT.get(id(request)) or {}
+    flow_prefill_done(id(request))      # CF: its prefix is cached now -- held same-prefix waiters may go
     _pm_ready(pm.get("chain") or [])
     held = pm.pop("backlog_held", 0)
     if held:
@@ -3726,6 +4704,7 @@ def _pm_feedback(info):
     unlearn prefixes the engine did not in fact have (over-prediction), so a stale or evicted node
     costs at most one mis-admitted request, not a run of them. Never raises."""
     try:
+        flow_note_cache(info)
         pm = _PM_INFLIGHT.pop(info.get("pm_ref"), None) or {}
         credit, cached = info.get("pm_credit"), info.get("cached_actual")
         ptok_exact = info.get("ptok_exact_local")
@@ -4480,6 +5459,72 @@ async def _finish_stream_response(resp, request, session):
         await session.close()
 
 
+# RS (2026-10-02): one durable record per GATEWAY-layer timeout (first response header, first token, stream idle). Without it a
+# timeout only showed up as a generic 'local-failed' 503 / failover, with no deadline, no wait, no size - so nobody could say
+# which layer gave up first or how much prefill the abort threw away. Same incidents/ dir as drains.jsonl; read by tools/timeout_audit.py.
+_TIMEOUT_LEDGER = os.path.expanduser(os.environ.get("GATEWAY_TIMEOUT_LEDGER", "~/.local/share/vllm-qwen27b/incidents/timeouts.jsonl"))
+
+
+def _timeout_note(request, layer, deadline_s, base, body, **extra):
+    try:
+        a = _ACTIVE.get(id(request)) or {}
+        t0 = a.get("t0")
+        row = {"t": round(time.time(), 3), "layer": layer, "deadline_s": round(float(deadline_s), 1),
+               "waited_s": round(time.time() - t0, 1) if t0 else None, "base": "local" if base == LOCAL else "remote",
+               "ptok_est": _est_tokens(body), "client": a.get("name") or _client_label(request), "bg": bool(a.get("bg")),
+               "tiny": bool(a.get("tiny")), "stream": bool(a.get("stream")), "route": a.get("route"), "phase": a.get("phase")}
+        row.update(extra)
+        os.makedirs(os.path.dirname(_TIMEOUT_LEDGER), exist_ok=True)
+        with open(_TIMEOUT_LEDGER, "a") as fh:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+    except Exception:       # bookkeeping must never touch the request path
+        pass
+
+
+class _ClientGone(Exception):
+    pass
+
+
+def _client_gone(request):
+    """Has the caller hung up? aiohttp does NOT cancel a handler when the client disconnects (handler_cancellation is
+    off), so before CF a queued or prefilling request of a caller that had already timed out was still admitted, still
+    prefilled by the engine, and only discovered dead at the first write -- the engine's work thrown away."""
+    tr = getattr(request, "transport", "absent")
+    if tr == "absent":
+        return False                      # a test double with no connection
+    return tr is None or tr.is_closing()
+
+
+async def _await_unless_gone(request, awaitable, timeout=None, poll=0.5):
+    """Await `awaitable` (an upstream call) but give up -- and cancel it, which closes the upstream connection and so
+    aborts the engine's prefill -- as soon as the caller hangs up. Same TimeoutError contract as asyncio.wait_for."""
+    task = asyncio.ensure_future(awaitable)
+    t_end = None if timeout is None else time.time() + timeout
+    try:
+        while True:
+            wait = poll if t_end is None else max(0.01, min(poll, t_end - time.time()))
+            done, _ = await asyncio.wait({task}, timeout=wait)
+            if done:
+                return task.result()
+            if _client_gone(request):
+                raise _ClientGone()
+            if t_end is not None and time.time() >= t_end:
+                raise asyncio.TimeoutError()
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except BaseException:       # noqa: BLE001 -- the cancelled upstream call
+                pass
+
+
+def _gone_response(request):
+    _active_set(request, client_disconnected=True, flow_held="client-gone")
+    _FLOW_STATS["client_gone"] += 1
+    return web.Response(status=499, text="client closed request")
+
+
 async def _relay(request, base, path, body, key, streaming, concurrency=1, provider_name=None):
     """
     Forward to (base) and relay the response to the client.
@@ -4500,6 +5545,8 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
             "X-Gateway-Provider": str(provider),
             "X-Gateway-Reason": str(info.get("reason") or "admitted"),
             "X-Gateway-Queue-Wait": str(round(info.get("waited") or 0.0, 3)),
+            "X-Gateway-Work-Class": str(info.get("flow_class") or ""),
+            "X-Gateway-Expected-Wait": str(info.get("flow_expected_wait_s") if info.get("flow_expected_wait_s") is not None else ""),
             "X-Gateway-Predicted-Occupancy": str(info.get("predicted_occupancy_s") or ""),
             "X-Gateway-Context-Provider": str(info.get("context_provider") or provider),
             "X-Gateway-Context-Limit": str(info.get("context_limit") or ""),
@@ -4511,12 +5558,17 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
         if streaming:
             # bound time-to-response-headers for streaming so a backend that accepts the
             # connection but never responds (a wedge) fails over instead of hanging.
-            up = await asyncio.wait_for(_open(session, base, path, body, key, streaming),
-                                        timeout=first_token_timeout(body, concurrency, local=(base == LOCAL)))
+            up = await _await_unless_gone(request, _open(session, base, path, body, key, streaming),
+                                          timeout=first_token_timeout(body, concurrency, local=(base == LOCAL)))
         else:
-            up = await _open(session, base, path, body, key, streaming)
+            up = await _await_unless_gone(request, _open(session, base, path, body, key, streaming))
+    except _ClientGone:
+        await session.close()
+        return "ok", _gone_response(request)
     except asyncio.TimeoutError:
         await session.close()
+        _timeout_note(request, "gateway:response-headers", first_token_timeout(body, concurrency, local=(base == LOCAL)), base, body,
+                      concurrency=concurrency, outcome="failover")
         # slow/wedged under load -> fail over, but do NOT flag as OOM (no 120s budget backoff:
         # local is busy, not crashed; a real crash returns 5xx/EngineDead below and DOES backoff).
         return "fail", (0, "no response headers within first-token deadline (busy/wedged)", False)
@@ -4684,9 +5736,14 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
     # allowing a legit big-context prefill the time it actually needs (scaled by concurrency).
     deadline = first_token_timeout(body, concurrency, local=(base == LOCAL))
     try:
-        phase = await asyncio.wait_for(_read_until_commit(), timeout=deadline)
+        phase = await _await_unless_gone(request, _read_until_commit(), timeout=deadline)
+    except _ClientGone:
+        await session.close()
+        return "ok", _gone_response(request)
     except asyncio.TimeoutError:
         await session.close()
+        _timeout_note(request, "gateway:first-token", deadline, base, body, concurrency=concurrency, outcome="failover",
+                      bytes_before=len(buf))
         return "fail", (up.status, f"no first token within {deadline:.0f}s (busy/wedged)", False)
     except Exception as e:
         await session.close()
@@ -4748,6 +5805,8 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
             except asyncio.TimeoutError:
                 _active_set(request, stream_watchdog=True, stream_idle_timeout_s=STREAM_IDLE_TIMEOUT_SECS,
                             reason="stream-idle-timeout")
+                _timeout_note(request, "gateway:stream-idle", STREAM_IDLE_TIMEOUT_SECS, base, body, outcome="aborted-after-output",
+                              out_chunks=_chunk_ct[0])
                 log.warning("stream idle for %.1fs -> aborting %s request", STREAM_IDLE_TIMEOUT_SECS,
                             "remote" if _is_remote_relay else "local")
                 try:
@@ -5069,9 +6128,19 @@ async def handle_completions(request):
     # accepted before its fence is visible to the deployer, and every later
     # request is refused before either local work or a paid hold can begin.
     if _draining():
-        return web.json_response({"error": {"type": "gateway_draining",
-                                            "message": "gateway deployment is draining accepted calls; retry shortly"}},
-                                 status=503, headers={"Retry-After": "30", "X-Gateway-Drain": "active"})
+        who = _client_label(request)
+        reason, since = _DRAIN_REASON, (_DRAIN_REC or {}).get("t0")
+        if _DRAIN_REC:
+            _DRAIN_REC["refused"] += 1
+            _DRAIN_REC["refused_by_client"][who] = _DRAIN_REC["refused_by_client"].get(who, 0) + 1
+        # RS: Retry-After no longer overshoots the end of the fence, and the message names the reason + age so a caller's
+        # error text (Halo's `last_error`) says WHY, not just "draining".
+        wait = max(1, min(30, int(_DRAIN_UNTIL - time.time())))
+        msg = ("gateway deployment is draining accepted calls; retry shortly"
+               + (f" (reason: {reason}; held {int(time.time() - since)}s; by {_DRAIN_REC['by']})" if since else ""))
+        return web.json_response({"error": {"type": "gateway_draining", "message": msg}},
+                                 status=503, headers={"Retry-After": str(wait), "X-Gateway-Drain": "active"})
+    _drain_reap()
     try:
         j = json.loads(body)
         if not isinstance(j, dict):
@@ -5329,6 +6398,21 @@ async def _route_completions(request, _no_overflow=False):
         record_event("remote", "big-prompt", request, units, 0, **ev)
         return await _overflow_forward()
 
+    # CF: PLANNED local-offline window (benchmark / engine upgrade): the remote valve carries the estate inside
+    # the daily cap; callers that must stay local (pinned, estate-local) and everything when no remote can take
+    # work are told to retry -- the engine is being worked on, so nothing is admitted to it.
+    if _local_offline():
+        if overflow_ok and not alias_local_only and not local_pin:
+            log.info("route %s planned local-offline window (%s) -> remote(local-offline)", path, _OFFLINE["reason"])
+            record_event("remote", "local-offline", request, units, 0, **ev)
+            return await _overflow_forward()
+        _OFFLINE["refused"] += 1
+        record_event("rejected-bg", "local-offline", request, units, 0, **ev)
+        left = max(5, min(60, int(_OFFLINE["until"] - time.time())))
+        return web.json_response({"error": {"message": "local engine is offline for planned work (%s); retry after %ds" % (
+            _OFFLINE["reason"], left), "type": "local_offline_window"}}, status=503,
+            headers={"Retry-After": str(left), "X-Gateway-Offline": "active"})
+
     # local DOWN -> overflow immediately (waiting for a slot won't help a dead engine) --
     # UNLESS this is background traffic under BG_LOCAL_ONLY: hold it and poll for recovery
     # instead (background can wait; it must never pay for remote to cover an engine restart).
@@ -5427,6 +6511,10 @@ async def _route_completions(request, _no_overflow=False):
             return await _overflow_forward()
         return web.json_response({"error": "request exceeds local token reservation budget"}, status=503)
     units *= sequences
+    flow_cls = flow_class_of(request, body, background, halo_control)       # CF: work class
+    if FLOW_MODE != "off":
+        flow_note_arrival(flow_cls, ptok, est_computed)
+        _active_set(request, flow_class=flow_cls)
     if halo_control:
         # Units estimate scheduler pressure from prompt size. Halo's one
         # control sequence must fit the protected place even with a long
@@ -5434,10 +6522,13 @@ async def _route_completions(request, _no_overflow=False):
         # remains charged and guarded independently.
         units = sequences
     reserved = False
+    claimed_at = 0.0
 
     def claim_local():
-        nonlocal reserved
+        nonlocal reserved, claimed_at
         global _inflight, _inflight_tokens, _inflight_reserved_tokens, _inflight_computed
+        claimed_at = time.time()
+        _flow_bump()
         _inflight += units
         _inflight_tokens += ptok
         _inflight_reserved_tokens += reservation
@@ -5457,6 +6548,9 @@ async def _route_completions(request, _no_overflow=False):
             _inflight_reserved_tokens -= reservation
             _inflight_computed = max(0, _inflight_computed - _pm.pop("backlog_held", 0))
             reserved = False
+            flow_note_service(flow_cls, time.time() - claimed_at)
+            flow_prefill_done(id(request))
+            _flow_bump()
 
     # TINY fast-lane: small calls skip the queue, but never the KV memory limit.
     # The final extra place belongs to Halo control, even when routine tiny
@@ -5523,12 +6617,54 @@ async def _route_completions(request, _no_overflow=False):
         background, overflow_ok, is_peak(), LOCAL_WAIT, BG_WAIT, INTERACTIVE_NEVER_OVERFLOW)
     admitted = False
     t_admit0 = time.time()
+    queued = False
+    # The size-implied unit cost does not change while we wait (est_computed is fixed at arrival), so
+    # compute it once rather than re-hashing the body on every 50 ms poll.
+    _desired_const = _desired_units(body, client, est_computed) * sequences
+
+    def _legacy_fits():
+        """The admission predicate exactly as it was before CF (lanes, bg-idle bypass, KV reservation, prefill
+        window). The flow ticket asks it too, so the ticket chosen to go next is always one that CAN go."""
+        bg_big_idle = (background and BG_BIG_LOCAL_WHEN_IDLE and _desired_const > lane_limit
+                       and _inflight == 0 and _waiting <= (1 if queued else 0))
+        admit_units = min(effective_budget(), _desired_const) if bg_big_idle else units
+        win_ok = bg_big_idle or prefill_window_ok(est_computed, halo_control)
+        ok = bool(_health["ok"] and not _local_offline() and admit_units >= sequences
+                  and ((_inflight + admit_units) <= lane_limit or bg_big_idle)
+                  and _memory_available(reservation, halo_control=halo_control) and win_ok)
+        return ok, admit_units, bg_big_idle, win_ok
+
+    flow_t = flow_make_ticket(request, body, flow_cls, _pm, ptok, units, lambda: _legacy_fits()[0])
+    if FLOW_MODE == "enforce" and flow_cls in FLOW_REFUSABLE and flow_t.deadline_at is not None:
+        # Local-first (Kevin 10-02): robot work waits for local until it would miss its own deadline (bounded by
+        # BG_WAIT_LOCAL) instead of overflowing to the paid remote after a few seconds.
+        # The flow class (not the legacy is_background() test, which does not know the overseer-* clients) owns the wait
+        # bound of robot work whenever remote is a possible valve.
+        if overflow_ok and not alias_local_only:
+            deadline = min(flow_t.deadline_at - flow_t.cost_s, t_admit0 + BG_WAIT_LOCAL)
+    if FLOW_MODE != "off":
+        _refusal = flow_admission_check(flow_t, bool(overflow_ok and not alias_local_only))
+        _active_set(request, flow_expected_wait_s=flow_t.expected_wait_s)
+        if _refusal and _refusal.get("overflow"):
+            _FLOW_STATS["valve_" + flow_cls] += 1
+            log.info("route %s %s cannot start locally in time (wait %.1fs + prefill %.1fs > %.1fs) -> remote(flow-deadline)",
+                     path, flow_cls, _refusal["expected_wait_s"], _refusal["own_prefill_s"], _refusal["deadline_in_s"])
+            flow_dequeue(flow_t)
+            record_event("remote", "flow-deadline", request, units, 0, **ev)
+            return await _overflow_forward()
+        if _refusal:
+            _FLOW_STATS["refused_" + flow_cls] += 1
+            log.info("route %s %s refused before prefill: expected wait %.1fs + prefill %.1fs > %.1fs left",
+                     path, flow_cls, _refusal["expected_wait_s"], _refusal["own_prefill_s"], _refusal["deadline_in_s"])
+            record_event("rejected-bg", "flow-deadline", request, units, 0, **ev)
+            return _flow_refusal_response(_refusal)
+    flow_enqueue(flow_t)
     _local_reason = "-"      # "bg-big-idle" when the idle-engine rule admitted a big background request
     if _lf_kept:             # LOCAL-FIRST: telemetry shows which predictive reason was overridden
         _local_reason = "lf-" + _lf_kept[0]
     admitted_conc = 1        # local concurrency at admission -> scales the first-token deadline
     waited = 0.0
-    queued = False
+    client_gone_queued = False
     try:
         while True:
             # big background request + idle engine: nothing in flight and nobody else queued
@@ -5539,13 +6675,16 @@ async def _route_completions(request, _no_overflow=False):
             # most big bg requests fit under lane_limit without ever needing this bypass; it
             # only fires for requests so large that even the proportional estimate would still
             # exceed budget-FG_RESERVED.
-            _desired = _desired_units(body, client, est_computed) * sequences
-            _bg_big_idle = (background and BG_BIG_LOCAL_WHEN_IDLE and _desired > lane_limit
-                            and _inflight == 0 and _waiting <= (1 if queued else 0))
-            _admit_units = min(effective_budget(), _desired) if _bg_big_idle else units
-            _win_ok = _bg_big_idle or prefill_window_ok(est_computed, halo_control)
-            if _health["ok"] and _admit_units >= sequences and ((_inflight + _admit_units) <= lane_limit or _bg_big_idle) \
-                    and _memory_available(reservation, halo_control=halo_control) and _win_ok:
+            if _client_gone(request):
+                client_gone_queued = True
+                break           # the caller hung up while queued: admit nothing, prefill nothing
+            if ((_local_offline() or not _health["ok"]) and overflow_ok and not alias_local_only and not local_pin
+                    and not (background and BG_LOCAL_ONLY and not _local_offline())):
+                break           # a planned offline window opened, or local died, under a waiter: the valve takes it
+            _fits, _admit_units, _bg_big_idle, _win_ok = _legacy_fits()
+            if _fits and flow_turn(flow_t):
+                flow_on_admit(flow_t)
+                _active_set(request, flow_adjacent=flow_t.adjacent, flow_held=flow_t.held or None)
                 if _bg_big_idle and (_inflight + _admit_units) > lane_limit:
                     _stats["bg_big_idle_local"] = _stats.get("bg_big_idle_local", 0) + 1
                     _local_reason = "bg-big-idle"
@@ -5574,14 +6713,24 @@ async def _route_completions(request, _no_overflow=False):
             waited += SLOT_POLL
             await local_healthy()  # refresh cached health while waiting
     finally:
+        flow_dequeue(flow_t)
         if queued:
             _waiting -= 1
             _waiting_by_class["background" if background else "interactive"] -= 1
         _note_admission_wait(waited)   # LOCAL-FIRST queue-wait signal (admitted or overflowed)
 
+    if client_gone_queued:
+        log.info("route %s caller hung up after %.1fs queued -> dropped before any prefill", path, waited)
+        record_event("gone", "queued", request, units, waited, **ev)
+        return _gone_response(request)
+
     if not admitted:
         # distinguish WHY we couldn't admit: lane-count vs total-context (size-aware) cap
-        if (_inflight + units) <= lane_limit and not prefill_window_ok(est_computed, halo_control):
+        if _local_offline():
+            reason = "local-offline"
+        elif not _health["ok"]:
+            reason = "local-down"
+        elif (_inflight + units) <= lane_limit and not prefill_window_ok(est_computed, halo_control):
             reason = "prefill"
         elif (_inflight + units) <= lane_limit:
             reason = "tokens"
@@ -5779,6 +6928,7 @@ async def gateway_stats(request):
         # a per-class split that record_event() does not actually track. See
         # gw-ttft-decomposition-telemetry for the real per-class latency breakdown this wants.
         "waiting_by_class": dict(_waiting_by_class),
+        "flow_mode": FLOW_MODE, "flow_waiting_by_work_class": {c: sum(1 for w in _FLOW["waiters"] if w.cls == c) for c in FLOW_CLASSES},
         "overflowed_after_wait": _stats["overflowed_after_wait"],
         "inflight_tokens": _inflight_tokens, "token_budget": TOKEN_BUDGET,
         "inflight_computed": _inflight_computed,
@@ -8172,6 +9322,10 @@ $('form').onsubmit=async e=>{e.preventDefault();const d={name:$('name').value,ba
 </script></div></body></html>"""
 
 async def _on_startup(app):
+    global _REMOTE_DEAD_PERSIST
+    _drain_startup_recover()
+    _REMOTE_DEAD_PERSIST = True
+    _remote_dead_load()
     _load_stats()
     _spend()   # R2: load (and, for a mid-day ledger, import today's recorded spend) before serving
     app["saver"] = asyncio.create_task(_stats_saver())
@@ -8215,6 +9369,10 @@ def make_app():
     app.router.add_post("/v1/chat/completions", handle_completions)
     app.router.add_post("/v1/completions", handle_completions)
     app.router.add_get("/gateway/stats", gateway_stats)
+    app.router.add_get("/gateway/capacity", gateway_capacity)                 # CF: capacity-aware flow facts
+    app.router.add_get("/gateway/offline", gateway_offline)                   # CF: planned local-offline window
+    app.router.add_post("/gateway/offline", gateway_offline)
+    app.router.add_delete("/gateway/offline", gateway_offline)
     app.router.add_get("/gateway/drain", gateway_drain)
     app.router.add_post("/gateway/drain", gateway_drain)
     app.router.add_delete("/gateway/drain", gateway_drain)

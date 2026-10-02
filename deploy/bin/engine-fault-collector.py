@@ -13,10 +13,10 @@ Deterministic, no LLM. Never fails the unit (exit 0). Kill switch: touch ~/.loca
 Writes: incidents/fault-<ts>/ , incidents/ledger.jsonl , and (append) the vault note Memory/Engine Fault Ledger.md
 """
 import argparse, glob, json, os, re, shutil, subprocess, sys, time
-from datetime import datetime
+from datetime import datetime, timezone
 
 HOME = os.path.expanduser("~")
-BASE = f"{HOME}/.local/share/vllm-qwen27b"
+BASE = os.environ.get("FAULT_COLLECTOR_BASE") or f"{HOME}/.local/share/vllm-qwen27b"
 INC = f"{BASE}/incidents"
 LEDGER = f"{INC}/ledger.jsonl"
 VAULT_NOTE = f"{HOME}/Obsidian/Memory/Engine Fault Ledger.md"
@@ -104,6 +104,105 @@ def uptime_before(ts: float):
         return None
 
 
+def _recently_recorded(window_s=240):
+    try:
+        d = json.load(open(f"{BASE}/recorded-fault.json"))
+        fresh = time.time() - float(d["t"]) < window_s
+        os.rename(f"{BASE}/recorded-fault.json", f"{BASE}/recorded-fault.last.json")
+        return fresh
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def nearest_xid_dir(ts: float, before_s=900, after_s=60):
+    """RS: the kernel-Xid archive (incidents/xid-*) written by the Xid archiver nearest BEFORE this death, so one record links both."""
+    best = None
+    for d in glob.glob(f"{INC}/xid-*"):
+        try:
+            t = datetime.strptime(os.path.basename(d)[4:], "%Y%m%d-%H%M%S").timestamp()
+        except Exception:  # noqa: BLE001
+            continue
+        if -after_s <= ts - t <= before_s and (best is None or t > best[0]):
+            best = (t, d)
+    return best[1] if best else None
+
+
+def emit_event(row, a):
+    """RS: every recorded death is also one estate event_log record (source=engine), so Halo's catch-up and the incident
+    timeline see it even when it is not a hand-off (planned stops, backfills)."""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("engine_actuator", f"{BASE}/engine-actuator.py")
+        ea = importlib.util.module_from_spec(spec); spec.loader.exec_module(ea)
+        if row["kind"] == "FAULT" and not (a.reconciled or a.at):
+            return  # the live FAULT path emits its hand-off (handoff_to_halo) itself
+        kind = "observation"
+        summ = (f"engine death recorded ({row['kind']} {row['signature']}{' ' + row['detail'] if row.get('detail') else ''})"
+                f"{' [backfilled]' if row.get('reconciled') else ''} at {row['ts']}"
+                f"{'; cause: ' + row['cause'] if row.get('cause') else ''}")
+        ea.emit(kind, summ, {"action": "engine-death", **{k: row.get(k) for k in
+                ("kind", "signature", "detail", "uptime_s", "xid_incident", "incident_dir", "wedge", "planned_by",
+                 "planned_reason", "in_flight", "reconciled")}})
+    except Exception as e:  # noqa: BLE001
+        print("emit_event error", repr(e), file=sys.stderr)
+
+
+def _ledger_ts():
+    out = []
+    try:
+        for l in open(LEDGER):
+            try:
+                out.append(datetime.fromisoformat(json.loads(l)["ts"]).timestamp())
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def reconcile(hours: float):
+    """RS: any unit death in the journal with no ledger row within +-240 s is backfilled. A death is the systemd line
+    'Main process exited' (covers SIGKILL, crash, exit-0). Cause is attributed from what the journal itself shows: a watchdog
+    wedge decision (watchdog.log) or the sudo 'systemctl kill|stop|restart' line. Idempotent; run from engine-actuator
+    announce-start (every engine start) so a lost record is healed within one restart, with no new cron."""
+    since = datetime.fromtimestamp(time.time() - hours * 3600).strftime("%Y-%m-%d %H:%M:%S")
+    jr = sh(f'journalctl -u {UNIT} -o short-iso --no-pager --since "{since}" | grep -E "Main process exited|Stopping vLLM"', timeout=60)
+    have = _ledger_ts()
+    wd = ""
+    try:
+        wd = open(f"{BASE}/watchdog.log", errors="replace").read()[-400000:]
+    except Exception:  # noqa: BLE001
+        pass
+    wedge_times = []
+    for x in wd.splitlines():
+        if "DECISION wedge CONFIRMED" in x and "RESTARTING" in x and "[DRY-RUN]" not in x:
+            try:  # watchdog.log stamps are UTC ("...Z")
+                wedge_times.append(datetime.strptime(x[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp())
+            except Exception:  # noqa: BLE001
+                pass
+    done = []
+    for l in jr.splitlines():
+        m = re.match(r"(\S+) \S+ systemd\[1\]: .*Main process exited, code=(\w+), status=(\S+)", l)
+        if not m:
+            continue
+        t = datetime.fromisoformat(m.group(1)).timestamp()
+        if any(abs(t - h) <= 240 for h in have):
+            continue
+        stamp = datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M:%S")
+        near = sh(f'journalctl --since "{datetime.fromtimestamp(t-20).strftime("%Y-%m-%d %H:%M:%S")}" '
+                  f'--until "{datetime.fromtimestamp(t+5).strftime("%Y-%m-%d %H:%M:%S")}" --no-pager -o cat 2>/dev/null | grep -E "COMMAND=.*(systemctl|vllm)" | head -3')
+        wedge = any(abs(wt - t) <= 90 for wt in wedge_times)
+        cause = ("watchdog confirmed generation wedge -> systemctl kill -s KILL" if wedge else
+                 ("; ".join(x.strip()[:140] for x in near.splitlines()) or f"code={m.group(2)} status={m.group(3)}; actor not in journal"))
+        cmd = [sys.executable, os.path.abspath(__file__), "--at", stamp, "--reconciled", "--no-vault", "--cause", cause]
+        if wedge:
+            cmd.append("--wedge")
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        done.append({"at": stamp, "cause": cause, "rc": r.returncode})
+        have.append(t)
+    print(json.dumps({"reconciled": done}))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stop-post", action="store_true")
@@ -111,8 +210,27 @@ def main():
     ap.add_argument("--window", type=int, default=240, help="journal seconds before the fault to read")
     ap.add_argument("--no-vault", action="store_true")
     ap.add_argument("--drill", action="store_true", help="with --at: replay a past fault AND emit its hand-off (tagged drill)")
+    ap.add_argument("--pre-kill", action="store_true",
+                    help="RS: called by the watchdog BEFORE it kills a wedged engine. Records the death now (ledger + incident + event) "
+                         "so it cannot be lost to the kill->restart race; the later --stop-post then skips (dedupe marker)")
+    ap.add_argument("--reconcile", action="store_true",
+                    help="RS: find engine deaths in the journal that have no ledger row and backfill them")
+    ap.add_argument("--hours", type=float, default=6.0, help="with --reconcile: how far back to look")
+    ap.add_argument("--wedge", action="store_true", help="with --at: the death was a watchdog-confirmed generation wedge")
+    ap.add_argument("--cause", default="", help="with --at: free-text cause recorded on the row")
+    ap.add_argument("--reconciled", action="store_true", help="internal: row is a backfill (emit an event, not a hand-off)")
     a = ap.parse_args()
     if os.path.exists(f"{BASE}/NO_FAULT_COLLECTOR"):
+        return
+    if a.reconcile:
+        return reconcile(a.hours)
+    if a.stop_post and _recently_recorded():
+        # RS: the watchdog already recorded this death via --pre-kill; ExecStopPost must not double-count it.
+        for src in ("wedge-restart.json", "planned-restart.json"):
+            try:
+                os.rename(f"{BASE}/{src}", f"{BASE}/{src[:-5]}.last.json")
+            except Exception:  # noqa: BLE001
+                pass
         return
     now = datetime.strptime(a.at, "%Y-%m-%d %H:%M:%S").timestamp() if a.at else time.time()
     since = datetime.fromtimestamp(now - a.window).strftime("%Y-%m-%d %H:%M:%S")
@@ -126,6 +244,8 @@ def main():
     # ended in a SIGKILL after the stop timeout -- 03:45 and 03:55 on 2026-10-02 were EF's own restarts mislabelled FAULT.
     marker = None
     try:
+        if a.at:
+            raise FileNotFoundError  # RS: a backfill must never consume the LIVE markers (it ate the 12:05 wedge marker)
         marker = json.load(open(f"{BASE}/planned-restart.json"))
         os.rename(f"{BASE}/planned-restart.json", f"{BASE}/planned-restart.last.json")
     except Exception:  # noqa: BLE001
@@ -134,14 +254,22 @@ def main():
     killed_after_timeout = result == "timeout" and (os.environ.get("EXIT_STATUS") in ("KILL", "9"))
     wedge = None
     try:
+        if a.at:
+            raise FileNotFoundError
         wedge = json.load(open(f"{BASE}/wedge-restart.json"))
         os.rename(f"{BASE}/wedge-restart.json", f"{BASE}/wedge-restart.last.json")
     except Exception:  # noqa: BLE001
         pass
+    if a.wedge and a.at:
+        wedge = {"by": "watchdog", "wedge": True, "backfilled": True}
+    if a.pre_kill and not wedge:
+        wedge = {"by": "watchdog", "wedge": True}
     if wedge:
         sig, detail, planned = "generation-wedge", "watchdog-confirmed (models healthy, generation probes timed out)", False
     elif marker or (requested_stop and "Traceback" not in journal):
         planned = True
+    if a.reconciled and sig == "unknown-exit" and not wedge and "COMMAND=" in a.cause and re.search(r"systemctl (stop|restart)", a.cause):
+        planned = True  # RS backfill: the journal shows someone ran systemctl stop/restart
     kind = "planned-stop" if planned else "FAULT"
     ts_s = datetime.fromtimestamp(now).strftime("%Y%m%d-%H%M%S")
     shape = scheduler_dump_shape(journal)
@@ -152,6 +280,17 @@ def main():
            "uptime_s": uptime_before(now) if not a.at else None, "dump": shape,
            "in_flight": {"n": len(live), "ptok": [r["ptok"] for r in live], "clients": sorted({str(r["client"]) for r in live})},
            "incident_dir": inc if kind == "FAULT" else None}
+    xid = nearest_xid_dir(now)
+    if xid:
+        row["xid_incident"] = xid
+    if a.cause:
+        row["cause"] = a.cause
+    if a.reconciled:
+        row["reconciled"] = True
+    if a.pre_kill:
+        row["recorded_by"] = "watchdog-pre-kill"
+    if wedge:
+        row["wedge"] = {k: wedge.get(k) for k in ("by", "consecutive_failures", "ts")}
     if planned:
         row["planned_by"] = (marker or {}).get("by") or "systemctl"
         row["planned_reason"] = (marker or {}).get("reason")
@@ -173,6 +312,12 @@ def main():
     if not a.drill:
         with open(LEDGER, "a") as f:
             f.write(json.dumps(row) + "\n")
+        if a.pre_kill:
+            try:
+                json.dump({"t": time.time(), "ts": row["ts"], "sig": sig}, open(f"{BASE}/recorded-fault.json", "w"))
+            except Exception:  # noqa: BLE001
+                pass
+        emit_event(row, a)
     if kind == "FAULT" and not a.no_vault:
         try:
             if not os.path.exists(VAULT_NOTE):
@@ -184,7 +329,7 @@ def main():
                 f.write(line)
         except Exception:  # noqa: BLE001
             pass
-    if kind == "FAULT" and (not a.at or a.drill):
+    if kind == "FAULT" and (not a.at or a.drill) and not a.reconciled:
         handoff_to_halo(row, sig, detail, shape, live, inc, drill=a.drill)
     print(json.dumps(row))
 

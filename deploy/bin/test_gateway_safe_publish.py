@@ -80,7 +80,7 @@ class SafePublish(unittest.TestCase):
              patch.object(pub, "_wait_empty") as wait:
             pub._fence_failed_release("token", 10)
             http.assert_any_call("/gateway/drain", "POST", {
-                "ttl_s": 1800, "reason": "governed gateway rollback"}, "token")
+                "ttl_s": 1800, "reason": "governed gateway rollback", "by": pub._BY}, "token")
             wait.assert_called_once_with("token", 10)
 
 

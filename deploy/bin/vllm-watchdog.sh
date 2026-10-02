@@ -62,6 +62,8 @@ MODEL="${WATCHDOG_MODEL:-$(curl -s -m 5 "$ENDPOINT_URL/v1/models" 2>/dev/null | 
 MODELS_TIMEOUT="${WATCHDOG_MODELS_TIMEOUT:-5}"       # seconds, GET /v1/models budget
 GEN_TIMEOUT="${WATCHDOG_GEN_TIMEOUT:-20}"            # seconds, hard timeout for the generation probe
 CONSEC_FAIL_THRESHOLD="${WATCHDOG_CONSEC_FAIL_THRESHOLD:-5}"   # consecutive gen failures required
+XID_FAST_THRESHOLD="${WATCHDOG_XID_FAST_THRESHOLD:-2}"   # RS: consecutive gen failures required when a kernel Xid corroborates
+XID_WINDOW_MIN="${WATCHDOG_XID_WINDOW_MIN:-8}"           # RS: how recent the Xid must be
 COOLDOWN_SEC="${WATCHDOG_COOLDOWN_SEC:-1800}"        # 30 min minimum between automated restarts
 MAX_RESTARTS_PER_HOUR="${WATCHDOG_MAX_RESTARTS_PER_HOUR:-2}"
 SERVICE="${WATCHDOG_SERVICE:-vllm-qwen27b.service}"
@@ -209,8 +211,18 @@ new_failures=$((prev_failures + 1))
 state_set_consecutive_failures "$new_failures"
 log "PROBE fail models=${models_code}(${models_time}s) gen=${gen_code}(${gen_time}s) -> generation-wedge signature, consecutive_failures=${new_failures}/${CONSEC_FAIL_THRESHOLD}"
 
-if [ "$new_failures" -lt "$CONSEC_FAIL_THRESHOLD" ]; then
-  log "DECISION below threshold (${new_failures}/${CONSEC_FAIL_THRESHOLD}), no action"
+# RS (2026-10-02): a kernel Xid (13/31/43/45/79) in the last XID_WINDOW_MIN minutes corroborates a generation failure: the
+# 10:34:40 and 12:00:30 CUDA faults each left a zombie engine (API up, workers dead) that sat out ALL 5 probes = 4 min 52 s of
+# full outage (local-only: nothing else can serve) before the kill. With an Xid on record the wedge is CONFIRMED by 2 probes
+# (still two consecutive failures, so a transient is not killed). The cooldown and restarts/hour rails below still apply.
+CONSEC_EFFECTIVE="$CONSEC_FAIL_THRESHOLD"
+xid_recent=$(journalctl -k --since "-${XID_WINDOW_MIN} min" --no-pager 2>/dev/null | grep -cE 'NVRM: Xid .*: (13|31|43|45|79),' || true)
+if [ "${xid_recent:-0}" -gt 0 ] && [ "$XID_FAST_THRESHOLD" -lt "$CONSEC_EFFECTIVE" ]; then
+  CONSEC_EFFECTIVE="$XID_FAST_THRESHOLD"
+  log "XID-CORROBORATED ${xid_recent} kernel Xid line(s) in the last ${XID_WINDOW_MIN} min -> wedge threshold ${CONSEC_EFFECTIVE} (instead of ${CONSEC_FAIL_THRESHOLD})"
+fi
+if [ "$new_failures" -lt "$CONSEC_EFFECTIVE" ]; then
+  log "DECISION below threshold (${new_failures}/${CONSEC_EFFECTIVE}), no action"
   exit 0
 fi
 
@@ -246,6 +258,13 @@ sudo -n systemctl reset-failed "$SERVICE" >> "$ACTION_LOG" 2>&1 || true
 # 2026-09-05 both sat out the full TimeoutStopSec=180 before systemd's SIGKILL). Kill the whole
 # control group up front so the restart starts immediately; the 180 s grace stays for operator
 # restarts, where a clean TP=2 teardown is worth waiting for.
+# EF2: tell the fault collector this death is a confirmed generation wedge (a FAULT for Halo, not a planned stop).
+printf '{"ts":"%s","by":"watchdog","wedge":true,"consecutive_failures":%s}\n' "$(date -Is)" "${new_failures}" > "$(dirname "$STATE_FILE")/wedge-restart.json" 2>/dev/null || true
+# RS (2026-10-02): record the death BEFORE killing. Two wedge kills (10:39, 12:05) never reached the fault ledger: the
+# ExecStopPost collector raced the `systemctl restart` issued 3 s after this kill and its record was lost. --pre-kill writes
+# ledger + incident dir + Halo hand-off now, with the journal still intact, and drops a dedupe marker so the later ExecStopPost
+# does not double-count. Bounded (timeout) and best-effort: a collector failure never delays recovery beyond the bound.
+timeout 60 /usr/bin/python3 "$(dirname "$STATE_FILE")/engine-fault-collector.py" --pre-kill >> "$ACTION_LOG" 2>&1 || true
 sudo -n systemctl kill -s KILL "$SERVICE" >> "$ACTION_LOG" 2>&1 || true
 sleep 3
 log "ACTION SIGKILL sent to ${SERVICE} control group (wedged engines never exit on SIGTERM); restarting now"

@@ -40,6 +40,9 @@ HALO_SUPERVISOR_LOCK = Path("/tmp/halo-incident-supervisor.lock")
 ESTATE_RUNTIME = Path("/home/kevin/.local/share/estate-overseer")
 
 
+_BY = (os.environ.get("PUBLISH_BY") or "gateway_safe_publish")[:60] + f" pid={os.getpid()}"
+
+
 def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -183,7 +186,7 @@ def _fence_failed_release(token: str, timeout_s: float) -> None:
     if current.get("draining"):
         raise RuntimeError("new gateway already has an unknown drain owner")
     opened = _http("/gateway/drain", "POST",
-                   {"ttl_s": 1800, "reason": "governed gateway rollback"}, token)
+                   {"ttl_s": 1800, "reason": "governed gateway rollback", "by": _BY}, token)
     if not opened.get("lease"):
         raise RuntimeError("new gateway did not grant a rollback drain lease")
     _wait_empty(token, timeout_s)
@@ -228,7 +231,7 @@ def publish(timeout_s: float = 1500, halo_wait_s: float = 1800) -> dict:
             raise RuntimeError("systemd stop timeout is shorter than accepted-call grace")
         backup = RUNTIME.with_name(f"{RUNTIME.name}.bak-{int(time.time())}-{os.getpid()}")
         _atomic_write(backup, previous)
-        opened = _http("/gateway/drain", "POST", {"ttl_s": 1800, "reason": "governed gateway publish"}, token)
+        opened = _http("/gateway/drain", "POST", {"ttl_s": 1800, "reason": "governed gateway publish", "by": _BY}, token)
         lease = opened["lease"]
         _wait_empty(token, timeout_s)
         # The minute scheduler and ten-second enforcer share this lock. Hold

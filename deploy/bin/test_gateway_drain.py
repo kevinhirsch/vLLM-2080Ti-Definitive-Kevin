@@ -2,6 +2,7 @@
 import asyncio
 import importlib.util
 import json
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -35,11 +36,13 @@ class DrainRequest:
 
 class Drain(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.old = (shim._DRAIN_UNTIL, shim._DRAIN_LEASE, shim._DRAIN_REASON)
-        shim._DRAIN_UNTIL, shim._DRAIN_LEASE, shim._DRAIN_REASON = 0.0, None, None
+        self.old = (shim._DRAIN_UNTIL, shim._DRAIN_LEASE, shim._DRAIN_REASON, shim._DRAIN_REC, shim._DRAIN_LEDGER)
+        shim._DRAIN_UNTIL, shim._DRAIN_LEASE, shim._DRAIN_REASON, shim._DRAIN_REC = 0.0, None, None, None
+        self._tmp = tempfile.mkdtemp()
+        shim._DRAIN_LEDGER = self._tmp + "/drains.jsonl"      # never write the production ledger from a test
 
     async def asyncTearDown(self):
-        shim._DRAIN_UNTIL, shim._DRAIN_LEASE, shim._DRAIN_REASON = self.old
+        shim._DRAIN_UNTIL, shim._DRAIN_LEASE, shim._DRAIN_REASON, shim._DRAIN_REC, shim._DRAIN_LEDGER = self.old
         shim._ACTIVE.clear()
 
     async def test_drain_preserves_an_accepted_call_and_refuses_new_work(self):
@@ -76,6 +79,37 @@ class Drain(unittest.IsolatedAsyncioTestCase):
             shim._DRAIN_UNTIL = time.time() - 1
             self.assertFalse(shim._draining())
             self.assertEqual((await shim.gateway_drain(DrainRequest("POST", {"ttl_s": 30}))).status, 200)
+
+    def _ledger(self):
+        return [json.loads(l) for l in open(shim._DRAIN_LEDGER)]
+
+    async def test_every_drain_is_one_durable_record_with_reason_holder_and_refusals(self):
+        with patch.object(shim, "_admin_ok", return_value=True), patch.object(shim, "_spend_settle"), patch.object(shim, "_telemetry_note_request"):
+            start = await shim.gateway_drain(DrainRequest("POST", {"ttl_s": 30, "reason": "engine planned restart: test", "by": "unit-test"}))
+            lease = json.loads(start.body)["lease"]
+            for _ in range(3):
+                r = await shim.handle_completions(Request())
+                self.assertEqual(r.status, 503)
+            self.assertIn("engine planned restart: test", json.loads(r.body)["error"]["message"])
+            self.assertLessEqual(int(r.headers["Retry-After"]), 30)
+            status = json.loads((await shim.gateway_drain(DrainRequest("GET"))).body)
+            self.assertEqual((status["by"], status["refused"]), ("unit-test", 3))
+            await shim.gateway_drain(DrainRequest("DELETE", {"lease": lease}))
+        rows = self._ledger()
+        self.assertEqual([r["event"] for r in rows], ["open", "close"])
+        self.assertEqual((rows[1]["how"], rows[1]["refused"], rows[1]["by"]), ("delete", 3, "unit-test"))
+        self.assertEqual(rows[1]["refused_by_client"], {"127.0.0.1": 3})
+
+    async def test_expired_lease_and_gateway_restart_both_close_the_record(self):
+        with patch.object(shim, "_admin_ok", return_value=True):
+            await shim.gateway_drain(DrainRequest("POST", {"ttl_s": 30, "reason": "x", "by": "t"}))
+            shim._DRAIN_UNTIL = time.time() - 1
+            await shim.gateway_drain(DrainRequest("GET"))           # lazy reap
+            self.assertEqual(self._ledger()[-1]["how"], "expired")
+            await shim.gateway_drain(DrainRequest("POST", {"ttl_s": 30, "reason": "y", "by": "t"}))
+            shim._DRAIN_REC = None                                  # the process holding the fence "died"
+            shim._drain_startup_recover()
+            self.assertEqual(self._ledger()[-1]["how"], "gateway-restart")
 
 
 if __name__ == "__main__":
