@@ -10,6 +10,8 @@
 # ruff: noqa: E501
 
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -20,6 +22,7 @@ from .utils import FLA_CHUNK_SIZE, check_shared_mem, is_nvidia_hopper
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
+_GDN_PIN_SM75 = os.environ.get("VLLM_GDN_TRITON_PIN_SM75", "1") != "0"
 
 
 @triton.heuristics(
@@ -29,13 +32,23 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in BKV_LIST
-        for BV in BKV_LIST
-        for num_warps in NUM_WARPS
-        for num_stages in [2, 3, 4]
-    ],
+    # [FORK] weicj#107 (autotune-pin portion): autotune key lacks T so the warmup
+    # (T=64) false optimum is reused for all shapes; micro-benchmark optimum on
+    # sm_75 (44 KB shared memory is safe) is BK32/BV64/w4. VLLM_GDN_TRITON_PIN_SM75=0
+    # restores the upstream autotune set.
+    configs=(
+        [triton.Config({"BK": 32, "BV": 64}, num_warps=4, num_stages=2)]
+        if _GDN_PIN_SM75
+        else [
+            triton.Config(
+                {"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages
+            )
+            for BK in BKV_LIST
+            for BV in BKV_LIST
+            for num_warps in NUM_WARPS
+            for num_stages in [2, 3, 4]
+        ]
+    ),
     key=["H", "K", "V", "BT"],
 )
 @triton.jit(do_not_specialize=["T"])

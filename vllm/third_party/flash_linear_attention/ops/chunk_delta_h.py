@@ -8,6 +8,8 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -17,6 +19,7 @@ from .op import exp, exp2
 from .utils import FLA_CHUNK_SIZE, use_cuda_graph
 
 NUM_WARPS = [2, 4, 8, 16]
+_GDN_PIN_SM75 = os.environ.get("VLLM_GDN_TRITON_PIN_SM75", "1") != "0"
 # Triton's AMD backend fails to lower this kernel with num_stages=4.
 _CHUNK_DELTA_H_NUM_STAGES = [2, 3] if torch.version.hip else [2, 3, 4]
 
@@ -32,12 +35,21 @@ _CHUNK_DELTA_H_NUM_STAGES = [2, 3] if torch.version.hip else [2, 3, 4]
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in _CHUNK_DELTA_H_NUM_STAGES
-        for BV in [32, 64]
-    ],
+    # [FORK] weicj#107 (autotune-pin portion): the autotune key lacks T, so the
+    # false optimum found during warmup (T=64) is reused for every shape.
+    # 2026-08-16 2080 Ti micro-benchmark: BV32/w4 is optimal across all shapes
+    # (32K: 112 ms vs 145 ms for BV32/w2). VLLM_GDN_TRITON_PIN_SM75=0 restores the
+    # upstream autotune set.
+    configs=(
+        [triton.Config({"BV": 32}, num_warps=4, num_stages=2)]
+        if _GDN_PIN_SM75
+        else [
+            triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
+            for num_warps in [2, 4]
+            for num_stages in _CHUNK_DELTA_H_NUM_STAGES
+            for BV in [32, 64]
+        ]
+    ),
     key=["H", "K", "V", "BT"],
     use_cuda_graph=use_cuda_graph,
 )
