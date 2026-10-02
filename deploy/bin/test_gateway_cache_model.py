@@ -91,6 +91,7 @@ class Base(unittest.TestCase):
     def serve_local(self, body, est=None):
         p = self.predict(body, est)
         shim._pm_commit(p["chain"])
+        shim._pm_ready(p["chain"])             # first token produced -> the prefix is in the engine cache
         return p
 
 
@@ -120,6 +121,13 @@ class Model(Base):
         for tag in ("A", "B", "C"):
             p = self.predict(convo(tag, 21))
             self.assertGreater(p["credit"], 0, tag)
+
+    def test_a_prefix_still_being_prefilled_is_not_yet_a_hit(self):
+        p = self.predict(convo("A", 20))
+        shim._pm_commit(p["chain"])                                # claimed, no first token yet
+        self.assertEqual(self.predict(convo("A", 21))["credit"], 0)
+        shim._pm_ready(p["chain"])
+        self.assertGreater(self.predict(convo("A", 21))["credit"], 0)
 
     def test_requests_served_remote_do_not_warm_the_local_cache(self):
         self.predict(convo("A", 20))                               # routed remote: never committed
@@ -153,6 +161,7 @@ class Model(Base):
         b = convo("A", 20)
         p = self.predict(b)
         shim._pm_commit(p["chain"], now=1000.0)
+        shim._pm_ready(p["chain"], now=1000.0)
         self.assertGreater(shim._pm_predict(convo("A", 21), 20000, now=1000.0 + 899)["credit"], 0)
         self.assertEqual(shim._pm_predict(convo("A", 21), 20000, now=1000.0 + 901)["credit"], 0)
 
@@ -276,6 +285,8 @@ class Routing(Base, unittest.IsolatedAsyncioTestCase):
 
         async def relay(request, base, path, body, key, streaming, *a, **k):
             self.calls.append("local" if base == shim.LOCAL else "remote")
+            if base == shim.LOCAL:               # the real relay marks the prefix cached at first token
+                shim._pm_ready((shim._PM_INFLIGHT.get(id(request)) or {}).get("chain") or [])
             return "ok", "local"
 
         async def forward_remote(request, path, body, streaming, endpoint=None):

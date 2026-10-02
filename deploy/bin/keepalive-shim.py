@@ -3555,7 +3555,7 @@ def _is_prefix_of(prev_hashes, this_hashes):
 
 
 # ---------------- CACHE-AWARE PREFILL COST MODEL (see PREFIX_ALIGN_TOKENS) ----------------
-_PM_NODES = collections.OrderedDict()      # rolling chain key -> last-touch epoch seconds
+_PM_NODES = collections.OrderedDict()      # rolling chain key -> [committed_at, ready_at|None]
 _PM_STATS = collections.Counter()
 _PM_PAIRS = collections.deque(maxlen=500)  # (predicted_credit, actual_cached, ptok) for local requests
 _PM_INFLIGHT = {}                          # id(request) -> prediction dict (chain etc.) until the request ends
@@ -3604,10 +3604,12 @@ def _pm_predict(body, est_tokens, now=None):
     est = max(1, int(est_tokens or 0))
     best, age = -1, None
     for i, (k, _) in enumerate(chain):
-        t = _PM_NODES.get(k)
-        if t is None or now - t > PREFIX_MODEL_TTL_SECS:
+        node = _PM_NODES.get(k)
+        # A node counts only once the request that wrote it has produced its FIRST TOKEN (its
+        # prefill is done and the blocks are in the cache); a still-prefilling prefix is a miss.
+        if node is None or node[1] is None or now - node[1] > PREFIX_MODEL_TTL_SECS:
             break
-        best, age = i, now - t
+        best, age = i, now - node[1]
     credit = 0
     if best >= 0 and total > 0:
         # chars->tokens is not uniform (tool-schema JSON vs prose), so the matched fraction is an
@@ -3646,10 +3648,20 @@ def _pm_commit(chain, now=None):
         return
     now = time.time() if now is None else now
     for k, _ in reversed(chain):
-        _PM_NODES[k] = now
+        node = _PM_NODES.get(k)
+        _PM_NODES[k] = [now, node[1] if node else None]
         _PM_NODES.move_to_end(k)
     while len(_PM_NODES) > max(1000, PREFIX_MODEL_MAX_NODES):
         _PM_NODES.popitem(last=False)
+
+
+def _pm_ready(chain, now=None):
+    """The committing request produced its first token: its prefix is now in the engine's cache."""
+    now = time.time() if now is None else now
+    for k, _ in chain:
+        node = _PM_NODES.get(k)
+        if node is not None:
+            node[1] = now
 
 
 def _pm_reset(reason):
@@ -4616,6 +4628,8 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
     # (c) for why this is the right spot and why non-streaming has no equivalent insertion point.
     if _t_first[0] is not None:
         _active_set(request, ttft=round(_t_first[0] - t_relay_start, 3))
+        if not _is_remote_relay:
+            _pm_ready((_PM_INFLIGHT.get(id(request)) or {}).get("chain") or [])
     _scan_usage(buf)   # TELEMETRY: covers the (common, for short responses) case where the whole
                         # stream -- usage trailer included -- already arrived within the gate
     _scan_content_shape(buf)
@@ -5077,12 +5091,22 @@ async def _route_completions(request, _no_overflow=False):
             f"prompt estimate {ptok} exceeds every configured provider context ({provider_ceiling}); "
             "rotate or compact the client session before retrying",
             "type": "context_length_exceeded", "code": "prompt_exceeds_all_providers"}}, status=413)
+    try:
+        maxtok = int(json.loads(body).get("max_tokens") or 0)
+    except Exception:
+        maxtok = 0
+    ev = dict(ptok=ptok, maxtok=maxtok, stream=streaming)
+    tiny = is_tiny(body)
+    background = is_background(body, request)
+    halo_control = _halo_control_request(request, body)
     # gw-admission-computed-token-cost: predicted UNCONDITIONALLY (not gated on
     # USE_COMPUTED_COST, which only decides whether admission COST uses this number) so the
     # card's own accuracy gate has real predicted-vs-actual data to grade from the moment this
     # deploys, before that switch is ever flipped on. Observe must run AFTER predict, against
     # the prefix state predict just read -- a miss this turn still becomes next turn's hit.
-    _pm = _pm_predict(body, ptok)
+    # Key the model on the body the ENGINE will actually see (think-guard / no-think policy /
+    # alias rewrite change the rendered prefix), not the body the client sent.
+    _pm = _pm_predict(_prepare_local_body(request, body, background), ptok)
     est_computed = _pm["computed"]
     units = estimate_units(body, client=client, computed=est_computed)
     # The chain holds raw digests (not JSON-serialisable), so it lives in a side table keyed by the
@@ -5094,14 +5118,6 @@ async def _route_completions(request, _no_overflow=False):
     # What the routing guards below treat as this request's "size": the predicted UNCACHED prefill
     # when the cache-aware cost model is on, else the raw prompt (previous behaviour, byte for byte).
     _cost_tokens = est_computed if USE_COMPUTED_COST else ptok
-    try:
-        maxtok = int(json.loads(body).get("max_tokens") or 0)
-    except Exception:
-        maxtok = 0
-    ev = dict(ptok=ptok, maxtok=maxtok, stream=streaming)
-    tiny = is_tiny(body)
-    background = is_background(body, request)
-    halo_control = _halo_control_request(request, body)
     alias = _alias_for_request(body)
     alias_kind = alias.get("kind")
     alias_local_only = alias_kind == "builtin-local"
