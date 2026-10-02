@@ -303,6 +303,15 @@ class Deadlines(Base):
             with patch.object(shim, "FLOW_MODE", "off"):
                 self.assertIsNone(shim.flow_admission_check(late, False))
 
+    def test_declared_deadline_is_total_patience_so_service_time_counts(self):
+        for _ in range(8):
+            shim._FLOW_SERVICE.append((time.time(), "background", 30.0))           # this class typically takes 30 s end to end
+        undeclared = self.ticket("background", prefix_parts=(("u", 100),), est=1000, computed=1000, deadline_s=40)
+        self.assertIsNone(shim.flow_admission_check(undeclared, False))            # a 'start within 40 s' default: starts at once
+        declared = self.ticket("background", prefix_parts=(("d", 100),), est=1000, computed=1000, deadline_s=20)
+        declared.declared = True
+        self.assertIsNotNone(shim.flow_admission_check(declared, False))           # 'I will wait 20 s for the answer' < 30 s service
+
     def test_caller_declared_deadline_overrides_the_class_default(self):
         req = Request("overseer-x", headers={"X-Gateway-Deadline-S": "42"})
         t = shim.flow_make_ticket(req, req.body, "background", pm_for((("a", 10),), 1000, 1000), 1000, 1, lambda: True)
@@ -314,6 +323,17 @@ class Deadlines(Base):
         self.assertAlmostEqual(t.deadline_at - time.time(), 600, delta=1)
         t = shim.flow_make_ticket(req, req.body, "kevin", pm_for((("a", 10),), 1000, 1000), 1000, 1, lambda: True)
         self.assertIsNone(t.deadline_at)
+
+
+class FailOpen(Base):
+    def test_a_broken_flow_hook_serves_with_legacy_admission(self):
+        t = self.ticket("background")
+        with patch.object(shim, "flow_pick", side_effect=RuntimeError("boom")):
+            self.assertTrue(shim.flow_turn(t))                                      # admit, as before CF
+        self.assertEqual(shim._FLOW_STATS["failopen_flow_turn"], 1)
+        with patch.object(shim, "flow_expected_wait", side_effect=KeyError("x")):
+            self.assertIsNone(shim.flow_admission_check(t, False))                  # no refusal
+        shim.flow_note_arrival("not-a-class-but-harmless", 1, 1)                    # bookkeeping never raises into a request
 
 
 class Facts(Base):

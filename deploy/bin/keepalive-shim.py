@@ -3410,6 +3410,29 @@ class FlowTicket:
         self.expected_wait_s, self.adjacent, self.held = None, False, ""
 
 
+_FLOW_ERR = {"n": 0, "last": 0.0}
+
+
+def _flow_failopen(default):
+    """CF can never take the gateway down: any exception inside a flow hook is logged (rate-limited) and counted, and
+    the hook answers `default` -- which is always the legacy behaviour (admit / no refusal / no-op)."""
+    def deco(fn):
+        def wrapper(*a, **k):
+            try:
+                return fn(*a, **k)
+            except Exception as e:          # noqa: BLE001
+                _FLOW_ERR["n"] += 1
+                _FLOW_STATS["failopen_" + fn.__name__] += 1
+                if time.time() - _FLOW_ERR["last"] > 60:
+                    _FLOW_ERR["last"] = time.time()
+                    log.exception("flow hook %s failed (%d so far); serving with legacy admission: %s", fn.__name__, _FLOW_ERR["n"], e)
+                return default
+        wrapper.__name__ = fn.__name__
+        wrapper.__doc__ = fn.__doc__
+        return wrapper
+    return deco
+
+
 def flow_prefill_tps():
     """Measured uncached-prefill rate (tok/s): median over recent samples in which the engine had a queue
     (so it was working at capacity), else the configured PREFILL_TPS."""
@@ -3542,10 +3565,12 @@ def flow_make_ticket(request, body, cls, pm, ptok, units, fits):
                       id(request), cost_s)
 
 
+@_flow_failopen(None)
 def flow_note_arrival(cls, ptok, est_computed):
     _FLOW_DEMAND.append((time.time(), cls, int(ptok or 0), int(est_computed or 0)))
 
 
+@_flow_failopen(None)
 def flow_enqueue(t):
     _FLOW["seq"] += 1
     t.seq = _FLOW["seq"]
@@ -3558,6 +3583,7 @@ def flow_enqueue(t):
     _flow_bump()
 
 
+@_flow_failopen(None)
 def flow_dequeue(t):
     try:
         _FLOW["waiters"].remove(t)
@@ -3649,6 +3675,7 @@ def flow_pick(now=None):
     return pick
 
 
+@_flow_failopen(True)
 def flow_turn(t):
     """May t take the engine place now? True whenever flow is off; in shadow mode counts what enforce would hold."""
     if FLOW_MODE == "off":
@@ -3661,6 +3688,7 @@ def flow_turn(t):
     return head is t
 
 
+@_flow_failopen(None)
 def flow_on_admit(t, request=None):
     """t just claimed its place: advance fair-queuing time, remember the prefix, start the prefill watch."""
     now = time.time()
@@ -3687,11 +3715,13 @@ def flow_on_admit(t, request=None):
     _flow_bump()
 
 
+@_flow_failopen(None)
 def flow_prefill_done(rid):
     if _FLOW["prefilling"].pop(rid, None) is not None:
         _flow_bump()
 
 
+@_flow_failopen(None)
 def flow_note_cache(info):
     """Grade the cache outcome of back-to-back same-prefix requests against all others."""
     try:
@@ -3706,6 +3736,7 @@ def flow_note_cache(info):
         pass
 
 
+@_flow_failopen(None)
 def flow_note_service(cls, duration_s):
     if duration_s and duration_s > 0:
         _FLOW_SERVICE.append((time.time(), cls or "kevin", float(duration_s)))
@@ -3733,6 +3764,14 @@ def flow_expected_wait(cls, cost_s=0.0, lane_limit=None, units=1, exclude=None):
     return round(max(prefill_term, lane_term), 1)
 
 
+def _flow_class_service_p50(cls, default=30.0):
+    v = sorted(d for _, c, d in list(_FLOW_SERVICE)[-200:] if c == cls)
+    if len(v) < 5:
+        v = sorted(d for _, _, d in list(_FLOW_SERVICE)[-200:])
+    return v[len(v) // 2] if v else default
+
+
+@_flow_failopen(None)
 def flow_admission_check(t, remote_can_take):
     """Deadline-aware admission. Returns None (go on) or a dict describing the refusal. Only refusable classes
     that cannot START before their deadline are refused, and only when remote cannot absorb them."""
@@ -3740,7 +3779,9 @@ def flow_admission_check(t, remote_can_take):
     if FLOW_MODE == "off" or t.cls not in FLOW_REFUSABLE or t.deadline_at is None:
         return None
     budget_s = t.deadline_at - time.time()
-    need = t.expected_wait_s + t.cost_s
+    # A deadline the CALLER declared (X-Gateway-Deadline-S) is its total patience for the answer, so the typical
+    # service time of its class (prefill + decode, measured) must fit as well; a class default is a start deadline.
+    need = t.expected_wait_s + (max(t.cost_s, _flow_class_service_p50(t.cls)) if t.declared else t.cost_s)
     if need <= budget_s:
         return None
     if FLOW_MODE == "shadow":
@@ -3856,6 +3897,7 @@ _FLOW_ROUTES = collections.deque(maxlen=30000)       # (t, decision, reason, cla
 _FLOW_EXPLICIT = frozenset({"alias", "intent", "forced", "local-down", "local-offline", "failover", "full-local-remote-alias"})
 
 
+@_flow_failopen(None)
 def flow_note_route(decision, reason, request):
     """Remote-as-a-valve accounting (Kevin 10-02: remote is for abnormal spikes, never the normal path)."""
     try:
