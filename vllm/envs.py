@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     # changing acceptance lengths can alter recurrent-state update topology.
     VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH: bool = False
     VLLM_CUSTOM_ALLREDUCE_MAX_SIZE_MB: int = 0
+    VLLM_ROPE_MAX_POSITION: int = 0
     VLLM_TURBOQUANT_DECODE_BLOCK_KV: int = 2
     VLLM_TURBOQUANT_MAX_KV_SPLITS: int | None = None
     VLLM_TURBOQUANT_SPEC_CONTINUATION_DECODE_FASTPATH: bool = False
@@ -899,6 +900,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ).lower(),
     # Fork (EXP-040): raise the custom-allreduce size cap above the 8 MiB default
     # (0 = keep default). 32 routes chunked-prefill allreduces off NCCL.
+    # Fork (EXP-017): size the rope cos/sin cache past the native window (0 = off).
+    "VLLM_ROPE_MAX_POSITION": lambda: int(os.getenv("VLLM_ROPE_MAX_POSITION") or 0),
     "VLLM_CUSTOM_ALLREDUCE_MAX_SIZE_MB": lambda: int(
         os.getenv("VLLM_CUSTOM_ALLREDUCE_MAX_SIZE_MB", "0")
     ),

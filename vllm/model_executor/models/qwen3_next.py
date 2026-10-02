@@ -6,6 +6,8 @@ from collections.abc import Iterable
 from itertools import islice
 
 import torch
+
+from vllm import envs
 from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
@@ -326,7 +328,8 @@ class Qwen3NextAttention(nn.Module):
 
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
-            max_position=config.max_position_embeddings,
+            # [FORK] EXP-017: VLLM_ROPE_MAX_POSITION sizes the rope cache past native.
+            max_position=(envs.VLLM_ROPE_MAX_POSITION or config.max_position_embeddings),
             rope_parameters=config.rope_parameters,
             dual_chunk_attention_config=self.dual_chunk_attention_config,
         )
