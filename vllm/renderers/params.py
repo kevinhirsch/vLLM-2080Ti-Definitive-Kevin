@@ -239,14 +239,22 @@ class TokenizeParams:
             and max_total_tokens is not None
             and max_output_tokens > max_total_tokens
         ):
-            raise VLLMValidationError(
-                f"{self.max_output_tokens_param}={max_output_tokens} "
-                f"cannot be greater than "
-                f"{self.max_total_tokens_param}={max_total_tokens=}. "
-                f"Please request fewer output tokens.",
-                parameter=self.max_output_tokens_param,
-                value=max_output_tokens,
+            # [local 2080ti fork] Be lenient instead of rejecting: clients
+            # that over-declare their output budget (e.g. codex declaring
+            # the model's full 128k window) would otherwise hard-fail every
+            # request. Clamp the budget down to the context window; the
+            # length checks below clamp it further to the actual remaining
+            # context once the prompt length is known.
+            logger.warning(
+                "Clamping %s=%d down to %d (max_model_len) instead of "
+                "rejecting the request.",
+                self.max_output_tokens_param,
+                max_output_tokens,
+                max_total_tokens,
             )
+            object.__setattr__(self, "max_output_tokens", max_total_tokens)
+            max_output_tokens = max_total_tokens
+            max_input_tokens = self.max_input_tokens
 
         if (
             max_input_tokens is not None
@@ -499,6 +507,25 @@ class TokenizeParams:
 
         if len(tokens) > max_input_tokens:
             token_count = len(tokens)
+            # [local 2080ti fork] Be lenient instead of rejecting: if the
+            # prompt does not fit alongside the declared output budget but
+            # still leaves room for at least one output token, clamp the
+            # budget to the remaining context instead of failing the
+            # request (same tolerance the chat path gets for sane budgets).
+            if (
+                self.max_total_tokens is not None
+                and self.max_total_tokens - token_count > 0
+            ):
+                logger.warning(
+                    "Prompt uses %d tokens, leaving only %d for output; "
+                    "clamping the declared output budget (%s=%s) to the "
+                    "remaining window instead of rejecting the request.",
+                    token_count,
+                    self.max_total_tokens - token_count,
+                    self.max_output_tokens_param,
+                    self.max_output_tokens,
+                )
+                return tokens
             # The tokenizer may have truncated the prompt to
             # max_input_tokens + 1 (see get_encode_kwargs), so the
             # actual prompt length could be larger.
