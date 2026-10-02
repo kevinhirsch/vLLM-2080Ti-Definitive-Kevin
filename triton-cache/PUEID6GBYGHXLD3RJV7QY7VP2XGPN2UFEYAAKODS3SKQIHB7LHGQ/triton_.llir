@@ -1,0 +1,75 @@
+; ModuleID = 'LLVMDialectModule'
+source_filename = "LLVMDialectModule"
+target datalayout = "e-p3:32:32-p4:32:32-p5:32:32-p6:32:32-p7:32:32-i64:64-i128:128-i256:256-v16:16-v32:32-n16:32:64"
+
+; Function Attrs: nounwind
+define ptx_kernel void @triton_(ptr addrspace(1) %0, ptr addrspace(1) %1, i64 %2, i32 %3, ptr addrspace(1) readnone captures(none) %4, ptr addrspace(1) readnone captures(none) %5) local_unnamed_addr #0 !dbg !4 {
+  %7 = tail call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x(), !dbg !13
+  %8 = shl i32 %7, 7, !dbg !14
+  %9 = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x(), !dbg !15
+  %10 = and i32 %9, 127, !dbg !15
+  %11 = or disjoint i32 %8, %10, !dbg !16
+  %12 = icmp slt i32 %11, %3, !dbg !17
+  %13 = sext i32 %11 to i64, !dbg !18
+  %14 = getelementptr float, ptr addrspace(1) %0, i64 %13, !dbg !18
+  %15 = tail call i32 asm sideeffect "mov.u32 $0, 0x0;\0A\09@$2 ld.global.b32 { $0 }, [ $1 + 0 ];", "=r,l,b"(ptr addrspace(1) %14, i1 %12) #2, !dbg !19
+  %16 = bitcast i32 %15 to float, !dbg !19
+  %17 = getelementptr float, ptr addrspace(1) %0, i64 %2, !dbg !20
+  %18 = getelementptr float, ptr addrspace(1) %17, i64 %13, !dbg !20
+  %19 = tail call i32 asm sideeffect "mov.u32 $0, 0x0;\0A\09@$2 ld.global.b32 { $0 }, [ $1 + 0 ];", "=r,l,b"(ptr addrspace(1) %18, i1 %12) #2, !dbg !21
+  %20 = bitcast i32 %19 to float, !dbg !21
+  %21 = fcmp ogt float %16, %20, !dbg !22
+  %22 = fcmp uno float %16, 0.000000e+00, !dbg !27
+  %23 = or i1 %22, %21, !dbg !28
+  %24 = getelementptr float, ptr addrspace(1) %1, i64 %13, !dbg !29
+  %25 = select i1 %23, i32 %15, i32 %19, !dbg !30
+  tail call void asm sideeffect "@$2 st.global.b32 [ $1 + 0 ], { $0 };", "r,l,b"(i32 %25, ptr addrspace(1) %24, i1 %12) #2, !dbg !31
+  ret void, !dbg !32
+}
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 2147483647) i32 @llvm.nvvm.read.ptx.sreg.ctaid.x() #1
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 1024) i32 @llvm.nvvm.read.ptx.sreg.tid.x() #1
+
+attributes #0 = { nounwind "nvvm.reqntid"="128" }
+attributes #1 = { mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+attributes #2 = { nounwind }
+
+!llvm.dbg.cu = !{!0}
+!llvm.module.flags = !{!2, !3}
+
+!0 = distinct !DICompileUnit(language: DW_LANG_C, file: !1, producer: "triton", isOptimized: true, runtimeVersion: 0, emissionKind: LineTablesOnly)
+!1 = !DIFile(filename: "cdtfkftqmw5rhkcpa6r77vycjru4sfveih7otfc4rr5vuhxbdioh.py", directory: "/home/kevin/.cache/vllm/torch_compile_cache/torch_aot_compile/5fbe226df49eb4fa8929b36256b4d2b739ba45b18bb6104e20abfe67d618642a/inductor_cache/dt")
+!2 = !{i32 2, !"Debug Info Version", i32 3}
+!3 = !{i32 4, !"nvvm-reflect-ftz", i32 1}
+!4 = distinct !DISubprogram(name: "triton_", linkageName: "triton_", scope: !1, file: !1, line: 22, type: !5, scopeLine: 22, spFlags: DISPFlagDefinition | DISPFlagOptimized, unit: !0)
+!5 = !DISubroutineType(cc: DW_CC_normal, types: !6)
+!6 = !{null, !7, !7, !9, !10, !11, !11}
+!7 = !DIDerivedType(tag: DW_TAG_pointer_type, name: "pointer", baseType: !8, size: 64, dwarfAddressSpace: 1)
+!8 = !DIBasicType(name: "float", size: 32, encoding: DW_ATE_float)
+!9 = !DIBasicType(name: "int", size: 64, encoding: DW_ATE_signed)
+!10 = !DIBasicType(name: "int", size: 32, encoding: DW_ATE_signed)
+!11 = !DIDerivedType(tag: DW_TAG_pointer_type, name: "pointer", baseType: !12, size: 64, dwarfAddressSpace: 1)
+!12 = !DIBasicType(name: "unknown_type", encoding: DW_ATE_signed)
+!13 = !DILocation(line: 23, column: 28, scope: !4)
+!14 = !DILocation(line: 23, column: 33, scope: !4)
+!15 = !DILocation(line: 24, column: 36, scope: !4)
+!16 = !DILocation(line: 24, column: 23, scope: !4)
+!17 = !DILocation(line: 25, column: 21, scope: !4)
+!18 = !DILocation(line: 27, column: 30, scope: !4)
+!19 = !DILocation(line: 27, column: 35, scope: !4)
+!20 = !DILocation(line: 28, column: 30, scope: !4)
+!21 = !DILocation(line: 28, column: 41, scope: !4)
+!22 = !DILocation(line: 169, column: 15, scope: !23, inlinedAt: !25)
+!23 = distinct !DILexicalBlockFile(scope: !4, file: !24, discriminator: 0)
+!24 = !DIFile(filename: "triton_helpers.py", directory: "/home/kevin/Desktop/wt-integrate/.venv/lib/python3.12/site-packages/torch/_inductor/runtime")
+!25 = !DILocation(line: 29, column: 40, scope: !26)
+!26 = distinct !DILexicalBlockFile(scope: !4, file: !1, discriminator: 0)
+!27 = !DILocation(line: 171, column: 21, scope: !23, inlinedAt: !25)
+!28 = !DILocation(line: 171, column: 16, scope: !23, inlinedAt: !25)
+!29 = !DILocation(line: 30, column: 25, scope: !4)
+!30 = !DILocation(line: 172, column: 29, scope: !23, inlinedAt: !25)
+!31 = !DILocation(line: 30, column: 36, scope: !4)
+!32 = !DILocation(line: 30, column: 4, scope: !4)

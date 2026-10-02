@@ -1,0 +1,116 @@
+; ModuleID = 'LLVMDialectModule'
+source_filename = "LLVMDialectModule"
+target datalayout = "e-p3:32:32-p4:32:32-p5:32:32-p6:32:32-p7:32:32-i64:64-i128:128-i256:256-v16:16-v32:32-n16:32:64"
+
+@assertFunc_0 = internal constant [8 x i8] c"unknown\00"
+@assertFile_0 = internal constant [201 x i8] c"/home/kevin/.cache/vllm/torch_compile_cache/torch_aot_compile/55291d2d55f689e31e881b556a8b92c12602c599a388439b7a2a80a2d2a8cc9b/inductor_cache/57/c5753pyqwkgwsvric2pyhjfuhzytgtcxd7deeb6at5j6f6pe5uwa.py\00"
+@assertMessage_0 = internal constant [40 x i8] c"index out of bounds: 0 <= tmp4 < 248320\00"
+
+; Function Attrs: noreturn
+declare !dbg !5 void @__assertfail(ptr, ptr, i32, ptr, i64) local_unnamed_addr #0
+
+define ptx_kernel void @triton_poi_fused_index_1(ptr addrspace(1) %0, ptr addrspace(1) %1, ptr addrspace(1) %2, i32 %3, ptr addrspace(1) readnone captures(none) %4, ptr addrspace(1) readnone captures(none) %5) local_unnamed_addr #1 !dbg !13 {
+  %7 = tail call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x(), !dbg !20
+  %8 = shl i32 %7, 10, !dbg !21
+  %9 = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x(), !dbg !22
+  %10 = shl nuw nsw i32 %9, 3, !dbg !22
+  %11 = and i32 %10, 1016, !dbg !22
+  %12 = or disjoint i32 %11, %8, !dbg !23
+  %13 = sdiv i32 %12, 256, !dbg !24
+  %14 = sext i32 %13 to i64, !dbg !25
+  %15 = getelementptr i64, ptr addrspace(1) %0, i64 %14, !dbg !25
+  %16 = tail call i64 asm sideeffect "mov.u64 $0, 0x0;\0A\09ld.global.L1::evict_last.b64 { $0 }, [ $1 + 0 ];", "=l,l"(ptr addrspace(1) %15) #4, !dbg !26
+  %17 = tail call i64 asm sideeffect "mov.u64 $0, 0x0;\0A\09ld.global.L1::evict_last.b64 { $0 }, [ $1 + 0 ];", "=l,l"(ptr addrspace(1) %15) #4, !dbg !26
+  %18 = tail call i64 asm sideeffect "mov.u64 $0, 0x0;\0A\09ld.global.L1::evict_last.b64 { $0 }, [ $1 + 0 ];", "=l,l"(ptr addrspace(1) %15) #4, !dbg !26
+  %19 = tail call i64 asm sideeffect "mov.u64 $0, 0x0;\0A\09ld.global.L1::evict_last.b64 { $0 }, [ $1 + 0 ];", "=l,l"(ptr addrspace(1) %15) #4, !dbg !26
+  %20 = tail call i64 asm sideeffect "mov.u64 $0, 0x0;\0A\09ld.global.L1::evict_last.b64 { $0 }, [ $1 + 0 ];", "=l,l"(ptr addrspace(1) %15) #4, !dbg !26
+  %21 = tail call i64 asm sideeffect "mov.u64 $0, 0x0;\0A\09ld.global.L1::evict_last.b64 { $0 }, [ $1 + 0 ];", "=l,l"(ptr addrspace(1) %15) #4, !dbg !26
+  %22 = tail call i64 asm sideeffect "mov.u64 $0, 0x0;\0A\09ld.global.L1::evict_last.b64 { $0 }, [ $1 + 0 ];", "=l,l"(ptr addrspace(1) %15) #4, !dbg !26
+  %23 = tail call i64 asm sideeffect "mov.u64 $0, 0x0;\0A\09ld.global.L1::evict_last.b64 { $0 }, [ $1 + 0 ];", "=l,l"(ptr addrspace(1) %15) #4, !dbg !26
+  %24 = add i64 %16, 248320, !dbg !27
+  %25 = icmp slt i64 %16, 0, !dbg !28
+  %26 = select i1 %25, i64 %24, i64 %16, !dbg !29
+  %27 = icmp ugt i64 %26, 248319, !dbg !30
+  br i1 %27, label %28, label %29, !dbg !31
+
+28:                                               ; preds = %6
+  tail call void @__assertfail(ptr nonnull @assertMessage_0, ptr nonnull @assertFile_0, i32 30, ptr nonnull @assertFunc_0, i64 1), !dbg !31
+  unreachable, !dbg !31
+
+29:                                               ; preds = %6
+  %30 = mul i32 %13, 256, !dbg !32
+  %.decomposed = sub i32 %12, %30, !dbg !32
+  tail call void @llvm.nvvm.barrier.cta.sync.aligned.all(i32 0), !dbg !31
+  %31 = sext i32 %.decomposed to i64, !dbg !33
+  %.idx = shl nuw nsw i64 %26, 9, !dbg !34
+  %32 = getelementptr i8, ptr addrspace(1) %1, i64 %.idx, !dbg !34
+  %33 = getelementptr half, ptr addrspace(1) %32, i64 %31, !dbg !34
+  %34 = tail call { i32, i32, i32, i32 } asm sideeffect "mov.u32 $0, 0x0;\0A\09mov.u32 $1, 0x0;\0A\09mov.u32 $2, 0x0;\0A\09mov.u32 $3, 0x0;\0A\09ld.global.v4.b32 { $0, $1, $2, $3 }, [ $4 + 0 ];", "=r,=r,=r,=r,l"(ptr addrspace(1) %33) #4, !dbg !35
+  %35 = extractvalue { i32, i32, i32, i32 } %34, 0, !dbg !35
+  %36 = extractvalue { i32, i32, i32, i32 } %34, 1, !dbg !35
+  %37 = extractvalue { i32, i32, i32, i32 } %34, 2, !dbg !35
+  %38 = extractvalue { i32, i32, i32, i32 } %34, 3, !dbg !35
+  %39 = sext i32 %12 to i64, !dbg !36
+  %40 = getelementptr half, ptr addrspace(1) %2, i64 %39, !dbg !36
+  tail call void asm sideeffect "st.global.v4.b32 [ $4 + 0 ], { $0, $1, $2, $3 };", "r,r,r,r,l"(i32 %35, i32 %36, i32 %37, i32 %38, ptr addrspace(1) %40) #4, !dbg !37
+  ret void, !dbg !38
+}
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 2147483647) i32 @llvm.nvvm.read.ptx.sreg.ctaid.x() #2
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 1024) i32 @llvm.nvvm.read.ptx.sreg.tid.x() #2
+
+; Function Attrs: convergent nocallback nounwind
+declare void @llvm.nvvm.barrier.cta.sync.aligned.all(i32) #3
+
+attributes #0 = { noreturn }
+attributes #1 = { "nvvm.reqntid"="128" }
+attributes #2 = { mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+attributes #3 = { convergent nocallback nounwind }
+attributes #4 = { nounwind }
+
+!llvm.dbg.cu = !{!0}
+!llvm.module.flags = !{!2, !3}
+!llvm.ident = !{!4}
+
+!0 = distinct !DICompileUnit(language: DW_LANG_C, file: !1, producer: "triton", isOptimized: true, runtimeVersion: 0, emissionKind: LineTablesOnly)
+!1 = !DIFile(filename: "c5753pyqwkgwsvric2pyhjfuhzytgtcxd7deeb6at5j6f6pe5uwa.py", directory: "/home/kevin/.cache/vllm/torch_compile_cache/torch_aot_compile/55291d2d55f689e31e881b556a8b92c12602c599a388439b7a2a80a2d2a8cc9b/inductor_cache/57")
+!2 = !{i32 2, !"Debug Info Version", i32 3}
+!3 = !{i32 4, !"nvvm-reflect-ftz", i32 1}
+!4 = !{!"clang version 3.8.0 (tags/RELEASE_380/final)"}
+!5 = !DISubprogram(name: "__assertfail", linkageName: "__assertfail", scope: !6, file: !6, type: !7, spFlags: DISPFlagOptimized)
+!6 = !DIFile(filename: "<unknown>", directory: "")
+!7 = !DISubroutineType(cc: DW_CC_normal, types: !8)
+!8 = !{null, !9, !9, !11, !9, !12}
+!9 = !DIDerivedType(tag: DW_TAG_pointer_type, name: "pointer", baseType: !10, size: 64, dwarfAddressSpace: 0)
+!10 = !DIBasicType(name: "unknown_type", encoding: DW_ATE_signed)
+!11 = !DIBasicType(name: "int", size: 32, encoding: DW_ATE_signed)
+!12 = !DIBasicType(name: "int", size: 64, encoding: DW_ATE_signed)
+!13 = distinct !DISubprogram(name: "triton_poi_fused_index_1", linkageName: "triton_poi_fused_index_1", scope: !1, file: !1, line: 18, type: !14, scopeLine: 18, spFlags: DISPFlagDefinition | DISPFlagOptimized, unit: !0)
+!14 = !DISubroutineType(cc: DW_CC_normal, types: !15)
+!15 = !{null, !16, !17, !17, !11, !19, !19}
+!16 = !DIDerivedType(tag: DW_TAG_pointer_type, name: "pointer", baseType: !12, size: 64, dwarfAddressSpace: 1)
+!17 = !DIDerivedType(tag: DW_TAG_pointer_type, name: "pointer", baseType: !18, size: 64, dwarfAddressSpace: 1)
+!18 = !DIBasicType(name: "half", size: 16, encoding: DW_ATE_float)
+!19 = !DIDerivedType(tag: DW_TAG_pointer_type, name: "pointer", baseType: !10, size: 64, dwarfAddressSpace: 1)
+!20 = !DILocation(line: 19, column: 28, scope: !13)
+!21 = !DILocation(line: 19, column: 33, scope: !13)
+!22 = !DILocation(line: 20, column: 36, scope: !13)
+!23 = !DILocation(line: 20, column: 23, scope: !13)
+!24 = !DILocation(line: 22, column: 19, scope: !13)
+!25 = !DILocation(line: 25, column: 30, scope: !13)
+!26 = !DILocation(line: 25, column: 35, scope: !13)
+!27 = !DILocation(line: 27, column: 18, scope: !13)
+!28 = !DILocation(line: 28, column: 18, scope: !13)
+!29 = !DILocation(line: 29, column: 32, scope: !13)
+!30 = !DILocation(line: 30, column: 36, scope: !13)
+!31 = !DILocation(line: 30, column: 52, scope: !13)
+!32 = !DILocation(line: 23, column: 19, scope: !13)
+!33 = !DILocation(line: 31, column: 35, scope: !13)
+!34 = !DILocation(line: 31, column: 30, scope: !13)
+!35 = !DILocation(line: 31, column: 46, scope: !13)
+!36 = !DILocation(line: 32, column: 25, scope: !13)
+!37 = !DILocation(line: 32, column: 36, scope: !13)
+!38 = !DILocation(line: 32, column: 4, scope: !13)
