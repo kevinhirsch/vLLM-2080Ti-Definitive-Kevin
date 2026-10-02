@@ -79,6 +79,12 @@ logger = init_logger(__name__)
 
 
 class Scheduler(SchedulerInterface):
+    # [FORK] class-level defaults so unit tests that build a bare Scheduler
+    # (bypassing __init__) keep working with the lane EF/EF2 hooks.
+    progress_guard_enabled: bool = False
+    short_first_enabled: bool = False
+    prefill_share_enabled: bool = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,
