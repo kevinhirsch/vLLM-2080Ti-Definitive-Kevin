@@ -4544,6 +4544,28 @@ async def _finish_stream_response(resp, request, session):
         await session.close()
 
 
+# RS (2026-10-02): one durable record per GATEWAY-layer timeout (first response header, first token, stream idle). Without it a
+# timeout only showed up as a generic 'local-failed' 503 / failover, with no deadline, no wait, no size - so nobody could say
+# which layer gave up first or how much prefill the abort threw away. Same incidents/ dir as drains.jsonl; read by tools/timeout_audit.py.
+_TIMEOUT_LEDGER = os.path.expanduser(os.environ.get("GATEWAY_TIMEOUT_LEDGER", "~/.local/share/vllm-qwen27b/incidents/timeouts.jsonl"))
+
+
+def _timeout_note(request, layer, deadline_s, base, body, **extra):
+    try:
+        a = _ACTIVE.get(id(request)) or {}
+        t0 = a.get("t0")
+        row = {"t": round(time.time(), 3), "layer": layer, "deadline_s": round(float(deadline_s), 1),
+               "waited_s": round(time.time() - t0, 1) if t0 else None, "base": "local" if base == LOCAL else "remote",
+               "ptok_est": _est_tokens(body), "client": a.get("name") or _client_label(request), "bg": bool(a.get("bg")),
+               "tiny": bool(a.get("tiny")), "stream": bool(a.get("stream")), "route": a.get("route"), "phase": a.get("phase")}
+        row.update(extra)
+        os.makedirs(os.path.dirname(_TIMEOUT_LEDGER), exist_ok=True)
+        with open(_TIMEOUT_LEDGER, "a") as fh:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+    except Exception:       # bookkeeping must never touch the request path
+        pass
+
+
 async def _relay(request, base, path, body, key, streaming, concurrency=1, provider_name=None):
     """
     Forward to (base) and relay the response to the client.
@@ -4581,6 +4603,8 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
             up = await _open(session, base, path, body, key, streaming)
     except asyncio.TimeoutError:
         await session.close()
+        _timeout_note(request, "gateway:response-headers", first_token_timeout(body, concurrency, local=(base == LOCAL)), base, body,
+                      concurrency=concurrency, outcome="failover")
         # slow/wedged under load -> fail over, but do NOT flag as OOM (no 120s budget backoff:
         # local is busy, not crashed; a real crash returns 5xx/EngineDead below and DOES backoff).
         return "fail", (0, "no response headers within first-token deadline (busy/wedged)", False)
@@ -4751,6 +4775,8 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
         phase = await asyncio.wait_for(_read_until_commit(), timeout=deadline)
     except asyncio.TimeoutError:
         await session.close()
+        _timeout_note(request, "gateway:first-token", deadline, base, body, concurrency=concurrency, outcome="failover",
+                      bytes_before=len(buf))
         return "fail", (up.status, f"no first token within {deadline:.0f}s (busy/wedged)", False)
     except Exception as e:
         await session.close()
@@ -4812,6 +4838,8 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
             except asyncio.TimeoutError:
                 _active_set(request, stream_watchdog=True, stream_idle_timeout_s=STREAM_IDLE_TIMEOUT_SECS,
                             reason="stream-idle-timeout")
+                _timeout_note(request, "gateway:stream-idle", STREAM_IDLE_TIMEOUT_SECS, base, body, outcome="aborted-after-output",
+                              out_chunks=_chunk_ct[0])
                 log.warning("stream idle for %.1fs -> aborting %s request", STREAM_IDLE_TIMEOUT_SECS,
                             "remote" if _is_remote_relay else "local")
                 try:
