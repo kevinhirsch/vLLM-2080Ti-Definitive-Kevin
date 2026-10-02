@@ -83,7 +83,7 @@ class Base(unittest.TestCase):
         flow = dict(waiters=[], vtime={c: 0.0 for c in shim.FLOW_CLASSES}, vclock=0.0, last_prefix=None, run=0,
                     last_admit={c: 0.0 for c in shim.FLOW_CLASSES}, prefilling={}, version=0, head=(-1, 0.0, None), seq=0)
         self.stack.enter_context(patch.dict(shim._FLOW, flow, clear=True))
-        for name in ("_FLOW_STATS", "_FLOW_DEMAND", "_FLOW_WAITS", "_FLOW_METER", "_FLOW_SERVICE"):
+        for name in ("_FLOW_STATS", "_FLOW_DEMAND", "_FLOW_WAITS", "_FLOW_METER", "_FLOW_SERVICE", "_FLOW_PURE"):
             self.stack.enter_context(patch.object(shim, name, type(getattr(shim, name))(
                 *([] if isinstance(getattr(shim, name), shim.collections.Counter) else [[]]),
                 **({"maxlen": getattr(shim, name).maxlen} if hasattr(getattr(shim, name), "maxlen") else {}))))
@@ -91,7 +91,7 @@ class Base(unittest.TestCase):
                                 FLOW_CEIL="kevin=0,halo=1.5,runner=1,background=0.5", FLOW_BACKLOG_S=40.0,
                                 FLOW_DEADLINES="kevin=0,halo=0,runner=900,background=600",
                                 FLOW_AFFINITY_MAX=6, FLOW_STARVE_S=300.0, PREFILL_TPS=500.0,
-                                FLOW_CLASS_MAP=_DEFAULT_MAP, FLOW_MARKERS="local-lane-runner batch job=runner", FLOW_PREFIX_HOLD_MAX_S=60.0, FLOW_URGENT_SLACK_S=30.0,
+                                FLOW_CLASS_MAP=_DEFAULT_MAP, FLOW_MARKERS="local-lane-runner batch job=runner", FLOW_MODEL_MAP="", FLOW_PREFIX_HOLD_MAX_S=60.0, FLOW_URGENT_SLACK_S=30.0,
                                 _inflight=0, _inflight_computed=0, _health={"ok": True},
                                 effective_budget=lambda: 14, LIGHT_PREFILL_SECS=5.0,
                                 PREFIX_HIT_MARGIN_TOKENS=0).items():
@@ -122,6 +122,12 @@ class Classes(Base):
         self.assertEqual(shim.flow_class_of(Request("anything", headers={"X-Work-Class": "runner"}), b"{}", False, False), "runner")
         self.assertEqual(shim.flow_class_of(Request("anything", headers={"X-Work-Class": "bogus"}), b"{}", False, False), "kevin")
         self.assertEqual(shim.flow_class_of(Request("anything"), b"{}", True, True), "halo")   # Halo control turn
+        # a model alias can carry the class for harnesses that cannot send a per-request header (checked before the client map)
+        with patch.object(shim, "FLOW_MODEL_MAP", "halo-chat=kevin"):
+            chat = Request("halo-hermes", model="halo-chat")
+            self.assertEqual(shim.flow_class_of(chat, chat.body, False, False), "kevin")
+            other = Request("halo-hermes", model="estate")
+            self.assertEqual(shim.flow_class_of(other, other.body, False, False), "halo")
         # the card runner's pi sessions share Kevin's host and provider: only the opening line tells them apart
         runner = Request("ubuntuide01 pi / x", content="local-lane-runner batch job. The full task card follows")
         self.assertEqual(shim.flow_class_of(runner, runner.body, False, False), "runner")
@@ -390,6 +396,17 @@ class Facts(Base):
             shim._FLOW_METER.append((time.time(), 0.0, 0.0, 0, 0, None))        # idle samples do not drag the rate
         self.assertAlmostEqual(shim.flow_prefill_tps(), 904.0, delta=4)
         self.assertEqual(shim.flow_decode_tps(), 60.0)
+
+    def test_pure_prefill_speed_excludes_queue_and_needs_enough_prefill(self):
+        self.assertIsNone(shim.flow_prefill_pure_tps())
+        mk = lambda toks, secs: {"vllm:request_prefill_kv_computed_tokens_sum": [({}, toks)], "vllm:request_prefill_time_seconds_sum": [({}, secs)]}
+        shim.flow_meter_update(mk(1000.0, 5.0), mk(0.0, 0.0), 10.0, 1, 0, None, None)
+        self.assertIsNone(shim.flow_prefill_pure_tps())                           # 5 prefill-seconds: too little to say
+        shim.flow_meter_update(mk(21000.0, 25.0), mk(1000.0, 5.0), 10.0, 1, 0, None, None)
+        self.assertAlmostEqual(shim.flow_prefill_pure_tps(), 21000.0 / 25.0)      # 840 tok/s per request, whatever the queue was
+        f = shim.flow_capacity_facts()
+        self.assertEqual(f["throughput"]["prefill_pure_tok_s"], 840.0)
+        self.assertIn("EXCLUDED", f["throughput"]["prefill_pure_basis"])
 
     def test_meter_update_reads_the_local_compute_counter(self):
         mk = lambda v: {"vllm:prompt_tokens_by_source_total": [({"source": "local_compute"}, v), ({"source": "local_cache_hit"}, 9e9)]}

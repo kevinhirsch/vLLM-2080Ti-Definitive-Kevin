@@ -3295,6 +3295,9 @@ FLOW_CLASS_MAP = os.environ.get("SHIM_FLOW_CLASS_MAP", ",".join((
 # Phrases (first 500 chars of the first two messages) that mark a class when the client name cannot: the card
 # runner's pi sessions arrive from the same host/provider as Kevin's own pi, 100% of them opening with this line.
 FLOW_MARKERS = os.environ.get("SHIM_FLOW_MARKERS", "local-lane-runner batch job=runner")
+# Request `model` -> class, checked before the client map: lets a harness that cannot send a per-request header (Hermes,
+# LibreChat) put Kevin's own chats in a distinct model alias and so in the interactive class. Empty by default.
+FLOW_MODEL_MAP = os.environ.get("SHIM_FLOW_MODEL_MAP", "")
 FLOW_DEMAND_WINDOW_S = float(os.environ.get("SHIM_FLOW_DEMAND_WINDOW_S", "300"))      # window of the demand_5m facts (env only; the drill shortens it)
 FLOW_AFFINITY_MAX = int(os.environ.get("SHIM_FLOW_AFFINITY_MAX", "6"))      # same-prefix grants in a row before FIFO order resumes
 FLOW_STARVE_S = float(os.environ.get("SHIM_FLOW_STARVE_S", "300"))          # a waiting class unserved this long ignores its ceiling once
@@ -3308,6 +3311,7 @@ _CFG.update({
     "SHIM_FLOW_DEADLINES":    ("FLOW_DEADLINES", _flow_norm(float)),
     "SHIM_FLOW_CLASS_MAP":    ("FLOW_CLASS_MAP", _flow_norm_classmap),
     "SHIM_FLOW_MARKERS":      ("FLOW_MARKERS", _flow_norm_classmap),
+    "SHIM_FLOW_MODEL_MAP":    ("FLOW_MODEL_MAP", _flow_norm_classmap),
     "SHIM_FLOW_AFFINITY_MAX": ("FLOW_AFFINITY_MAX", int),
     "SHIM_FLOW_STARVE_S":     ("FLOW_STARVE_S", float),
     "SHIM_FLOW_PREFIX_HOLD_MAX_S": ("FLOW_PREFIX_HOLD_MAX_S", float),
@@ -3330,6 +3334,7 @@ _FLOW_STATS = collections.Counter()
 _FLOW_DEMAND = collections.deque(maxlen=20000)       # (t, class, ptok, est_computed_tokens)
 _FLOW_WAITS = collections.deque(maxlen=4000)         # (t, class, waited_s) per ticket that left the queue
 _FLOW_METER = collections.deque(maxlen=900)          # (t, compute_tok_s, decode_tok_s, running, waiting, hit_rate)
+_FLOW_PURE = collections.deque(maxlen=600)           # (t, computed tokens, prefill seconds) deltas between scrapes
 _FLOW_SERVICE = collections.deque(maxlen=400)        # (t, class, duration_s) local completions
 _FLOW_CACHE = {"adjacent": [0, 0, 0], "other": [0, 0, 0]}   # [requests, cached_tokens, prompt_tokens]
 _FLOW_MODE_STATE = {"mode": None, "since": None, "basis": None, "events": collections.deque(maxlen=200)}
@@ -3372,6 +3377,15 @@ def flow_class_of(request, body, background, halo_control):
     h = (request.headers.get("X-Work-Class") or "").strip().lower()
     if h in FLOW_CLASSES:
         return h
+    try:
+        models = _flow_parse_classmap(FLOW_MODEL_MAP)
+        if models:
+            mdl = str(json.loads(body).get("model") or "").strip().lower()
+            for pat, cls in models:
+                if mdl == pat:
+                    return cls
+    except Exception:
+        pass
     if halo_control:
         return "halo"
     try:
@@ -3445,6 +3459,17 @@ def flow_prefill_tps():
     return PREFILL_TPS
 
 
+def flow_prefill_pure_tps(now=None, window=300.0):
+    """Per-request prefill speed with queue and admission wait excluded (see flow_meter_update), or None when the last
+    `window` seconds hold too little prefill to say (< 10 prefill-seconds or < 1,000 computed tokens)."""
+    now = time.time() if now is None else now
+    rows = [r for r in _FLOW_PURE if now - r[0] <= window]
+    toks, secs = sum(r[1] for r in rows), sum(r[2] for r in rows)
+    if secs < 10.0 or toks < 1000:
+        return None
+    return toks / secs
+
+
 def flow_decode_tps():
     vals = sorted(r[2] for r in list(_FLOW_METER)[-120:] if r[2] and r[2] > 0 and (r[3] or 0) > 0)
     return vals[len(vals) // 2] if vals else None
@@ -3467,6 +3492,15 @@ def flow_meter_update(fam, prev_fam, dt, running, waiting, hit_rate, gen_tok_s):
         cur, prev = src(fam), src(prev_fam)
         rate = max(0.0, cur - prev) / dt if cur is not None and prev is not None else None
         _FLOW_METER.append((time.time(), rate, gen_tok_s, running, waiting, hit_rate))
+        # PURE per-request prefill speed, queue wait excluded: computed tokens / prefill seconds, both from the engine's
+        # own per-request histograms (request_prefill_kv_computed_tokens, request_prefill_time_seconds -- queue time is a
+        # separate histogram). This is what a request experiences once started; budgets should derive from THIS one.
+        def hsum(f, name):
+            return _fv(f, name + "_sum")
+        ct, pt = hsum(fam, "vllm:request_prefill_kv_computed_tokens"), hsum(fam, "vllm:request_prefill_time_seconds")
+        ct0, pt0 = hsum(prev_fam, "vllm:request_prefill_kv_computed_tokens"), hsum(prev_fam, "vllm:request_prefill_time_seconds")
+        if None not in (ct, pt, ct0, pt0) and pt >= pt0 and ct >= ct0:
+            _FLOW_PURE.append((time.time(), ct - ct0, pt - pt0))
     except Exception:
         pass
 
@@ -3981,7 +4015,13 @@ def flow_capacity_facts(now=None, cls=None, ptok=None):
         **m,
         "mode_since": _FLOW_MODE_STATE["since"], "mode_changes": list(_FLOW_MODE_STATE["events"])[:20],
         "throughput": {
+            "prefill_pure_tok_s": None if flow_prefill_pure_tps(now) is None else round(flow_prefill_pure_tps(now), 1),
+            "prefill_pure_basis": ("computed tokens / prefill seconds per request over the last 5 min (queue and admission wait "
+                                   "EXCLUDED; derive per-request budgets from this)" if flow_prefill_pure_tps(now) is not None
+                                   else "too little prefill in the last 5 min to say; use the configured SHIM_PREFILL_TPS"),
             "prefill_uncached_tok_s": round(tps, 1),
+            "prefill_basis_note": "prefill_uncached_tok_s is the engine's AGGREGATE uncached-prompt throughput while it had a queue (it falls when "
+                                  "decode or a benchmark shares the engine); it sizes the engine backlog, not per-request budgets",
             "prefill_basis": "measured" if len([r for r in list(_FLOW_METER)[-120:] if r[1] and (r[4] or 0) > 0]) >= 5
                              else "configured SHIM_PREFILL_TPS (too few busy samples yet)",
             "decode_tok_s_aggregate": None if dtps is None else round(dtps, 1),
