@@ -1,0 +1,20 @@
+{
+  "id": "code_exec_019",
+  "category": "code_exec",
+  "description": "camel_to_snake",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Write a Python function `camel_to_snake(s)` using the `re` module that converts a camelCase or PascalCase identifier to snake_case (all lowercase, words separated by underscores). Example: 'HTTPServerError' style edge cases are not tested; only simple camelCase/PascalCase words like 'userId' -> 'user_id'.\n\nReply with a single Python code block containing only your function definition(s) (imports allowed if needed). Do not include any example usage, test calls, or print statements of your own -- a separate test harness will be run against your function afterward. Do not print anything else outside the code block."
+      }
+    ],
+    "max_tokens": 900
+  },
+  "check": {
+    "type": "code_exec",
+    "expected_stdout": "user_id\nfirst_name\nget_http_response\nsimple\na\n",
+    "timeout_sec": 10,
+    "harness": "for s in ['userId', 'FirstName', 'getHTTPResponse'.replace('HTTP','Http'), 'simple', 'A']:\n    print(camel_to_snake(s))"
+  }
+}

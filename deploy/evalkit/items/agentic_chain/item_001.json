@@ -1,0 +1,93 @@
+{
+  "id": "agentic_chain_001",
+  "category": "agentic_chain",
+  "description": "lookup user then email them using the retrieved address",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "lookup_user",
+        "description": "Look up a user by id.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "user_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "user_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "send_email",
+        "description": "Send an email.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "to": {
+              "type": "string"
+            },
+            "subject": {
+              "type": "string"
+            },
+            "body": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "to",
+            "subject",
+            "body"
+          ]
+        }
+      }
+    }
+  ],
+  "user": "Look up user u_1042 and send them a welcome email letting them know their account is ready.",
+  "steps": [
+    {
+      "expect_tool": "lookup_user",
+      "arg_checks": [
+        {
+          "path": "user_id",
+          "match": "exact",
+          "value": "u_1042"
+        }
+      ],
+      "inject_result": {
+        "user_id": "u_1042",
+        "name": "Dana Kim",
+        "email": "dana.kim@example.com"
+      },
+      "max_tokens": 300
+    },
+    {
+      "expect_tool": "send_email",
+      "arg_checks": [
+        {
+          "path": "to",
+          "match": "exact",
+          "value_from_previous_result": "email"
+        }
+      ],
+      "inject_result": {
+        "status": "sent",
+        "message_id": "m_001"
+      },
+      "max_tokens": 300
+    },
+    {
+      "final": true,
+      "answer_check": {
+        "pattern": "sent|success|done|confirm",
+        "must_not_pattern": "\\b(not|n't|unable|fail(ed|s)?|couldn't|cannot|can't|never|didn't|wasn't|isn't|error|sorry|unfortunately)\\b"
+      },
+      "max_tokens": 150
+    }
+  ]
+}

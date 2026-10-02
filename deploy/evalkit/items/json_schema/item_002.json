@@ -1,0 +1,50 @@
+{
+  "id": "json_schema_002",
+  "category": "json_schema",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Return a JSON object describing a product with exactly these fields: sku (string matching the pattern two uppercase letters followed by four digits, e.g. 'AB1234'), price (number >= 0), in_stock (boolean), categories (array of 1 to 5 strings). Respond with ONLY the JSON object, no other text."
+      }
+    ],
+    "response_format": {
+      "type": "json_object"
+    },
+    "max_tokens": 400
+  },
+  "check": {
+    "type": "json_schema",
+    "schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sku",
+        "price",
+        "in_stock",
+        "categories"
+      ],
+      "properties": {
+        "sku": {
+          "type": "string",
+          "pattern": "^[A-Z]{2}\\d{4}$"
+        },
+        "price": {
+          "type": "number",
+          "minimum": 0
+        },
+        "in_stock": {
+          "type": "boolean"
+        },
+        "categories": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 5,
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

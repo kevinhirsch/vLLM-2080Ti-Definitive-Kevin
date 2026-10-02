@@ -1,0 +1,82 @@
+{
+  "id": "tool_call_005",
+  "category": "tool_call",
+  "description": "tool choice among 2 close distractors",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "I need a hotel room in Tokyo for 3 nights."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "book_flight",
+          "description": "Book a flight.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "origin": {
+                "type": "string"
+              },
+              "destination": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "origin",
+              "destination"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "book_hotel",
+          "description": "Book a hotel room.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string"
+              },
+              "nights": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "city",
+              "nights"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "max_tokens": 400
+  },
+  "check": {
+    "type": "tool_call",
+    "expected_calls": [
+      {
+        "name": "book_hotel",
+        "args": [
+          {
+            "path": "city",
+            "match": "regex",
+            "pattern": "(?i)tokyo"
+          },
+          {
+            "path": "nights",
+            "match": "numeric",
+            "value": 3
+          }
+        ]
+      }
+    ],
+    "mode": "in_order"
+  }
+}

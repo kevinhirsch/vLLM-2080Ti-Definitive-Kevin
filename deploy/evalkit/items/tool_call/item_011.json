@@ -1,0 +1,56 @@
+{
+  "id": "tool_call_011",
+  "category": "tool_call",
+  "description": "nested/multiline code argument, lint a loop",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Please lint this code using the tool:\n\n```\ntotal = 0\nfor i in range(10):\n    if i % 2 == 0:\n        total += i\nprint(total)\n```"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "lint_code",
+          "description": "Lint a block of source code.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "max_tokens": 400
+  },
+  "check": {
+    "type": "tool_call",
+    "expected_calls": [
+      {
+        "name": "lint_code",
+        "args": [
+          {
+            "path": "code",
+            "match": "contains",
+            "value": "for i in range(10):"
+          },
+          {
+            "path": "code",
+            "match": "regex",
+            "pattern": "if i % 2 == 0:"
+          }
+        ]
+      }
+    ],
+    "mode": "in_order"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "id": "code_exec_008",
+  "category": "code_exec",
+  "description": "is_anagram",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Write a Python function `is_anagram(a, b)` returning True if strings a and b are anagrams of each other (ignore case and spaces), else False.\n\nReply with a single Python code block containing only your function definition(s) (imports allowed if needed). Do not include any example usage, test calls, or print statements of your own -- a separate test harness will be run against your function afterward. Do not print anything else outside the code block."
+      }
+    ],
+    "max_tokens": 900
+  },
+  "check": {
+    "type": "code_exec",
+    "expected_stdout": "True\nTrue\nTrue\nTrue\nFalse\nFalse\n",
+    "timeout_sec": 10,
+    "harness": "for a, b in [('', ''), ('a', 'a'), ('listen', 'silent'), ('Dormitory', 'Dirty Room'), ('hello', 'world'), ('abc', 'ab')]:\n    print(is_anagram(a, b))"
+  }
+}

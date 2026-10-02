@@ -1,0 +1,14 @@
+{
+  "id": "long_ctx_003",
+  "category": "long_ctx",
+  "description": "single-fact retrieval, ~32000 target tokens, depth 50%",
+  "corpus_tokens": 32000,
+  "request": {
+    "question": "Search the source code corpus above for a comment line containing the exact text 'SENTINEL-32000-50'. That line states a magic number. Reply with ONLY that magic number (digits only), nothing else.",
+    "max_tokens": 60
+  },
+  "check": {
+    "type": "single_fact",
+    "expected_number": 195453
+  }
+}

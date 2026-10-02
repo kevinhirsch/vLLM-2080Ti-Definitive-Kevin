@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=vLLM - Troubleshoot
+Comment=Full diagnostic: service, health, inference test, GPUs, disk, errors, known fixes
+Exec=konsole -e /home/kevin/.local/share/vllm-qwen27b/vllm-troubleshoot.sh
+Icon=tools-report-bug
+Terminal=false
+Categories=System;

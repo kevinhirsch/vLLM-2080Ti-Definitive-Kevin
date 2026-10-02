@@ -1,0 +1,52 @@
+{
+  "id": "tool_call_001",
+  "category": "tool_call",
+  "description": "single tool, basic call",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "What's the current weather in Paris?"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get the current weather for a city.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string",
+                "description": "City name"
+              }
+            },
+            "required": [
+              "city"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "max_tokens": 400
+  },
+  "check": {
+    "type": "tool_call",
+    "expected_calls": [
+      {
+        "name": "get_weather",
+        "args": [
+          {
+            "path": "city",
+            "match": "regex",
+            "pattern": "(?i)paris"
+          }
+        ]
+      }
+    ],
+    "mode": "in_order"
+  }
+}

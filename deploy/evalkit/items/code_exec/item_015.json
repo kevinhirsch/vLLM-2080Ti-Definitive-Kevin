@@ -1,0 +1,20 @@
+{
+  "id": "code_exec_015",
+  "category": "code_exec",
+  "description": "is_balanced",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Write a Python function `is_balanced(s)` that returns True if all brackets in s among ()[]{} are properly opened/closed/nested (ignore all other characters), else False. An empty string is balanced.\n\nReply with a single Python code block containing only your function definition(s) (imports allowed if needed). Do not include any example usage, test calls, or print statements of your own -- a separate test harness will be run against your function afterward. Do not print anything else outside the code block."
+      }
+    ],
+    "max_tokens": 900
+  },
+  "check": {
+    "type": "code_exec",
+    "expected_stdout": "True\nTrue\nTrue\nFalse\nFalse\nTrue\nFalse\nTrue\n",
+    "timeout_sec": 10,
+    "harness": "for s in ['', '()', '([{}])', '(]', '([)]', 'a(b[c]d)e', '(((', 'no brackets here']:\n    print(is_balanced(s))"
+  }
+}

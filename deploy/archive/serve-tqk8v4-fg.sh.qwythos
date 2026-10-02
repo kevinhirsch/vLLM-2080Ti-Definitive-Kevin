@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Boot-persistent daily driver: Qwythos-27B-GPTQ-Int4 + MTP on the 2080Ti fork.
+# Swapped from Qwen3.6 on 2026-07-30 (Qwythos is faster + higher quality — see
+# ~/Desktop/qwythos-quant/RUNBOOK.md). Rollback: cp serve-tqk8v4-fg.sh.qwen36
+# over this file and `sudo systemctl restart vllm-qwen27b`.
+# Env is supplied by systemd EnvironmentFile (vllm-qwen27b.env: TurboQuant + gcc-13 pin).
+#
+# Optimized config (2026-07-30): YaRN OFF (native 262K, rope_type=default in the model's
+#   config.json — backup at config.json.yarn1m for the 1M profile), num_speculative_tokens 3
+#   (spec 4 crashes), turboquant_k8v4 KV (fp16 KV is faster but garbles output on this fork).
+# NOTE: no --chat-template override — Qwythos ships its own (Qwen3.5 tool-use spec + identity);
+#   froggeric's patch was Qwen3.6-specific.
+set -euo pipefail
+
+ARGS=(
+  /home/kevin/Desktop/vLLM-2080Ti-Definitive/.venv/bin/python
+  -m
+  vllm.entrypoints.openai.api_server
+  --host
+  0.0.0.0
+  --port
+  8000
+  --model
+  /home/kevin/Desktop/models/Qwythos-27B-GPTQ-Int4
+  --served-model-name
+  qwythos
+  qwen3.6:27b
+  --dtype
+  half
+  --tensor-parallel-size
+  2
+  --generation-config
+  vllm
+  --gpu-memory-utilization
+  0.88
+  --max-model-len
+  262144
+  --enable-chunked-prefill
+  --max-num-seqs
+  2
+  --max-num-batched-tokens
+  2560
+  --quantization
+  gptq_marlin
+  --kv-cache-dtype
+  turboquant_k8v4
+  --mamba-cache-mode
+  align
+  --enable-prefix-caching
+  --enable-prompt-tokens-details
+  --language-model-only
+  --skip-mm-profiling
+  --disable-log-stats
+  --reasoning-parser
+  qwen3
+  --tool-call-parser
+  qwen3_xml
+  --enable-auto-tool-choice
+  --additional-config
+  '{"gdn_prefill_backend":"flashqla_legacy"}'
+  --speculative-config
+  '{"method":"mtp","num_speculative_tokens":3}'
+  --compilation-config
+  '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[4],"max_cudagraph_capture_size":4}'
+)
+
+exec "${ARGS[@]}"

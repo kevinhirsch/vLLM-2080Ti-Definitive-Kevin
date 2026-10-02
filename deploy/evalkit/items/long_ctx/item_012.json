@@ -1,0 +1,18 @@
+{
+  "id": "long_ctx_012",
+  "category": "long_ctx",
+  "description": "multi-fact retrieval, ~128000 target tokens, depths 20/50/80%",
+  "corpus_tokens": 128000,
+  "request": {
+    "question": "Search the source code corpus above for all comment lines containing the text 'SENTINEL-128000-' (there are exactly three: for depths 20, 50, and 80). Each states a magic number. Reply with exactly three lines, one magic number per line, in the order: the -20 one first, then -50, then -80. Digits only, nothing else on each line.",
+    "max_tokens": 120
+  },
+  "check": {
+    "type": "multi_fact",
+    "expected_numbers": [
+      533306,
+      515343,
+      389569
+    ]
+  }
+}

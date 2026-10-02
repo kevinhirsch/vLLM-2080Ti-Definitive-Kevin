@@ -1,0 +1,17 @@
+{
+  "id": "instruction_004",
+  "category": "instruction",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Describe your favorite season of the year in exactly 12 words. Output only those 12 words as a single sentence, nothing else."
+      }
+    ],
+    "max_tokens": 300
+  },
+  "check": {
+    "type": "word_count",
+    "value": 12
+  }
+}

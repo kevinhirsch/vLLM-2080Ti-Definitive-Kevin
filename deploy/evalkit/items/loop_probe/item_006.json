@@ -1,0 +1,18 @@
+{
+  "id": "loop_probe_006",
+  "category": "loop_probe",
+  "description": "100 distinct: distinct color names (simple or compound, e.g. 'sky blue' is fine)",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "List exactly 100 distinct color names (simple or compound, e.g. 'sky blue' is fine). Format each line as '<N>. <item>' with N running from 1 to 100 in strictly increasing order, one item per line. All 100 items must be distinct (case-insensitive) -- do not repeat any item. Output only the 100 numbered lines: no title, no intro, no closing remarks, no blank lines."
+      }
+    ],
+    "max_tokens": 2500
+  },
+  "check": {
+    "type": "loop_probe",
+    "count": 100
+  }
+}

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=vLLM - Logs
+Comment=Follow the live vLLM server logs (Ctrl+C to stop)
+Exec=konsole -e /home/kevin/.local/share/vllm-qwen27b/vllm-logs.sh
+Icon=utilities-terminal
+Terminal=false
+Categories=System;

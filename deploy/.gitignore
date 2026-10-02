@@ -1,0 +1,12 @@
+# NEVER commit the real shim.env — it holds the live DeepSeek key. Only shim.env.example.
+shim.env
+env/shim.env
+**/shim.env
+
+# runtime junk
+__pycache__/
+*.pyc
+*.pid
+*.log
+watchdog-state.json
+*.bak-*

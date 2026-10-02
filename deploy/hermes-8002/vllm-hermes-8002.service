@@ -1,0 +1,15 @@
+[Unit]
+Description=vLLM Hermes dedicated engine - solo 2080Ti 22GB on :8002
+After=network-online.target
+
+[Service]
+Type=simple
+User=kevin
+EnvironmentFile=/home/kevin/.local/share/vllm-qwen27b/vllm-qwen27b.env
+ExecStart=/home/kevin/.local/share/vllm-qwen27b/serve-hermes-8002.sh
+Restart=always
+RestartSec=15
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

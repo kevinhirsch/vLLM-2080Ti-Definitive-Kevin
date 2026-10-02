@@ -1,0 +1,17 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Journals / run artifacts
+*.jsonl
+journal*.json
+
+# Local env / editor
+.venv/
+venv/
+.env
+*.log
+.DS_Store
+.idea/
+.vscode/

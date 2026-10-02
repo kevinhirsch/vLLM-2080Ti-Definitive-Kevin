@@ -1,0 +1,109 @@
+{
+  "id": "tool_call_019",
+  "category": "tool_call",
+  "description": "tool choice among 3 close finance distractors",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Convert 250 EUR to USD for me."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_stock_price",
+          "description": "Get the current stock price for a ticker symbol.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "symbol": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "symbol"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "get_exchange_rate",
+          "description": "Get the exchange rate between two currencies.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "base": {
+                "type": "string"
+              },
+              "quote": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "base",
+              "quote"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "convert_currency",
+          "description": "Convert an amount from one currency to another.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "amount": {
+                "type": "number"
+              },
+              "from_currency": {
+                "type": "string"
+              },
+              "to_currency": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "amount",
+              "from_currency",
+              "to_currency"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "max_tokens": 400
+  },
+  "check": {
+    "type": "tool_call",
+    "expected_calls": [
+      {
+        "name": "convert_currency",
+        "args": [
+          {
+            "path": "amount",
+            "match": "numeric",
+            "value": 250
+          },
+          {
+            "path": "from_currency",
+            "match": "regex",
+            "pattern": "(?i)eur"
+          },
+          {
+            "path": "to_currency",
+            "match": "regex",
+            "pattern": "(?i)usd"
+          }
+        ]
+      }
+    ],
+    "mode": "in_order"
+  }
+}

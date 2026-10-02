@@ -1,0 +1,20 @@
+{
+  "id": "code_exec_016",
+  "category": "code_exec",
+  "description": "longest_common_prefix",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Write a Python function `longest_common_prefix(strs)` where strs is a list of strings; return the longest common prefix string among them (empty string if the list is empty or there is no common prefix).\n\nReply with a single Python code block containing only your function definition(s) (imports allowed if needed). Do not include any example usage, test calls, or print statements of your own -- a separate test harness will be run against your function afterward. Do not print anything else outside the code block."
+      }
+    ],
+    "max_tokens": 900
+  },
+  "check": {
+    "type": "code_exec",
+    "expected_stdout": "''\n'fl'\n''\n'same'\n'single'\n",
+    "timeout_sec": 10,
+    "harness": "for strs in [[], ['flower','flow','flight'], ['dog','racecar','car'], ['same','same','same'], ['single']]:\n    print(repr(longest_common_prefix(strs)))"
+  }
+}

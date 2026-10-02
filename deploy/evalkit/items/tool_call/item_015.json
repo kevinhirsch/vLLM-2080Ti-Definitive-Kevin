@@ -1,0 +1,64 @@
+{
+  "id": "tool_call_015",
+  "category": "tool_call",
+  "description": "unicode argument: emoji in subject line",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Send an email to team@example.com with subject '🎉 Congrats on the launch!' and body 'Great work everyone.'"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "send_email",
+          "description": "Send an email.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "to": {
+                "type": "string"
+              },
+              "subject": {
+                "type": "string"
+              },
+              "body": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "to",
+              "subject",
+              "body"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "max_tokens": 400
+  },
+  "check": {
+    "type": "tool_call",
+    "expected_calls": [
+      {
+        "name": "send_email",
+        "args": [
+          {
+            "path": "to",
+            "match": "exact",
+            "value": "team@example.com"
+          },
+          {
+            "path": "subject",
+            "match": "contains",
+            "value": "🎉"
+          }
+        ]
+      }
+    ],
+    "mode": "in_order"
+  }
+}

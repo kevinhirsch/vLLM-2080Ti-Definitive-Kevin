@@ -1,0 +1,10 @@
+# mtp-requal.conf — points vllm-qwen27b at the MTP re-qualification serve
+# variant WITHOUT touching the live MTP-off script. Copy without ".example"
+# into /etc/systemd/system/vllm-qwen27b.service.d/ to activate; delete the
+# copy to roll back. See deploy/docs/QWEN-3.8-MTP-REQUALIFICATION.md.
+#
+# Optional: sweep the draft length by adding, e.g.
+#   Environment=MTP_K=2
+[Service]
+ExecStart=
+ExecStart=/home/kevin/.local/share/vllm-qwen27b/serve-qwen38-mtp-requal-fg.sh

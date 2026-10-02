@@ -1,0 +1,60 @@
+{
+  "id": "tool_call_014",
+  "category": "tool_call",
+  "description": "unicode argument: non-Latin script text",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Translate the Japanese greeting こんにちは into English."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "translate_text",
+          "description": "Translate text into a target language.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "target_language": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "text",
+              "target_language"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "max_tokens": 400
+  },
+  "check": {
+    "type": "tool_call",
+    "expected_calls": [
+      {
+        "name": "translate_text",
+        "args": [
+          {
+            "path": "text",
+            "match": "exact",
+            "value": "こんにちは"
+          },
+          {
+            "path": "target_language",
+            "match": "regex",
+            "pattern": "(?i)\\benglish\\b|\\ben\\b"
+          }
+        ]
+      }
+    ],
+    "mode": "in_order"
+  }
+}

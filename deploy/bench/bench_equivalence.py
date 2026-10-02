@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""Spec-decode losslessness check: greedy output with MTP ON must equal greedy
+output with MTP OFF (speculative decoding is verify-and-reject; a divergence
+means the verify path is broken, which is exactly what garbled 2026-08-14).
+
+Two engines can't run side-by-side on this box, so this is record/replay:
+
+    # 1. against the CURRENT MTP-off engine (the trusted reference):
+    python3 bench_equivalence.py record --out ref-mtp-off.json
+    # 2. switch to the requal serve variant, then:
+    python3 bench_equivalence.py check --ref ref-mtp-off.json
+
+Prompts cover the failure surface: short prose, code emission, a 60K-context
+recall (the old garble band), and a tool-flavored prompt. Greedy (temperature
+0) is deliberate: Qwen discourages it for QUALITY, but for equivalence it is
+the correct instrument — sampling would mask real divergence. Tiny numeric
+drift can legitimately flip a late token (fp nondeterminism, cudagraph vs
+eager kernels), so the bar is a >=PREFIX_MIN-character identical prefix
+(whitespace-normalized; see the constant's comment), not byte equality to
+the end.
+"""
+import argparse
+import json
+import sys
+
+from bench_lib import DEFAULT_BASE, DEFAULT_MODEL, build_context_prompt, chat
+
+# Identity bar measured in whitespace-normalized CHARACTERS (not tokens):
+# 800 chars ≈ 200 tokens at ~4 chars/token, i.e. half of each 400-token probe
+# must match before fp-drift divergence is tolerated.
+PREFIX_MIN = 800
+
+PROBES = [
+    ("prose", "Explain in one paragraph why a watchdog must clear a systemd "
+              "start-limit latch before restarting a unit."),
+    ("code", "Write a Python function `parse_kv(line: str) -> dict` that parses "
+             "'k1=v1;k2=v2' pairs, ignoring empty segments. Code only."),
+    ("ctx60k", None),  # built at runtime: 60K-token doc + recall question
+    ("toolish", "You have a tool `get_weather(city)`. The user asks: what's the "
+                "weather in Tempe? Respond with the tool call you would make."),
+]
+
+
+def build_messages(name: str) -> list:
+    if name == "ctx60k":
+        doc = build_context_prompt(60000, "EQ-60K-SALTBUSH")
+        return [{"role": "user", "content": doc +
+                 "\n\nState the exact AUDIT MARKER value, then summarize the "
+                 "policy in two sentences."}]
+    text = dict(PROBES)[name]
+    return [{"role": "user", "content": text}]
+
+
+def run_probes(base: str, model: str) -> dict:
+    out = {}
+    for name, _ in PROBES:
+        msgs = build_messages(name)
+        r = chat(base, model, msgs, max_tokens=400, temperature=0.0, top_p=1.0,
+                 top_k=-1, seed=42, timeout=600.0,
+                 extra={"chat_template_kwargs": {"enable_thinking": False}})
+        out[name] = r["content"]
+        print(f"[{name}] {r['completion_tokens']} tok, "
+              f"{r['decode_tps']:.1f} tok/s", flush=True)
+    return out
+
+
+def norm(s: str) -> str:
+    return " ".join(s.split())
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("mode", choices=["record", "check"])
+    ap.add_argument("--base-url", default=DEFAULT_BASE)
+    ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap.add_argument("--out", default="ref-mtp-off.json")
+    ap.add_argument("--ref", default="ref-mtp-off.json")
+    args = ap.parse_args()
+
+    ref = None
+    if args.mode == "check":
+        # validate the reference BEFORE burning GPU time on the probe suite
+        try:
+            with open(args.ref) as f:
+                ref = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            ap.error(f"cannot load --ref {args.ref!r}: {exc}")
+        # a valid-JSON non-object (list/str/number) would survive the load and
+        # only blow up at ref.get(...) AFTER the probe suite burned GPU time
+        if not isinstance(ref, dict):
+            ap.error(f"--ref {args.ref!r} must be a JSON object mapping probe "
+                     "names to reference text")
+
+    outputs = run_probes(args.base_url, args.model)
+    if args.mode == "record":
+        with open(args.out, "w") as f:
+            json.dump(outputs, f, indent=2)
+        print(f"reference recorded -> {args.out}")
+        return 0
+    failures = []
+    for name, text in outputs.items():
+        a, b = norm(ref.get(name, "")), norm(text)
+        common = 0
+        for ca, cb in zip(a, b):
+            if ca != cb:
+                break
+            common += 1
+        # bar is anchored to the REFERENCE length only — a truncated check
+        # output must fail, not shrink the requirement to its own size
+        needed = min(PREFIX_MIN, len(a))
+        ok = bool(a) and len(b) >= needed and common >= needed
+        print(f"[{name}] common prefix {common} chars "
+              f"(ref {len(a)}, now {len(b)}) -> {'OK' if ok else 'DIVERGED'}")
+        if not ok:
+            failures.append(name)
+    if failures:
+        print(f"\nEQUIVALENCE FAIL: {', '.join(failures)} — the MTP verify "
+              "path is altering output. Do NOT ship MTP; attach both JSONs "
+              "to the incident notes.")
+        return 1
+    print("\nequivalence OK: MTP output matches the MTP-off reference.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

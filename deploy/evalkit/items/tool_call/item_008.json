@@ -1,0 +1,98 @@
+{
+  "id": "tool_call_008",
+  "category": "tool_call",
+  "description": "parallel calls: two different tools",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "I'm about to travel to Tokyo: tell me the current weather there, and also convert 100 USD to JPY. Do both in this turn."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get the current weather for a city.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string",
+                "description": "City name"
+              }
+            },
+            "required": [
+              "city"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "convert_currency",
+          "description": "Convert an amount from one currency to another.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "amount": {
+                "type": "number"
+              },
+              "from_currency": {
+                "type": "string"
+              },
+              "to_currency": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "amount",
+              "from_currency",
+              "to_currency"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "max_tokens": 400
+  },
+  "check": {
+    "type": "tool_call",
+    "expected_calls": [
+      {
+        "name": "get_weather",
+        "args": [
+          {
+            "path": "city",
+            "match": "regex",
+            "pattern": "(?i)tokyo"
+          }
+        ]
+      },
+      {
+        "name": "convert_currency",
+        "args": [
+          {
+            "path": "amount",
+            "match": "numeric",
+            "value": 100
+          },
+          {
+            "path": "from_currency",
+            "match": "regex",
+            "pattern": "(?i)usd"
+          },
+          {
+            "path": "to_currency",
+            "match": "regex",
+            "pattern": "(?i)jpy"
+          }
+        ]
+      }
+    ],
+    "mode": "any_order"
+  }
+}

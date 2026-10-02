@@ -1,0 +1,17 @@
+{
+  "id": "instruction_008",
+  "category": "instruction",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Respond with a syntactically valid-looking IPv4 address (four dot-separated numbers, each 0-255) and absolutely nothing else -- no words, no punctuation besides the dots."
+      }
+    ],
+    "max_tokens": 300
+  },
+  "check": {
+    "type": "regex_fullmatch",
+    "pattern": "(25[0-5]|2[0-4]\\d|1?\\d?\\d)(\\.(25[0-5]|2[0-4]\\d|1?\\d?\\d)){3}"
+  }
+}

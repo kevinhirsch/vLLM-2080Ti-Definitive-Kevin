@@ -1,0 +1,54 @@
+{
+  "id": "json_schema_009",
+  "category": "json_schema",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Return a JSON object describing a user profile with exactly these fields: username (3-16 chars, only lowercase letters/digits/underscore), email (string containing '@'), active (boolean), roles (array of at least 1 string, each one of exactly: 'admin', 'user', 'guest'). Respond with ONLY the JSON object, no other text."
+      }
+    ],
+    "response_format": {
+      "type": "json_object"
+    },
+    "max_tokens": 400
+  },
+  "check": {
+    "type": "json_schema",
+    "schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "username",
+        "email",
+        "active",
+        "roles"
+      ],
+      "properties": {
+        "username": {
+          "type": "string",
+          "pattern": "^[a-z0-9_]{3,16}$"
+        },
+        "email": {
+          "type": "string",
+          "pattern": "@"
+        },
+        "active": {
+          "type": "boolean"
+        },
+        "roles": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "enum": [
+              "admin",
+              "user",
+              "guest"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

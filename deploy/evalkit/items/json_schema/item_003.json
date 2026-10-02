@@ -1,0 +1,51 @@
+{
+  "id": "json_schema_003",
+  "category": "json_schema",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Return a JSON object describing a mailing address with exactly these fields: street (string), city (string), zip (a 5-digit string), country (one of exactly: 'US', 'CA', 'MX'). Respond with ONLY the JSON object, no other text."
+      }
+    ],
+    "response_format": {
+      "type": "json_object"
+    },
+    "max_tokens": 400
+  },
+  "check": {
+    "type": "json_schema",
+    "schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "street",
+        "city",
+        "zip",
+        "country"
+      ],
+      "properties": {
+        "street": {
+          "type": "string",
+          "minLength": 1
+        },
+        "city": {
+          "type": "string",
+          "minLength": 1
+        },
+        "zip": {
+          "type": "string",
+          "pattern": "^\\d{5}$"
+        },
+        "country": {
+          "type": "string",
+          "enum": [
+            "US",
+            "CA",
+            "MX"
+          ]
+        }
+      }
+    }
+  }
+}

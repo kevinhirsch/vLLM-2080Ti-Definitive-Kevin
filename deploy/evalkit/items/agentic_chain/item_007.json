@@ -1,0 +1,83 @@
+{
+  "id": "agentic_chain_007",
+  "category": "agentic_chain",
+  "description": "flight gate lookup then notify passenger with gate info from result",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "lookup_flight",
+        "description": "Look up gate and status info for a flight.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "flight_number": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "flight_number"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "notify_passenger",
+        "description": "Send a notification message to a passenger.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "message"
+          ]
+        }
+      }
+    }
+  ],
+  "user": "Look up flight UA123's gate and let the passenger know.",
+  "steps": [
+    {
+      "expect_tool": "lookup_flight",
+      "arg_checks": [
+        {
+          "path": "flight_number",
+          "match": "exact",
+          "value": "UA123"
+        }
+      ],
+      "inject_result": {
+        "gate": "B12",
+        "status": "on time"
+      },
+      "max_tokens": 300
+    },
+    {
+      "expect_tool": "notify_passenger",
+      "arg_checks": [
+        {
+          "path": "message",
+          "match": "contains",
+          "value_from_previous_result": "gate"
+        }
+      ],
+      "inject_result": {
+        "status": "sent"
+      },
+      "max_tokens": 300
+    },
+    {
+      "final": true,
+      "answer_check": {
+        "pattern": "sent|notified|let them know|done",
+        "must_not_pattern": "\\b(not|n't|unable|fail(ed|s)?|couldn't|cannot|can't|never|didn't|wasn't|isn't|error|sorry|unfortunately)\\b"
+      },
+      "max_tokens": 150
+    }
+  ]
+}

@@ -1,0 +1,83 @@
+{
+  "id": "agentic_chain_009",
+  "category": "agentic_chain",
+  "description": "3-step: resolve email to user id -> subscription lookup, answer states plan and renewal date",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_user_id",
+        "description": "Resolve an email address to an internal user id.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "email": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "email"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_subscription",
+        "description": "Get subscription plan info for a user id.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "user_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "user_id"
+          ]
+        }
+      }
+    }
+  ],
+  "user": "Look up the subscription plan for the account with email pat@example.com.",
+  "steps": [
+    {
+      "expect_tool": "get_user_id",
+      "arg_checks": [
+        {
+          "path": "email",
+          "match": "exact",
+          "value": "pat@example.com"
+        }
+      ],
+      "inject_result": {
+        "user_id": "u_500"
+      },
+      "max_tokens": 300
+    },
+    {
+      "expect_tool": "get_subscription",
+      "arg_checks": [
+        {
+          "path": "user_id",
+          "match": "exact",
+          "value_from_previous_result": "user_id"
+        }
+      ],
+      "inject_result": {
+        "plan": "pro",
+        "renews_on": "2026-09-01"
+      },
+      "max_tokens": 300
+    },
+    {
+      "final": true,
+      "answer_check": {
+        "pattern": "(?=.*pro)(?=.*2026-09-01)",
+        "must_not_pattern": "\\b(not|n't|unable|fail(ed|s)?|couldn't|cannot|can't|never|didn't|wasn't|isn't|error|sorry|unfortunately)\\b"
+      },
+      "max_tokens": 150
+    }
+  ]
+}

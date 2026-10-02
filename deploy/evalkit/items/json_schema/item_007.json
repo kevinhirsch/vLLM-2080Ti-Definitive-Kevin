@@ -1,0 +1,53 @@
+{
+  "id": "json_schema_007",
+  "category": "json_schema",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Return a JSON object describing a weather report with exactly these fields: city (non-empty string), temp_c (number), condition (one of exactly: 'sunny', 'cloudy', 'rainy', 'snowy', 'windy'), humidity_pct (integer 0 to 100). Respond with ONLY the JSON object, no other text."
+      }
+    ],
+    "response_format": {
+      "type": "json_object"
+    },
+    "max_tokens": 400
+  },
+  "check": {
+    "type": "json_schema",
+    "schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "city",
+        "temp_c",
+        "condition",
+        "humidity_pct"
+      ],
+      "properties": {
+        "city": {
+          "type": "string",
+          "minLength": 1
+        },
+        "temp_c": {
+          "type": "number"
+        },
+        "condition": {
+          "type": "string",
+          "enum": [
+            "sunny",
+            "cloudy",
+            "rainy",
+            "snowy",
+            "windy"
+          ]
+        },
+        "humidity_pct": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        }
+      }
+    }
+  }
+}

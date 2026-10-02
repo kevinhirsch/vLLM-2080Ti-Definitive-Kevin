@@ -1,0 +1,24 @@
+[Unit]
+Description=vLLM 2080Ti Definitive - Qwen3.6-27B GPTQ-INT4 (TQK8V4 fast, two250K, MTP3)
+Documentation=https://github.com/weicj/vLLM-2080Ti-Definitive
+After=network-online.target systemd-sysctl.service
+Wants=network-online.target
+# StartLimit* belong in [Unit], not [Service] (systemd ignores them there).
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=kevin
+Group=kevin
+WorkingDirectory=/home/kevin/Desktop/vLLM-2080Ti-Definitive
+EnvironmentFile=/home/kevin/.local/share/vllm-qwen27b/vllm-qwen27b.env
+ExecStart=/home/kevin/.local/share/vllm-qwen27b/serve-tqk8v4-fg.sh
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=90
+KillMode=control-group
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

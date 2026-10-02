@@ -1,0 +1,56 @@
+{
+  "id": "tool_call_010",
+  "category": "tool_call",
+  "description": "nested/multiline code argument",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Run this snippet using the tool and tell me what it prints:\n\n```\ndef add(a, b):\n    return a + b\n\nprint(add(2, 3))\n```"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "run_snippet",
+          "description": "Run a code snippet and return its output.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "max_tokens": 400
+  },
+  "check": {
+    "type": "tool_call",
+    "expected_calls": [
+      {
+        "name": "run_snippet",
+        "args": [
+          {
+            "path": "code",
+            "match": "regex",
+            "pattern": "def\\s+add\\s*\\(\\s*a\\s*,\\s*b\\s*\\)"
+          },
+          {
+            "path": "code",
+            "match": "contains",
+            "value": "return a + b"
+          }
+        ]
+      }
+    ],
+    "mode": "in_order"
+  }
+}

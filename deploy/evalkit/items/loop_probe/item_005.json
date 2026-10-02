@@ -1,0 +1,18 @@
+{
+  "id": "loop_probe_005",
+  "category": "loop_probe",
+  "description": "100 distinct: distinct fruit or vegetable names",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "List exactly 100 distinct fruit or vegetable names. Format each line as '<N>. <item>' with N running from 1 to 100 in strictly increasing order, one item per line. All 100 items must be distinct (case-insensitive) -- do not repeat any item. Output only the 100 numbered lines: no title, no intro, no closing remarks, no blank lines."
+      }
+    ],
+    "max_tokens": 2500
+  },
+  "check": {
+    "type": "loop_probe",
+    "count": 100
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "id": "instruction_007",
+  "category": "instruction",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Write one short sentence about dogs that does NOT contain the letter 'e' anywhere (case-insensitive). Output only that sentence."
+      }
+    ],
+    "max_tokens": 300
+  },
+  "check": {
+    "type": "no_letter",
+    "value": "e"
+  }
+}

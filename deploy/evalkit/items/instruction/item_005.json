@@ -1,0 +1,16 @@
+{
+  "id": "instruction_005",
+  "category": "instruction",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Write a short warning sign message about a wet floor, entirely in uppercase letters. There must be no lowercase letters anywhere in your response."
+      }
+    ],
+    "max_tokens": 300
+  },
+  "check": {
+    "type": "all_upper"
+  }
+}

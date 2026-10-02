@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=vLLM - Restart
+Comment=Restart vllm-qwen27b and wait for the API to come back (asks for password)
+Exec=konsole -e /home/kevin/.local/share/vllm-qwen27b/vllm-restart.sh
+Icon=view-refresh
+Terminal=false
+Categories=System;

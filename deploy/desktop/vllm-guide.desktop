@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=vLLM - Guide
+Comment=Open the vLLM server documentation (config options, ops, troubleshooting)
+Exec=kate /home/kevin/Desktop/vLLM-Server-Guide.md
+Icon=help-contents
+Terminal=false
+Categories=System;
