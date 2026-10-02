@@ -463,7 +463,11 @@ class InputBatch:
             raise NotImplementedError("Unrecognized request type")
 
         # Speculative decoding: by default 1 token is generated.
-        self.num_accepted_tokens_cpu[req_index] = 1
+        # [FORK][LANE EF] ...unless this request was merely dropped from the
+        # batch for a step (still running, state intact): restore its count.
+        _saved = getattr(request, "saved_num_accepted_tokens", 1)
+        self.num_accepted_tokens_cpu[req_index] = _saved if _saved >= 1 else 1
+        request.saved_num_accepted_tokens = 1
 
         # Add request lora ID
         if request.lora_request:

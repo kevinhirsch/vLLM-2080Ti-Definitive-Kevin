@@ -21,6 +21,7 @@ from vllm.distributed import (
 )
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
+from vllm.utils import ef_fence as _ef_fence
 from vllm.model_executor.custom_op import CustomOp, PluggableLayer
 from vllm.model_executor.layers.fla.ops import (
     chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
@@ -2095,6 +2096,26 @@ def gdn_attention_core(
             a=a_or_z_out,
             core_attn_out=core_attn_out,
         )
+        # [FORK][LANE EF] attribution fence for steps that carry prefill tokens
+        # (see vllm/utils/ef_fence.py); never on pure-decode steps.
+        if _ef_fence.ENABLED:
+            _am = forward_context.attn_metadata
+            _m = _am.get(self.prefix) if isinstance(_am, dict) else None
+            if _m is not None and getattr(_m, "num_prefills", 0) > 0:
+                _ef_fence.fence(
+                    f"gdn:{self.prefix}",
+                    lambda: {
+                        "num_prefills": getattr(_m, "num_prefills", None),
+                        "num_decodes": getattr(_m, "num_decodes", None),
+                        "num_spec_decodes": getattr(_m, "num_spec_decodes", None),
+                        "num_actual_tokens": getattr(_m, "num_actual_tokens", None),
+                        "num_accepted_tokens": (
+                            _m.num_accepted_tokens.tolist()
+                            if getattr(_m, "num_accepted_tokens", None) is not None
+                            else None
+                        ),
+                    },
+                )
 
 
 def gdn_attention_core_fake(
