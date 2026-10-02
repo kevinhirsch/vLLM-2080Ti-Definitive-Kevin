@@ -1282,6 +1282,20 @@ class GPUModelRunner(
         # consecutive batches contain mostly the same requests. If batches
         # have low request overlap (e.g., alternating between two distinct
         # sets of requests), this optimization becomes very inefficient.
+        # [FORK][LANE EF] A running spec-decode request that is not scheduled in
+        # a step (token budget exhausted by a prefill chunk, etc.) is dropped
+        # from the persistent batch. InputBatch.add_request() re-seeds its
+        # num_accepted_tokens with 1, but its recurrent (GDN/Mamba) state still
+        # sits at slot accepted-1 of the speculative window, so the next step
+        # would read a stale slot. Stash the count so add_request can restore it.
+        if self.speculative_config is not None and not self.use_async_scheduling:
+            for req_id in unscheduled_req_ids:
+                _idx = self.input_batch.req_id_to_index.get(req_id)
+                _rs = self.requests.get(req_id)
+                if _idx is not None and _rs is not None:
+                    _rs.saved_num_accepted_tokens = int(
+                        self.input_batch.num_accepted_tokens_cpu[_idx]
+                    )
         for req_id in unscheduled_req_ids:
             self.input_batch.remove_request(req_id)
 
@@ -1479,6 +1493,8 @@ class GPUModelRunner(
                 # The request is resumed from preemption.
                 # Replace the existing block IDs with the new ones.
                 req_state.block_ids = new_block_ids
+                # [FORK][LANE EF] preempted state was freed: accepted count resets.
+                req_state.saved_num_accepted_tokens = 1
 
             if req_index is None:
                 # The request is not in the persistent batch.
@@ -3855,6 +3871,31 @@ class GPUModelRunner(
             num_sampled_ids: int = len(sampled_ids) if sampled_ids else 0
 
             if not sampled_ids:
+                if (
+                    not self.use_async_scheduling
+                    and int(self.discard_request_mask.np[req_idx]) == 0
+                    and scheduler_output.num_scheduled_tokens.get(req_ids[req_idx], 0)
+                    > 0
+                ):
+                    # [FORK][LANE EF] A non-discarded row produced no valid
+                    # token: the scheduler cannot roll back rejected drafts for
+                    # it and its num_computed_tokens drifts (17:03:23 fault).
+                    _rid = req_ids[req_idx]
+                    try:
+                        _raw = sampled_token_ids[req_idx].tolist()
+                    except Exception:  # pragma: no cover - diagnostics only
+                        _raw = "<unreadable>"
+                    logger.warning(
+                        "WORKER-INVARIANT empty sample row req=%s sched=%s spec=%s "
+                        "raw=%s worker_computed=%s worker_num_tokens=%s vocab=%s",
+                        _rid,
+                        scheduler_output.num_scheduled_tokens.get(_rid),
+                        scheduler_output.scheduled_spec_decode_tokens.get(_rid),
+                        _raw,
+                        self.requests[_rid].num_computed_tokens,
+                        self.requests[_rid].num_tokens,
+                        self.input_batch.vocab_size,
+                    )
                 continue
 
             start_idx = self.input_batch.num_tokens_no_spec[req_idx]

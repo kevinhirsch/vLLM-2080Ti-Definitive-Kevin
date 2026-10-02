@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -453,6 +454,22 @@ class Scheduler(SchedulerInterface):
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
 
+        # [FORK][LANE EF] Scheduler/worker progress-invariant guard. See
+        # _check_progress_invariant. Evidence: 2026-10-01 17:03:23 the engine
+        # died with "ValueError: repeats may not contain negative values"
+        # (num_scheduled_tokens = -2 for a request with num_computed_tokens =
+        # num_tokens + 3). A request whose computed-token counter disagrees
+        # with its token count is unrecoverable in place (the GDN recurrent
+        # state has already consumed the extra tokens), so instead of killing
+        # the whole engine the request is preempted and recomputed from the
+        # prefix cache. VLLM_SCHED_INVARIANT_GUARD=0 restores upstream behavior.
+        self.progress_guard_enabled: bool = (
+            os.environ.get("VLLM_SCHED_INVARIANT_GUARD", "1") != "0"
+            and not self.scheduler_config.async_scheduling
+        )
+        self._heal_queue: list[Request] = []
+        self.num_progress_violations: int = 0
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -601,6 +618,96 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    def _record_progress_violation(
+        self, kind: str, request: Request, **detail: Any
+    ) -> None:
+        """Count + log (rate limited) a scheduler progress-invariant violation."""
+        self.num_progress_violations += 1
+        n = self.num_progress_violations
+        if n <= 50 or n % 100 == 0:
+            logger.error(
+                "SCHED-INVARIANT violation #%d kind=%s req=%s computed=%d "
+                "num_tokens=%d num_prompt=%d num_output=%d struct=%s detail=%s "
+                "-> %s",
+                n,
+                kind,
+                request.request_id,
+                request.num_computed_tokens,
+                request.num_tokens,
+                request.num_prompt_tokens,
+                len(request.output_token_ids),
+                request.use_structured_output,
+                detail,
+                "preempt+recompute" if self.progress_guard_enabled else "no-heal",
+            )
+
+    def _check_progress_invariant(
+        self,
+        request: Request,
+        pre_computed: int,
+        pre_num_tokens: int,
+        num_scheduled: int,
+        num_spec_scheduled: int,
+        num_generated: int,
+    ) -> bool:
+        """Non-async invariant: a row that reached the end of its known tokens
+        this step (decode row or final prefill chunk) must end the step with
+        exactly one uncomputed token: num_computed_tokens == num_tokens - 1.
+
+        Returns True if the invariant holds (or does not apply); False after
+        recording a violation and queueing the request for preempt+recompute.
+        """
+        if pre_computed < pre_num_tokens:
+            return True  # mid-prefill chunk: no sample expected
+        if request.num_computed_tokens == request.num_tokens - 1:
+            return True
+        self._record_progress_violation(
+            "computed-ne-num_tokens-minus-1",
+            request,
+            pre_computed=pre_computed,
+            pre_num_tokens=pre_num_tokens,
+            scheduled=num_scheduled,
+            spec_scheduled=num_spec_scheduled,
+            generated=num_generated,
+        )
+        if self.progress_guard_enabled:
+            self._heal_queue.append(request)
+        return False
+
+    def _note_unscheduled_decode_rows(
+        self, num_scheduled_tokens: dict[str, int], token_budget: int, num_new: int
+    ) -> None:
+        dropped = [
+            r
+            for r in self.running
+            if r.request_id not in num_scheduled_tokens
+            and r.num_computed_tokens >= r.num_tokens - 1
+        ]
+        self._sched_steps = getattr(self, "_sched_steps", 0) + 1
+        if not dropped:
+            return
+        self.num_decode_rows_dropped = getattr(
+            self, "num_decode_rows_dropped", 0
+        ) + len(dropped)
+        self.num_steps_with_drops = getattr(self, "num_steps_with_drops", 0) + 1
+        n = self.num_steps_with_drops
+        if n <= 30 or n % 50 == 0:
+            logger.warning(
+                "SCHED-DROP step=%d decode rows left out=%d (total rows dropped=%d, "
+                "steps with drops=%d) running=%d scheduled=%d new=%d "
+                "budget_left=%d/%d spec_sched_rows=%d",
+                self._sched_steps,
+                len(dropped),
+                self.num_decode_rows_dropped,
+                n,
+                len(self.running),
+                len(num_scheduled_tokens),
+                num_new,
+                token_budget,
+                self.max_num_scheduled_tokens,
+                sum(1 for v in num_scheduled_tokens.values() if v > 1),
+            )
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -724,6 +831,16 @@ class Scheduler(SchedulerInterface):
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
 
+        # [FORK][LANE EF] Preempt+recompute requests whose progress invariant
+        # was violated last step (see _check_progress_invariant).
+        if self._heal_queue:
+            for healed in self._heal_queue:
+                if healed.status == RequestStatus.RUNNING and healed in self.running:
+                    self.running.remove(healed)
+                    self._preempt_request(healed, scheduled_timestamp)
+                    preempted_reqs.append(healed)
+            self._heal_queue.clear()
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -810,6 +927,28 @@ class Scheduler(SchedulerInterface):
                 - request.num_computed_tokens
                 - self.num_sampled_tokens_per_step,
             )
+
+            if num_new_tokens < 0 and self.progress_guard_enabled:
+                if (
+                    request.num_computed_tokens
+                    >= self.max_model_len - self.num_sampled_tokens_per_step
+                ):
+                    # Context ceiling, not a bookkeeping fault: the request
+                    # cannot advance (handled by the zero-token path below).
+                    num_new_tokens = 0
+                else:
+                    # [FORK][LANE EF] Would reach np.repeat() with a negative
+                    # count and kill the engine (2026-10-01 17:03:23).
+                    self._record_progress_violation(
+                        "negative-num_new_tokens",
+                        request,
+                        num_new_tokens=num_new_tokens,
+                        spec=len(request.spec_token_ids),
+                    )
+                    self.running.pop(req_index)
+                    self._preempt_request(request, scheduled_timestamp)
+                    preempted_reqs.append(request)
+                    continue
 
             # Apply Mamba alignment before encoder caps.
             if self.need_mamba_block_aligned_split:
@@ -1472,6 +1611,14 @@ class Scheduler(SchedulerInterface):
             # record whether it was capacity-bound.
             if not defer_prefills:
                 self.prefill_capacity_bound = bool(self.waiting)
+
+        # [FORK][LANE EF] Decode-row drop telemetry. A running request that
+        # is NOT scheduled in a step is removed from the worker's persistent
+        # batch; count decode-phase rows left out and the budget left.
+        if self.progress_guard_enabled:
+            self._note_unscheduled_decode_rows(
+                num_scheduled_tokens, token_budget, len(scheduled_new_reqs)
+            )
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -2182,6 +2329,8 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
+            _pg_pre_computed = request.num_computed_tokens
+            _pg_pre_num_tokens = request.num_tokens
             if scheduled_spec_token_ids and (
                 generated_token_ids or self.num_sampled_tokens_per_step == 0
             ):
@@ -2283,6 +2432,20 @@ class Scheduler(SchedulerInterface):
                     request.status = RequestStatus.FINISHED_ERROR
                     request.resumable = False
                     stopped = True
+
+            if (
+                self.progress_guard_enabled
+                and not stopped
+                and request.status == RequestStatus.RUNNING
+            ):
+                self._check_progress_invariant(
+                    request,
+                    _pg_pre_computed,
+                    _pg_pre_num_tokens,
+                    num_tokens_scheduled,
+                    len(scheduled_spec_token_ids) if scheduled_spec_token_ids else 0,
+                    len(generated_token_ids),
+                )
 
             routed_experts = None
             if (

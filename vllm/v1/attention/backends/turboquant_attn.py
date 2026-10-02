@@ -33,6 +33,7 @@ from vllm import envs
 from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
+from vllm.utils.ef_fence import fence as _ef_fence
 from vllm.model_executor.layers.quantization.turboquant.centroids import (
     get_centroids,
 )
@@ -1152,6 +1153,26 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # num_decodes/num_decode_tokens from metadata give the split point.
         num_decodes = attn_metadata.num_decodes
         num_decode_tokens = attn_metadata.num_decode_tokens
+        # [FORK][LANE EF] steps that carry prefill/continuation tokens are long:
+        # fence so a stream fault is attributed to the stage that caused it.
+        _ef_fence_on = N > num_decode_tokens and not getattr(
+            attn_metadata, "force_spec_decode", False
+        )
+        _ef_ctx = lambda: {  # noqa: E731
+            "layer": getattr(layer, "layer_name", None),
+            "N": N,
+            "num_decodes": num_decodes,
+            "num_decode_tokens": num_decode_tokens,
+            "max_query_len": attn_metadata.max_query_len,
+            "max_seq_len": attn_metadata.max_seq_len,
+            "q_lens": (
+                attn_metadata.query_start_loc_cpu[1:]
+                - attn_metadata.query_start_loc_cpu[:-1]
+            ).tolist(),
+            "seq_lens": attn_metadata.seq_lens_cpu.tolist(),
+        }
+        if _ef_fence_on:
+            _ef_fence("tq:pre-attn(kv-store+previous-layers)", _ef_ctx)
 
         if attn_metadata.force_spec_decode:
             if (
@@ -1270,6 +1291,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     layer,
                 )
 
+            if _ef_fence_on:
+                _ef_fence("tq:mixed-decode-portion", _ef_ctx)
+
             # --- Prefill portion (remaining requests) ---
             # CRITICAL: use prefill-specific max_seq_len so flash_attn's
             # fast path (max_query_len == max_seq_len) triggers for
@@ -1356,6 +1380,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 PiT,
                 layer=layer,
             )
+
+        if _ef_fence_on:
+            _ef_fence("tq:prefill-portion", _ef_ctx)
 
         # Write into output buffer: attn_out is (N, Hq, D)
         # output may be 2D (N, Hq*D) or 3D (N, Hq, D)
