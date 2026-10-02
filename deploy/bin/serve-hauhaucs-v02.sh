@@ -50,10 +50,10 @@ ARGS=(
   --gpu-memory-utilization ${VLLM_GPU_UTIL:-0.84}
   --compilation-config "${V02_COMPILATION_CONFIG:-$CC_DEFAULT}"
   --speculative-config "${V02_SPEC:-$SPEC_DEFAULT}"
-  --max-model-len 524288
+  --max-model-len ${V02_MAXLEN:-524288}
   --hf-overrides '{"rope_parameters":{"rope_type":"yarn","factor":2.0,"original_max_position_embeddings":262144,"mrope_interleaved":true,"mrope_section":[11,11,10],"partial_rotary_factor":0.25,"rope_theta":10000000}}'
   --enable-chunked-prefill
-  --max-num-seqs 16
+  --max-num-seqs ${V02_MAXSEQS:-16}
   --max-num-batched-tokens ${VLLM_MNBT:-3584}
   --scheduling-policy priority
   --kv-cache-dtype ${V02_KV_DTYPE:-turboquant_k3v4_nc}
