@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     # This is intentionally unsafe for general production workloads because
     # changing acceptance lengths can alter recurrent-state update topology.
     VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH: bool = False
+    VLLM_CUSTOM_ALLREDUCE_MAX_SIZE_MB: int = 0
     VLLM_TURBOQUANT_DECODE_BLOCK_KV: int = 2
     VLLM_TURBOQUANT_MAX_KV_SPLITS: int | None = None
     VLLM_TURBOQUANT_SPEC_CONTINUATION_DECODE_FASTPATH: bool = False
@@ -896,6 +897,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         )()
         or "auto"
     ).lower(),
+    # Fork (EXP-040): raise the custom-allreduce size cap above the 8 MiB default
+    # (0 = keep default). 32 routes chunked-prefill allreduces off NCCL.
+    "VLLM_CUSTOM_ALLREDUCE_MAX_SIZE_MB": lambda: int(
+        os.getenv("VLLM_CUSTOM_ALLREDUCE_MAX_SIZE_MB", "0")
+    ),
     "VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH": lambda: bool(
         int(os.getenv("VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH", "0"))
     ),

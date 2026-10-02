@@ -207,6 +207,9 @@ class CustomAllreduce:
                 "group does not have MNNVL-capable GPUs on every rank."
             )
             return
+        if envs.VLLM_CUSTOM_ALLREDUCE_MAX_SIZE_MB > 0:
+            # Fork EXP-040 override of the default cap (see vllm/envs.py).
+            max_size = envs.VLLM_CUSTOM_ALLREDUCE_MAX_SIZE_MB * 1024 * 1024
         device_capability = current_platform.get_device_capability()
         if (
             current_platform.is_cuda()
