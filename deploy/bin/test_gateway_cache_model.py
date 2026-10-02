@@ -240,6 +240,28 @@ class Units(Base):
             self.assertAlmostEqual(shim._prefill_backlog_secs(), 30.0)
 
 
+class Window(Base):
+    def test_window_is_off_in_legacy_mode_and_for_halo_control(self):
+        with patch.object(shim, "_inflight_computed", 500_000):
+            self.assertTrue(shim.prefill_window_ok(40_000))                          # flag off
+            with patch.object(shim, "USE_COMPUTED_COST", 1):
+                self.assertTrue(shim.prefill_window_ok(40_000, halo_control=True))
+
+    def test_light_requests_always_fit_and_others_need_room(self):
+        with patch.object(shim, "USE_COMPUTED_COST", 1), patch.object(shim, "PREFILL_TPS", 1000.0), \
+                patch.object(shim, "PREFILL_ADMIT_SECS", 45.0), patch.object(shim, "LIGHT_PREFILL_SECS", 5.0):
+            with patch.object(shim, "_inflight_computed", 200_000):                  # 200s queued
+                self.assertTrue(shim.prefill_window_ok(4_000))                       # light: always
+                self.assertFalse(shim.prefill_window_ok(12_000))
+            with patch.object(shim, "_inflight_computed", 4_000):                     # queue ~empty
+                self.assertTrue(shim.prefill_window_ok(90_000))                      # even a huge one runs
+            with patch.object(shim, "_inflight_computed", 30_000):
+                self.assertTrue(shim.prefill_window_ok(12_000))                      # 30+12 <= 45
+                self.assertFalse(shim.prefill_window_ok(20_000))                     # 30+20 > 45
+            with patch.object(shim, "PREFILL_ADMIT_SECS", 0.0), patch.object(shim, "_inflight_computed", 10**6):
+                self.assertTrue(shim.prefill_window_ok(50_000))                      # 0 = off
+
+
 class Decision(Base):
     def setUp(self):
         super().setUp()
@@ -351,6 +373,15 @@ class Routing(Base, unittest.IsolatedAsyncioTestCase):
             with patch.object(shim, "_est_tokens", lambda b: 2_000):
                 self.assertEqual(await self.route(light), "remote")   # arrivals during a monster go remote
                 self.assertEqual(self.events, [("remote", "monster")])
+
+    async def test_medium_request_behind_a_full_prefill_queue_waits_then_overflows_with_reason_prefill(self):
+        medium = convo("M", 6)
+        with patch.object(shim, "USE_COMPUTED_COST", 1), patch.object(shim, "_est_tokens", lambda b: 12_000), \
+                patch.object(shim, "_inflight_computed", 40_000), patch.object(shim, "PREFILL_TPS", 1000.0), \
+                patch.object(shim, "MONSTER_PREFILL_SECS", 0.0), patch.object(shim, "BIG_PROMPT", 0):
+            self.assertEqual(await self.route(medium), "remote")
+        self.assertEqual(self.events, [("remote", "prefill")])
+        self.assertEqual(shim._inflight, 0)
 
     async def test_remote_served_turn_does_not_pretend_to_warm_local(self):
         cold = convo("C", 20)

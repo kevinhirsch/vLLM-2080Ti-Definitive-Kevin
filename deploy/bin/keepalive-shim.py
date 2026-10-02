@@ -306,6 +306,16 @@ PREFIX_MODEL_MAX_NODES = int(os.environ.get("SHIM_PREFIX_MODEL_MAX_NODES", "6000
 MONSTER_PREFILL_SECS = float(os.environ.get("SHIM_MONSTER_PREFILL_SECS", "30"))
 HEAVY_PREFILL_SECS = float(os.environ.get("SHIM_HEAVY_PREFILL_SECS", "20"))
 HEAVY_ADMIT_BACKLOG_SECS = float(os.environ.get("SHIM_HEAVY_ADMIT_BACKLOG_SECS", "15"))
+# PREFILL ADMISSION WINDOW (LS lane, 2026-10-02). Measured with the cost model live: the first six
+# hours kept in-flight uncached prefill at 100-150 s (14 requests, avg ~12K tokens each -- none
+# "heavy" on its own) and local TTFT p50 sat at 27-53 s; after an engine restart emptied the
+# queue it was 7.5 s. vLLM prefills in arrival order, so the queue the shim lets in IS every later
+# request's wait. A request is admitted to the local engine only when its own prefill seconds fit
+# under PREFILL_ADMIT_SECS together with what is already prefilling -- or when it is LIGHT (a few
+# seconds of prefill), which always fits. A request that does not fit waits for a lane like any
+# other (local-wait), then overflows. 0 = off.
+PREFILL_ADMIT_SECS = float(os.environ.get("SHIM_PREFILL_ADMIT_SECS", "45"))
+LIGHT_PREFILL_SECS = float(os.environ.get("SHIM_LIGHT_PREFILL_SECS", "5"))
 # 2026-09-05 (evalkit run-2 forensics): background classification by X-Client only matched the
 # substrings "cron"/"batch", so the research service ("workflow-bg"), the research feeder and the
 # local digester all ran as FOREGROUND and could fill every lane, queueing genuinely interactive
@@ -449,6 +459,8 @@ _CFG = {
     "SHIM_MONSTER_PREFILL_SECS": ("MONSTER_PREFILL_SECS", float),
     "SHIM_HEAVY_PREFILL_SECS": ("HEAVY_PREFILL_SECS", float),
     "SHIM_HEAVY_ADMIT_BACKLOG_SECS": ("HEAVY_ADMIT_BACKLOG_SECS", float),
+    "SHIM_PREFILL_ADMIT_SECS": ("PREFILL_ADMIT_SECS", float),
+    "SHIM_LIGHT_PREFILL_SECS": ("LIGHT_PREFILL_SECS", float),
     "SHIM_BG_XCLIENTS":      ("BG_XCLIENTS", lambda v: [m.lower() for m in _parse_seq(v, _CFG_SEP["SHIM_BG_XCLIENTS"])]),
     "SHIM_POOL_TOKENS":      ("POOL_TOKENS",      int),
     "SHIM_BG_WAIT_SECS":     ("BG_WAIT",          float),
@@ -3739,6 +3751,17 @@ def _prefill_backlog_secs():
     return _inflight_computed / max(1.0, PREFILL_TPS)
 
 
+def prefill_window_ok(est_computed, halo_control=False):
+    """May a request with this predicted uncached prefill join the engine's prefill queue now?"""
+    if not USE_COMPUTED_COST or halo_control or PREFILL_ADMIT_SECS <= 0 or PREFILL_TPS <= 0:
+        return True
+    own = max(0, est_computed or 0) / PREFILL_TPS
+    backlog = _prefill_backlog_secs()
+    # An (almost) empty queue admits anything -- a request bigger than the whole window would
+    # otherwise never run; the heavy-request backlog rule and the monster guard bound the rest.
+    return own <= LIGHT_PREFILL_SECS or backlog <= LIGHT_PREFILL_SECS or backlog + own <= PREFILL_ADMIT_SECS
+
+
 def _desired_units(body, client=None, computed=None):
     """The size-implied unit cost with NO ceiling applied -- how many lanes this request would
     take if it could have as many as it wants. Used two ways: estimate_units() clamps it to
@@ -5117,7 +5140,11 @@ async def _route_completions(request, _no_overflow=False):
     # the prefix state predict just read -- a miss this turn still becomes next turn's hit.
     # Key the model on the body the ENGINE will actually see (think-guard / no-think policy /
     # alias rewrite change the rendered prefix), not the body the client sent.
-    _pm = _pm_predict(_prepare_local_body(request, body, background), ptok)
+    try:
+        _pm_body = _prepare_local_body(request, body, background)
+    except Exception:
+        _pm_body = body          # malformed request: it is rejected further down; just don't crash here
+    _pm = _pm_predict(_pm_body, ptok)
     est_computed = _pm["computed"]
     units = estimate_units(body, client=client, computed=est_computed)
     # The chain holds raw digests (not JSON-serialisable), so it lives in a side table keyed by the
@@ -5456,6 +5483,7 @@ async def _route_completions(request, _no_overflow=False):
     deadline = time.time() + admission_wait_seconds(
         background, overflow_ok, is_peak(), LOCAL_WAIT, BG_WAIT, INTERACTIVE_NEVER_OVERFLOW)
     admitted = False
+    t_admit0 = time.time()
     _local_reason = "-"      # "bg-big-idle" when the idle-engine rule admitted a big background request
     if _lf_kept:             # LOCAL-FIRST: telemetry shows which predictive reason was overridden
         _local_reason = "lf-" + _lf_kept[0]
@@ -5476,8 +5504,9 @@ async def _route_completions(request, _no_overflow=False):
             _bg_big_idle = (background and BG_BIG_LOCAL_WHEN_IDLE and _desired > lane_limit
                             and _inflight == 0 and _waiting <= (1 if queued else 0))
             _admit_units = min(effective_budget(), _desired) if _bg_big_idle else units
+            _win_ok = _bg_big_idle or prefill_window_ok(est_computed, halo_control)
             if _health["ok"] and _admit_units >= sequences and ((_inflight + _admit_units) <= lane_limit or _bg_big_idle) \
-                    and _memory_available(reservation, halo_control=halo_control):
+                    and _memory_available(reservation, halo_control=halo_control) and _win_ok:
                 if _bg_big_idle and (_inflight + _admit_units) > lane_limit:
                     _stats["bg_big_idle_local"] = _stats.get("bg_big_idle_local", 0) + 1
                     _local_reason = "bg-big-idle"
@@ -5488,6 +5517,11 @@ async def _route_completions(request, _no_overflow=False):
                 admitted_conc = _inflight
                 admitted = True
                 break
+            if (background and not _win_ok and _health["ok"] and (_inflight + _admit_units) <= lane_limit
+                    and remote_ok()):
+                # Only the engine's prefill queue is full: background work is patient and has no
+                # reason to pay for remote because of it -- keep waiting (bounded) for it to drain.
+                deadline = max(deadline, t_admit0 + BG_WAIT_LOCAL)
             if time.time() >= deadline:
                 break
             if not queued:                       # first time we couldn't get a slot -> we're backlogged
@@ -5508,7 +5542,9 @@ async def _route_completions(request, _no_overflow=False):
 
     if not admitted:
         # distinguish WHY we couldn't admit: lane-count vs total-context (size-aware) cap
-        if (_inflight + units) <= lane_limit:
+        if (_inflight + units) <= lane_limit and not prefill_window_ok(est_computed, halo_control):
+            reason = "prefill"
+        elif (_inflight + units) <= lane_limit:
             reason = "tokens"
         elif background and (_inflight + units) <= effective_budget():
             reason = "bg-yield"      # lanes exist but are reserved for interactive
@@ -7442,6 +7478,12 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
     <input id=f_use_computed_cost type=number min=0 max=1></label>
    <label><span class=k>Safety margin added to a predicted-cheap request's cost</span><span class=hint>tokens &middot; padding for tokenizer/cache-boundary slop</span>
     <input id=f_prefix_hit_margin_tokens type=number min=0 step=128></label>
+   <label><span class=k>Prefill admission window (cache-aware mode)</span><span class=hint>seconds of uncached prefill the engine may hold in its queue &middot; a request that does not fit waits for a lane, then overflows &middot; reason "prefill"</span>
+    <input id=f_prefill_admit_secs type=number min=0 step=5></label>
+   <label><span class=k>A request this small always fits the window</span><span class=hint>seconds of prefill</span>
+    <input id=f_light_prefill_secs type=number min=0 step=1></label>
+   <label><span class=k>Monster = this many seconds of prefill already in flight (cache-aware mode)</span><span class=hint>seconds &middot; new arrivals go remote &middot; reason "monster"</span>
+    <input id=f_monster_prefill_secs type=number min=0 step=5></label>
    <label><span class=k>Treat this much in-flight context as "a monster is running"</span><span class=hint>tokens &middot; caused reason "monster"</span>
     <input id=f_monster_inflight type=number min=0 step=10000></label>
    <label><span class=k>Upper bound on the first-token wait budget</span><span class=hint>seconds</span>
@@ -7698,6 +7740,7 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
     monster:     {why:'A huge prefill was already monopolizing the engine -- new arrivals overflow until it drains.', field:'f_monster_inflight', label:v=>'threshold = '+Number(v).toLocaleString()+' tok in flight', fix:'Raise the monster-inflight threshold, or expect this while a big job runs.'},
     'tiny-fast': {why:'This was a tiny/fast-lane request, but even the reserved tiny headroom was full.', field:'f_tiny_extra_lanes', label:v=>'extra tiny lanes = '+v, fix:'Add more tiny extra lanes.'},
     tokens:      {why:'A lane was free, but serving this would have exceeded the total in-flight context budget.', field:'f_token_budget', label:v=>'budget = '+Number(v).toLocaleString()+' tok', fix:'Raise the total in-flight context cap.'},
+    prefill:     {why:'The engine already had about as much uncached prompt to prefill as the admission window allows (and this request was not small); it waited for a lane, then overflowed.', field:'f_prefill_admit_secs', label:v=>'window = '+v+' s of prefill', fix:'Raise the prefill admission window, or wait for the backlog to drain.'},
     'bg-yield':  {why:'Lanes existed, but they are reserved for interactive traffic -- this request was background.', field:'f_fg_reserved', label:v=>'reserved for interactive = '+v, fix:'Lower the reserved-for-interactive count, or accept background waits longer.'},
     cap:         {why:'All lanes were busy and this request waited past its queue timeout.', field:'f_local_budget', label:v=>'budget = '+v+' lane(s)', fix:'Raise Local budget (lanes), or raise the queue-wait timeout.'},
     failover:    {why:'Local accepted the request but errored or ran out of memory mid-flight, so it fell back to remote.', field:'f_oom_backoff_secs', label:v=>'backoff = '+v+'s', fix:'Check engine logs for the underlying crash.'},
