@@ -3655,6 +3655,17 @@ def _pm_commit(chain, now=None):
         _PM_NODES.popitem(last=False)
 
 
+def _pm_prefill_done(request):
+    """First token out of the local engine: the prompt is prefilled, so (a) its prefix is in the
+    cache and (b) it no longer occupies the engine's prefill queue -- only its decode remains."""
+    global _inflight_computed
+    pm = _PM_INFLIGHT.get(id(request)) or {}
+    _pm_ready(pm.get("chain") or [])
+    held = pm.pop("backlog_held", 0)
+    if held:
+        _inflight_computed = max(0, _inflight_computed - held)
+
+
 def _pm_ready(chain, now=None):
     """The committing request produced its first token: its prefix is now in the engine's cache."""
     now = time.time() if now is None else now
@@ -4629,7 +4640,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
     if _t_first[0] is not None:
         _active_set(request, ttft=round(_t_first[0] - t_relay_start, 3))
         if not _is_remote_relay:
-            _pm_ready((_PM_INFLIGHT.get(id(request)) or {}).get("chain") or [])
+            _pm_prefill_done(request)
     _scan_usage(buf)   # TELEMETRY: covers the (common, for short responses) case where the whole
                         # stream -- usage trailer included -- already arrived within the gate
     _scan_content_shape(buf)
@@ -5369,6 +5380,7 @@ async def _route_completions(request, _no_overflow=False):
         _inflight_tokens += ptok
         _inflight_reserved_tokens += reservation
         _inflight_computed += est_computed
+        _pm["backlog_held"] = est_computed          # released at first token (prefill done), not at stream end
         reserved = True
         # The engine will now prefill this prompt: from here on its prefix is (being) cached, so
         # the next turn of this conversation is cheap. Learn ONLY from requests that go local.
@@ -5381,7 +5393,7 @@ async def _route_completions(request, _no_overflow=False):
             _inflight -= units
             _inflight_tokens -= ptok
             _inflight_reserved_tokens -= reservation
-            _inflight_computed = max(0, _inflight_computed - est_computed)
+            _inflight_computed = max(0, _inflight_computed - _pm.pop("backlog_held", 0))
             reserved = False
 
     # TINY fast-lane: small calls skip the queue, but never the KV memory limit.

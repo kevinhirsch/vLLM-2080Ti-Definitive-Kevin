@@ -286,7 +286,10 @@ class Routing(Base, unittest.IsolatedAsyncioTestCase):
         async def relay(request, base, path, body, key, streaming, *a, **k):
             self.calls.append("local" if base == shim.LOCAL else "remote")
             if base == shim.LOCAL:               # the real relay marks the prefix cached at first token
-                shim._pm_ready((shim._PM_INFLIGHT.get(id(request)) or {}).get("chain") or [])
+                self.backlog_before_ft = shim._inflight_computed
+                shim._pm_prefill_done(request)
+                self.backlog_after_ft = shim._inflight_computed
+                self.units_after_ft = shim._inflight
             return "ok", "local"
 
         async def forward_remote(request, path, body, streaming, endpoint=None):
@@ -366,6 +369,15 @@ class Routing(Base, unittest.IsolatedAsyncioTestCase):
         with patch.object(shim, "USE_COMPUTED_COST", 1), patch.object(shim, "_relay", spying_relay):
             await self.route(convo("D", 20))
         self.assertEqual(seen, [58_000])
+        self.assertEqual(shim._inflight_computed, 0)
+
+    async def test_prefill_backlog_ends_at_first_token_but_the_lane_is_held_until_the_stream_ends(self):
+        with patch.object(shim, "USE_COMPUTED_COST", 1):
+            await self.route(convo("E", 20))
+        self.assertEqual(self.backlog_before_ft, 58_000)    # prefilling: counted against the engine
+        self.assertEqual(self.backlog_after_ft, 0)          # first token out: only decode remains
+        self.assertGreaterEqual(self.units_after_ft, 1)     # ...but the lane is still occupied
+        self.assertEqual(shim._inflight, 0)                 # and released at the end
         self.assertEqual(shim._inflight_computed, 0)
 
 
