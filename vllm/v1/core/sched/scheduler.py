@@ -470,6 +470,101 @@ class Scheduler(SchedulerInterface):
         self._heal_queue: list[Request] = []
         self.num_progress_violations: int = 0
 
+        # [FORK][LANE EF2] Short-first interleave (head-of-line blocking fix).
+        # In mamba-align mode every non-final prefill chunk is a whole
+        # block (3568 tokens), so a running 28-46K prefill takes the entire
+        # 3584-token step budget at every step and a newly arrived SHORT
+        # request (whole prompt <= one block) cannot be admitted until the
+        # long prefill finishes (measured: decoder TTFT median 19-21 s behind
+        # a 28K prefill). While a short request waits and a long prefill is
+        # running, the long prefill's chunk is skipped for up to
+        # VLLM_SCHED_SHORT_FIRST_RUN consecutive steps so the waiting short
+        # requests (and all decode rows) run; the following step is always a
+        # normal one, so the long prefill cannot be starved.
+        # VLLM_SCHED_SHORT_FIRST=0 restores the previous behavior exactly.
+        self.short_first_enabled: bool = (
+            os.environ.get("VLLM_SCHED_SHORT_FIRST", "1") != "0"
+            and self.need_mamba_block_aligned_split
+        )
+        self.short_first_max_run: int = max(
+            int(os.environ.get("VLLM_SCHED_SHORT_FIRST_RUN", "1")), 1
+        )
+        self._short_first_streak: int = 0
+        self.num_short_first_yields: int = 0
+
+        # [FORK][LANE EF2] Prefill/decode time-slicing. VLLM_SCHED_PREFILL_SHARE=f
+        # (0<f<1) gives a long prefill chunk at most fraction f of wall time
+        # while decode rows are running: after a chunk step lasting T seconds,
+        # long chunks sit out for T*(1-f)/f seconds of (fast) decode-only
+        # steps. 1.0 (default) = off.
+        _share = float(os.environ.get("VLLM_SCHED_PREFILL_SHARE", "1.0"))
+        self.prefill_share: float = _share if 0.0 < _share < 1.0 else 1.0
+        self.prefill_share_enabled: bool = (
+            self.prefill_share < 1.0 and self.need_mamba_block_aligned_split
+        )
+        self._ps_last_t: float = 0.0
+        self._ps_last_had_chunk: bool = False
+        self._ps_chunk_secs: float = 0.0
+        self._ps_cooldown_until: float = 0.0
+        self.num_prefill_share_cooldown_steps: int = 0
+
+    def _prefill_remaining(self, request: Request) -> int:
+        """Prompt tokens still to prefill (0 for a decode-phase row)."""
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        return max(prefill_end - request.num_computed_tokens, 0)
+
+    def _prefill_share_cooldown(self, now: float) -> bool:
+        """[FORK][LANE EF2] Update the chunk-time estimate from the previous
+        step and report whether long prefill chunks sit this step out so decode
+        rows get their share of wall time (see __init__)."""
+        if not self.prefill_share_enabled:
+            return False
+        if self._ps_last_had_chunk:
+            dur = min(max(now - self._ps_last_t, 0.0), 10.0)
+            self._ps_chunk_secs = (
+                dur
+                if self._ps_chunk_secs <= 0.0
+                else 0.5 * self._ps_chunk_secs + 0.5 * dur
+            )
+            if any(self._prefill_remaining(r) == 0 for r in self.running):
+                self._ps_cooldown_until = (
+                    now
+                    + self._ps_chunk_secs
+                    * (1.0 - self.prefill_share)
+                    / self.prefill_share
+                )
+            self._ps_last_had_chunk = False
+        return now < self._ps_cooldown_until
+
+    def _short_first_should_yield(self) -> bool:
+        """[FORK][LANE EF2] True for the step on which running long prefill
+        chunks are skipped so waiting short requests can be admitted.
+
+        Facts only: a long prefill is running (remaining > one block, so its
+        next chunk is a full block), a short request is waiting (its whole
+        remaining prompt fits one block), and the number of consecutive yield
+        steps is below short_first_max_run."""
+        if (
+            not self.short_first_enabled
+            or self._short_first_streak >= self.short_first_max_run
+        ):
+            return False
+        block = self.cache_config.block_size
+        if not any(self._prefill_remaining(r) > block for r in self.running):
+            return False
+        seen = 0
+        for q in (self.waiting, self.skipped_waiting):
+            for r in q:
+                seen += 1
+                if seen > 16:
+                    return False
+                if (
+                    r.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+                    and r.num_tokens - r.num_computed_tokens <= block
+                ):
+                    return True
+        return False
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -831,6 +926,22 @@ class Scheduler(SchedulerInterface):
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
 
+        # [FORK][LANE EF2] Decide once per step whether long prefill chunks
+        # yield to waiting short requests (see __init__).
+        _now = time.monotonic()
+        in_cooldown = self._prefill_share_cooldown(_now)
+        yield_long_prefill = (not in_cooldown) and self._short_first_should_yield()
+        self._short_first_streak = (
+            self._short_first_streak + 1 if yield_long_prefill else 0
+        )
+        if yield_long_prefill:
+            self.num_short_first_yields += 1
+        if in_cooldown:
+            self.num_prefill_share_cooldown_steps += 1
+        # Long prefill chunks sit this step out (admission of short requests
+        # and all decode rows still run).
+        yield_long_prefill = yield_long_prefill or in_cooldown
+
         # [FORK][LANE EF] Preempt+recompute requests whose progress invariant
         # was violated last step (see _check_progress_invariant).
         if self._heal_queue:
@@ -892,6 +1003,14 @@ class Scheduler(SchedulerInterface):
             if defer_prefills and request.is_prefill_chunk:
                 # DP prefill balancing: defer this in-progress prefill chunk to a
                 # cadence-aligned step; decodes still run to fill this step.
+                req_index += 1
+                continue
+
+            if (
+                yield_long_prefill
+                and self._prefill_remaining(request) > self.cache_config.block_size
+            ):
+                # [FORK][LANE EF2] Long prefill sits this step out.
                 req_index += 1
                 continue
 
@@ -1327,6 +1446,13 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    if yield_long_prefill and num_new_tokens > request_token_budget:
+                        # [FORK][LANE EF2] A yield step admits only requests
+                        # whose whole remaining prompt fits this step; a
+                        # waiting long prefill starts on the next, normal step.
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
 
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.
@@ -1618,6 +1744,12 @@ class Scheduler(SchedulerInterface):
         if self.progress_guard_enabled:
             self._note_unscheduled_decode_rows(
                 num_scheduled_tokens, token_budget, len(scheduled_new_reqs)
+            )
+
+        if self.prefill_share_enabled:
+            self._ps_last_t = _now
+            self._ps_last_had_chunk = any(
+                v >= self.cache_config.block_size for v in num_scheduled_tokens.values()
             )
 
         # Check if the scheduling constraints are satisfied.
