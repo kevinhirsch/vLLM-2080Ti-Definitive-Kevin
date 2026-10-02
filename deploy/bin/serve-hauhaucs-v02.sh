@@ -10,6 +10,8 @@
 #   * speculative-config gains disable_eagle_block_drop=true: upstream #53388 supersedes our
 #     VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK retention patch (keeps the trailing aligned Mamba block under MTP).
 set -euo pipefail
+# experiment overrides (V02_* variables), written by the UP lane; absent = production defaults
+[ -f /home/kevin/.local/share/vllm-qwen27b/v02.override.env ] && . /home/kevin/.local/share/vllm-qwen27b/v02.override.env
 V02_ROOT=${V02_ROOT:-/home/kevin/Desktop/wt-integrate}
 cd "$V02_ROOT"
 export PATH="/home/kevin/.local/share/shim-gcc15:$V02_ROOT/.venv/bin:/usr/local/cuda-13/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin"
@@ -25,6 +27,7 @@ export FLASHINFER_ENABLE_AOT=${FLASHINFER_ENABLE_AOT:-1} FLASHINFER_WORKSPACE_BA
 if [ "${V02_RUNNER:-v2}" = "v1" ]; then export VLLM_USE_V2_MODEL_RUNNER=0; fi
 CC_DEFAULT='{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64],"max_cudagraph_capture_size":64}'
 unset VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK VLLM_PREFIX_CACHE_USE_RETAINED_MTP_BLOCK VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS || true
+SPEC_DEFAULT='{"method":"mtp","num_speculative_tokens":3,"disable_eagle_block_drop":true}'
 ARGS=(
   "$V02_ROOT/.venv/bin/python"
   -m vllm.entrypoints.openai.api_server
@@ -41,19 +44,19 @@ ARGS=(
     qwen3.8-27b-gptq-int4
     qwen27b-int4-tqk8v4-two250K-mtp3-text-only-cu128
   --dtype half
-  --no-async-scheduling
+  ${V02_ASYNC_FLAG:---no-async-scheduling}
   --tensor-parallel-size 2
   --generation-config /home/kevin/.local/share/vllm-qwen27b/gencfg
   --gpu-memory-utilization ${VLLM_GPU_UTIL:-0.84}
   --compilation-config "${V02_COMPILATION_CONFIG:-$CC_DEFAULT}"
-  --speculative-config '{"method":"mtp","num_speculative_tokens":3,"disable_eagle_block_drop":true}'
+  --speculative-config "${V02_SPEC:-$SPEC_DEFAULT}"
   --max-model-len 524288
   --hf-overrides '{"rope_parameters":{"rope_type":"yarn","factor":2.0,"original_max_position_embeddings":262144,"mrope_interleaved":true,"mrope_section":[11,11,10],"partial_rotary_factor":0.25,"rope_theta":10000000}}'
   --enable-chunked-prefill
   --max-num-seqs 16
   --max-num-batched-tokens ${VLLM_MNBT:-3584}
   --scheduling-policy priority
-  --kv-cache-dtype turboquant_k3v4_nc
+  --kv-cache-dtype ${V02_KV_DTYPE:-turboquant_k3v4_nc}
   --mamba-cache-mode align
   --enable-prefix-caching
   --enable-prompt-tokens-details
