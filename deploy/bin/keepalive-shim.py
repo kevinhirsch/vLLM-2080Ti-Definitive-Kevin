@@ -746,6 +746,58 @@ _ACTIVE = {}          # id(request) -> {name, ip, ua, ep, model, ptok, maxtok, s
 _DRAIN_UNTIL = 0.0
 _DRAIN_LEASE = None
 _DRAIN_REASON = None
+# RS (2026-10-02): every drain is one durable record. Before this a drain left NO trace of who raised it, why, how long it held,
+# or how many requests it refused (the 503 reason text was a constant), so "why was the estate down 20 min?" was unanswerable.
+# Events are append-only JSONL: {"event":"open"|"close", ...}; `close.how` is delete | expired | gateway-restart.
+_DRAIN_LEDGER = os.path.expanduser(os.environ.get("GATEWAY_DRAIN_LEDGER", "~/.local/share/vllm-qwen27b/incidents/drains.jsonl"))
+_DRAIN_REC = None    # live record of the open drain: {t0, reason, by, ttl_s, active_at_open, refused, refused_by_client{}}
+
+
+def _drain_ledger_write(row):
+    try:
+        os.makedirs(os.path.dirname(_DRAIN_LEDGER), exist_ok=True)
+        with open(_DRAIN_LEDGER, "a") as fh:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+    except Exception:       # never let bookkeeping affect admission
+        pass
+
+
+def _drain_close_record(how, now=None):
+    """Write the close event for the open drain record (idempotent)."""
+    global _DRAIN_REC
+    rec, _DRAIN_REC = _DRAIN_REC, None
+    if not rec:
+        return
+    now = time.time() if now is None else now
+    end = min(now, rec["t0"] + rec["ttl_s"]) if how == "expired" else now
+    _drain_ledger_write({"event": "close", "how": how, "t": round(end, 3), "t0": round(rec["t0"], 3), "duration_s": round(end - rec["t0"], 1),
+                         "reason": rec["reason"], "by": rec["by"], "ttl_s": rec["ttl_s"], "active_at_open": rec["active_at_open"],
+                         "active_at_close": len(_ACTIVE), "refused": rec["refused"],
+                         "refused_by_client": dict(sorted(rec["refused_by_client"].items(), key=lambda kv: -kv[1])[:12])})
+
+
+def _drain_reap(now=None):
+    """Close the record of a lease that expired without a DELETE (a crashed deployer)."""
+    if _DRAIN_REC and not _draining(now):
+        _drain_close_record("expired", now)
+
+
+def _drain_startup_recover():
+    """A previous gateway process may have died/been replaced while a drain was open (every publish does exactly that):
+    close it in the ledger as `gateway-restart` so open/close always pair."""
+    try:
+        last = None
+        with open(_DRAIN_LEDGER) as fh:
+            for ln in fh:
+                if ln.strip():
+                    last = json.loads(ln)
+        if last and last.get("event") == "open":
+            _drain_ledger_write({"event": "close", "how": "gateway-restart", "t": round(time.time(), 3), "t0": last.get("t"),
+                                 "duration_s": round(time.time() - float(last.get("t") or time.time()), 1), "reason": last.get("reason"),
+                                 "by": last.get("by"), "ttl_s": last.get("ttl_s"), "active_at_open": last.get("active"),
+                                 "refused": None, "note": "refused count unknown: the process that held the fence is gone"})
+    except Exception:
+        pass
 
 
 def _draining(now=None):
@@ -754,11 +806,15 @@ def _draining(now=None):
 
 async def gateway_drain(request):
     """Admin-controlled, leased admission fence for lossless gateway publication."""
-    global _DRAIN_UNTIL, _DRAIN_LEASE, _DRAIN_REASON
+    global _DRAIN_UNTIL, _DRAIN_LEASE, _DRAIN_REASON, _DRAIN_REC
     if request.method == "GET":
+        _drain_reap()
         return web.json_response({"draining": _draining(), "active": len(_ACTIVE),
                                   "until": _DRAIN_UNTIL if _draining() else None,
-                                  "reason": _DRAIN_REASON if _draining() else None})
+                                  "reason": _DRAIN_REASON if _draining() else None,
+                                  "by": _DRAIN_REC["by"] if _DRAIN_REC else None,
+                                  "since": _DRAIN_REC["t0"] if _DRAIN_REC else None,
+                                  "refused": _DRAIN_REC["refused"] if _DRAIN_REC else None})
     if not _admin_ok(request):
         return web.json_response({"error": "admin token required"}, status=401)
     if request.method == "DELETE":
@@ -769,6 +825,7 @@ async def gateway_drain(request):
         if not isinstance(body, dict) or body.get("lease") != _DRAIN_LEASE or not _DRAIN_LEASE:
             return web.json_response({"error": "drain lease mismatch"}, status=409)
         _DRAIN_UNTIL, _DRAIN_LEASE, _DRAIN_REASON = 0.0, None, None
+        _drain_close_record("delete")
         return web.json_response({"draining": False, "active": len(_ACTIVE)})
     try:
         body = await request.json()
@@ -777,12 +834,19 @@ async def gateway_drain(request):
             raise ValueError("ttl_s outside [30, 1800]")
     except (ValueError, TypeError, AttributeError):
         return web.json_response({"error": "ttl_s must be 30..1800 seconds"}, status=400)
+    _drain_reap()
     if _draining():
         return web.json_response({"error": "another drain lease is active", "active": len(_ACTIVE),
-                                  "until": _DRAIN_UNTIL}, status=409)
+                                  "until": _DRAIN_UNTIL, "reason": _DRAIN_REASON,
+                                  "by": _DRAIN_REC["by"] if _DRAIN_REC else None}, status=409)
     _DRAIN_LEASE = os.urandom(16).hex()
     _DRAIN_UNTIL = time.time() + ttl
-    _DRAIN_REASON = str(body.get("reason") or "deployment")[:80]
+    _DRAIN_REASON = str(body.get("reason") or "deployment")[:120]
+    by = str(body.get("by") or request.headers.get("X-Client") or request.headers.get("User-Agent") or "?")[:80]
+    _DRAIN_REC = {"t0": time.time(), "reason": _DRAIN_REASON, "by": by, "ttl_s": ttl, "active_at_open": len(_ACTIVE),
+                  "refused": 0, "refused_by_client": {}}
+    _drain_ledger_write({"event": "open", "t": round(_DRAIN_REC["t0"], 3), "reason": _DRAIN_REASON, "by": by, "ttl_s": ttl,
+                         "active": len(_ACTIVE)})
     return web.json_response({"draining": True, "active": len(_ACTIVE),
                               "until": _DRAIN_UNTIL, "lease": _DRAIN_LEASE})
 _CLIENT_NAMES_FILE = "/home/kevin/.local/share/vllm-qwen27b/clients.map"   # "<ip or X-Client> = <friendly name>"
@@ -5069,9 +5133,19 @@ async def handle_completions(request):
     # accepted before its fence is visible to the deployer, and every later
     # request is refused before either local work or a paid hold can begin.
     if _draining():
-        return web.json_response({"error": {"type": "gateway_draining",
-                                            "message": "gateway deployment is draining accepted calls; retry shortly"}},
-                                 status=503, headers={"Retry-After": "30", "X-Gateway-Drain": "active"})
+        who = _client_label(request)
+        reason, since = _DRAIN_REASON, (_DRAIN_REC or {}).get("t0")
+        if _DRAIN_REC:
+            _DRAIN_REC["refused"] += 1
+            _DRAIN_REC["refused_by_client"][who] = _DRAIN_REC["refused_by_client"].get(who, 0) + 1
+        # RS: Retry-After no longer overshoots the end of the fence, and the message names the reason + age so a caller's
+        # error text (Halo's `last_error`) says WHY, not just "draining".
+        wait = max(1, min(30, int(_DRAIN_UNTIL - time.time())))
+        msg = ("gateway deployment is draining accepted calls; retry shortly"
+               + (f" (reason: {reason}; held {int(time.time() - since)}s; by {_DRAIN_REC['by']})" if since else ""))
+        return web.json_response({"error": {"type": "gateway_draining", "message": msg}},
+                                 status=503, headers={"Retry-After": str(wait), "X-Gateway-Drain": "active"})
+    _drain_reap()
     try:
         j = json.loads(body)
         if not isinstance(j, dict):
@@ -8172,6 +8246,7 @@ $('form').onsubmit=async e=>{e.preventDefault();const d={name:$('name').value,ba
 </script></div></body></html>"""
 
 async def _on_startup(app):
+    _drain_startup_recover()
     _load_stats()
     _spend()   # R2: load (and, for a mid-day ledger, import today's recorded spend) before serving
     app["saver"] = asyncio.create_task(_stats_saver())

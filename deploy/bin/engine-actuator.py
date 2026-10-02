@@ -244,7 +244,7 @@ def write_diag(names, by, reason):
     return {"staged": names, "previous": prev, "event_seq": seq}
 
 
-def drain_and_wait(deadline_s, reason, token):
+def drain_and_wait(deadline_s, reason, token, by=None):
     """Raise the gateway admission fence and wait for accepted requests to finish. Returns facts."""
     facts = {"fence": False, "waited_s": 0, "active_at_start": None, "active_at_end": None}
     try:
@@ -253,7 +253,7 @@ def drain_and_wait(deadline_s, reason, token):
             facts["note"] = "another drain lease is already held (a gateway publish?); not taking it"
             facts["active_at_start"] = cur.get("active")
             return facts, None
-        opened = http(f"{GATEWAY}/gateway/drain", "POST", {"ttl_s": int(deadline_s) + 1200, "reason": f"engine planned restart: {reason}"[:120]}, token)
+        opened = http(f"{GATEWAY}/gateway/drain", "POST", {"ttl_s": int(deadline_s) + 1200, "reason": f"engine planned restart: {reason}"[:120], "by": by or "engine-actuator"}, token)
         lease = opened.get("lease")
         facts["fence"] = bool(lease)
         facts["active_at_start"] = opened.get("active")
@@ -331,7 +331,7 @@ def do_restart(a):
     drain_facts, lease = ({"skipped": "engine unhealthy; nothing to drain"}, None)
     if healthy and not a.no_drain:
         write_job(state="draining")
-        drain_facts, lease = drain_and_wait(a.drain_s, reason, token)
+        drain_facts, lease = drain_and_wait(a.drain_s, reason, token, by)
     write_job(state="stopping", drain=drain_facts)
     json.dump({"ts": now_iso(), "by": by, "reason": reason, "drain": drain_facts, "active_at_stop": drain_facts.get("active_at_end")},
               open(PLANNED, "w"))
