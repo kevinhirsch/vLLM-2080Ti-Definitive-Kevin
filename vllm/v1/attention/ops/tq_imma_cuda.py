@@ -96,10 +96,27 @@ def default_splits(S: int, Hk: int, max_len_hint: int | None = None) -> int:
     return min(ns, 128)
 
 
+_LUT_CACHE: dict = {}
+
+
+def _lut_for(centroids: torch.Tensor, norm_correction: bool):
+    key = (centroids.data_ptr(), centroids.device.index, bool(norm_correction))
+    v = _LUT_CACHE.get(key)
+    if v is None:
+        v = int8_lut(tuple(float(x) for x in centroids.float().cpu().tolist()), bool(norm_correction))
+        _LUT_CACHE[key] = v
+    return v
+
+
+def qsplit_enabled() -> bool:
+    # hi/lo int8 query planes: LSE error ~15x lower (needed when the LSE is merged with another partial), +8% time
+    return os.getenv("VLLM_TQ_IMMA_QSPLIT", "1") == "1"
+
+
 def tq_imma_decode_attention(
     query: torch.Tensor,  # [S*QL, Hq, D] fp16, un-rotated
     kv_cache: torch.Tensor,  # [num_blocks, block_size, Hk, slot] uint8
-    block_table: torch.Tensor,  # [S, max_blocks] int32
+    block_table: torch.Tensor,  # [S, max_blocks] int32 (row stride may be 0 = shared table)
     row_lens: torch.Tensor,  # [S*QL] int32: causal length per query row
     centroids: torch.Tensor,
     scale: float,
@@ -111,9 +128,10 @@ def tq_imma_decode_attention(
     output_buf: torch.Tensor | None = None,
     lse_buf: torch.Tensor | None = None,
     max_len_hint: int | None = None,
+    num_seqs: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     R, Hq, D = query.shape
-    S = block_table.shape[0]
+    S = num_seqs if num_seqs is not None else block_table.shape[0]
     Hk = kv_cache.shape[2]
     assert R == S * q_per_seq and query.dtype == torch.float16
     if PiT is None:
@@ -121,12 +139,13 @@ def tq_imma_decode_attention(
     ns = num_splits or default_splits(S, Hk, max_len_hint)
     q_rot = (query.float() @ PiT).contiguous()
     dev = query.device
-    q8 = torch.empty(R, Hq, D, dtype=torch.int8, device=dev)
+    q8 = torch.empty(R, Hq, 2 * D, dtype=torch.int8, device=dev)
     qs = torch.empty(R, Hq, dtype=torch.float32, device=dev)
     mid = torch.empty(R, Hq, ns, D + 8, dtype=torch.float32, device=dev)
     out = output_buf[:R, :Hq, :D] if output_buf is not None else torch.empty(R, Hq, D, dtype=torch.float16, device=dev)
     lse = lse_buf[:R, :Hq] if lse_buf is not None else torch.empty(R, Hq, dtype=torch.float32, device=dev)
-    lo, hi, cscale, _ = int8_lut(tuple(float(x) for x in centroids.tolist()), bool(norm_correction))
-    _load().decode(q_rot, kv_cache, block_table, row_lens, q8, qs, mid, out, lse, q_per_seq, ns, scale, cscale,
-                   1 if norm_correction else 0, lo, hi)
+    lo, hi, cscale, _ = _lut_for(centroids, norm_correction)
+    rl = row_lens if (row_lens.dtype == torch.int32 and row_lens.is_contiguous()) else row_lens.to(torch.int32).contiguous()
+    _load().decode(q_rot, kv_cache, block_table, rl, q8, qs, mid, out, lse, S, q_per_seq, ns, scale, cscale,
+                   1 if norm_correction else 0, lo, hi, 1 if qsplit_enabled() else 0)
     return out, lse
