@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# K6 window (~25 min): (1) TP2 reference probes on the live config, (2) stream-priority mux microbench on GPU0,
+# K6 window (~30 min): (1) TP2 reference probes on the live config, (2) stream-priority mux microbench on GPU0,
 # (3) single-card TP1 engine on GPU1 with the full int4 stack -> weights / KV GiB / pool tokens / prefill rate /
-# decode rates / ITL-under-prefill, (4) restore EXACTLY the override env present at window start.
+# decode rates / ITL-under-prefill, (3b) both GPUs: mux_ar_bench (second TP communicator cost/safety), (4) restore EXACTLY the override env present at window start.
 # Run under:  cd /home/kevin/Desktop/vLLM-2080Ti-Definitive && .venv/bin/python deploy/bin/gateway-offline.py run \
 #   --reason "K6 P/D disaggregation rates + mux microbench" --by K6 --ttl 2400 -- bash /home/kevin/Desktop/wt-k6/tools/k6/k6_win.sh
 set -u
@@ -26,6 +26,7 @@ boot(){ # boot LABEL : actuator restart with current $O, wait for health
 }
 restore(){
   cp -a $OUT/override.at_start.env $O; boot restore || { sleep 30; boot restore2; }
+  sudo -n systemctl start vllm-qwen27b-watchdog.timer
   log "restored: health $(health); xid now $(journalctl -k --no-pager | grep -c 'NVRM: Xid') (start $XID0)"
 }
 trap 'log "abort trap -> restore"; restore; exit 1' INT TERM
@@ -53,6 +54,13 @@ if boot tp1; then
   log "TP1 itl_under_prefill: $(python3 itl_under_prefill.py --prefill 16000 2>&1 | tail -1)"
 fi
 wait $MUX
+# ---- (3b) both GPUs free: second-communicator cost/safety for lead M (K3 constraint) ----
+log "stopping engine + watchdog timer for the 2-GPU bench"
+sudo -n systemctl stop vllm-qwen27b-watchdog.timer; sudo -n systemctl stop vllm-qwen27b; sleep 8
+nvidia-smi --query-gpu=index,memory.used --format=csv,noheader >> $OUT/win.log
+CUDA_DEVICE_ORDER=PCI_BUS_ID MASTER_PORT=29561 timeout 900 $PY -m torch.distributed.run --nproc-per-node 2 --master-port 29561 \
+  $K/mux_ar_bench.py --out $OUT/mux_ar.json > $OUT/mux_ar.out 2>&1
+log "mux_ar bench rc=$? $(grep -h -E 'second_custom_ar|DEADLOCK|Error' $OUT/mux_ar.out | head -3 | cut -c1-600 | tr '\n' ' ')"
 # ---- (4) restore ----
 trap - INT TERM; restore
 log "window end"

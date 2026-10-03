@@ -193,11 +193,18 @@ class ForwardContext:
         )
 
 
+import vllm.k6_mux as _k6_mux  # noqa: E402  [FORK][LANE K6] lane-aware forward context
+
 _forward_context: ForwardContext | None = None
 
 
 def get_forward_context() -> ForwardContext:
     """Get the current forward context."""
+    if _k6_mux.ENABLED and _k6_mux.in_prefill_lane():
+        # [FORK][LANE K6] the prefill lane thread has its own forward context
+        ctx = _k6_mux.lane_forward_context()
+        assert ctx is not None, "K6 prefill lane: forward context is not set."
+        return ctx
     assert _forward_context is not None, (
         "Forward context is not set. "
         "Please use `set_forward_context` to set the forward context."
@@ -206,6 +213,8 @@ def get_forward_context() -> ForwardContext:
 
 
 def is_forward_context_available() -> bool:
+    if _k6_mux.ENABLED and _k6_mux.in_prefill_lane():
+        return _k6_mux.lane_forward_context() is not None
     return _forward_context is not None
 
 
@@ -247,6 +256,13 @@ def override_forward_context(forward_context: ForwardContext | None):
     This is used to override the forward context for a specific
     forward pass.
     """
+    if _k6_mux.ENABLED and _k6_mux.in_prefill_lane():
+        prev_lane_ctx = _k6_mux.set_lane_forward_context(forward_context)
+        try:
+            yield
+        finally:
+            _k6_mux.set_lane_forward_context(prev_lane_ctx)
+        return
     global _forward_context
     prev_context = _forward_context
     _forward_context = forward_context

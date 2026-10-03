@@ -4,6 +4,8 @@
 
 import torch
 
+import vllm.k6_mux as _k6_mux  # [FORK][LANE K6]
+
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     MARLIN_SUPPORTED_GROUP_SIZES,
@@ -197,7 +199,9 @@ class MarlinLinearKernel(MPLinearKernel):
             weight=w_q,
             weight_scale=w_s,
             weight_zp=w_zp,  # type: ignore
-            workspace=self.workspace,
+            workspace=(
+                _k6_mux.marlin_workspace(self.workspace) if _k6_mux.ENABLED else self.workspace
+            ),  # [FORK][LANE K6] per-lane split-K lock workspace
             wtype=c.weight_type,
             input_size_per_partition=c.partition_weight_shape[0],
             output_size_per_partition=c.partition_weight_shape[1],

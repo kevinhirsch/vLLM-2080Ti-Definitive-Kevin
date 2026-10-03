@@ -38,6 +38,8 @@ from typing import TYPE_CHECKING, Any, Protocol
 from unittest.mock import patch
 
 import torch
+
+import vllm.k6_mux as _k6_mux  # [FORK][LANE K6]
 import torch.distributed
 import torch.distributed._functional_collectives as funcol
 import torch.distributed._symmetric_memory
@@ -155,6 +157,15 @@ def _get_unique_name(name: str) -> str:
 _groups: dict[str, Callable[[], "GroupCoordinator | None"]] = {}
 
 
+def _resolve_group(group_name: str) -> "GroupCoordinator":
+    """[FORK][LANE K6] compiled collective ops look their group up by name; a K6 prefill lane
+    substitutes its own GroupCoordinator (one collective in flight per communicator)."""
+    group = _groups[group_name]()
+    if _k6_mux.ENABLED:
+        return _k6_mux.resolve_group(group_name, group)
+    return group
+
+
 def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)
 
@@ -193,7 +204,7 @@ def resume_device_comms() -> None:
 
 def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     assert group_name in _groups, f"Group {group_name} is not found."
-    group = _groups[group_name]()
+    group = _resolve_group(group_name)
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     return group._all_reduce_out_place(tensor)
@@ -207,7 +218,7 @@ def reduce_scatter(
     tensor: torch.Tensor, dim: int, world_size: int, group_name: str
 ) -> torch.Tensor:
     assert group_name in _groups, f"Group {group_name} is not found."
-    group = _groups[group_name]()
+    group = _resolve_group(group_name)
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     return group._reduce_scatter_out_place(tensor, dim)
@@ -225,7 +236,7 @@ def all_gather(
     tensor: torch.Tensor, dim: int, world_size: int, group_name: str
 ) -> torch.Tensor:
     assert group_name in _groups, f"Group {group_name} is not found."
-    group = _groups[group_name]()
+    group = _resolve_group(group_name)
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     return group._all_gather_out_place(tensor, dim)
@@ -1547,6 +1558,11 @@ _TP: GroupCoordinator | None = None
 
 def get_tp_group() -> GroupCoordinator:
     assert _TP is not None, "tensor model parallel group is not initialized"
+    if _k6_mux.ENABLED:
+        # [FORK][LANE K6] a prefill lane runs on its own TP communicator
+        o = _k6_mux.group_override(_TP.unique_name)
+        if o is not None:
+            return o
     return _TP
 
 
