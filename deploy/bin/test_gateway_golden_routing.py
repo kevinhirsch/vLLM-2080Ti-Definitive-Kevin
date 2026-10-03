@@ -277,6 +277,9 @@ def _run_scenario(sc, n, tmp):
                            "waiting": m._waiting, "waiting_by_class": dict(m._waiting_by_class),
                            "active_left": len(m._ACTIVE), "pm_inflight_left": len(m._PM_INFLIGHT),
                            "baseline_inflight": list(base_inflight)}
+    outcome["stats"] = {**{k: m._stats.get(k, 0) for k in ("total", "local", "remote", "held", "rejected_bg",
+                                                          "client_gone")},
+                        "remote_reasons": dict(m._remote_reasons), "flow_routes": len(m._FLOW_ROUTES)}
     outcome["queued_s"] = round(clock.now - T0, 3)
     outcome["polls"] = clock.sleeps
     if flightrec:

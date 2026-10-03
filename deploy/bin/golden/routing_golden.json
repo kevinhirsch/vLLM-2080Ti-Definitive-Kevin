@@ -52,6 +52,18 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "alias": 1
+   },
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -155,6 +167,16 @@
     "type": "alias_disabled"
    },
    "status": 409
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 0,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 0
   },
   "telemetry": [
    {
@@ -295,6 +317,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -422,6 +454,18 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "alias": 1
+   },
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -548,6 +592,18 @@
     "remote": true
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "bg-yield": 1
+   },
+   "total": 1
   },
   "telemetry": [
    {
@@ -688,6 +744,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -814,6 +880,18 @@
     "remote": true
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "bg-yield": 1
+   },
+   "total": 1
   },
   "telemetry": [
    {
@@ -954,6 +1032,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -1081,6 +1169,18 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "big-out": 1
+   },
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -1207,6 +1307,18 @@
     "remote": true
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "cap": 1
+   },
+   "total": 1
   },
   "telemetry": [
    {
@@ -1346,6 +1458,16 @@
     }
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
   },
   "telemetry": [
    {
@@ -1489,6 +1611,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -1615,6 +1747,18 @@
     "remote": true
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "big-prompt": 1
+   },
+   "total": 1
   },
   "telemetry": [
    {
@@ -1758,6 +1902,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -1900,6 +2054,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -2026,6 +2190,18 @@
     "remote": true
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "cap": 1
+   },
+   "total": 1
   },
   "telemetry": [
    {
@@ -2169,6 +2345,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 15.0,
@@ -2308,6 +2494,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -2411,6 +2607,16 @@
     "type": "context_length_exceeded"
    },
    "status": 413
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 0,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 0
   },
   "telemetry": [
    {
@@ -2539,6 +2745,18 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "size": 1
+   },
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -2640,6 +2858,16 @@
   "response": {
    "error": "Expecting value: line 1 column 1 (char 0)",
    "status": 400
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 0,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 0
   },
   "telemetry": [
    {
@@ -2778,6 +3006,18 @@
     "Retry-After": "60"
    },
    "status": 503
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "failover": 1
+   },
+   "total": 1
   },
   "telemetry": [
    {
@@ -2918,6 +3158,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -3057,6 +3307,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -3195,6 +3455,16 @@
     }
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
   },
   "telemetry": [
    {
@@ -3338,6 +3608,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -3477,6 +3757,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -3604,6 +3894,18 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "cap": 1
+   },
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -3722,6 +4024,16 @@
     "Retry-After": "300"
    },
    "status": 503
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 1,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
   },
   "telemetry": [
    {
@@ -3862,6 +4174,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -3988,6 +4310,18 @@
     "remote": true
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "forced": 1
+   },
+   "total": 1
   },
   "telemetry": [
    {
@@ -4128,6 +4462,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -4229,6 +4573,16 @@
   "response": {
    "error": "Expecting value: line 1 column 1 (char 0)",
    "status": 400
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 0,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 0
   },
   "telemetry": [
    {
@@ -4369,6 +4723,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -4507,6 +4871,16 @@
     }
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
   },
   "telemetry": [
    {
@@ -4647,6 +5021,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -4751,6 +5135,16 @@
     "type": "invalid_request_error"
    },
    "status": 400
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 0,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 0
   },
   "telemetry": [
    {
@@ -4859,6 +5253,16 @@
    },
    "status": 503
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 0,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 0
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -4964,6 +5368,16 @@
    },
    "status": 400
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 0,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 0
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -5068,6 +5482,16 @@
     "type": "invalid_request_error"
    },
    "status": 400
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 0,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 0
   },
   "telemetry": [
    {
@@ -5196,6 +5620,18 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "vision": 1
+   },
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -5301,6 +5737,16 @@
    },
    "status": 400
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 0,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 0
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -5405,6 +5851,16 @@
     "type": "invalid_request_error"
    },
    "status": 400
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 0,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 0
   },
   "telemetry": [
    {
@@ -5532,6 +5988,18 @@
     "remote": true
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "big-prompt": 1
+   },
+   "total": 1
   },
   "telemetry": [
    {
@@ -5672,6 +6140,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 1,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -5790,6 +6268,16 @@
     "Retry-After": "300"
    },
    "status": 503
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 1,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
   },
   "telemetry": [
    {
@@ -5918,6 +6406,18 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "local-down": 1
+   },
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -6025,6 +6525,16 @@
    },
    "status": 503
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 0,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 0
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -6128,6 +6638,16 @@
     "type": "local_unavailable"
    },
    "status": 503
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 0,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 0
   },
   "telemetry": [
    {
@@ -6255,6 +6775,18 @@
     "remote": true
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "local-down": 1
+   },
+   "total": 1
   },
   "telemetry": [
    {
@@ -6395,6 +6927,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 4.0,
@@ -6496,6 +7038,16 @@
   "response": {
    "kind": "spins",
    "note": "still queued after 20000 polls"
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 0,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 0
   },
   "telemetry": [
    {
@@ -6614,6 +7166,18 @@
     "type": "full_local_remote_disabled"
    },
    "status": 503
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "full-local-remote-alias": 1
+   },
+   "total": 1
   },
   "telemetry": [
    {
@@ -6754,6 +7318,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -6892,6 +7466,16 @@
     }
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
   },
   "telemetry": [
    {
@@ -7032,6 +7616,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -7171,6 +7765,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -7275,6 +7879,16 @@
    },
    "status": 413
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 0,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 0
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -7376,6 +7990,16 @@
   "response": {
    "error": "request exceeds local token reservation budget",
    "status": 503
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 0,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 0
   },
   "telemetry": [
    {
@@ -7516,6 +8140,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -7617,6 +8251,16 @@
   "response": {
    "error": "invalid literal for int() with base 10: 'lots'",
    "status": 400
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 0,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 0
   },
   "telemetry": [
    {
@@ -7757,6 +8401,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -7896,6 +8550,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -8001,6 +8665,16 @@
    },
    "status": 400
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 0,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 0
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -8105,6 +8779,16 @@
     "type": "invalid_request_error"
    },
    "status": 400
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 0,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 0
   },
   "telemetry": [
    {
@@ -8245,6 +8929,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -8371,6 +9065,18 @@
     "remote": true
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "monster": 1
+   },
+   "total": 1
   },
   "telemetry": [
    {
@@ -8511,6 +9217,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 15.0,
@@ -8649,6 +9365,16 @@
     }
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
   },
   "telemetry": [
    {
@@ -8789,6 +9515,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -8913,6 +9649,16 @@
   "response": {
    "body": "08c714c128105c31",
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
   },
   "telemetry": [
    {
@@ -9061,6 +9807,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -9193,6 +9949,16 @@
   "response": {
    "body": "08c714c128105c31",
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
   },
   "telemetry": [
    {
@@ -9333,6 +10099,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 10.0,
@@ -9459,6 +10235,18 @@
     "remote": true
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "cap": 1
+   },
+   "total": 1
   },
   "telemetry": [
    {
@@ -9599,6 +10387,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 3.0,
@@ -9725,6 +10523,18 @@
     "remote": true
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "cap": 1
+   },
+   "total": 1
   },
   "telemetry": [
    {
@@ -9865,6 +10675,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 6.0,
@@ -10003,6 +10823,16 @@
     }
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
   },
   "telemetry": [
    {
@@ -10143,6 +10973,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -10269,6 +11109,16 @@
     "type": "local_only_unavailable"
    },
    "status": 503
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 1,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
   },
   "telemetry": [
    {
@@ -10405,6 +11255,18 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "failover": 1
+   },
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -10534,6 +11396,16 @@
     "Retry-After": "60"
    },
    "status": 503
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 1,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
   },
   "telemetry": [
    {
@@ -10670,6 +11542,18 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "failover": 1
+   },
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -10785,6 +11669,16 @@
   "response": {
    "body_sha": "19d6140abcd1dd2b",
    "status": 499
+  },
+  "stats": {
+   "client_gone": 1,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
   },
   "telemetry": [
    {
@@ -10913,6 +11807,18 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "local-down": 1
+   },
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -11040,6 +11946,18 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "local-offline": 1
+   },
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -11162,6 +12080,16 @@
    },
    "status": 503
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 1,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -11283,6 +12211,16 @@
     "X-Gateway-Offline": "active"
    },
    "status": 503
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 1,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
   },
   "telemetry": [
    {
@@ -11410,6 +12348,18 @@
     "remote": true
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "local-offline": 1
+   },
+   "total": 1
   },
   "telemetry": [
    {
@@ -11574,6 +12524,18 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 2,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "big-prompt": 1
+   },
+   "total": 2
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -11713,6 +12675,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -11840,6 +12812,18 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "perf": 1
+   },
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -11966,6 +12950,18 @@
     "remote": true
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "cap": 1
+   },
+   "total": 1
   },
   "telemetry": [
    {
@@ -12106,6 +13102,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -12233,6 +13239,18 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "predicted": 1
+   },
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -12354,6 +13372,16 @@
     }
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 0,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 0
   },
   "telemetry": [
    {
@@ -12477,6 +13505,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 0,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 0
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -12578,6 +13616,16 @@
   "response": {
    "body_sha": "e1eccb164efe5244",
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 0,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 0
   },
   "telemetry": [
    {
@@ -12700,6 +13748,16 @@
     }
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 0,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 0
   },
   "telemetry": [
    {
@@ -12840,6 +13898,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -12944,6 +14012,16 @@
     "type": "context_length_exceeded"
    },
    "status": 413
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 0,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 0
   },
   "telemetry": [
    {
@@ -13084,6 +14162,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -13210,6 +14298,18 @@
     "remote": true
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "intent": 1
+   },
+   "total": 1
   },
   "telemetry": [
    {
@@ -13350,6 +14450,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -13477,6 +14587,18 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "size": 1
+   },
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -13603,6 +14725,18 @@
     "remote": true
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "size": 1
+   },
+   "total": 1
   },
   "telemetry": [
    {
@@ -13743,6 +14877,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -13881,6 +15025,16 @@
     }
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
   },
   "telemetry": [
    {
@@ -14021,6 +15175,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 1.5,
@@ -14147,6 +15311,18 @@
     "remote": true
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "tiny-fast": 1
+   },
+   "total": 1
   },
   "telemetry": [
    {
@@ -14287,6 +15463,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -14413,6 +15599,16 @@
     "type": "local_only_unavailable"
    },
    "status": 503
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 1,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
   },
   "telemetry": [
    {
@@ -14549,6 +15745,18 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "failover": 1
+   },
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -14678,6 +15886,16 @@
     "Retry-After": "60"
    },
    "status": 503
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 1,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
   },
   "telemetry": [
    {
@@ -14813,6 +16031,18 @@
     "remote": true
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "failover": 1
+   },
+   "total": 1
   },
   "telemetry": [
    {
@@ -14953,6 +16183,16 @@
    },
    "status": 200
   },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
+  },
   "telemetry": [
    {
     "admission_wait": 0.0,
@@ -15054,6 +16294,16 @@
   "response": {
    "error": "request exceeds local token reservation budget",
    "status": 503
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 0,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 0
   },
   "telemetry": [
    {
@@ -15181,6 +16431,18 @@
     "remote": true
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 0,
+   "rejected_bg": 0,
+   "remote": 1,
+   "remote_reasons": {
+    "tokens": 1
+   },
+   "total": 1
   },
   "telemetry": [
    {
@@ -15320,6 +16582,16 @@
     }
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
   },
   "telemetry": [
    {
@@ -15462,6 +16734,16 @@
     }
    },
    "status": 200
+  },
+  "stats": {
+   "client_gone": 0,
+   "flow_routes": 1,
+   "held": 0,
+   "local": 1,
+   "rejected_bg": 0,
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
   },
   "telemetry": [
    {
