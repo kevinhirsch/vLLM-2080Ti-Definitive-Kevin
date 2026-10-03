@@ -46,6 +46,12 @@ def load_ext(m: str | None = None, e: int | None = None):
 
         if m == "g":
             name, src, defs = "lp_marlin_g8", "lp_marlin_g8.cu", ["-DLP_A8G"]
+        elif m == "p16":   # W4A16 fp16 Marlin with LP_PIPE register-staged loads (production path candidate)
+            name, src, defs = "lp_marlin_p16", "lp_marlin_pipe.cu", ["-DLP_PIPE", "-DLP_WITH_FP16", "-DLP_NO_S8"]
+        elif m == "r16":   # same fp16 template WITHOUT LP_PIPE (reference: must equal vLLM's stock marlin_gemm)
+            name, src, defs = "lp_marlin_r16", "lp_marlin_pipe.cu", ["-DLP_WITH_FP16", "-DLP_NO_S8"]
+        elif m == "pe":    # W4A8 LP_A8E (EMAX e; e=0 == stock per-token W4A8) with LP_PIPE
+            name, src, defs = f"lp_marlin_pe8_x{e}", "lp_marlin_pipe.cu", ["-DLP_PIPE", "-DLP_A8E", f"-DLP_EMAX={e}"]
         else:
             name, src, defs = f"lp_marlin_e8_x{e}", "lp_marlin_e8.cu", ["-DLP_A8E", f"-DLP_EMAX={e}"]
         build = os.path.realpath(os.environ.get("VLLM_LP_W4A8G_BUILD", os.path.join(_ROOT, ".deps", name + "_build")))

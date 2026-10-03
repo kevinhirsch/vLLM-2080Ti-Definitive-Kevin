@@ -820,6 +820,67 @@ __global__ void Marlin(
     cp_async_fence();
   };
 
+#ifdef LP_PIPE
+  // Lane LP: Turing has no cp.async, so vLLM's sm_75 cp_async* are synchronous LDG->STS copies and every tile's global
+  // latency is exposed between two barriers. LP_PIPE issues the next tile's global loads into registers BEFORE the
+  // current tile's first sub-step MMAs and commits them to shared memory after it (one barrier), hiding the latency.
+  static_assert(b_sh_wr_iters >= 2, "LP_PIPE needs >= 2 register sub-steps per tile");
+  constexpr int lp_nb = b_sh_wr_iters * b_thread_vecs;
+  int4 lp_pa[a_sh_wr_iters];
+  int4 lp_pb[lp_nb];
+  int4 lp_ps, lp_pz;
+  bool lp_has = false, lp_hs = false, lp_hz = false;
+  int lp_pipe = 0;
+  auto lp_fetch_regs = [&](int pipe, int a_off, bool pred) {
+    lp_has = pred;
+    lp_hs = lp_hz = false;
+    lp_pipe = pipe;
+    if (pred) {
+  #pragma unroll
+      for (int i = 0; i < a_sh_wr_iters; i++) {
+        if (a_sh_wr_pred[i]) lp_pa[i] = A[a_gl_rd_delta_i * i + a_gl_rd + a_gl_rd_delta_o * a_off];
+      }
+  #pragma unroll
+      for (int i = 0; i < lp_nb; i++) {
+        constexpr int count = div_ceil(b_sh_stride, threads);
+        int b_gl_idx = b_gl_rd + (i % count) * threads + b_gl_stride * (i / count) * div_ceil(threads, b_sh_stride);
+        lp_pb[i] = B[b_gl_idx];
+      }
+      b_gl_rd += b_gl_rd_delta_o;
+      if constexpr (group_blocks != -1) {
+        if (pipe % div_ceil(group_blocks, thread_k_blocks) == 0) {
+          if (s_sh_wr_pred) { lp_ps = scales_ptr[s_gl_rd]; lp_hs = true; }
+          s_gl_rd += s_gl_rd_delta * s_tb_groups;
+        }
+      }
+      if constexpr (has_zp && group_blocks != -1) {
+        if (pipe % div_ceil(group_blocks, thread_k_blocks) == 0) {
+          if (zp_sh_wr_pred) { lp_pz = zp_ptr[zp_gl_rd]; lp_hz = true; }
+          zp_gl_rd += zp_gl_rd_delta * zp_tb_groups;
+        }
+      }
+    }
+  };
+  auto lp_commit = [&]() {
+    if (lp_has) {
+      int4* sh_a_stage = sh_a + a_sh_stage * lp_pipe;
+  #pragma unroll
+      for (int i = 0; i < a_sh_wr_iters; i++) {
+        if (a_sh_wr_pred[i]) sh_a_stage[a_sh_wr_trans[i]] = lp_pa[i];
+      }
+      int4* sh_b_stage = sh_b + b_sh_stage * lp_pipe;
+  #pragma unroll
+      for (int i = 0; i < lp_nb; i++) sh_b_stage[threads * i + threadIdx.x] = lp_pb[i];
+      if constexpr (group_blocks != -1) {
+        if (lp_hs) (sh_s + s_sh_stage * lp_pipe)[s_sh_wr] = lp_ps;
+      }
+      if constexpr (has_zp && group_blocks != -1) {
+        if (lp_hz) (sh_zp + zp_sh_stage * lp_pipe)[zp_sh_wr] = lp_pz;
+      }
+    }
+  };
+#endif
+
   auto fetch_col_zp_to_shared = [&]() {
     if (zp_sh_wr_pred) {
       cp_async4(&sh_zp[zp_sh_wr], &zp_ptr[zp_gl_rd]);
@@ -1653,14 +1714,25 @@ __global__ void Marlin(
     for (int pipe = 0; pipe < stages;) {
   #pragma unroll
       for (int k = 0; k < b_sh_wr_iters; k++) {
+#ifdef LP_PIPE
+        if (k == b_sh_wr_iters - 1) {
+          lp_commit();       // next tile: registers -> shared, after this tile's sub-step k-1 MMAs
+          __syncthreads();
+        }
+#endif
         fetch_to_registers(k + 1, pipe % stages);
         fetch_scales_to_registers(k + 1, pipe);
         fetch_zp_to_registers(k + 1, pipe);
         if (k == b_sh_wr_iters - 2) {
+#ifdef LP_PIPE
+          lp_fetch_regs((pipe + stages - 1) % stages, pipe, slice_iters >= stages);
+          pipe++;
+#else
           fetch_to_shared((pipe + stages - 1) % stages, pipe,
                           slice_iters >= stages);
           pipe++;
           wait_for_stage();
+#endif
         }
 
         if constexpr (!is_a_8bit) {

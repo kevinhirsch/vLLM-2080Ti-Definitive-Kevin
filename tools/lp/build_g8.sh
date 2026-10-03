@@ -6,5 +6,5 @@ export CC=/usr/bin/gcc-15 CXX=/usr/bin/g++-15 NVCC_CCBIN=/usr/bin/g++-15 CUDAHOS
 CUDA_VISIBLE_DEVICES= /home/kevin/Desktop/wt-integrate/.venv/bin/python -c "
 import sys; sys.path.insert(0,'/home/kevin/Desktop/wt-lp')
 from vllm.model_executor.layers.quantization.utils import lp_w4a8g as L
-for m, e in [('g', 2)] + [('e', x) for x in ${LP_EMAXES:-(1, 2, 3)}]:
+for m, e in [('g', 2), ('p16', 0), ('r16', 0), ('pe', 3), ('pe', 0)] + [('e', x) for x in ${LP_EMAXES:-(1, 2, 3)}]:
     print('BUILT', m, e, L.load_ext(m, e).__file__, flush=True)"
