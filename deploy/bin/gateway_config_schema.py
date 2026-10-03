@@ -243,6 +243,8 @@ _k("SHIM_REP_GUARD", "bool", "1", "Abort degenerate repetition loops.", gname="R
 _k("SHIM_REP_MIN_PATTERN", "int", "8", "Shortest repeated pattern detected.", unit="chars", gname="REP_MIN_PATTERN", tunable=True)
 _k("SHIM_REP_MAX_PATTERN", "int", "64", "Longest repeated pattern detected.", unit="chars", gname="REP_MAX_PATTERN", tunable=True)
 _k("SHIM_REP_MIN_COUNT", "int", "6", "Repeats that count as a loop.", gname="REP_MIN_COUNT", tunable=True)
+_k("SHIM_REPEAT_NOTE", "bool", "1", "Note a cross-turn identical tool-call loop inside the newest tool result.", gname="REPEAT_NOTE", tunable=True, kill=True, owner="RA")
+_k("SHIM_REPEAT_NOTE_MIN", "int", "3", "Consecutive identical call+result exchanges before the loop note is added.", gname="REPEAT_NOTE_MIN", tunable=True, owner="RA")
 _k("SHIM_NONTHINK_PROFILE", "bool", "1", "Apply the non-thinking sampling profile (EXP-026).", gname="NONTHINK_PROFILE", tunable=True, kill=True)
 _k("SHIM_NONTHINK_PP", "float", "1.5", "Non-thinking presence penalty.", gname="NONTHINK_PP", tunable=True)
 _k("SHIM_NONTHINK_TOP_P", "float", "0.80", "Non-thinking top_p.", lo=0, hi=1, gname="NONTHINK_TOP_P", tunable=True)
