@@ -9,9 +9,13 @@
 // Chunk algebra (tools/k9/gdn_chunk_ref.py, exact vs the recurrence to 5e-16):
 //   G = cumsum_chunk(g); L_ji = beta_j e^{G_j-G_i} k_j.k_i (i<j); R = beta (V - e^G (K M0)); U = (I+L)^{-1} R;
 //   O = scale (e^G (Q M0) + P U), P_ti = e^{G_t-G_i} q_t.k_i (i<=t); M1 = e^{G_C} M0 + K^T (e^{G_C-G} U).
-// Block = 4 warps, one (sequence, v-head, NC-column slice of the state). The state slice lives in fp32 mma
-// accumulators across all chunks (warp w owns dk rows 32w..32w+31). F16QK: Q K^T and K K^T accumulate in fp16 (full
-// HMMA rate on GeForce; safe because |q.k| <= 1 for unit vectors), everything else accumulates in fp32.
+// v2 (two kernels): k9_gdn_prep runs fully parallel over (chunk, v-head) and produces everything that does not depend
+// on the recurrent state: P (decayed causal Q K^T) and T = (I + L)^{-1} (column-parallel forward substitution in fp32),
+// both stored fp16 (|P| <= 1; FLA stores T in bf16). k9_gdn_main walks the chunks of one (sequence, v-head, NC-column
+// state slice) with only tensor-core products on the serial path: Y = K M0, QM = Q M0, U = T R, O += P U,
+// M = e^{G_C} M + (e^{G_C-G} K)^T U. The state slice lives in fp32 mma accumulators across all chunks (warp w owns dk
+// rows 32w..32w+31); 28.5 KB smem -> 2 blocks/SM. F16QK (prep only): Q K^T and K K^T accumulate in fp16 (full HMMA
+// rate on GeForce; safe because |q.k| <= 1 for unit vectors); every other product accumulates in fp32.
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -50,40 +54,190 @@ static __device__ __forceinline__ uint32_t noff(int r, int ch) {
   return (uint32_t)(r * NC * 2 + ((ch ^ ((r >> 1) & (NCH - 1))) * 16));
 }
 
-template <int NC, bool F16QK>
-__global__ void __launch_bounds__(NT, 1) k9_gdn_chunk_fwd(
+
+// chunk slot -> (sequence b, first token s, rows n); slots enumerate ceil(len/64) chunks per sequence in order
+static __device__ __forceinline__ bool find_chunk(const int* __restrict__ cu, int N, int slot, int& b, int& s, int& n) {
+  int acc = 0;
+  for (int i = 0; i < N; ++i) {
+    const int a0 = cu[i], a1 = cu[i + 1], nc = (a1 - a0 + C - 1) / C;
+    if (slot < acc + nc) { b = i; s = a0 + (slot - acc) * C; n = min(C, a1 - s); return true; }
+    acc += nc;
+  }
+  return false;
+}
+static __device__ __forceinline__ int chunk_base(const int* __restrict__ cu, int b) {
+  int acc = 0;
+  for (int i = 0; i < b; ++i) acc += (cu[i + 1] - cu[i] + C - 1) / C;
+  return acc;
+}
+// G = inclusive cumsum of g over the chunk rows (zero beyond n), beta (zero beyond n); warp 0
+static __device__ __forceinline__ void scan_g(const float* __restrict__ g, const float* __restrict__ beta, int64_t gb_row,
+                                              int s, int n, int hv, int lane, float* sG, float* sB) {
+  float ga = 0.f, gb2 = 0.f, ba = 0.f, bb = 0.f;
+  const int r0 = 2 * lane, r1 = 2 * lane + 1;
+  if (r0 < n) { ga = g[(int64_t)(s + r0) * gb_row + hv]; ba = beta[(int64_t)(s + r0) * gb_row + hv]; }
+  if (r1 < n) { gb2 = g[(int64_t)(s + r1) * gb_row + hv]; bb = beta[(int64_t)(s + r1) * gb_row + hv]; }
+  float x = ga + gb2;
+#pragma unroll
+  for (int off = 1; off < 32; off <<= 1) {
+    const float y = __shfl_up_sync(0xffffffffu, x, off);
+    if (lane >= off) x += y;
+  }
+  sG[r1] = x; sG[r0] = x - gb2; sB[r0] = ba; sB[r1] = bb;
+}
+
+template <bool F16QK>
+__global__ void __launch_bounds__(NT, 2) k9_gdn_prep(
     const half* __restrict__ q, int64_t q_row, int64_t q_head,
     const half* __restrict__ k, int64_t k_row, int64_t k_head,
-    const half* __restrict__ v, int64_t v_row, int64_t v_head,
-    const float* __restrict__ g, const float* __restrict__ beta, int64_t gb_row,  // [T, Hv] (head stride 1)
-    const float* __restrict__ state_in, float* __restrict__ state_out,  // [N, Hv, dv, dk]
-    half* __restrict__ o, int64_t o_row, int64_t o_head,
-    const int* __restrict__ cu, int Hk, int Hv, float scale) {
-  static_assert(NC == 32, "this version: NC = 32 (4 warps x 8 columns in the substitution)");
-  constexpr int NT8 = NC / 8;           // n8 tiles over the column slice
-  constexpr uint32_t SK = 0;            // K tile, 16384 B
-  constexpr uint32_t SL = SK + 16384;   // L fp32 [64][65], 16640 B
-  constexpr uint32_t SM = SL + 64 * 65 * 4;  // M0 fp16 [128][NC] / R fp32 [64][NC] (union), 8192 B
-  constexpr uint32_t SU = SM + 8192;    // U fp16 [64][NC]
-  constexpr uint32_t SU2 = SU + 64 * NC * 2;  // U' = e^{G_C-G} U fp16
-  constexpr uint32_t SG = SU2 + 64 * NC * 2;  // G fp32 [64], beta fp32 [64]
+    const float* __restrict__ g, const float* __restrict__ beta, int64_t gb_row,
+    half* __restrict__ Pout, half* __restrict__ Tout,  // [slots, Hv, 64, 64]
+    const int* __restrict__ cu, int N, int Hk, int Hv) {
+  constexpr uint32_t SK = 0, SL = 16384, SG = SL + 64 * 65 * 4;
   extern __shared__ __align__(128) uint8_t sm[];
   const uint32_t sb = (uint32_t)__cvta_generic_to_shared(sm);
   float* sL = reinterpret_cast<float*>(sm + SL);
-  float* sR = reinterpret_cast<float*>(sm + SM);
   float* sG = reinterpret_cast<float*>(sm + SG);
   float* sB = sG + 64;
+  const int slot = blockIdx.x, hv = blockIdx.y, hq = hv / (Hv / Hk);
+  int b, s, n;
+  if (!find_chunk(cu, N, slot, b, s, n)) return;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int gq = lane >> 2, cq = lane & 3, lr = lane & 7, lm = lane >> 3;
+#pragma unroll
+  for (int j = 0; j < (C * 16) / NT; ++j) {
+    const int idx = tid + j * NT, r = idx >> 4, ch = idx & 15;
+    uint4 val = make_uint4(0, 0, 0, 0);
+    if (r < n) val = *reinterpret_cast<const uint4*>(k + (int64_t)(s + r) * k_row + (int64_t)hq * k_head + ch * 8);
+    *reinterpret_cast<uint4*>(sm + SK + koff(r, ch)) = val;
+  }
+  if (warp == 0) scan_g(g, beta, gb_row, s, n, hv, lane, sG, sB);
+  __syncthreads();
+  const int ra = 16 * warp + gq, rb = ra + 8;
+  const float Ga = sG[ra], Gb = sG[rb], Ba = sB[ra], Bb = sB[rb];
+  uint32_t qa[D / 8][2];
+  {
+    const half* qp = q + (int64_t)hq * q_head;
+#pragma unroll
+    for (int kk = 0; kk < D / 8; ++kk) {
+      qa[kk][0] = ra < n ? *reinterpret_cast<const uint32_t*>(qp + (int64_t)(s + ra) * q_row + 8 * kk + 2 * cq) : 0u;
+      qa[kk][1] = rb < n ? *reinterpret_cast<const uint32_t*>(qp + (int64_t)(s + rb) * q_row + 8 * kk + 2 * cq) : 0u;
+    }
+  }
+  float sqk[8][4], skk[8][4];
+  if (F16QK) {
+    uint32_t hq2[8][2] = {}, hk2[8][2] = {};
+#pragma unroll
+    for (int kk = 0; kk < D / 8; kk += 2) {
+      uint32_t ka[4];
+      ldsm4(ka, sb + SK + koff(16 * warp + lr + (lm & 1) * 8, kk + (lm >> 1)));
+#pragma unroll
+      for (int np = 0; np < 4; ++np) {
+        uint32_t bb[4];
+        ldsm4(bb, sb + SK + koff(16 * np + 8 * (lm & 1) + lr, kk + (lm >> 1)));
+        mma_f16(hq2[2 * np], qa[kk][0], qa[kk][1], bb[0]);
+        mma_f16(hq2[2 * np + 1], qa[kk][0], qa[kk][1], bb[1]);
+        mma_f16(hq2[2 * np], qa[kk + 1][0], qa[kk + 1][1], bb[2]);
+        mma_f16(hq2[2 * np + 1], qa[kk + 1][0], qa[kk + 1][1], bb[3]);
+        mma_f16(hk2[2 * np], ka[0], ka[1], bb[0]);
+        mma_f16(hk2[2 * np + 1], ka[0], ka[1], bb[1]);
+        mma_f16(hk2[2 * np], ka[2], ka[3], bb[2]);
+        mma_f16(hk2[2 * np + 1], ka[2], ka[3], bb[3]);
+      }
+    }
+#pragma unroll
+    for (int nt = 0; nt < 8; ++nt) {
+      float2 a = __half22float2(*reinterpret_cast<half2*>(&hq2[nt][0])), c2 = __half22float2(*reinterpret_cast<half2*>(&hq2[nt][1]));
+      sqk[nt][0] = a.x; sqk[nt][1] = a.y; sqk[nt][2] = c2.x; sqk[nt][3] = c2.y;
+      a = __half22float2(*reinterpret_cast<half2*>(&hk2[nt][0])); c2 = __half22float2(*reinterpret_cast<half2*>(&hk2[nt][1]));
+      skk[nt][0] = a.x; skk[nt][1] = a.y; skk[nt][2] = c2.x; skk[nt][3] = c2.y;
+    }
+  } else {
+#pragma unroll
+    for (int nt = 0; nt < 8; ++nt)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) { sqk[nt][e] = 0.f; skk[nt][e] = 0.f; }
+#pragma unroll
+    for (int kk = 0; kk < D / 8; kk += 2) {
+      uint32_t ka[4];
+      ldsm4(ka, sb + SK + koff(16 * warp + lr + (lm & 1) * 8, kk + (lm >> 1)));
+#pragma unroll
+      for (int np = 0; np < 4; ++np) {
+        uint32_t bb[4];
+        ldsm4(bb, sb + SK + koff(16 * np + 8 * (lm & 1) + lr, kk + (lm >> 1)));
+        mma_f32(sqk[2 * np], qa[kk][0], qa[kk][1], bb[0]);
+        mma_f32(sqk[2 * np + 1], qa[kk][0], qa[kk][1], bb[1]);
+        mma_f32(sqk[2 * np], qa[kk + 1][0], qa[kk + 1][1], bb[2]);
+        mma_f32(sqk[2 * np + 1], qa[kk + 1][0], qa[kk + 1][1], bb[3]);
+        mma_f32(skk[2 * np], ka[0], ka[1], bb[0]);
+        mma_f32(skk[2 * np + 1], ka[0], ka[1], bb[1]);
+        mma_f32(skk[2 * np], ka[2], ka[3], bb[2]);
+        mma_f32(skk[2 * np + 1], ka[2], ka[3], bb[3]);
+      }
+    }
+  }
+  half* Pp = Pout + ((int64_t)slot * Hv + hv) * C * C;
+#pragma unroll
+  for (int nt = 0; nt < 8; ++nt) {
+    float p[4], l[4];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      const int row = (e < 2) ? ra : rb, col = 8 * nt + 2 * cq + (e & 1);
+      const float Gr = (e < 2) ? Ga : Gb, Br = (e < 2) ? Ba : Bb;
+      const float dec = __expf(fminf(Gr - sG[col], 0.f));
+      p[e] = col <= row ? dec * sqk[nt][e] : 0.f;
+      l[e] = col < row ? Br * dec * skk[nt][e] : 0.f;
+    }
+    *reinterpret_cast<uint32_t*>(Pp + ra * C + 8 * nt + 2 * cq) = pack2(p[0], p[1]);
+    *reinterpret_cast<uint32_t*>(Pp + rb * C + 8 * nt + 2 * cq) = pack2(p[2], p[3]);
+    sL[ra * 65 + 8 * nt + 2 * cq] = l[0]; sL[ra * 65 + 8 * nt + 2 * cq + 1] = l[1];
+    sL[rb * 65 + 8 * nt + 2 * cq] = l[2]; sL[rb * 65 + 8 * nt + 2 * cq + 1] = l[3];
+  }
+  __syncthreads();
+  // T = (I + L)^{-1}: thread col solves (I + L) t = e_col by forward substitution (fp32, L reads are warp broadcasts)
+  if (tid < C) {
+    const int col = tid;
+    float t[C];
+#pragma unroll
+    for (int j = 0; j < C; ++j) {
+      float acc = (j == col) ? 1.f : 0.f;
+#pragma unroll
+      for (int i = 0; i < j; ++i) acc = fmaf(-sL[j * 65 + i], t[i], acc);
+      t[j] = acc;
+    }
+    half* Tp = Tout + ((int64_t)slot * Hv + hv) * C * C;
+#pragma unroll
+    for (int j = 0; j < C; ++j) Tp[j * C + col] = __float2half_rn(t[j]);
+  }
+}
 
+template <int NC>
+__global__ void __launch_bounds__(NT, 2) k9_gdn_main(
+    const half* __restrict__ q, int64_t q_row, int64_t q_head,
+    const half* __restrict__ k, int64_t k_row, int64_t k_head,
+    const half* __restrict__ v, int64_t v_row, int64_t v_head,
+    const float* __restrict__ g, const float* __restrict__ beta, int64_t gb_row,
+    const half* __restrict__ Pin, const half* __restrict__ Tin,
+    const float* __restrict__ state_in, float* __restrict__ state_out,  // [N, Hv, dv, dk]
+    half* __restrict__ o, int64_t o_row, int64_t o_head,
+    const int* __restrict__ cu, int Hk, int Hv, float scale) {
+  static_assert(NC == 32, "NC = 32");
+  constexpr int NT8 = NC / 8;
+  constexpr uint32_t SK = 0;                    // K tile 16384 B (rescaled in place by e^{G_C-G} after Y)
+  constexpr uint32_t SMR = SK + 16384;          // M0 fp16 [128][NC] / R fp16 [64][NC], 8192 B
+  constexpr uint32_t SU = SMR + 8192;           // U fp16 [64][NC], 4096 B
+  constexpr uint32_t SG = SU + 64 * NC * 2;     // G, beta fp32 [64] each
+  extern __shared__ __align__(128) uint8_t sm[];
+  const uint32_t sb = (uint32_t)__cvta_generic_to_shared(sm);
+  float* sG = reinterpret_cast<float*>(sm + SG);
+  float* sB = sG + 64;
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int gq = lane >> 2, cq = lane & 3, lr = lane & 7, lm = lane >> 3;
   const int nsl = D / NC;
-  const int hv = blockIdx.x / nsl, cs = blockIdx.x % nsl;
-  const int hq = hv / (Hv / Hk);
-  const int b = blockIdx.y;
-  const int t0 = cu[b], t1 = cu[b + 1];
-  const int c0 = cs * NC;
+  const int hv = blockIdx.x / nsl, cs = blockIdx.x % nsl, hq = hv / (Hv / Hk);
+  const int b = blockIdx.y, t0 = cu[b], t1 = cu[b + 1], c0 = cs * NC;
+  int slot = chunk_base(cu, b);
 
-  // state slice M0 [dk rows 32w + 16mt + (gq | gq+8)][cols 8nt + 2cq (+1)] in fp32 accumulators
   float Mr[2][NT8][4];
   {
     const float* st = state_in + ((int64_t)b * Hv + hv) * D * D;
@@ -97,10 +251,8 @@ __global__ void __launch_bounds__(NT, 1) k9_gdn_chunk_fwd(
           Mr[mt][nt][e] = st[(int64_t)c * D + d];
         }
   }
-
-  for (int s = t0; s < t1; s += C) {
+  for (int s = t0; s < t1; s += C, ++slot) {
     const int n = min(C, t1 - s);
-    // ---- stage: K tile, g/beta -> G, M0 fp16 ----
 #pragma unroll
     for (int j = 0; j < (C * 16) / NT; ++j) {
       const int idx = tid + j * NT, r = idx >> 4, ch = idx & 15;
@@ -108,19 +260,7 @@ __global__ void __launch_bounds__(NT, 1) k9_gdn_chunk_fwd(
       if (r < n) val = *reinterpret_cast<const uint4*>(k + (int64_t)(s + r) * k_row + (int64_t)hq * k_head + ch * 8);
       *reinterpret_cast<uint4*>(sm + SK + koff(r, ch)) = val;
     }
-    if (warp == 0) {
-      float ga = 0.f, gb2 = 0.f, ba = 0.f, bb = 0.f;
-      const int r0 = 2 * lane, r1 = 2 * lane + 1;
-      if (r0 < n) { ga = g[(int64_t)(s + r0) * gb_row + hv]; ba = beta[(int64_t)(s + r0) * gb_row + hv]; }
-      if (r1 < n) { gb2 = g[(int64_t)(s + r1) * gb_row + hv]; bb = beta[(int64_t)(s + r1) * gb_row + hv]; }
-      float x = ga + gb2;
-#pragma unroll
-      for (int off = 1; off < 32; off <<= 1) {
-        const float y = __shfl_up_sync(0xffffffffu, x, off);
-        if (lane >= off) x += y;
-      }
-      sG[r1] = x; sG[r0] = x - gb2; sB[r0] = ba; sB[r1] = bb;
-    }
+    if (warp == 0) scan_g(g, beta, gb_row, s, n, hv, lane, sG, sB);
 #pragma unroll
     for (int mt = 0; mt < 2; ++mt)
 #pragma unroll
@@ -128,15 +268,11 @@ __global__ void __launch_bounds__(NT, 1) k9_gdn_chunk_fwd(
 #pragma unroll
         for (int hh = 0; hh < 2; ++hh) {
           const int d = 32 * warp + 16 * mt + gq + hh * 8;
-          *reinterpret_cast<uint32_t*>(sm + SM + noff<NC>(d, nt) + 4 * cq) = pack2(Mr[mt][nt][2 * hh], Mr[mt][nt][2 * hh + 1]);
+          *reinterpret_cast<uint32_t*>(sm + SMR + noff<NC>(d, nt) + 4 * cq) = pack2(Mr[mt][nt][2 * hh], Mr[mt][nt][2 * hh + 1]);
         }
-    __syncthreads();
-
-    const int ra = 16 * warp + gq, rb = ra + 8;  // this thread's chunk rows
-    const float Ga = sG[ra], Gb = sG[rb], Ba = sB[ra], Bb = sB[rb];
-    const float GC = sG[C - 1];
-
-    // ---- Q fragments (rows 16w..16w+15) straight from global ----
+    __syncthreads();  // S1
+    const int ra = 16 * warp + gq, rb = ra + 8;
+    const float Ga = sG[ra], Gb = sG[rb], Ba = sB[ra], Bb = sB[rb], GC = sG[C - 1];
     uint32_t qa[D / 8][2];
     {
       const half* qp = q + (int64_t)hq * q_head;
@@ -146,77 +282,6 @@ __global__ void __launch_bounds__(NT, 1) k9_gdn_chunk_fwd(
         qa[kk][1] = rb < n ? *reinterpret_cast<const uint32_t*>(qp + (int64_t)(s + rb) * q_row + 8 * kk + 2 * cq) : 0u;
       }
     }
-    // ---- S_qk = Q K^T, S_kk = K K^T (16 x 64 per warp) ----
-    float sqk[8][4], skk[8][4];
-    if (F16QK) {
-      uint32_t hq2[8][2] = {}, hk2[8][2] = {};
-#pragma unroll
-      for (int kk = 0; kk < D / 8; kk += 2) {
-        uint32_t ka[4];
-        ldsm4(ka, sb + SK + koff(16 * warp + lr + (lm & 1) * 8, kk + (lm >> 1)));
-#pragma unroll
-        for (int np = 0; np < 4; ++np) {
-          uint32_t bb[4];
-          ldsm4(bb, sb + SK + koff(16 * np + 8 * (lm & 1) + lr, kk + (lm >> 1)));
-          mma_f16(hq2[2 * np], qa[kk][0], qa[kk][1], bb[0]);
-          mma_f16(hq2[2 * np + 1], qa[kk][0], qa[kk][1], bb[1]);
-          mma_f16(hq2[2 * np], qa[kk + 1][0], qa[kk + 1][1], bb[2]);
-          mma_f16(hq2[2 * np + 1], qa[kk + 1][0], qa[kk + 1][1], bb[3]);
-          mma_f16(hk2[2 * np], ka[0], ka[1], bb[0]);
-          mma_f16(hk2[2 * np + 1], ka[0], ka[1], bb[1]);
-          mma_f16(hk2[2 * np], ka[2], ka[3], bb[2]);
-          mma_f16(hk2[2 * np + 1], ka[2], ka[3], bb[3]);
-        }
-      }
-#pragma unroll
-      for (int nt = 0; nt < 8; ++nt) {
-        float2 a = __half22float2(*reinterpret_cast<half2*>(&hq2[nt][0])), c2 = __half22float2(*reinterpret_cast<half2*>(&hq2[nt][1]));
-        sqk[nt][0] = a.x; sqk[nt][1] = a.y; sqk[nt][2] = c2.x; sqk[nt][3] = c2.y;
-        a = __half22float2(*reinterpret_cast<half2*>(&hk2[nt][0])); c2 = __half22float2(*reinterpret_cast<half2*>(&hk2[nt][1]));
-        skk[nt][0] = a.x; skk[nt][1] = a.y; skk[nt][2] = c2.x; skk[nt][3] = c2.y;
-      }
-    } else {
-#pragma unroll
-      for (int nt = 0; nt < 8; ++nt)
-#pragma unroll
-        for (int e = 0; e < 4; ++e) { sqk[nt][e] = 0.f; skk[nt][e] = 0.f; }
-#pragma unroll
-      for (int kk = 0; kk < D / 8; kk += 2) {
-        uint32_t ka[4];
-        ldsm4(ka, sb + SK + koff(16 * warp + lr + (lm & 1) * 8, kk + (lm >> 1)));
-#pragma unroll
-        for (int np = 0; np < 4; ++np) {
-          uint32_t bb[4];
-          ldsm4(bb, sb + SK + koff(16 * np + 8 * (lm & 1) + lr, kk + (lm >> 1)));
-          mma_f32(sqk[2 * np], qa[kk][0], qa[kk][1], bb[0]);
-          mma_f32(sqk[2 * np + 1], qa[kk][0], qa[kk][1], bb[1]);
-          mma_f32(sqk[2 * np], qa[kk + 1][0], qa[kk + 1][1], bb[2]);
-          mma_f32(sqk[2 * np + 1], qa[kk + 1][0], qa[kk + 1][1], bb[3]);
-          mma_f32(skk[2 * np], ka[0], ka[1], bb[0]);
-          mma_f32(skk[2 * np + 1], ka[0], ka[1], bb[1]);
-          mma_f32(skk[2 * np], ka[2], ka[3], bb[2]);
-          mma_f32(skk[2 * np + 1], ka[2], ka[3], bb[3]);
-        }
-      }
-    }
-    // P (decayed causal Q K^T) -> fp16 A fragments; L (strictly lower, beta-scaled decayed K K^T) -> smem fp32
-    uint32_t pa[8][2];
-#pragma unroll
-    for (int nt = 0; nt < 8; ++nt) {
-      float p[4], l[4];
-#pragma unroll
-      for (int e = 0; e < 4; ++e) {
-        const int row = (e < 2) ? ra : rb, col = 8 * nt + 2 * cq + (e & 1);
-        const float Gr = (e < 2) ? Ga : Gb, Br = (e < 2) ? Ba : Bb;
-        const float dec = __expf(fminf(Gr - sG[col], 0.f));
-        p[e] = col <= row ? dec * sqk[nt][e] : 0.f;
-        l[e] = col < row ? Br * dec * skk[nt][e] : 0.f;
-      }
-      pa[nt][0] = pack2(p[0], p[1]); pa[nt][1] = pack2(p[2], p[3]);
-      sL[ra * 65 + 8 * nt + 2 * cq] = l[0]; sL[ra * 65 + 8 * nt + 2 * cq + 1] = l[1];
-      sL[rb * 65 + 8 * nt + 2 * cq] = l[2]; sL[rb * 65 + 8 * nt + 2 * cq + 1] = l[3];
-    }
-    // ---- Y = K_w M0, QM = Q_w M0 (16 x NC per warp), fp32 accumulate ----
     float y[NT8][4], qm[NT8][4];
 #pragma unroll
     for (int nt = 0; nt < NT8; ++nt)
@@ -228,8 +293,8 @@ __global__ void __launch_bounds__(NT, 1) k9_gdn_chunk_fwd(
       ldsm4(ka, sb + SK + koff(16 * warp + lr + (lm & 1) * 8, kk + (lm >> 1)));
 #pragma unroll
       for (int np = 0; np < NT8 / 2; ++np) {
-        uint32_t bm[4];  // (kk, 2np), (kk+1, 2np), (kk, 2np+1), (kk+1, 2np+1)
-        ldsm4t(bm, sb + SM + noff<NC>(8 * (kk + (lm & 1)) + lr, 2 * np + (lm >> 1)));
+        uint32_t bm[4];
+        ldsm4t(bm, sb + SMR + noff<NC>(8 * (kk + (lm & 1)) + lr, 2 * np + (lm >> 1)));
         mma_f32(y[2 * np], ka[0], ka[1], bm[0]);
         mma_f32(y[2 * np], ka[2], ka[3], bm[1]);
         mma_f32(y[2 * np + 1], ka[0], ka[1], bm[2]);
@@ -240,8 +305,7 @@ __global__ void __launch_bounds__(NT, 1) k9_gdn_chunk_fwd(
         mma_f32(qm[2 * np + 1], qa[kk + 1][0], qa[kk + 1][1], bm[3]);
       }
     }
-    // R = beta (V - e^G Y); O starts as e^G QM
-    float rr[NT8][4];
+    uint32_t rpk[NT8][2];  // R = beta (V - e^G Y) packed fp16 (rows ra | rb); O starts as e^G QM
     {
       const half* vp = v + (int64_t)hv * v_head + c0;
       const float ea = __expf(Ga), eb = __expf(Gb);
@@ -250,45 +314,68 @@ __global__ void __launch_bounds__(NT, 1) k9_gdn_chunk_fwd(
         float2 va = make_float2(0.f, 0.f), vb = make_float2(0.f, 0.f);
         if (ra < n) va = __half22float2(*reinterpret_cast<const half2*>(vp + (int64_t)(s + ra) * v_row + 8 * nt + 2 * cq));
         if (rb < n) vb = __half22float2(*reinterpret_cast<const half2*>(vp + (int64_t)(s + rb) * v_row + 8 * nt + 2 * cq));
-        rr[nt][0] = Ba * (va.x - ea * y[nt][0]); rr[nt][1] = Ba * (va.y - ea * y[nt][1]);
-        rr[nt][2] = Bb * (vb.x - eb * y[nt][2]); rr[nt][3] = Bb * (vb.y - eb * y[nt][3]);
+        rpk[nt][0] = pack2(Ba * (va.x - ea * y[nt][0]), Ba * (va.y - ea * y[nt][1]));
+        rpk[nt][1] = pack2(Bb * (vb.x - eb * y[nt][2]), Bb * (vb.y - eb * y[nt][3]));
         qm[nt][0] *= ea; qm[nt][1] *= ea; qm[nt][2] *= eb; qm[nt][3] *= eb;
       }
     }
-    __syncthreads();  // all warps done reading M0 fp16 and writing L
-#pragma unroll
-    for (int nt = 0; nt < NT8; ++nt) {
-      sR[ra * NC + 8 * nt + 2 * cq] = rr[nt][0]; sR[ra * NC + 8 * nt + 2 * cq + 1] = rr[nt][1];
-      sR[rb * NC + 8 * nt + 2 * cq] = rr[nt][2]; sR[rb * NC + 8 * nt + 2 * cq + 1] = rr[nt][3];
-    }
-    __syncthreads();
-    // ---- forward substitution U = (I + L)^{-1} R: warp w owns columns 8w..8w+7, 4 lanes per column ----
+    // T and P fragments for this warp's rows (A layout) straight from global
+    uint32_t ta[C / 8][2], pa[C / 8][2];
     {
-      const int col = 8 * warp + (lane >> 2), p = lane & 3;
-      float ur[16];
+      const half* Tp = Tin + ((int64_t)slot * Hv + hv) * C * C;
+      const half* Pp = Pin + ((int64_t)slot * Hv + hv) * C * C;
 #pragma unroll
-      for (int m = 0; m < 16; ++m) ur[m] = 0.f;
-#pragma unroll
-      for (int j = 0; j < C; ++j) {
-        float part = 0.f;
-#pragma unroll
-        for (int m = 0; m < 16; ++m)
-          if (4 * m < j) {  // compile-time prune; i = 4m + p < j checked at run time
-            const int i = 4 * m + p;
-            if (i < j) part = fmaf(sL[j * 65 + i], ur[m], part);
-          }
-        part += __shfl_xor_sync(0xffffffffu, part, 1);
-        part += __shfl_xor_sync(0xffffffffu, part, 2);
-        const float uj = sR[j * NC + col] - part;
-        if (p == (j & 3)) ur[j >> 2] = uj;
-        if (p == 0) {
-          *reinterpret_cast<half*>(sm + SU + noff<NC>(j, col >> 3) + 2 * (col & 7)) = __float2half_rn(uj);
-          *reinterpret_cast<half*>(sm + SU2 + noff<NC>(j, col >> 3) + 2 * (col & 7)) = __float2half_rn(__expf(GC - sG[j]) * uj);
-        }
+      for (int kk = 0; kk < C / 8; ++kk) {
+        ta[kk][0] = *reinterpret_cast<const uint32_t*>(Tp + ra * C + 8 * kk + 2 * cq);
+        ta[kk][1] = *reinterpret_cast<const uint32_t*>(Tp + rb * C + 8 * kk + 2 * cq);
+        pa[kk][0] = *reinterpret_cast<const uint32_t*>(Pp + ra * C + 8 * kk + 2 * cq);
+        pa[kk][1] = *reinterpret_cast<const uint32_t*>(Pp + rb * C + 8 * kk + 2 * cq);
       }
     }
-    __syncthreads();
-    // ---- O = scale (e^G QM + P U) ----
+    __syncthreads();  // S2: M0 fp16 and K (as A of Y) no longer read
+#pragma unroll
+    for (int nt = 0; nt < NT8; ++nt) {
+      *reinterpret_cast<uint32_t*>(sm + SMR + noff<NC>(ra, nt) + 4 * cq) = rpk[nt][0];
+      *reinterpret_cast<uint32_t*>(sm + SMR + noff<NC>(rb, nt) + 4 * cq) = rpk[nt][1];
+    }
+    // K rows *= e^{G_C - G_i}: the state update then uses U directly
+#pragma unroll
+    for (int j = 0; j < (C * 16) / NT; ++j) {
+      const int idx = tid + j * NT, r = idx >> 4, ch = idx & 15;
+      uint4* p4 = reinterpret_cast<uint4*>(sm + SK + koff(r, ch));
+      uint4 val = *p4;
+      const half2 f = __float2half2_rn(__expf(GC - sG[r]));
+      half2* h = reinterpret_cast<half2*>(&val);
+#pragma unroll
+      for (int e = 0; e < 4; ++e) h[e] = __hmul2(h[e], f);
+      *p4 = val;
+    }
+    __syncthreads();  // S3
+    // U = T R (16 x NC per warp)
+    float u[NT8][4];
+#pragma unroll
+    for (int nt = 0; nt < NT8; ++nt)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) u[nt][e] = 0.f;
+#pragma unroll
+    for (int kk = 0; kk < C / 8; kk += 2) {
+#pragma unroll
+      for (int np = 0; np < NT8 / 2; ++np) {
+        uint32_t br[4];
+        ldsm4t(br, sb + SMR + noff<NC>(8 * (kk + (lm & 1)) + lr, 2 * np + (lm >> 1)));
+        mma_f32(u[2 * np], ta[kk][0], ta[kk][1], br[0]);
+        mma_f32(u[2 * np], ta[kk + 1][0], ta[kk + 1][1], br[1]);
+        mma_f32(u[2 * np + 1], ta[kk][0], ta[kk][1], br[2]);
+        mma_f32(u[2 * np + 1], ta[kk + 1][0], ta[kk + 1][1], br[3]);
+      }
+    }
+#pragma unroll
+    for (int nt = 0; nt < NT8; ++nt) {
+      *reinterpret_cast<uint32_t*>(sm + SU + noff<NC>(ra, nt) + 4 * cq) = pack2(u[nt][0], u[nt][1]);
+      *reinterpret_cast<uint32_t*>(sm + SU + noff<NC>(rb, nt) + 4 * cq) = pack2(u[nt][2], u[nt][3]);
+    }
+    __syncthreads();  // S4
+    // O = scale (e^G QM + P U)
 #pragma unroll
     for (int kk = 0; kk < C / 8; kk += 2) {
 #pragma unroll
@@ -309,7 +396,7 @@ __global__ void __launch_bounds__(NT, 1) k9_gdn_chunk_fwd(
         if (rb < n) *reinterpret_cast<uint32_t*>(op + (int64_t)(s + rb) * o_row + 8 * nt + 2 * cq) = pack2(scale * qm[nt][2], scale * qm[nt][3]);
       }
     }
-    // ---- M = e^{G_C} M + K^T U' (warp w: dk rows 32w..32w+31) ----
+    // M = e^{G_C} M + Kscaled^T U
     {
       const float eC = __expf(GC);
 #pragma unroll
@@ -323,10 +410,10 @@ __global__ void __launch_bounds__(NT, 1) k9_gdn_chunk_fwd(
         uint32_t bu[NT8 / 2][4];
 #pragma unroll
         for (int np = 0; np < NT8 / 2; ++np)
-          ldsm4t(bu[np], sb + SU2 + noff<NC>(8 * (2 * kp + (lm & 1)) + lr, 2 * np + (lm >> 1)));
+          ldsm4t(bu[np], sb + SU + noff<NC>(8 * (2 * kp + (lm & 1)) + lr, 2 * np + (lm >> 1)));
 #pragma unroll
         for (int mt = 0; mt < 2; ++mt) {
-          uint32_t at[4];  // (d 0-7, i 0-7) a0(k0), (d 8-15, i 0-7) a1(k0), (d 0-7, i 8-15) a0(k1), (d 8-15, i 8-15) a1(k1)
+          uint32_t at[4];
           ldsm4t(at, sb + SK + koff(16 * kp + 8 * (lm >> 1) + lr, (32 * warp + 16 * mt) / 8 + (lm & 1)));
 #pragma unroll
           for (int np = 0; np < NT8 / 2; ++np) {
@@ -338,7 +425,7 @@ __global__ void __launch_bounds__(NT, 1) k9_gdn_chunk_fwd(
         }
       }
     }
-    __syncthreads();  // smem reused by the next chunk
+    __syncthreads();  // S5
   }
   {
     float* st = state_out + ((int64_t)b * Hv + hv) * D * D;
@@ -367,21 +454,37 @@ std::vector<at::Tensor> k9_gdn_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at:
   TORCH_CHECK(g.is_contiguous() && beta.is_contiguous() && g.size(1) == v.size(1), "g/beta [T, Hv] contiguous");
   TORCH_CHECK(cu.dtype() == at::kInt && state_in.is_contiguous(), "cu int32, contiguous state");
   const int Hk = q.size(1), Hv = v.size(1), N = cu.size(0) - 1;
+  const int64_t T = v.size(0);
   TORCH_CHECK(Hv % Hk == 0 && state_in.size(0) == N && state_in.size(1) == Hv, "shapes");
-  auto o = at::empty({v.size(0), Hv, D}, v.options());
+  auto o = at::empty({T, Hv, D}, v.options());
   auto st = at::empty_like(state_in);
   if (N <= 0) return {o, st};
-  constexpr int NC = 32;
-  constexpr uint32_t SMEM = 16384 + 64 * 65 * 4 + 8192 + 2 * 64 * NC * 2 + 512;
-  auto kern = f16qk ? k9_gdn_chunk_fwd<NC, true> : k9_gdn_chunk_fwd<NC, false>;
-  cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
-  dim3 grid(Hv * (D / NC), N);
-  kern<<<grid, NT, SMEM, at::cuda::getCurrentCUDAStream()>>>(
-      (const half*)q.data_ptr(), q.stride(0), q.stride(1), (const half*)k.data_ptr(), k.stride(0), k.stride(1),
-      (const half*)v.data_ptr(), v.stride(0), v.stride(1), g.data_ptr<float>(), beta.data_ptr<float>(), g.stride(0),
-      state_in.data_ptr<float>(), st.data_ptr<float>(), (half*)o.data_ptr(), o.stride(0), o.stride(1),
-      cu.data_ptr<int>(), Hk, Hv, (float)scale);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  const int64_t slots = T / C + N;  // >= sum ceil(len/64)
+  auto P = at::empty({slots, Hv, C, C}, v.options());
+  auto Tm = at::empty({slots, Hv, C, C}, v.options());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  {
+    constexpr uint32_t SMEM = 16384 + 64 * 65 * 4 + 512;
+    auto kern = f16qk ? k9_gdn_prep<true> : k9_gdn_prep<false>;
+    cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    kern<<<dim3(slots, Hv), NT, SMEM, stream>>>(
+        (const half*)q.data_ptr(), q.stride(0), q.stride(1), (const half*)k.data_ptr(), k.stride(0), k.stride(1),
+        g.data_ptr<float>(), beta.data_ptr<float>(), g.stride(0), (half*)P.data_ptr(), (half*)Tm.data_ptr(),
+        cu.data_ptr<int>(), N, Hk, Hv);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  {
+    constexpr int NC = 32;
+    constexpr uint32_t SMEM = 16384 + 8192 + 64 * NC * 2 + 512;
+    auto kern = k9_gdn_main<NC>;
+    cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    kern<<<dim3(Hv * (D / NC), N), NT, SMEM, stream>>>(
+        (const half*)q.data_ptr(), q.stride(0), q.stride(1), (const half*)k.data_ptr(), k.stride(0), k.stride(1),
+        (const half*)v.data_ptr(), v.stride(0), v.stride(1), g.data_ptr<float>(), beta.data_ptr<float>(), g.stride(0),
+        (const half*)P.data_ptr(), (const half*)Tm.data_ptr(), state_in.data_ptr<float>(), st.data_ptr<float>(),
+        (half*)o.data_ptr(), o.stride(0), o.stride(1), cu.data_ptr<int>(), Hk, Hv, (float)scale);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
   return {o, st};
 }
 

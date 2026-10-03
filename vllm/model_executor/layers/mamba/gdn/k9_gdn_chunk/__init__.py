@@ -12,7 +12,7 @@ import torch
 
 _EXT = None
 ENABLED = os.getenv("VLLM_K9_GDN_CHUNK", "0") == "1"
-F16QK = os.getenv("VLLM_K9_GDN_F16QK", "1") == "1"
+F16QK = os.getenv("VLLM_K9_GDN_F16QK", "0") == "1"  # fp16-acc Q K^T / K K^T: ~1% faster, 1.5-2x the output error
 
 
 def _load():
