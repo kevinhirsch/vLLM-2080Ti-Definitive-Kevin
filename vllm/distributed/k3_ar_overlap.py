@@ -30,6 +30,7 @@ import torch
 from vllm.utils.torch_utils import direct_register_custom_op
 
 _LAYERS: dict[str, "weakref.ref"] = {}
+_LOGGED = False
 _COMM_STREAMS: dict[int, torch.cuda.Stream] = {}
 
 
@@ -100,6 +101,14 @@ def k3_row_linear_ar_impl(x: torch.Tensor, layer_name: str) -> torch.Tensor:
     ):
         return plain(layer, x, bias)
 
+    global _LOGGED
+    if not _LOGGED:
+        _LOGGED = True
+        from vllm.logger import init_logger
+
+        init_logger(__name__).info(
+            "K3 k3_ar_overlap ACTIVE: chunks=%d first n=%d", k, n
+        )
     main = torch.cuda.current_stream()
     comm = _comm_stream(x.device)
     out_dim = layer.output_size
