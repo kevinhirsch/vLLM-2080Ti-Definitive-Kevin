@@ -384,8 +384,8 @@ __global__ void __launch_bounds__(NTHR, 1) tq_imma_stage1(
         const float al = al_s[row], sa = sa_s[row], zs = zs_s[row];
 #pragma unroll
         for (int n = 0; n < 4; n++) {
-          O[m][n][0] = O[m][n][0] * al + sa * (float)C[m][n][0] + zs;
-          O[m][n][1] = O[m][n][1] * al + sa * (float)C[m][n][1] + zs;
+          O[m][n][0] = fmaf(O[m][n][0], al, fmaf(sa, (float)C[m][n][0], zs));
+          O[m][n][1] = fmaf(O[m][n][1], al, fmaf(sa, (float)C[m][n][1], zs));
         }
       }
     }
@@ -739,8 +739,8 @@ __global__ void __launch_bounds__(NTHR, 2) tq_imma2_stage1(
         const float al = al_s[row], sa = sa_s[row], zs = zs_s[row];
 #pragma unroll
         for (int n = 0; n < 4; n++) {
-          O[m][n][0] = O[m][n][0] * al + sa * (float)C[m][n][0] + zs;
-          O[m][n][1] = O[m][n][1] * al + sa * (float)C[m][n][1] + zs;
+          O[m][n][0] = fmaf(O[m][n][0], al, fmaf(sa, (float)C[m][n][0], zs));
+          O[m][n][1] = fmaf(O[m][n][1], al, fmaf(sa, (float)C[m][n][1], zs));
         }
       }
     }
@@ -776,6 +776,306 @@ static inline size_t tq_imma2_smem_bytes(int MT, bool qsplit = false) {
   const int MR = MT * 8;
   return (size_t)T * KW * 4 + T * VW * 4 + MR * HD * (qsplit ? 2 : 1) + MR * LDP + 2 * T * 4 + 6 * MR * 4;
 }
+
+// ===================================================================================================================
+// Prefill over the cached TurboQuant prefix (continuation chunk): many query rows (Lq tokens x GQA heads of one kv head)
+// against the C cached tokens, non-causal (every prefix token precedes the chunk).  FA2-style: each warp owns 8 rows
+// (one IMMA m-tile) for the whole walk, so QK -> softmax -> PV stay in registers; the CTA (8 warps, 64 rows) decodes
+// each 64-token KV chunk ONCE into an int8 K tile + a transposed 4-bit V tile shared by its 64 rows.
+// Output: prefix attention (normalized O fp16 + natural-log LSE) to be merged with the chunk's own causal attention.
+// ===================================================================================================================
+#define KRW 25  // prefill raw-K row (words): 24 code words + norm
+__device__ __forceinline__ int tau_tok(int n, int c) { return 16 * (n >> 1) + 4 * (c >> 1) + 2 * (n & 1) + (c & 1); }
+
+template <bool QSPLIT>
+__global__ void __launch_bounds__(NTHR, 1) tq_imma_prefill(
+    const int8_t* __restrict__ Q8, const float* __restrict__ QS, const uint8_t* __restrict__ KV,
+    const int* __restrict__ BT, int C, __half* __restrict__ Out, float* __restrict__ Lse, float* __restrict__ Mid,
+    long sq8r, long sq8h, long scb, long scp, long sch, long sor, long soh, long slr, long smr, long smh, long sms,
+    int Lq, int Hq, int G, int bs, int nbt, int NS, float attn_scale, float cscale, int norm_corr, uint32_t lut_lo,
+    uint32_t lut_hi) {
+  extern __shared__ __align__(16) unsigned char smem[];
+  int8_t* Ks = reinterpret_cast<int8_t*>(smem);                    // [T][256] swizzled int8 K
+  uint32_t* Vraw = reinterpret_cast<uint32_t*>(Ks + T * HD);       // [T][VW]
+  uint2* Vt = reinterpret_cast<uint2*>(Vraw + T * VW);             // [64 jp][16 tq] swizzled
+  float* f_s = reinterpret_cast<float*>(Vt + 64 * 16);             // [T]
+  float* vs_s = f_s + T;
+  float* vz_s = vs_s + T;
+  uint32_t* Kraw = reinterpret_cast<uint32_t*>(vz_s + T);         // [T][KRW]
+
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int g = lane >> 2, t4 = lane & 3;
+  const int kvh = blockIdx.y, sid = blockIdx.z;
+  const int Rtot = Lq * G;
+  const int row = blockIdx.x * 64 + warp * 8 + g;  // this lane's A row (and C row)
+  const bool row_ok = row < Rtot;
+  const int tq = row_ok ? row / G : 0, hh = row_ok ? row % G : 0;
+  const int hq = kvh * G + hh;
+
+  int split_len = (C + NS - 1) / NS;
+  split_len = (split_len + T - 1) / T * T;
+  const int t0 = split_len * sid;
+  const int t1 = min(t0 + split_len, C);
+
+  // Q fragments (k-step s = 4*sq + j, lane t4 -> dims 64*sq + 16*t4 + 4*j .. +3) live in registers for the walk
+  uint4 qa[4], qb[4];
+  float qsc = 0.f;
+#pragma unroll
+  for (int sq = 0; sq < 4; sq++) {
+    qa[sq] = make_uint4(0, 0, 0, 0);
+    qb[sq] = make_uint4(0, 0, 0, 0);
+  }
+  if (row_ok) {
+    const int8_t* src = Q8 + (long)tq * sq8r + (long)hq * sq8h;
+#pragma unroll
+    for (int sq = 0; sq < 4; sq++) {
+      qa[sq] = *reinterpret_cast<const uint4*>(src + 64 * sq + 16 * t4);
+      if (QSPLIT) qb[sq] = *reinterpret_cast<const uint4*>(src + HD + 64 * sq + 16 * t4);
+    }
+    qsc = QS[(long)tq * (sq8r / sq8h) + hq];
+  }
+
+  // per-lane smem offsets hoisted out of the walk (all n / p / kk dependence becomes immediates)
+  int kb_off[4];  // Ks byte offset of (row tau(n=0, g), chunk 4*sq + t4); + 256*(16*(n>>1) + 2*(n&1)) per n-tile
+  {
+    const int rb = 4 * (g >> 1) + (g & 1);
+#pragma unroll
+    for (int sq = 0; sq < 4; sq++) kb_off[sq] = 256 * rb + 16 * (4 * (sq ^ (g & 1)) + t4);
+  }
+  int vt_idx[2][4];  // Vt uint2 index of (jp = 8p + g, quad 4kk + t4) for p parity; + 128*p
+#pragma unroll
+  for (int par = 0; par < 2; par++)
+#pragma unroll
+    for (int kk = 0; kk < 4; kk++)
+      vt_idx[par][kk] = 16 * g + 4 * (kk ^ (g & 3)) + (t4 ^ ((2 * par + (g >> 2)) & 3));
+
+  float O[8][4][2];
+#pragma unroll
+  for (int p = 0; p < 8; p++)
+#pragma unroll
+    for (int n = 0; n < 4; n++) O[p][n][0] = O[p][n][1] = 0.f;
+  float m_run = -INFINITY, l_run = 0.f;
+
+  const long koff = (long)kvh * sch;
+  Pref2 cur;
+#ifdef TQ_IMMA_PROF
+  long long _pt = clock64();
+#endif
+  if (t0 < t1) load_chunk2(cur, KV, chunk_addr(BT, 0, nbt, t0, bs, scb, scp, koff), min(T, t1 - t0), bs, scp, lane, warp);
+
+  for (int c0 = t0; c0 < t1; c0 += T) {
+    const int nvalid = min(T, t1 - c0);
+    __syncthreads();  // previous chunk fully consumed (Ks / Vt / f_s / vs_s)
+    TQP(0);
+    // ---- stage this warp's 8 tokens: funnel-shift records, raw K words + norm, raw V words, metadata
+#pragma unroll
+    for (int u = 0; u < 8; u++) {
+      const int tk = warp * 8 + u;
+      const uint32_t r0 = cur.w0[u], r1 = cur.w1[u];
+      uint32_t n0 = __shfl_down_sync(0xffffffffu, r0, 1);
+      const uint32_t x = __shfl_sync(0xffffffffu, r1, 0);
+      const uint32_t n1 = __shfl_down_sync(0xffffffffu, r1, 1);
+      if (lane == 31) n0 = x;
+      const bool s2 = (cur.shb >> u) & 1u;
+      const uint32_t ksh = s2 ? 16u : 0u, vsh = s2 ? 0u : 16u;
+      const int dl = s2 ? 1 : 0;
+      if (lane < 24) Kraw[tk * KRW + lane] = __funnelshift_r(r0, n0, ksh);
+      if (lane == 24) Kraw[tk * KRW + 24] = s2 ? (r0 >> 16) : (r0 & 0xFFFFu);
+      const int i0 = lane - 24 - dl;
+      if (i0 >= 0) Vraw[tk * VW + i0] = __funnelshift_r(r0, n0, vsh);
+      const int i1 = 8 + lane - dl;
+      if (i1 <= 31) Vraw[tk * VW + i1] = __funnelshift_r(r1, n1, vsh);
+      if (i1 == 32) {
+        const uint32_t meta = __funnelshift_r(r1, n1, vsh);
+        vs_s[tk] = __half2float(__ushort_as_half((unsigned short)(meta & 0xFFFFu)));
+        vz_s[tk] = __half2float(__ushort_as_half((unsigned short)(meta >> 16)));
+      }
+    }
+    TQP(7);
+    __syncwarp();
+    // ---- K decode, all 32 lanes: 64 tasks = 8 tokens x 8 units of 12 code bytes (32 dims)
+#pragma unroll
+    for (int it = 0; it < 2; it++) {
+      const int a = lane + 32 * it, u = a >> 3, k = a & 7;
+      const int tk = warp * 8 + u;
+      const uint32_t* kr = Kraw + tk * KRW + 3 * k;
+      const uint32_t kw = kr[0], kw1 = kr[1], kw2 = kr[2];
+      const uint32_t ga = kw & 0xFFFFFFu, gb = (kw >> 24) | ((kw1 & 0xFFFFu) << 8);
+      const uint32_t gc = (kw1 >> 16) | ((kw2 & 0xFFu) << 16), gd = kw2 >> 8;
+      const uint32_t sa = spread3(ga), sb = spread3(gb), sc = spread3(gc), sd = spread3(gd);
+      uint4 w0, w1;
+      w0.x = __byte_perm(lut_lo, lut_hi, sa & 0xFFFFu);
+      w0.y = __byte_perm(lut_lo, lut_hi, sa >> 16);
+      w0.z = __byte_perm(lut_lo, lut_hi, sb & 0xFFFFu);
+      w0.w = __byte_perm(lut_lo, lut_hi, sb >> 16);
+      w1.x = __byte_perm(lut_lo, lut_hi, sc & 0xFFFFu);
+      w1.y = __byte_perm(lut_lo, lut_hi, sc >> 16);
+      w1.z = __byte_perm(lut_lo, lut_hi, sd & 0xFFFFu);
+      w1.w = __byte_perm(lut_lo, lut_hi, sd >> 16);
+      *reinterpret_cast<uint4*>(Ks + kq_off(tk, 2 * k)) = w0;
+      *reinterpret_cast<uint4*>(Ks + kq_off(tk, 2 * k + 1)) = w1;
+      int ss = __dp4a((int)w0.x, (int)w0.x, 0);
+      ss = __dp4a((int)w0.y, (int)w0.y, ss); ss = __dp4a((int)w0.z, (int)w0.z, ss); ss = __dp4a((int)w0.w, (int)w0.w, ss);
+      ss = __dp4a((int)w1.x, (int)w1.x, ss); ss = __dp4a((int)w1.y, (int)w1.y, ss);
+      ss = __dp4a((int)w1.z, (int)w1.z, ss); ss = __dp4a((int)w1.w, (int)w1.w, ss);
+      ss += __shfl_xor_sync(0xffffffffu, ss, 1);
+      ss += __shfl_xor_sync(0xffffffffu, ss, 2);
+      ss += __shfl_xor_sync(0xffffffffu, ss, 4);
+      if (k == 0)
+        f_s[tk] = (tk < nvalid && ss > 0)
+                      ? __half2float(__ushort_as_half((unsigned short)Kraw[tk * KRW + 24])) * attn_scale *
+                            (norm_corr ? rsqrtf((float)ss) : cscale)
+                      : 0.f;
+    }
+    if (c0 + T < t1)
+      load_chunk2(cur, KV, chunk_addr(BT, 0, nbt, c0 + T, bs, scb, scp, koff), min(T, t1 - c0 - T), bs, scp, lane, warp);
+    TQP(1);
+    __syncwarp();
+    // ---- this warp's two quads (tokens 8w..8w+7) of the transposed V tile
+    {
+      const uint16_t* Vh = reinterpret_cast<const uint16_t*>(Vraw);
+#pragma unroll
+      for (int k = 0; k < 4; k++) {
+        const int jp = lane + 32 * (k & 1), q = 2 * warp + (k >> 1);
+        const uint32_t a0 = Vh[(4 * q + 0) * VW * 2 + jp], a1 = Vh[(4 * q + 1) * VW * 2 + jp];
+        const uint32_t a2 = Vh[(4 * q + 2) * VW * 2 + jp], a3 = Vh[(4 * q + 3) * VW * 2 + jp];
+        const uint32_t lo = a0 | (a1 << 16), hi = a2 | (a3 << 16);
+        Vt[vt_off(jp, q)] = make_uint2(__byte_perm(lo, hi, 0x6420), __byte_perm(lo, hi, 0x7531));
+      }
+    }
+    TQP(2);
+    __syncthreads();
+    TQP(3);
+
+    // ---- QK^T: 8 rows x 64 tokens (n-tile n, column c <-> token tau(n, c))
+    float s[8][2];
+    {
+      int acc[8][2], acc2[8][2];
+#pragma unroll
+      for (int n = 0; n < 8; n++) acc[n][0] = acc[n][1] = acc2[n][0] = acc2[n][1] = 0;
+#pragma unroll
+      for (int sq = 0; sq < 4; sq++) {
+#pragma unroll
+        for (int n = 0; n < 8; n++) {
+          const uint4 b = *reinterpret_cast<const uint4*>(Ks + kb_off[sq] + 256 * (16 * (n >> 1) + 2 * (n & 1)));
+          imma_s8(acc[n], qa[sq].x, b.x);
+          imma_s8(acc[n], qa[sq].y, b.y);
+          imma_s8(acc[n], qa[sq].z, b.z);
+          imma_s8(acc[n], qa[sq].w, b.w);
+          if (QSPLIT) {
+            imma_s8(acc2[n], qb[sq].x, b.x);
+            imma_s8(acc2[n], qb[sq].y, b.y);
+            imma_s8(acc2[n], qb[sq].z, b.z);
+            imma_s8(acc2[n], qb[sq].w, b.w);
+          }
+        }
+      }
+#pragma unroll
+      for (int n = 0; n < 8; n++)
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+          const int tk = tau_tok(n, 2 * t4 + i);
+          const float v = ((float)acc[n][i] + (QSPLIT ? (float)acc2[n][i] * (1.f / 254.f) : 0.f)) * qsc * f_s[tk];
+          s[n][i] = (tk < nvalid) ? v : -INFINITY;
+        }
+    }
+    TQP(4);
+    // ---- online softmax in registers (row g shared by the 4 t4 lanes)
+    uint32_t pa[4];
+    float alpha, sa, zs;
+    {
+      float cmax = -INFINITY;
+#pragma unroll
+      for (int n = 0; n < 8; n++) cmax = fmaxf(cmax, fmaxf(s[n][0], s[n][1]));
+      cmax = fmaxf(cmax, __shfl_xor_sync(0xffffffffu, cmax, 1));
+      cmax = fmaxf(cmax, __shfl_xor_sync(0xffffffffu, cmax, 2));
+      const float m_new = fmaxf(m_run, cmax);
+      alpha = (m_run == -INFINITY) ? 0.f : __expf(m_run - m_new);
+      float psum = 0.f, zsum = 0.f, amax = 0.f;
+#pragma unroll
+      for (int n = 0; n < 8; n++)
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+          const int tk = tau_tok(n, 2 * t4 + i);
+          const float p = (m_new == -INFINITY) ? 0.f : __expf(s[n][i] - m_new);
+          psum += p;
+          zsum += p * vz_s[tk];
+          s[n][i] = p * vs_s[tk];
+          amax = fmaxf(amax, s[n][i]);
+        }
+#pragma unroll
+      for (int o = 1; o <= 2; o <<= 1) {
+        psum += __shfl_xor_sync(0xffffffffu, psum, o);
+        zsum += __shfl_xor_sync(0xffffffffu, zsum, o);
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+      }
+      l_run = l_run * alpha + psum;
+      m_run = m_new;
+      const float inv = amax > 0.f ? 255.f / amax : 0.f;
+      sa = amax * (1.f / 255.f);
+      zs = zsum;
+#pragma unroll
+      for (int kk = 0; kk < 4; kk++)
+        pa[kk] = __float2uint_rn(s[2 * kk][0] * inv) | (__float2uint_rn(s[2 * kk][1] * inv) << 8) |
+                 (__float2uint_rn(s[2 * kk + 1][0] * inv) << 16) | (__float2uint_rn(s[2 * kk + 1][1] * inv) << 24);
+    }
+    TQP(5);
+    // ---- PV: 8 jp-tiles x 4 dims, k = 64 tokens (quad 4*kk + t4 = tokens 16*kk + 4*t4 .. +3)
+#pragma unroll
+    for (int p = 0; p < 8; p++) {
+      int Cc[4][2];
+#pragma unroll
+      for (int n = 0; n < 4; n++) Cc[n][0] = Cc[n][1] = 0;
+#pragma unroll
+      for (int kk = 0; kk < 4; kk++) {
+        const uint2 w = Vt[vt_idx[p & 1][kk] + 128 * p];
+        imma_u8(Cc[0], pa[kk], w.x & 0x0F0F0F0Fu);
+        imma_u8(Cc[1], pa[kk], (w.x >> 4) & 0x0F0F0F0Fu);
+        imma_u8(Cc[2], pa[kk], w.y & 0x0F0F0F0Fu);
+        imma_u8(Cc[3], pa[kk], (w.y >> 4) & 0x0F0F0F0Fu);
+      }
+#pragma unroll
+      for (int n = 0; n < 4; n++) {
+        O[p][n][0] = fmaf(O[p][n][0], alpha, fmaf(sa, (float)Cc[n][0], zs));
+        O[p][n][1] = fmaf(O[p][n][1], alpha, fmaf(sa, (float)Cc[n][1], zs));
+      }
+    }
+    TQP(6);
+  }
+
+  if (!row_ok) return;
+  const float il = l_run > 0.f ? 1.f / l_run : 0.f;
+  const float lse = l_run > 0.f ? m_run + logf(l_run) : -INFINITY;
+  if (NS == 1) {
+    __half* o = Out + (long)tq * sor + (long)hq * soh;
+#pragma unroll
+    for (int p = 0; p < 8; p++)
+#pragma unroll
+      for (int i = 0; i < 2; i++) {
+        const int jp = 8 * p + 2 * t4 + i;
+        const __half2 h01 = __floats2half2_rn(O[p][0][i] * il, O[p][1][i] * il);
+        const __half2 h23 = __floats2half2_rn(O[p][2][i] * il, O[p][3][i] * il);
+        uint2 pk;
+        pk.x = *reinterpret_cast<const uint32_t*>(&h01);
+        pk.y = *reinterpret_cast<const uint32_t*>(&h23);
+        *reinterpret_cast<uint2*>(o + 4 * jp) = pk;
+      }
+    if (t4 == 0) Lse[(long)tq * slr + hq] = lse;
+  } else {
+    float* mo = Mid + (long)tq * smr + (long)hq * smh + (long)sid * sms;
+#pragma unroll
+    for (int p = 0; p < 8; p++)
+#pragma unroll
+      for (int i = 0; i < 2; i++) {
+        const int jp = 8 * p + 2 * t4 + i;
+        *reinterpret_cast<float4*>(mo + 4 * jp) =
+            make_float4(O[p][0][i] * il, O[p][1][i] * il, O[p][2][i] * il, O[p][3][i] * il);
+      }
+    if (t4 == 0) mo[HD] = lse;
+  }
+}
+
+static inline size_t tq_imma_prefill_smem_bytes() { return (size_t)T * HD + T * VW * 4 + 64 * 16 * 8 + 3 * T * 4 + T * KRW * 4; }
 
 // Reduce over KV splits using only the per-split lse (-inf = empty). grid (R*Hq), block HD threads.
 __global__ void tq_imma_stage2(const float* __restrict__ Mid, __half* __restrict__ Out, float* __restrict__ Lse, int Hq,

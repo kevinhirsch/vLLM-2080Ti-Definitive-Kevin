@@ -80,4 +80,47 @@ void tq_imma_decode(torch::Tensor q_rot, torch::Tensor kv, torch::Tensor bt, tor
                                                          lse.stride(0));
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("decode", &tq_imma_decode, "tq imma decode"); }
+// Prefix attention for one continuation chunk: q_rot [Lq, Hq, D] fp32 (rotated) vs the C cached tokens of block-table row
+// `bt` [1, nbt]; out [Lq, Hq, D] f16 + lse [Lq, Hq] f32 (natural log).  mid [Lq, Hq, NS, D+8] only used when NS > 1.
+void tq_imma_prefill_prefix(torch::Tensor q_rot, torch::Tensor kv, torch::Tensor bt, int64_t C, torch::Tensor q8,
+                            torch::Tensor qs, torch::Tensor out, torch::Tensor lse, torch::Tensor mid, int64_t NS,
+                            double scale, double cscale, int64_t norm_corr, int64_t lut_lo, int64_t lut_hi,
+                            int64_t qsplit) {
+  const c10::cuda::CUDAGuard guard(q_rot.device());
+  TORCH_CHECK(q_rot.size(2) == HD && q_rot.stride(2) == 1 && q_rot.stride(1) == HD, "q_rot layout");
+  TORCH_CHECK(kv.size(3) >= 230 && kv.stride(3) == 1 && kv.size(1) >= T, "kv layout");
+  TORCH_CHECK(bt.stride(-1) == 1, "bt layout");
+  TORCH_CHECK(out.stride(2) == 1 && out.size(2) == HD, "out layout");
+  TORCH_CHECK(q8.size(2) >= 2 * HD && q8.is_contiguous(), "q8 workspace");
+  const int Hk = kv.size(2), Hq = q_rot.size(1), Lq = q_rot.size(0);
+  const int G = Hq / Hk;
+  auto st = at::cuda::getCurrentCUDAStream();
+  const int sp = qsplit ? 1 : 0;
+  tq_imma_qquant<<<Lq * Hq, 64, 0, st>>>(q_rot.data_ptr<float>(), q8.data_ptr<int8_t>(), qs.data_ptr<float>(), Hq, sp,
+                                          q_rot.stride(0), q_rot.stride(1));
+  const long qh = sp ? 2 * HD : HD;
+  const size_t smem = tq_imma_prefill_smem_bytes();
+  dim3 grid((unsigned)((Lq * G + 63) / 64), Hk, (unsigned)NS);
+  const bool use_mid = NS > 1;
+  if (use_mid) TORCH_CHECK(mid.size(2) >= NS && mid.stride(2) % 4 == 0, "mid workspace");
+  const long smr = use_mid ? mid.stride(0) : 0, smh = use_mid ? mid.stride(1) : 0, sms = use_mid ? mid.stride(2) : 0;
+#define LP(spv)                                                                                                     \
+  tq_imma_prefill<spv><<<grid, NTHR, smem, st>>>(                                                                   \
+      q8.data_ptr<int8_t>(), qs.data_ptr<float>(), kv.data_ptr<uint8_t>(), bt.data_ptr<int>(), (int)C,              \
+      reinterpret_cast<__half*>(out.data_ptr<at::Half>()), lse.data_ptr<float>(),                                   \
+      use_mid ? mid.data_ptr<float>() : nullptr, (long)Hq * qh, qh, kv.stride(0), kv.stride(1), kv.stride(2),        \
+      out.stride(0), out.stride(1), lse.stride(0), smr, smh, sms, Lq, Hq, G, (int)kv.size(1), (int)bt.size(-1),     \
+      (int)NS, (float)scale, (float)cscale, (int)norm_corr, (uint32_t)lut_lo, (uint32_t)lut_hi)
+  if (sp) { LP(true); } else { LP(false); }
+#undef LP
+  if (use_mid)
+    tq_imma_stage2<<<Lq * Hq, HD, NS * sizeof(float), st>>>(mid.data_ptr<float>(),
+                                                            reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+                                                            lse.data_ptr<float>(), Hq, (int)NS, smr, smh, sms,
+                                                            out.stride(0), out.stride(1), lse.stride(0));
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("decode", &tq_imma_decode, "tq imma decode");
+  m.def("prefill_prefix", &tq_imma_prefill_prefix, "tq imma prefill over the cached prefix");
+}
