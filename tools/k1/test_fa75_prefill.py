@@ -67,7 +67,7 @@ def main():
         row = dict(Tq=Tq, Tkv=Tkv, Hq=Hq, Hk=Hk, causal=causal, q_mult=qm, fi_vs_ref=fi_rel,
                    fi_lse_err_if_natural=fl_nat, fi_lse_err_if_base2=fl_b2)
         for vv in variants:
-            for bn in (16, 32):
+            for bn in (16,):
                 o, lse = K1.fa75_prefill(q, k, v, scale=scale, causal=causal, return_lse=True, variant=vv, bn=bn)
                 torch.cuda.synchronize()
                 r_ref = rel(o, ref_o)

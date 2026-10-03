@@ -18,8 +18,26 @@ CAP_BYTES = int(os.getenv("K1_CAP_MB", "260")) * 1024 * 1024
 MIN_FREE_MB = int(os.getenv("K1_MIN_FREE_MB", "420"))
 
 
+def preflight() -> None:
+    """No CUDA call before this: refuse while an engine window/boot runs or the engine is unhealthy."""
+    if not os.getenv("K1_IN_WINDOW"):
+        busy = subprocess.run(
+            ["pgrep", "-af", r"gateway-offline.py run|boot2?\.sh|engine-actuator.py restart|_win[A-Za-z0-9]*\.sh"],
+            capture_output=True, text=True).stdout.strip()
+        if busy:
+            raise SystemExit(f"K1 guard: engine window/boot in progress, not touching the GPU:\n{busy}")
+        import urllib.request
+        try:
+            ok = urllib.request.urlopen("http://127.0.0.1:8001/health", timeout=3).status == 200
+        except Exception:
+            ok = False
+        if not ok:
+            raise SystemExit("K1 guard: engine not healthy (booting or down); not touching the GPU")
+
+
 def gpu_guard(dev: int = 0) -> None:
-    """Refuse to run unless the card has headroom; cap the caching allocator."""
+    """Refuse to run unless the card has headroom and no engine window/boot is in progress; cap the allocator."""
+    preflight()
     free, total = torch.cuda.mem_get_info(dev)
     if free < MIN_FREE_MB * 1024 * 1024:
         raise SystemExit(f"K1 guard: only {free / 2**20:.0f} MiB free on cuda:{dev}, need {MIN_FREE_MB}")
@@ -87,3 +105,7 @@ def ref_attention(q, k, v, scale, causal, chunk_heads=1):
             out[r0:r1, h] = torch.softmax(s, dim=-1) @ vh
             del s
     return out, lse
+
+
+if not os.getenv("K1_NO_PREFLIGHT"):
+    preflight()

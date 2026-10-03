@@ -64,7 +64,7 @@ static __device__ __forceinline__ uint32_t pack_h2(float a, float b) {
 // PV16: P V accumulates each BN-key slice in fp16 then adds into fp32 O (fa75's scheme), else straight fp32.
 // LAZY: rescale O only when some row max of the warp grows by more than LAZY_TAU (log2 units); P is then bounded
 // by 2^LAZY_TAU instead of 1 (the running max that defines the exponent is kept stale).
-template <int BN, bool CAUSAL, bool PV16, bool LAZY>
+template <int BN, bool CAUSAL, bool PV16, bool LAZY, bool QK4, int ABL = 0>
 __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
     const half* __restrict__ q, int64_t q_row, int64_t q_head,
     const half* __restrict__ k, int64_t k_row, int64_t k_head,
@@ -177,7 +177,7 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
   constexpr int NT8 = BN / 8;  // n8 score tiles per warp per key tile
   for (int kt = 0; kt < n_tiles; ++kt) {
     const int n0 = kt * BN;
-    load_tile(v_, v_row, n0, stage);  // V(kt) in flight during Q K^T
+    if (!(ABL & 1)) load_tile(v_, v_row, n0, stage);  // V(kt) in flight during Q K^T
 
     const bool warp_active = n0 < warp_kv_end;  // warp-uniform
     float s[NT8][4];
@@ -185,7 +185,40 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
     for (int nt = 0; nt < NT8; ++nt)
 #pragma unroll
       for (int i = 0; i < 4; ++i) s[nt][i] = 0.0f;
-    if (warp_active) {
+    if (warp_active && !(ABL & 2)) {
+      if (QK4) {
+        // two independent accumulator sets (dims 0..127 from registers, 128..255 from smem), interleaved:
+        // 4 HMMA dependency chains per warp instead of 2, and the smem Q loads overlap register-Q HMMAs
+        float s2[NT8][4];
+#pragma unroll
+        for (int nt = 0; nt < NT8; ++nt)
+#pragma unroll
+          for (int i = 0; i < 4; ++i) s2[nt][i] = 0.0f;
+#pragma unroll
+        for (int kk = 0; kk < HD / 16; kk += 2) {
+          const int kh = kk + HD / 16;
+          uint32_t ah[4];
+          ldsm_x4(ah, qh_off(sQH, 16 * warp + lr + (lm & 1) * 8, kk + (lm >> 1)));
+#pragma unroll
+          for (int np = 0; np < BN / 16; ++np) {
+            uint32_t bl[4], bh[4];
+            ldsm_x4(bl, sK + tile_off(16 * np + 8 * (lm & 1) + lr, kk + (lm >> 1)));
+            ldsm_x4(bh, sK + tile_off(16 * np + 8 * (lm & 1) + lr, kh + (lm >> 1)));
+            mma1688(s[2 * np], qf[kk][0], qf[kk][1], bl[0]);
+            mma1688(s2[2 * np], ah[0], ah[1], bh[0]);
+            mma1688(s[2 * np + 1], qf[kk][0], qf[kk][1], bl[1]);
+            mma1688(s2[2 * np + 1], ah[0], ah[1], bh[1]);
+            mma1688(s[2 * np], qf[kk + 1][0], qf[kk + 1][1], bl[2]);
+            mma1688(s2[2 * np], ah[2], ah[3], bh[2]);
+            mma1688(s[2 * np + 1], qf[kk + 1][0], qf[kk + 1][1], bl[3]);
+            mma1688(s2[2 * np + 1], ah[2], ah[3], bh[3]);
+          }
+        }
+#pragma unroll
+        for (int nt = 0; nt < NT8; ++nt)
+#pragma unroll
+          for (int i = 0; i < 4; ++i) s[nt][i] += s2[nt][i];
+      } else {
 #pragma unroll
       for (int kk = 0; kk < HD / 8; kk += 2) {
         uint32_t a[4];
@@ -205,11 +238,12 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
           mma1688(s[2 * np + 1], a[2], a[3], bb[3]);
         }
       }
+      }
     }
     store_tile(TILE_BYTES, stage);
 
     const bool more = kt + 1 < n_tiles;
-    if (more) load_tile(k_, k_row, n0 + BN, stage);  // K(kt+1) in flight during softmax and P V
+    if (more && !(ABL & 1)) load_tile(k_, k_row, n0 + BN, stage);  // K(kt+1) in flight during softmax and P V
 
     if (warp_active) {
       const bool need_mask = (n0 + BN > Tkv) || (CAUSAL && n0 + BN - 1 > m0 + 16 * warp + offs);
@@ -250,7 +284,7 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
         for (int nt = 0; nt < NT8; ++nt)
 #pragma unroll
           for (int e = 0; e < 2; ++e) {
-            float p = exp2f(s[nt][2 * hh + e] - m_use);
+            float p = (ABL & 8) ? s[nt][2 * hh + e] : exp2f(s[nt][2 * hh + e] - m_use);
             s[nt][2 * hh + e] = p;
             sum += p;
           }
@@ -264,7 +298,7 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
         }
       }
     }
-    __syncthreads();  // V(kt) visible, K(kt) no longer read
+    if (!(ABL & 16)) __syncthreads();  // V(kt) visible, K(kt) no longer read
 
     if (warp_active) {
       uint32_t pa[NT8][2];
@@ -275,7 +309,9 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
       }
 #pragma unroll
       for (int dn = 0; dn < HD / 8; dn += 4) {
-        if (PV16) {
+        if (ABL & 4) {
+          oacc[dn][0] += __uint_as_float(pa[0][0]);  // keep P live
+        } else if (PV16) {
           uint32_t t[4][2] = {};
 #pragma unroll
           for (int j = 0; j < NT8; ++j) {
@@ -303,7 +339,7 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
       }
     }
     if (more) store_tile(0, stage);
-    __syncthreads();  // K(kt+1) visible, V(kt) no longer read
+    if (!(ABL & 16)) __syncthreads();  // K(kt+1) visible, V(kt) no longer read
   }
 
   // Normalize, store O and LSE
@@ -329,12 +365,12 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
 #endif
 }
 
-template <int BN, bool CAUSAL, bool PV16, bool LAZY>
+template <int BN, bool CAUSAL, bool PV16, bool LAZY, bool QK4, int ABL = 0>
 static void launch(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, at::Tensor& o,
                    float* lse_ptr, int64_t lse_row, int64_t lse_head,
                    const at::Tensor& cu_q, const at::Tensor& cu_k, int max_q, float scale_log2) {
   constexpr uint32_t SMEM = 2 * BN * HD * 2 + BM * HD;
-  auto kern = k1fa_kernel<BN, CAUSAL, PV16, LAZY>;
+  auto kern = k1fa_kernel<BN, CAUSAL, PV16, LAZY, QK4, ABL>;
   static bool attr_set[64] = {};
   const int dev = q.get_device();
   if (!attr_set[dev]) {
@@ -354,7 +390,7 @@ static void launch(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-// variant: bit0 = PV16, bit1 = LAZY; bn in {16, 32}
+// variant: bit0 = PV16, bit1 = LAZY, bit2 = QK4 (two interleaved QK accumulator sets); bn = 16
 void k1fa_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, c10::optional<at::Tensor> lse,
               at::Tensor cu_q, at::Tensor cu_k, int64_t max_q, double scale, bool causal, int64_t bn,
               int64_t variant) {
@@ -382,28 +418,35 @@ void k1fa_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, c10::optio
   }
   if (max_q <= 0) return;
   const float sl2 = (float)(scale * 1.4426950408889634);
-#define K1_DISPATCH(BNV, C, P, L) \
-  launch<BNV, C, P, L>(q, k, v, o, lse_ptr, lse_row, lse_head, cu_q, cu_k, (int)max_q, sl2)
-  const bool pv16 = variant & 1, lazy = variant & 2;
-  if (bn == 16) {
-    if (causal) {
-      if (pv16) { if (lazy) K1_DISPATCH(16, true, true, true); else K1_DISPATCH(16, true, true, false); }
-      else { if (lazy) K1_DISPATCH(16, true, false, true); else K1_DISPATCH(16, true, false, false); }
-    } else {
-      if (pv16) { if (lazy) K1_DISPATCH(16, false, true, true); else K1_DISPATCH(16, false, true, false); }
-      else { if (lazy) K1_DISPATCH(16, false, false, true); else K1_DISPATCH(16, false, false, false); }
-    }
-  } else if (bn == 32) {
-    if (causal) {
-      if (pv16) { if (lazy) K1_DISPATCH(32, true, true, true); else K1_DISPATCH(32, true, true, false); }
-      else { if (lazy) K1_DISPATCH(32, true, false, true); else K1_DISPATCH(32, true, false, false); }
-    } else {
-      if (pv16) { if (lazy) K1_DISPATCH(32, false, true, true); else K1_DISPATCH(32, false, true, false); }
-      else { if (lazy) K1_DISPATCH(32, false, false, true); else K1_DISPATCH(32, false, false, false); }
-    }
-  } else {
-    TORCH_CHECK(false, "bn must be 16 or 32");
+#define K1_DISPATCH(C, P, L, Q) \
+  launch<16, C, P, L, Q>(q, k, v, o, lse_ptr, lse_row, lse_head, cu_q, cu_k, (int)max_q, sl2)
+  TORCH_CHECK(bn == 16, "bn must be 16");
+  const int vv = (int)variant & 7;
+#define K1_V(C)                                                  \
+  switch (vv) {                                                  \
+    case 0: K1_DISPATCH(C, false, false, false); break;          \
+    case 1: K1_DISPATCH(C, true, false, false); break;           \
+    case 2: K1_DISPATCH(C, false, true, false); break;           \
+    case 3: K1_DISPATCH(C, true, true, false); break;            \
+    case 4: K1_DISPATCH(C, false, false, true); break;           \
+    case 5: K1_DISPATCH(C, true, false, true); break;            \
+    case 6: K1_DISPATCH(C, false, true, true); break;            \
+    default: K1_DISPATCH(C, true, true, true); break;            \
   }
+  if (variant >= 8) {
+    // timing ablations (results are wrong on purpose), causal v7 base: bit3 no global loads, bit4 no QK,
+    // bit5 no PV, bit6 no exp, bit7 no barriers
+    TORCH_CHECK(causal, "ablations are causal only");
+    switch ((int)(variant >> 3)) {
+#define K1_ABL(A) case A: launch<16, true, true, true, true, A>(q, k, v, o, lse_ptr, lse_row, lse_head, cu_q, cu_k, (int)max_q, sl2); break;
+      K1_ABL(1) K1_ABL(2) K1_ABL(4) K1_ABL(8) K1_ABL(16) K1_ABL(6) K1_ABL(3) K1_ABL(5) K1_ABL(17)
+#undef K1_ABL
+      default: TORCH_CHECK(false, "unknown ablation");
+    }
+    return;
+  }
+  if (causal) { K1_V(true) } else { K1_V(false) }
+#undef K1_V
 #undef K1_DISPATCH
 }
 
