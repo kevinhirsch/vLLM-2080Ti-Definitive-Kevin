@@ -4926,6 +4926,37 @@ def _history_summary_blocking(since_ts, max_files, hard_line_cap=500000):
 # existing functions, edited in place to plug into it -------------------------------------
 
 
+def _retract_route_event(request):
+    """Lane SH (L163): undo the counters, ring entries and routing row of this request's last record_event(). Used when
+    a spend-refused overflow re-enters the router and is served locally: before, the one request was counted twice
+    (once 'remote <reason>' although nothing was paid, once 'local')."""
+    try:
+        rec = request.get("gw_last_route_event")
+        request["gw_last_route_event"] = None
+    except Exception:
+        return
+    if not rec:
+        return
+    decision, reason, ev, row, waited = rec
+    _stats["total"] -= 1
+    key = {"local": "local", "held": "held", "rejected-bg": "rejected_bg", "gone": "client_gone"}.get(decision, "remote")
+    _stats[key] = _stats.get(key, 0) - 1
+    if key == "remote":
+        _remote_reasons[reason] -= 1
+        if _remote_reasons[reason] <= 0:
+            del _remote_reasons[reason]
+    if waited and waited > 0:
+        _stats["waited_total"] -= waited
+        _stats["waited_n"] -= 1
+    for ring, item in ((_events, ev), (_FLOW_ROUTES, row)):
+        if item is None:
+            continue
+        for k, x in enumerate(ring):
+            if x is item:
+                del ring[k]
+                break
+
+
 def record_event(decision, reason, request, units, waited, ptok=0, maxtok=0, stream=False):
     # route values: "local" / "remote" (unchanged), plus two BG-LOCAL-ONLY additions --
     # "held" (a background request that waited out a local-availability event and was served
@@ -4954,7 +4985,7 @@ def record_event(decision, reason, request, units, waited, ptok=0, maxtok=0, str
         _stats["waited_total"] += waited
         _stats["waited_n"] += 1
     _stats["peak_inflight"] = max(_stats["peak_inflight"], _inflight)
-    flow_note_route(decision, final_reason, request)
+    _route_row = flow_note_route(decision, final_reason, request)
     # TELEMETRY: pull whatever _relay()/_forward_remote()/the local-success branches have
     # already stashed on this request's live-registry entry (ttft/outtok are None for the
     # "record-before-forward" remote branches -- see DESIGN.md (c) for exactly why, and where
@@ -4962,7 +4993,7 @@ def record_event(decision, reason, request, units, waited, ptok=0, maxtok=0, str
     # _ACTIVE entry but read later, in handle_completions' finally, after the request finishes).
     _rinfo = _ACTIVE.get(id(request)) or {}
     _outtok, _outtok_lb = _rinfo.get("outtok"), _rinfo.get("outtok_lb")
-    _events.appendleft({"t": round(time.time(), 1), "d": decision, "r": final_reason,
+    _ev = ({"t": round(time.time(), 1), "d": decision, "r": final_reason,
                         "client": _client_label(request), "units": units,
                         "waited": round(waited or 0, 1),
                         "ep": request.path.rsplit("/", 1)[-1],
@@ -4972,6 +5003,11 @@ def record_event(decision, reason, request, units, waited, ptok=0, maxtok=0, str
                         "ttft": _rinfo.get("ttft"), "outtok": _outtok, "outtok_lb": _outtok_lb,
                         "cost_est": (_remote_cost_estimate(ptok, _outtok if _outtok is not None else _outtok_lb)
                                      if decision == "remote" else 0.0)})
+    _events.appendleft(_ev)
+    try:                       # lane SH (L163): what this request counted, so a re-entry can take it back
+        request["gw_last_route_event"] = (decision, reason, _ev, _route_row, waited)
+    except Exception:
+        pass
 
 def _gpu_stats():
     now = time.time()
@@ -6164,7 +6200,9 @@ def flow_note_route(decision, reason, request):
         info = _ACTIVE.get(id(request)) or {}
         headroom = bool(_health.get("ok") and not _local_offline() and _inflight < effective_budget()
                         and flow_backlog_s() <= LIGHT_PREFILL_SECS)
-        _FLOW_ROUTES.append((time.time(), decision, reason, info.get("flow_class"), headroom))
+        row = (time.time(), decision, reason, info.get("flow_class"), headroom)
+        _FLOW_ROUTES.append(row)
+        return row
     except Exception as _e:
         _swallowed("flow_note_route", _e)
 
@@ -9458,6 +9496,7 @@ async def _route_completions(request, _no_overflow=False):
         if resp is not None and getattr(resp, "headers", {}).get("X-Gateway-Spend-Refused"):
             if reentry:
                 log.info("route %s overflow refused by the spend authority -> local", path)
+                _retract_route_event(request)        # L163: the remote event is replaced by the local one
                 return await _route_completions(request, _no_overflow=True)
             return _cap_exhausted_unavailable("local failed and the daily remote cap is exhausted")
         return resp

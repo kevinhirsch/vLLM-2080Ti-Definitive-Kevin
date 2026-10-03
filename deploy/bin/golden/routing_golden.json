@@ -12478,19 +12478,6 @@
     "alias": "qwen-local",
     "alias_kind": "native",
     "cls": "kevin",
-    "cost_est": 0.0085713,
-    "d": "remote",
-    "maxtok": 4000,
-    "ptok": 57142,
-    "r": "big-prompt",
-    "stream": false,
-    "units": 1,
-    "waited": 0
-   },
-   {
-    "alias": "qwen-local",
-    "alias_kind": "native",
-    "cls": "kevin",
     "cost_est": 0.0,
     "d": "local",
     "maxtok": 4000,
@@ -12526,15 +12513,13 @@
   },
   "stats": {
    "client_gone": 0,
-   "flow_routes": 2,
+   "flow_routes": 1,
    "held": 0,
    "local": 1,
    "rejected_bg": 0,
-   "remote": 1,
-   "remote_reasons": {
-    "big-prompt": 1
-   },
-   "total": 2
+   "remote": 0,
+   "remote_reasons": {},
+   "total": 1
   },
   "telemetry": [
    {
