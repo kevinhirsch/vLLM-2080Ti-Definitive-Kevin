@@ -59,6 +59,17 @@ class Shape(unittest.TestCase):
         self.assertEqual(s.reasoning_at_output, 60)
         kw = shim._shape_kw(s, json.dumps({"tools": TOOLS}).encode(), local=True)
         self.assertEqual((kw["finish_reason"], kw["tool_calls_n"], kw["tool_args_valid"]), ("tool_calls", 1, True))
+        self.assertTrue(kw["has_tool_calls"])
+        self.assertNotIn("content_empty", kw)          # only false negatives are corrected
+
+    def test_split_content_line_is_not_a_false_empty(self):
+        line = sse(delta(content="the only answer"))
+        old_saw = shim._sse_content_shape(line[:20], False, False)
+        old_saw = shim._sse_content_shape(line[20:], *old_saw)
+        self.assertEqual(old_saw, (False, False))       # the legacy scan misses a split line
+        s = shim._SSEShape()
+        s.feed(line[:20]); s.feed(line[20:])
+        self.assertIs(shim._shape_kw(s, b"{}", local=True)["content_empty"], False)
 
     def test_remote_shape_does_not_claim_finish_reason(self):
         s = shim._SSEShape()
