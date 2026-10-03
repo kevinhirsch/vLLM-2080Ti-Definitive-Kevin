@@ -10,7 +10,8 @@ OUT=/home/kevin/projects/lanes/k6/win; mkdir -p $OUT; cd $K
 PY=/home/kevin/Desktop/wt-integrate/.venv/bin/python
 log(){ echo "$(date '+%F %T') $*" | tee -a $OUT/win.log; }
 XID0=$(journalctl -k --no-pager | grep -c "NVRM: Xid")
-cp -a $O $OUT/override.at_start.env; log "window start; xid=$XID0; override saved ($(wc -l < $O) lines)"
+WD0=$(systemctl is-active vllm-qwen27b-watchdog.timer 2>/dev/null || true)   # restore exactly this state at the end
+cp -a $O $OUT/override.at_start.env; log "window start; xid=$XID0; override saved ($(wc -l < $O) lines); watchdog.timer=$WD0"
 health(){ curl -s -m 3 -o /dev/null -w "%{http_code}" localhost:8001/health; }
 boot(){ # boot LABEL : actuator restart with current $O, wait for health
   for p in $(pgrep -f "[w]armup-after-start.sh"); do kill $p; done
@@ -26,7 +27,8 @@ boot(){ # boot LABEL : actuator restart with current $O, wait for health
 }
 restore(){
   cp -a $OUT/override.at_start.env $O; boot restore || { sleep 30; boot restore2; }
-  sudo -n systemctl start vllm-qwen27b-watchdog.timer
+  if [ "$WD0" = active ]; then sudo -n systemctl start vllm-qwen27b-watchdog.timer; fi
+  log "watchdog.timer now $(systemctl is-active vllm-qwen27b-watchdog.timer 2>/dev/null) (window start: $WD0)"
   log "restored: health $(health); xid now $(journalctl -k --no-pager | grep -c 'NVRM: Xid') (start $XID0)"
 }
 trap 'log "abort trap -> restore"; restore; exit 1' INT TERM
@@ -56,7 +58,7 @@ fi
 wait $MUX
 # ---- (3b) both GPUs free: second-communicator cost/safety for lead M (K3 constraint) ----
 log "stopping engine + watchdog timer for the 2-GPU bench"
-sudo -n systemctl stop vllm-qwen27b-watchdog.timer; sudo -n systemctl stop vllm-qwen27b; sleep 8
+[ "$WD0" = active ] && sudo -n systemctl stop vllm-qwen27b-watchdog.timer; sudo -n systemctl stop vllm-qwen27b; sleep 8
 nvidia-smi --query-gpu=index,memory.used --format=csv,noheader >> $OUT/win.log
 CUDA_DEVICE_ORDER=PCI_BUS_ID MASTER_PORT=29561 timeout 900 $PY -m torch.distributed.run --nproc-per-node 2 --master-port 29561 \
   $K/mux_ar_bench.py --out $OUT/mux_ar.json > $OUT/mux_ar.out 2>&1
