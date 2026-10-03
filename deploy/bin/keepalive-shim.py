@@ -539,6 +539,10 @@ _CFG = {
     "SHIM_PERF_BREAKER_MIN_SAMPLES": ("PERF_BREAKER_MIN_SAMPLES", int),
     "SHIM_PERF_BREAKER_HOLD_SECS": ("PERF_BREAKER_HOLD_SECS", float),
     "SHIM_STREAM_IDLE_TIMEOUT_SECS": ("STREAM_IDLE_TIMEOUT_SECS", float),
+    "SHIM_REASONING_WATCHDOG": ("REASONING_WATCHDOG", lambda v: str(v).strip().lower()),
+    "SHIM_REASONING_BUDGET_TOKENS": ("REASONING_BUDGET_TOKENS", int),
+    "SHIM_REASONING_CHARS_PER_TOKEN": ("REASONING_CHARS_PER_TOKEN", float),
+    "SHIM_THINK_BUDGET_EXPLICIT": ("THINK_BUDGET_EXPLICIT", int),
     # LOCAL-FIRST (L1, 2026-09-25) -- see the block after STREAM_IDLE_TIMEOUT_SECS below.
     "SHIM_LOCAL_FIRST":      ("LOCAL_FIRST", lambda v: str(v).lower() not in ("0", "false", "off", "")),
     "SHIM_LOCAL_FIRST_REASONS": ("LOCAL_FIRST_REASONS", lambda v: _parse_reason_set(v)),
@@ -655,6 +659,22 @@ PERF_BREAKER_KV_PCT = float(os.environ.get("SHIM_PERF_BREAKER_KV_PCT", "85"))
 PERF_BREAKER_MIN_SAMPLES = int(os.environ.get("SHIM_PERF_BREAKER_MIN_SAMPLES", "3"))
 PERF_BREAKER_HOLD_SECS = float(os.environ.get("SHIM_PERF_BREAKER_HOLD_SECS", "45"))
 STREAM_IDLE_TIMEOUT_SECS = float(os.environ.get("SHIM_STREAM_IDLE_TIMEOUT_SECS", "45"))
+# [LANE GW2 / L95, 2026-10-03] Long-empty-generation watchdog. Measured: pi sends
+# chat_template_kwargs.enable_thinking=true (pi models.json thinkingFormat=qwen-chat-template), which
+# thinking_budget_guard() reads as "caller handled thinking" and so leaves UNBOUNDED; with max_tokens
+# clamped to LOCAL_MAX_OUT=16384 a turn can think for 16384 tokens (~18 min at contended decode) and return
+# nothing (3 such pi turns 2026-10-03 05:21-05:23, 529-1076 s). Two independent, default-OFF fixes:
+#  SHIM_REASONING_WATCHDOG=off|shadow|retry  committed LOCAL stream that has streamed >= BUDGET estimated
+#      reasoning tokens with no content and no tool call yet. shadow: log + count what retry would have done.
+#      retry: abort the upstream generation and re-issue the same request with thinking OFF, piping its answer
+#      into the SAME client stream (the client has only seen reasoning deltas so far, so this is seamless).
+#  SHIM_REASONING_BUDGET_TOKENS  the budget, in tokens estimated as reasoning chars / SHIM_REASONING_CHARS_PER_TOKEN.
+#  SHIM_THINK_BUDGET_EXPLICIT=N  (0=off) the sampler-level source fix: an explicit enable_thinking=true without a
+#      thinking_token_budget gets thinking_token_budget=N (vLLM force-closes </think> at N -- no wasted work).
+REASONING_WATCHDOG = os.environ.get("SHIM_REASONING_WATCHDOG", "off").strip().lower()
+REASONING_BUDGET_TOKENS = int(os.environ.get("SHIM_REASONING_BUDGET_TOKENS", "8192"))
+REASONING_CHARS_PER_TOKEN = float(os.environ.get("SHIM_REASONING_CHARS_PER_TOKEN", "4.0"))
+THINK_BUDGET_EXPLICIT = int(os.environ.get("SHIM_THINK_BUDGET_EXPLICIT", "0"))
 
 # ---------------- LOCAL-FIRST overflow policy (L1, 2026-09-25) ----------------
 # Kevin 2026-09-25: "Is the GPU being used? Otherwise ... we're wasting money and/or time
@@ -3752,6 +3772,54 @@ def _note_payload_outcome(request, payload, stream):
         pass
 
 
+_SHAPE_STATS = collections.defaultdict(collections.Counter)   # [GW2 / L94] route -> response-shape counters
+
+
+def _shape_stats_note(route, status, info):
+    """Response-shape counters per route for /gateway/stats (successful chat responses only). Never raises."""
+    try:
+        if route not in ("local", "remote", "held") or (status is not None and status >= 400):
+            return
+        if info.get("content_empty") is None and info.get("finish_reason") is None:
+            return                     # not a chat completion we classified
+        c = _SHAPE_STATS["local" if route == "held" else route]
+        c["responses"] += 1
+        c["finish:%s" % (info.get("finish_reason") or "unknown")] += 1
+        if info.get("content_empty") and not info.get("has_tool_calls"):
+            c["empty_no_tool"] += 1
+        if info.get("has_tool_calls") or info.get("tool_calls_n"):
+            c["tool_responses"] += 1
+            v = info.get("tool_args_valid")
+            c["tool_args_valid" if v is True else ("tool_args_invalid" if v is False else "tool_args_unchecked")] += 1
+        if info.get("reasoning_watchdog"):
+            c["reasoning_watchdog_%s" % info["reasoning_watchdog"]] += 1
+    except Exception:
+        pass
+
+
+def _shape_stats_summary():
+    out = {}
+    for route, c in _SHAPE_STATS.items():
+        n = c["responses"] or 0
+        checked = c["tool_args_valid"] + c["tool_args_invalid"]
+        out[route] = {
+            "responses": n,
+            "finish_reason": {k[7:]: v for k, v in sorted(c.items()) if k.startswith("finish:")},
+            "finish_length_rate": round(c["finish:length"] / n, 4) if n else None,
+            "empty_no_tool": c["empty_no_tool"],
+            "empty_no_tool_rate": round(c["empty_no_tool"] / n, 4) if n else None,
+            "tool_responses": c["tool_responses"],
+            "tool_args_valid": c["tool_args_valid"], "tool_args_invalid": c["tool_args_invalid"],
+            "tool_args_unchecked": c["tool_args_unchecked"],
+            "tool_args_valid_rate": round(c["tool_args_valid"] / checked, 4) if checked else None,
+            "reasoning_watchdog": {k[19:]: v for k, v in c.items() if k.startswith("reasoning_watchdog_")},
+        }
+    return {"since_process_start": True, "by_route": out,
+            "reasoning_watchdog": {"mode": REASONING_WATCHDOG, "budget_tokens": REASONING_BUDGET_TOKENS,
+                                   "chars_per_token": REASONING_CHARS_PER_TOKEN, "triggers": dict(_RW_STATS)},
+            "think_budget_explicit": THINK_BUDGET_EXPLICIT}
+
+
 def _telemetry_note_request(info, resp=None):
     """Runs exactly once per request, from handle_completions' existing finally block --
     AFTER the response has already been returned to the client, regardless of which of the
@@ -3821,6 +3889,7 @@ def _telemetry_note_request(info, resp=None):
             except Exception:
                 pass
         _pm_feedback(info)        # LS lane: grade + self-correct the cache-aware cost model
+        _shape_stats_note(route, status, info)
         # (e) append-only JSONL request log -- see DESIGN.md (e) / REPORT.md. Never write on the
         # request path: this only appends a small dict to a bounded in-memory list;
         # _jsonl_flusher() (sibling to _stats_saver()) does the actual blocking file I/O off the
@@ -3854,6 +3923,15 @@ def _telemetry_note_request(info, resp=None):
             "content_len": info.get("content_len"),
             "content_empty": info.get("content_empty"),
             "has_tool_calls": info.get("has_tool_calls"),
+            # [GW2 / L94+L95] tool-call argument validity (JSON object + request tool schema), reasoning volume,
+            # reasoning streamed before the first content/tool call (sizes the reasoning watchdog), its action.
+            "tool_calls_n": info.get("tool_calls_n"), "tool_args_valid": info.get("tool_args_valid"),
+            "tool_args_error": info.get("tool_args_error"),
+            "reasoning_chars": info.get("reasoning_chars"),
+            "reasoning_chars_at_output": info.get("reasoning_chars_at_output"),
+            "reasoning_watchdog": info.get("reasoning_watchdog"),
+            "reasoning_watchdog_at_tok": info.get("reasoning_watchdog_at_tok"),
+            "reasoning_watchdog_ok": info.get("reasoning_watchdog_ok"),
             "ptok_exact": info.get("ptok_exact"),
             "predicted_occupancy_s": info.get("predicted_occupancy_s"),
             "context_provider": info.get("context_provider"),
@@ -6713,9 +6791,21 @@ def thinking_budget_guard(body):
     # with reasoning_effort=low still returned empty), so treating it as "caller knows best"
     # silently disabled the budget for anyone who sets it. Both Hermes instances send
     # reasoning_effort=medium on every request, so they were bypassing this entirely.
-    if (j.get("thinking_token_budget") is not None
-            or (j.get("chat_template_kwargs") or {}).get("enable_thinking") is not None):
+    _et = (j.get("chat_template_kwargs") or {}).get("enable_thinking")
+    if j.get("thinking_token_budget") is not None or _et is False:
         return body
+    if _et is not None:
+        # [LANE GW2 / L95] "thinking ON" is not "thinking BOUNDED": pi says enable_thinking=true on every turn
+        # and was left unbounded (16384-token empty turns). THINK_BUDGET_EXPLICIT>0 bounds it at the sampler;
+        # 0 (default) keeps the old "caller was explicit" behaviour byte for byte.
+        try:
+            mt = int(j.get("max_tokens") or 0)
+        except Exception:
+            return body
+        if THINK_BUDGET_EXPLICIT <= 0 or mt <= 0 or THINK_BUDGET_EXPLICIT >= mt:
+            return body
+        j["thinking_token_budget"] = THINK_BUDGET_EXPLICIT
+        return json.dumps(j).encode()
     try:
         mt = int(j.get("max_tokens") or 0)
     except Exception:
@@ -7058,6 +7148,9 @@ def _looks_meaningful(text):
     i = text.find('"reasoning_content":"')
     if i != -1 and text[i + 21:i + 22] not in ("", '"'):
         return True
+    i = text.find('"reasoning":"')      # [GW2] vLLM >= 0.29 streams reasoning as delta.reasoning
+    if i != -1 and text[i + 13:i + 14] not in ("", '"'):
+        return True
     i = text.find('"content":"')
     if i != -1 and text[i + 11:i + 12] not in ("", '"'):
         return True
@@ -7097,6 +7190,246 @@ def _sse_content_shape(data, saw_content, saw_tool_call):
     except Exception:
         pass
     return saw_content, saw_tool_call
+
+
+# [LANE GW2 / L94, 2026-10-03] Response-shape telemetry that a hard number can be read from: finish_reason and
+# tool-call ARGUMENT validity for local rows (before this, has_tool_calls recorded presence only and every local
+# row had finish_reason=null, so neither stop-vs-length nor broken tool calls were measurable). Telemetry only.
+TOOL_ARGS_MAX_CHARS = 1 << 20      # per response; a bigger argument blob is reported as unchecked (None), not invalid
+
+
+class _SSEShape:
+    """Lossless running facts over one streamed chat completion: line-buffered (an SSE line split across network
+    chunks is reassembled, unlike _sse_content_shape's best-effort scan), choice 0 only. Tracks finish_reason,
+    the tool calls' names + concatenated argument fragments, reasoning/content character counts, and how much
+    reasoning had streamed before the first real output (content or tool call). Never raises."""
+
+    __slots__ = ("tail", "finish", "tools", "reasoning_chars", "content_chars", "reasoning_at_output",
+                 "args_chars", "overflow")
+
+    def __init__(self):
+        self.tail = b""
+        self.finish = None
+        self.tools = {}
+        self.reasoning_chars = 0
+        self.content_chars = 0
+        self.reasoning_at_output = None
+        self.args_chars = 0
+        self.overflow = False
+
+    @property
+    def saw_output(self):
+        return self.reasoning_at_output is not None
+
+    def reasoning_tokens_est(self):
+        return int(self.reasoning_chars / max(0.5, REASONING_CHARS_PER_TOKEN))
+
+    def feed(self, chunk):
+        try:
+            complete, self.tail = _sse_split_tail(self.tail, chunk)
+            if complete:
+                self._scan(complete)
+        except Exception:
+            pass
+
+    def close(self):
+        try:
+            if self.tail:
+                tail, self.tail = self.tail, b""
+                self._scan(tail)
+        except Exception:
+            pass
+
+    def _output(self):
+        if self.reasoning_at_output is None:
+            self.reasoning_at_output = self.reasoning_chars
+
+    def _scan(self, data):
+        for ln in bytes(data).split(b"\n"):
+            ln = ln.strip()
+            if not ln.startswith(b"data:"):
+                continue
+            raw = ln[5:].strip()
+            if raw in (b"", b"[DONE]"):
+                continue
+            try:
+                ev = json.loads(raw)
+            except Exception:
+                continue
+            for ch in (ev.get("choices") or []) if isinstance(ev, dict) else []:
+                if not isinstance(ch, dict) or (ch.get("index") or 0) != 0:
+                    continue
+                if ch.get("finish_reason"):
+                    self.finish = ch["finish_reason"]
+                d = ch.get("delta") or {}
+                r = d.get("reasoning") or d.get("reasoning_content")
+                if r:
+                    self.reasoning_chars += len(r)
+                c = d.get("content") if d else ch.get("text")     # legacy /v1/completions streams `text`
+                if c:
+                    self.content_chars += len(c)
+                    if str(c).strip():
+                        self._output()
+                for tc in d.get("tool_calls") or []:
+                    self._output()
+                    slot = self.tools.setdefault(tc.get("index") or 0, {"name": "", "args": []})
+                    f = tc.get("function") or {}
+                    if f.get("name") and not slot["name"]:
+                        slot["name"] = f["name"]
+                    a = f.get("arguments")
+                    if a:
+                        self.args_chars += len(a)
+                        if self.args_chars > TOOL_ARGS_MAX_CHARS:
+                            self.overflow = True
+                        else:
+                            slot["args"].append(a)
+
+    def calls(self):
+        return [{"name": v["name"], "arguments": "".join(v["args"])} for _, v in sorted(self.tools.items())]
+
+
+def _schema_error(value, schema, path="$", depth=0):
+    """First violation of `value` against a JSON-schema subset (type, enum, const, required, properties,
+    additionalProperties, items, anyOf/oneOf, minItems/maxItems), or None. Keywords outside the subset ($ref,
+    pattern, formats, ...) are ignored -- i.e. treated as satisfied -- so this can under-report, never over-report."""
+    if not isinstance(schema, dict) or depth > 32:
+        return None
+    t = schema.get("type")
+    if t is not None:
+        types = t if isinstance(t, list) else [t]
+        ok = False
+        for ty in types:
+            if (ty == "object" and isinstance(value, dict)) or (ty == "array" and isinstance(value, list)) \
+                    or (ty == "string" and isinstance(value, str)) or (ty == "null" and value is None) \
+                    or (ty == "boolean" and isinstance(value, bool)) \
+                    or (ty == "integer" and isinstance(value, int) and not isinstance(value, bool)) \
+                    or (ty == "integer" and isinstance(value, float) and value.is_integer()) \
+                    or (ty == "number" and isinstance(value, (int, float)) and not isinstance(value, bool)) \
+                    or ty not in ("object", "array", "string", "null", "boolean", "integer", "number"):
+                ok = True
+                break
+        if not ok:
+            return "%s: expected %s, got %s" % (path, "|".join(map(str, types)), type(value).__name__)
+    if "enum" in schema and isinstance(schema["enum"], list) and value not in schema["enum"]:
+        return "%s: not in enum" % path
+    if "const" in schema and value != schema["const"]:
+        return "%s: != const" % path
+    for kw in ("anyOf", "oneOf"):
+        alts = schema.get(kw)
+        if isinstance(alts, list) and alts and all(_schema_error(value, a, path, depth + 1) for a in alts):
+            return "%s: matches no %s branch" % (path, kw)
+    if isinstance(value, dict):
+        props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+        for k in schema.get("required") or []:
+            if k not in value:
+                return "%s: missing required '%s'" % (path, k)
+        extra = schema.get("additionalProperties")
+        for k, v in value.items():
+            if k in props:
+                e = _schema_error(v, props[k], "%s.%s" % (path, k), depth + 1)
+                if e:
+                    return e
+            elif extra is False:
+                return "%s: unexpected property '%s'" % (path, k)
+            elif isinstance(extra, dict):
+                e = _schema_error(v, extra, "%s.%s" % (path, k), depth + 1)
+                if e:
+                    return e
+    if isinstance(value, list):
+        if isinstance(schema.get("minItems"), int) and len(value) < schema["minItems"]:
+            return "%s: fewer than minItems" % path
+        if isinstance(schema.get("maxItems"), int) and len(value) > schema["maxItems"]:
+            return "%s: more than maxItems" % path
+        if isinstance(schema.get("items"), dict):
+            for i, v in enumerate(value):
+                e = _schema_error(v, schema["items"], "%s[%d]" % (path, i), depth + 1)
+                if e:
+                    return e
+    return None
+
+
+def _request_tool_schemas(body):
+    """{tool name: parameters schema} from a request body (bytes/str/dict); None when it declares no tools."""
+    try:
+        j = json.loads(body) if isinstance(body, (bytes, bytearray, str)) else body
+        tools = j.get("tools") if isinstance(j, dict) else None
+        if not tools:
+            return None
+        out = {}
+        for t in tools:
+            f = (t or {}).get("function") or {}
+            if f.get("name"):
+                out[f["name"]] = f.get("parameters") if isinstance(f.get("parameters"), dict) else {}
+        return out
+    except Exception:
+        return None
+
+
+def tool_args_check(calls, schemas):
+    """(tool_args_valid, error) for a response's tool calls [{"name", "arguments": str|dict}].
+    None when there are no calls. A call is valid when its arguments parse as a JSON OBJECT (an empty string
+    counts as {}), and, when the request declared tools, it names one of them and its arguments satisfy that
+    tool's parameters schema. error is the FIRST problem, short ('json: ...', 'unknown_tool: x', 'schema: ...')."""
+    if not calls:
+        return None, None
+    for c in calls:
+        name, a = c.get("name") or "", c.get("arguments")
+        if isinstance(a, dict):
+            args = a
+        else:
+            a = (a or "").strip()
+            try:
+                args = json.loads(a) if a else {}
+            except Exception as e:
+                return False, ("json: %s" % e)[:160]
+            if not isinstance(args, dict):
+                return False, "json: arguments not an object"
+        if schemas is not None:
+            if name not in schemas:
+                return False, ("unknown_tool: %s" % name)[:160]
+            e = _schema_error(args, schemas[name])
+            if e:
+                return False, ("schema: %s: %s" % (name, e))[:160]
+    return True, None
+
+
+def _shape_kw(shape, body, local):
+    """_active_set kwargs for a finished stream's _SSEShape (L94 + L95 telemetry)."""
+    kw = {"reasoning_chars": shape.reasoning_chars, "reasoning_chars_at_output": shape.reasoning_at_output}
+    if local and shape.finish is not None:
+        kw["finish_reason"] = shape.finish
+    if shape.tools:
+        kw["tool_calls_n"] = len(shape.tools)
+        if shape.overflow:
+            kw["tool_args_valid"], kw["tool_args_error"] = None, "unchecked: arguments over %d chars" % TOOL_ARGS_MAX_CHARS
+        else:
+            kw["tool_args_valid"], kw["tool_args_error"] = tool_args_check(shape.calls(), _request_tool_schemas(body))
+    return kw
+
+
+def _nonstream_shape_kw(data, body, local):
+    """Same fields for a buffered (non-streaming) chat completion body."""
+    try:
+        d = json.loads(data)
+        ch = (d.get("choices") or [{}])[0]
+        m = ch.get("message") or ({"content": ch.get("text")} if "text" in ch else {})   # legacy completions
+        kw = {}
+        r = m.get("reasoning") or m.get("reasoning_content") or ""
+        kw["reasoning_chars"] = len(r)
+        if local:
+            kw["finish_reason"] = ch.get("finish_reason")
+            kw["content_len"] = len(m.get("content") or "")
+            kw["content_empty"] = not (m.get("content") or "").strip()
+            kw["has_tool_calls"] = bool(m.get("tool_calls"))
+        tcs = m.get("tool_calls") or []
+        if tcs:
+            calls = [{"name": (t.get("function") or {}).get("name") or "",
+                      "arguments": (t.get("function") or {}).get("arguments")} for t in tcs]
+            kw["tool_calls_n"] = len(calls)
+            kw["tool_args_valid"], kw["tool_args_error"] = tool_args_check(calls, _request_tool_schemas(body))
+        return kw
+    except Exception:
+        return {}
 
 
 async def _prepare_stream_response(resp, request, initial, session):
@@ -7278,6 +7611,10 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
                 log.warning("upstream %s returned %d: %s", base, up.status,
                             data[:400].decode("utf-8", "replace"))
             _note_remote_status(base, up.status)
+            if up.status < 400:     # [GW2 / L94] finish_reason + tool-arg validity for buffered responses
+                _skw = _nonstream_shape_kw(data, body, local=(base.rstrip("/") == LOCAL.rstrip("/")))
+                if _skw:
+                    _active_set(request, **_skw)
             ct = up.headers.get("Content-Type", "application/json").split(";")[0]
             return "ok", web.Response(body=data, status=up.status, content_type=ct,
                                        headers=_route_receipt())
@@ -7384,6 +7721,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
     _saw_content = [False]
     _saw_tool_call = [False]
     _scan_tail = [b""]     # SL lane: the unterminated last SSE line, carried into the next chunk
+    _shape = _SSEShape()   # [GW2 / L94+L95] lossless finish_reason / tool-call args / reasoning counter
 
     def _scan_usage_stream(chunk):
         """_scan_usage for a chunk stream: a usage trailer that straddles a network chunk
@@ -7434,6 +7772,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
                         # stream -- usage trailer included -- already arrived within the gate
     _scan_content_shape(buf)
     _scan_tail[0] = bytes(buf[buf.rfind(b"\n") + 1:])[-(1 << 20):]   # partial last line -> next chunk
+    _shape.feed(buf)
 
     if phase == "clean_end":
         # upstream finished before any 'meaningful' chunk — deliver as-is (short/empty response),
@@ -7446,8 +7785,10 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
                   "content_empty": not _saw_content[0], "has_tool_calls": _saw_tool_call[0]}
         if _exact_outtok[0] is not None:
             _outkw["outtok"] = _exact_outtok[0]
-        if _is_remote_relay and _exact_finish[0] is not None:
+        if _exact_finish[0] is not None:      # [GW2 / L94] local rows too (was remote-only)
             _outkw["finish_reason"] = _exact_finish[0]
+        _shape.close()
+        _outkw.update(_shape_kw(_shape, body, local=not _is_remote_relay))
         # gw-admission-computed-token-cost: local only -- prefix caching is a local-engine
         # concept, and remote's own cache accounting (if any) isn't comparable to it.
         if not _is_remote_relay and _exact_ptok[0] is not None:
@@ -7466,6 +7807,48 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
     resp = _mk_resp()
     if not await _prepare_stream_response(resp, request, bytes(buf), session):
         return "ok", resp
+    # [GW2 / L95] long-empty-generation watchdog: armed for a LOCAL stream whose request still has thinking on.
+    _rw = {"armed": (not _is_remote_relay and REASONING_WATCHDOG in ("shadow", "retry")
+                     and REASONING_BUDGET_TOKENS > 0 and not _thinking_disabled(body)),
+           "retried": False}
+
+    async def _reasoning_retry():
+        """Abort the thinking-only generation (closing the connection makes vLLM abort the request and free its
+        lane) and stream the same request with thinking OFF into the already-open client stream."""
+        try:
+            up.close()
+        except Exception:
+            pass
+        _scan_tail[0] = b""
+        _shape.tail = b""
+        s2 = aiohttp.ClientSession()
+        try:
+            up2 = await _open(s2, base, path, strip_thinking(body), key, True)
+            if up2.status >= 400:
+                txt = (await up2.read())[:300].decode("utf-8", "replace")
+                await resp.write(('data: {"error":{"message":%s}}\n\n' % json.dumps(
+                    "reasoning watchdog retry failed: %s %s" % (up2.status, txt))).encode())
+                return False
+            while True:
+                ch2 = await asyncio.wait_for(up2.content.readany(), timeout=STREAM_IDLE_TIMEOUT_SECS)
+                if not ch2:
+                    break
+                await resp.write(ch2)
+                _chunk_ct[0] += 1
+                _scan_usage_stream(ch2)
+                _scan_content_shape(ch2)
+                _shape.feed(ch2)
+            return True
+        except Exception as e:
+            try:
+                await resp.write(('data: {"error":{"message":%s}}\n\n' % json.dumps(
+                    "reasoning watchdog retry interrupted: %s" % e)).encode())
+            except Exception:
+                pass
+            return False
+        finally:
+            await s2.close()
+
     # TELEMETRY: exact output-token count when the client asked for stream_options.include_usage
     # and the usage trailer didn't already arrive within the gate phase above (long streams) --
     # same cheap per-chunk scan, applied to whatever's left of the stream.
@@ -7499,6 +7882,14 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
             _chunk_ct[0] += 1
             _scan_usage_stream(chunk)
             _scan_content_shape(chunk)
+            _shape.feed(chunk)
+            if _rw["armed"] and not _shape.saw_output and _shape.reasoning_tokens_est() >= REASONING_BUDGET_TOKENS:
+                _rw["armed"] = False
+                act = _reasoning_watchdog_note(request, base, body, _shape, REASONING_WATCHDOG)
+                if act == "retry":
+                    _rw["retried"] = True
+                    _active_set(request, reasoning_watchdog_ok=await _reasoning_retry())
+                    break
     except Exception as e:
         try:
             await resp.write(f'data: {{"error":{{"message":"stream interrupted: {e}"}}}}\n\n'.encode())
@@ -7511,8 +7902,10 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
               "content_empty": not _saw_content[0], "has_tool_calls": _saw_tool_call[0]}
     if _exact_outtok[0] is not None:
         _outkw["outtok"] = _exact_outtok[0]
-    if _is_remote_relay and _exact_finish[0] is not None:
+    if _exact_finish[0] is not None:          # [GW2 / L94] local rows too (was remote-only)
         _outkw["finish_reason"] = _exact_finish[0]
+    _shape.close()
+    _outkw.update(_shape_kw(_shape, body, local=not _is_remote_relay))
     # LS lane 2026-10-01: this committed-stream path (every response longer than the first-token
     # gate -- i.e. nearly all real traffic) never recorded computed_actual, so the cost model's
     # predicted-vs-actual gate had no data (0 of 40,000 local rows). Same local-only rule as above.
@@ -7524,6 +7917,31 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
         _outkw.update(_remote_usage_kw(_exact_ptok[0], _exact_hit[0], _exact_miss[0]))
     _active_set(request, **_outkw)
     return "ok", resp
+
+
+_RW_STATS = collections.Counter()      # [GW2 / L95] reasoning-watchdog triggers since start, by action
+
+
+def _thinking_disabled(body):
+    try:
+        j = json.loads(body)
+        return (j.get("chat_template_kwargs") or {}).get("enable_thinking") is False
+    except Exception:
+        return False
+
+
+def _reasoning_watchdog_note(request, base, body, shape, mode):
+    """Record one watchdog trigger (shadow or real) and return the action to take: 'retry' or 'shadow'."""
+    act = "retry" if mode == "retry" else "shadow"
+    est = shape.reasoning_tokens_est()
+    _RW_STATS[act] += 1
+    _active_set(request, reasoning_watchdog=act, reasoning_watchdog_at_tok=est)
+    _timeout_note(request, "gateway:reasoning-budget", REASONING_BUDGET_TOKENS, base, body,
+                  outcome=("aborted-retry-no-think" if act == "retry" else "shadow-would-retry"),
+                  reasoning_chars=shape.reasoning_chars, reasoning_tok_est=est)
+    log.warning("reasoning watchdog (%s): %d est reasoning tokens, no content/tool call yet -> %s", mode, est,
+                "abort + retry no-think" if act == "retry" else "would retry (shadow)")
+    return act
 
 
 def _sse_split_tail(tail, chunk, cap=1 << 20):
@@ -8801,6 +9219,7 @@ async def gateway_stats(request):
         "remote_402_count": _remote_dead_count,
         "prefill_backlog_secs": round(_prefill_backlog_secs(), 1),
         "cache_model": _pm_summary(),
+        "response_shape": _shape_stats_summary(),      # [GW2 / L94+L95]
         "inflight_reserved_tokens": _inflight_reserved_tokens,
         "halo_control_lane_limit": admission_lane_limit(
             False, effective_budget(), FG_RESERVED, halo_control=True,
