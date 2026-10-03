@@ -1,7 +1,7 @@
 # EF2 (L134/L135) fault-roots A/B + L134 rider, one window (main 2026-10-03: GPU-validate before merging into integrate).
 #   1. engine STOPPED: tools/ef2/l134_rider.sh 1 (queue row 7; race proof + memcheck of FI 0.6.8 vs 0.6.18, ~15 min, GPU1)
 #   2. BASE arm  = the override found at window start on the production root (current default)
-#   3. EF2 arm   = immutable RELEASE of ef2/fault-roots cb393fe4fe (integrate 7004df6ae8 + a9e7fdf6cb TQ plan() private
+#   3. EF2 arm   = immutable RELEASE ef2-cb393fe4fe-20261003T1642 (RL) of ef2/fault-roots cb393fe4fe (integrate 7004df6ae8 + a9e7fdf6cb TQ plan() private
 #                  indptr copies + cb393fe4fe sampler sentinel guard) with VLLM_SAMPLER_SENTINEL_GUARD=1
 #   each arm: quick.py, 120K-token needle (continuation-chunk path incl. prefix-combine), evalkit long_ctx, engine errors
 #   4. restore (framework): override verbatim, restart, health, KV pool, timers, .so, lease.
@@ -58,14 +58,13 @@ steps:
   # 3. EF2 arm
   - name: ef2-boot
     boot:
-      release: {sha: cb393fe4fe, label: ef2, from: /home/kevin/Desktop/wt-integrate}
+      release: ef2-cb393fe4fe-20261003T1642   # built + verified by RL (= integrate 7004df6ae8 + a9e7fdf6cb + cb393fe4fe)
       label: ef2
       env: {VLLM_SAMPLER_SENTINEL_GUARD: "1"}
       timeout_s: 1200
-  - name: ef2-verify-running
+  - name: ef2-verify-running   # hard check: the EF2 arm's numbers mean nothing unless the engine runs this release
     timeout_s: 120
-    on_fail: continue
-    run: "python3 /home/kevin/Desktop/vLLM-2080Ti-Definitive/deploy/bin/release.py verify \"$(basename {{RELEASE_ef2_boot}})\" --running | tee {{RESULTS}}/verify_running.json | tail -3"
+    run: "python3 /home/kevin/Desktop/vLLM-2080Ti-Definitive/deploy/bin/release.py verify ef2-cb393fe4fe-20261003T1642 --running | tee {{RESULTS}}/verify_running.json | python3 -c 'import json,sys;v=json.load(sys.stdin);print(v.get(\"ok\"),v.get(\"engine_runs_this_release\"));sys.exit(0 if v[\"ok\"] and v[\"engine_runs_this_release\"] else 1)'"
   - name: ef2-measure
     timeout_s: 2400
     on_fail: continue
