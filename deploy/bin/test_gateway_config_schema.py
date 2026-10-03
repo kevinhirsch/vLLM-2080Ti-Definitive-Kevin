@@ -328,15 +328,15 @@ class PublisherShipsTheSchema(unittest.TestCase):
                     patch.object(pub, "DASH_SOURCE", d / "src" / "dash.html"), \
                     patch.object(pub, "DASH_RUNTIME", d / "live" / "dash.html"):
                 live = d / "live" / "gateway_config_schema.py"
-                st = pub._install_dashboard()
+                st = pub._install_gateway_files(b"page")
                 self.assertEqual(st["config_schema"], "installed")
                 self.assertEqual(live.read_text(), "schema v2\n")
-                self.assertEqual(pub._install_dashboard()["config_schema"], "current")
-                pub._restore_dashboard(st)                         # first install rolled back -> removed
+                self.assertEqual(pub._install_gateway_files(b"page")["config_schema"], "current")
+                pub._restore_gateway_files(st)                         # first install rolled back -> removed
                 self.assertFalse(live.exists())
                 live.write_text("schema v1\n")
-                st = pub._install_dashboard()
-                pub._restore_dashboard(st)
+                st = pub._install_gateway_files(b"page")
+                pub._restore_gateway_files(st)
                 self.assertEqual(live.read_text(), "schema v1\n")
             # a source tree without the module ships nothing and reports it
             (d / "src" / "gateway_config_schema.py").unlink()
@@ -344,4 +344,26 @@ class PublisherShipsTheSchema(unittest.TestCase):
                     patch.object(pub, "RUNTIME", d / "live" / "keepalive-shim.py"), \
                     patch.object(pub, "DASH_SOURCE", d / "src" / "dash.html"), \
                     patch.object(pub, "DASH_RUNTIME", d / "live" / "dash.html"):
-                self.assertEqual(pub._install_dashboard()["config_schema"], "absent")
+                self.assertEqual(pub._install_gateway_files(b"page")["config_schema"], "absent")
+
+    def test_dashboard_only_install_never_touches_the_live_schema(self):
+        """Regression 2026-10-03 09:15: test_gateway_dashboard.py redirects only DASH_RUNTIME and calls
+        _install_dashboard(); while the schema install rode inside it, every suite run overwrote the LIVE
+        ~/.local/share/vllm-qwen27b/gateway_config_schema.py. Every write must land in the redirected directory."""
+        from unittest.mock import patch
+        import gateway_safe_publish as pub
+        writes = []
+        real = pub._atomic_write
+        with tempfile.TemporaryDirectory() as td:
+            dash = pathlib.Path(td) / "gateway_dashboard.html"
+
+            def spy(path, data, mode=0o755):
+                writes.append(str(path))
+                if not str(path).startswith(td):
+                    raise AssertionError("write outside the test dir: %s" % path)
+                return real(path, data, mode)
+            with patch.object(pub, "DASH_RUNTIME", dash), patch.object(pub, "_atomic_write", spy):
+                st = pub._install_dashboard(b"<html>v1</html>")
+                pub._restore_dashboard(st)
+        self.assertTrue(writes)
+        self.assertTrue(all(w.startswith(td) for w in writes), writes)
