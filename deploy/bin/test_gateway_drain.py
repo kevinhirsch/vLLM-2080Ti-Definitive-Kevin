@@ -2,6 +2,7 @@
 import asyncio
 import importlib.util
 import json
+import shutil
 import tempfile
 import time
 import unittest
@@ -39,6 +40,7 @@ class Drain(unittest.IsolatedAsyncioTestCase):
         self.old = (shim._DRAIN_UNTIL, shim._DRAIN_LEASE, shim._DRAIN_REASON, shim._DRAIN_REC, shim._DRAIN_LEDGER)
         shim._DRAIN_UNTIL, shim._DRAIN_LEASE, shim._DRAIN_REASON, shim._DRAIN_REC = 0.0, None, None, None
         self._tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._tmp, True)      # ratchet: no unmanaged temp dirs
         shim._DRAIN_LEDGER = self._tmp + "/drains.jsonl"      # never write the production ledger from a test
 
     async def asyncTearDown(self):

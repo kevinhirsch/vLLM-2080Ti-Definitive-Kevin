@@ -88,7 +88,18 @@ def main():
     ap.add_argument("--wait-s", type=int, default=120)
     ap.add_argument("--lease")
     ap.add_argument("rest", nargs="*")
-    a = ap.parse_args()
+    # `run ... -- CMD ARGS` (L54): argparse matches the `nargs="*"` positional as EMPTY as soon as the
+    # command word is consumed (before the interleaved --reason/--by options), so the trailing
+    # "-- CMD" was then rejected as "unrecognized arguments" on every Python we run (3.11 venv and
+    # 3.14 system alike). Split at the first bare "--" ourselves; CMD's own flags (`-- ls -l`) then
+    # never reach argparse either.
+    argv = sys.argv[1:]
+    tail = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, tail = argv[:i], argv[i + 1:]
+    a = ap.parse_args(argv)
+    a.rest = list(a.rest) + tail
     if a.cmd == "status":
         print(json.dumps(http("/gateway/offline"), indent=1)); return 0
     if a.cmd == "close":
@@ -105,7 +116,10 @@ def main():
     save_lease(lease, a.by, a.reason, a.ttl)
     if a.cmd == "open":
         print(json.dumps({"opened": True, "lease": lease, **st})); return 0
-    cmd = [x for x in a.rest if x != "--"]
+    cmd = list(a.rest)
+    if not cmd:
+        print(json.dumps({"error": "run needs a command after --"}), file=sys.stderr)
+        http("/gateway/offline", "DELETE", {"lease": lease}); drop_lease(lease); return 2
     import signal
     for sg in (signal.SIGTERM, signal.SIGHUP):                    # a TERM'd wrapper must still close its window
         signal.signal(sg, lambda *_: sys.exit(143))

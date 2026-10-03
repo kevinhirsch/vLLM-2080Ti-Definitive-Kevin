@@ -1,5 +1,5 @@
 """RS: every gateway-layer timeout is one durable record (layer, deadline, wait, size, outcome)."""
-import importlib.util, json, tempfile, unittest
+import importlib.util, json, shutil, tempfile, unittest
 from pathlib import Path
 
 SPEC = importlib.util.spec_from_file_location("shim_timeout_test", Path(__file__).with_name("keepalive-shim.py"))
@@ -15,7 +15,8 @@ class Req:
 class TimeoutLedger(unittest.TestCase):
     def test_note_writes_layer_deadline_wait_and_size(self):
         old = shim._TIMEOUT_LEDGER
-        shim._TIMEOUT_LEDGER = tempfile.mkdtemp() + "/timeouts.jsonl"
+        _d = tempfile.mkdtemp(); self.addCleanup(shutil.rmtree, _d, True)
+        shim._TIMEOUT_LEDGER = _d + "/timeouts.jsonl"
         r = Req()
         shim._ACTIVE[id(r)] = {"name": "halo", "t0": shim.time.time() - 40, "bg": False, "stream": True, "route": "local"}
         try:
@@ -41,7 +42,8 @@ class RemoteBreakerPersistence(unittest.TestCase):
     def test_402_breaker_survives_a_gateway_restart(self):
         import time
         old = (shim._REMOTE_DEAD_FILE, shim._REMOTE_DEAD_PERSIST, shim._remote_dead_until)
-        shim._REMOTE_DEAD_FILE = tempfile.mkdtemp() + "/dead.json"
+        _d = tempfile.mkdtemp(); self.addCleanup(shutil.rmtree, _d, True)
+        shim._REMOTE_DEAD_FILE = _d + "/dead.json"
         shim._REMOTE_DEAD_PERSIST = True
         try:
             shim._remote_dead_until = 0.0

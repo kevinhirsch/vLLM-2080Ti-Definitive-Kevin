@@ -6,6 +6,7 @@ import signal
 import stat
 import subprocess
 import sys
+import shutil
 import tempfile
 import time
 import unittest
@@ -25,6 +26,7 @@ def load(lease_file):
 class LeaseFileTests(unittest.TestCase):
     def setUp(self):
         self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d, True)
         self.lf = os.path.join(self.d, "sub", "offline-lease.json")
         self.m = load(self.lf)
 
