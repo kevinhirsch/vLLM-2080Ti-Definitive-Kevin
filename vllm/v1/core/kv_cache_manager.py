@@ -236,6 +236,20 @@ class KVCacheManager:
         """Whether a local prefix cache lookup may be run for this request."""
         return self.enable_caching and not request.skip_reading_prefix_cache
 
+    def probe_prefix_cache_hit(self, request: Request) -> int:
+        """Tokens a fresh admission of ``request`` would take from the local
+        prefix cache right now -- the same reconciled hit
+        ``get_computed_blocks`` returns, without its side effects (no KV
+        events, no stats, no block references). The scheduler reads it to
+        size a waiting request by what it would actually compute. Advisory:
+        blocks can be evicted, or cached this step, before admission."""
+        if not self.prefix_cache_lookup_enabled(request) or request.num_tokens <= 1:
+            return 0
+        _, num_hit, _ = self.coordinator.find_longest_cache_hit(
+            request.block_hashes, request.num_tokens - 1
+        )
+        return num_hit
+
     def record_prefix_cache_stats(self, request: Request, num_hits: int) -> None:
         # Don't count a request that skipped the cache lookup.
         if not self.log_stats or not self.prefix_cache_lookup_enabled(request):
