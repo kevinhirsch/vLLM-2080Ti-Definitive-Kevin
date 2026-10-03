@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
@@ -46,6 +47,11 @@ if TYPE_CHECKING:
     from vllm.v1.hisparse.coordinator import HiSparseCoordinator
 
 logger = init_logger(__name__)
+
+
+def eager_tail_publish_enabled() -> bool:
+    """[FORK][LANE CR] VLLM_GDN_TAIL_PUBLISH=copy (default off)."""
+    return os.environ.get("VLLM_GDN_TAIL_PUBLISH", "").strip().lower() == "copy"
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -1483,6 +1489,17 @@ class MambaManager(SingleTypeKVCacheManager):
             # connector; a request that finishes first hands off this table
             # source directly.
             self._producer_partial_tail_reqs: dict[str, tuple[KVCacheBlock, int]] = {}
+            # [FORK][LANE CR] VLLM_GDN_TAIL_PUBLISH=copy: the producer's prompt
+            # tail state is published by an EAGER copy into a dedicated block
+            # one step after the forward that wrote it, instead of hashing the
+            # live running slot and relying on a lazy CoW (weicj #240 obs. 2).
+            # Entries: (request, pinned source block, boundary tokens).
+            self.eager_tail_publish = eager_tail_publish_enabled() and (
+                getattr(kv_cache_spec.mamba_type, "name", None) == "GDN_ATTN"
+            )
+            self._eager_tail_intents: list[tuple[Request, KVCacheBlock, int]] = []
+            self.num_eager_tail_published = 0
+            self.num_eager_tail_dropped = 0
 
     @classmethod
     def find_longest_cache_hit(
@@ -2038,6 +2055,46 @@ class MambaManager(SingleTypeKVCacheManager):
 
     def new_step_starts(self) -> None:
         self.cached_blocks_this_step.clear()
+        if self.mamba_cache_mode == "align" and self._eager_tail_intents:
+            self._publish_eager_tails()
+
+    def _publish_eager_tails(self) -> None:
+        """[FORK][LANE CR] Publish last step's prompt-tail states by copy.
+
+        Runs at the start of scheduling step N+1, so the copy queued here is
+        executed in step N+1's preamble: after step N's forward wrote the
+        boundary state into ``source`` and before step N+1's forward can
+        advance it. The hash is registered on ``dst`` only, never on a live
+        running slot, and is deferred for same-step hits (a consumer's own CoW
+        copy must not read ``dst`` in the same batched copy).
+        """
+        intents, self._eager_tail_intents = self._eager_tail_intents, []
+        for request, source, num_tokens in intents:
+            if source.is_null or self.block_pool.get_num_free_blocks() < 1:
+                # Never block or evict hard for an optimisation: drop it.
+                self.block_pool.free_blocks([source])
+                self.num_eager_tail_dropped += 1
+                continue
+            (dst,) = self.block_pool.get_new_blocks(1)
+            partial_hash = self.block_pool.cache_partial_block(
+                request=request,
+                block=dst,
+                num_tokens=num_tokens,
+                kv_cache_group_id=self.kv_cache_group_id,
+                block_size=self.block_size,
+            )
+            if partial_hash is None:
+                self.block_pool.free_blocks([source, dst])
+                self.num_eager_tail_dropped += 1
+                continue
+            # Both endpoints stay retained until the copy has run: ``source``
+            # keeps the pin taken when the intent was recorded and ``dst`` its
+            # allocation ref; take_kv_cache_block_copies hands both to the
+            # scheduler's fenced free, after which ``dst`` is an evictable
+            # cached block holding exactly state@num_tokens.
+            self._pending_cow_copies.append((source, dst))
+            self.cached_blocks_this_step.add(partial_hash)
+            self.num_eager_tail_published += 1
 
     def _cache_partial_tail_block(
         self,
@@ -2102,6 +2159,13 @@ class MambaManager(SingleTypeKVCacheManager):
             return None
         source_block = blocks[block_idx]
         if source_block.is_null:
+            return None
+
+        if self.eager_tail_publish:
+            # [FORK][LANE CR] The state at num_tokens is only written by THIS
+            # step's forward; pin the slot and publish a copy next step.
+            source_block.ref_cnt += 1
+            self._eager_tail_intents.append((request, source_block, num_tokens))
             return None
 
         partial_hash = self.block_pool.cache_partial_block(
