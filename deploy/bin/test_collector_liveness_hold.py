@@ -23,6 +23,18 @@ class HoldAttribution(unittest.TestCase):
             if row["kind"] == "planned-stop":
                 self.assertEqual(row["planned_by"], "DFT")
 
+    def test_planned_stop_signature_is_planned(self):
+        """L141: the observed exit shape is kept as exit_signature; the signature of a planned stop is 'planned'."""
+        with tempfile.TemporaryDirectory() as base:
+            json.dump({"ts": "x", "by": "S4", "reason": "arm restore", "drain": {}}, open(f"{base}/planned-restart.json", "w"))
+            r = run(base, "--stop-post", SERVICE_RESULT="success", EXIT_STATUS="0")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            row = json.loads(open(f"{base}/incidents/ledger.jsonl").read().splitlines()[-1])
+            self.assertEqual(row["kind"], "planned-stop")
+            self.assertEqual(row["signature"], "planned")
+            self.assertIn("exit_signature", row)
+            self.assertEqual(row["planned_by"], "S4")
+
     def test_expired_hold_is_ignored(self):
         with tempfile.TemporaryDirectory() as base:
             now = time.time()
