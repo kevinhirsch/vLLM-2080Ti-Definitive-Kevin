@@ -15,6 +15,7 @@ Run:  python -m pytest -q test_gateway_gw2_shape.py
 """
 import asyncio
 import json
+import os
 import time
 import unittest
 from unittest.mock import patch
@@ -491,3 +492,112 @@ class CreditProbe(unittest.IsolatedAsyncioTestCase):
             with patch.object(shim, "_local_offline", lambda now=None: True):
                 await shim._credit_sources(object(), {"credit": 0, "computed": 9000, "chain": []}, self.body(), 9000)
         self.assertEqual(self.seen, [])
+
+
+class OfflineWindowSurvivesRestart(unittest.IsolatedAsyncioTestCase):
+    """GW2 2026-10-03: the 09:11 gateway publish dropped K5's planned offline window (it lived only in memory)."""
+
+    async def asyncSetUp(self):
+        import tempfile
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.tmp = self._td.name
+        self.state = os.path.join(self.tmp, "offline-window.json")
+        self._p = [patch.object(shim, "OFFLINE_STATE_FILE", self.state), patch.object(shim, "_admin_ok", lambda r: True),
+                   patch.dict(shim._OFFLINE, {"until": 0.0, "lease": None, "reason": None, "by": None, "t0": None,
+                                              "ttl_s": None, "refused": 0}),
+                   patch.object(shim, "_flow_event", lambda e: None)]
+        for p in self._p:
+            p.start()
+        app = web.Application()
+        app.router.add_route("*", "/gateway/offline", shim.gateway_offline)
+        self.runner = web.AppRunner(app)
+        await self.runner.setup()
+        site = web.TCPSite(self.runner, "127.0.0.1", 0)
+        await site.start()
+        self.url = "http://127.0.0.1:%d/gateway/offline" % self.runner.addresses[0][1]
+
+    async def asyncTearDown(self):
+        await self.runner.cleanup()
+        for p in self._p:
+            p.stop()
+
+    async def call(self, method, body=None):
+        async with aiohttp.ClientSession() as s:
+            async with s.request(method, self.url, json=body) as r:
+                return r.status, await r.json()
+
+    def restart(self):
+        shim._OFFLINE.update(until=0.0, lease=None, reason=None, by=None, t0=None, ttl_s=None, refused=0)
+        return shim._offline_restore()
+
+    async def test_window_is_restored_with_its_lease_and_close_persists(self):
+        self.assertTrue(self.state.startswith(self.tmp))
+        st, d = await self.call("POST", {"ttl_s": 600, "reason": "K5 A/B", "by": "K5"})
+        self.assertEqual(st, 200)
+        lease = d["lease"]
+        self.assertTrue(self.restart())                         # a gateway restart
+        st, d = await self.call("GET")
+        self.assertTrue(d["offline"])
+        self.assertEqual((d["reason"], d["by"]), ("K5 A/B", "K5"))
+        st, d = await self.call("POST", {"lease": lease, "ttl_s": 900})     # owner can still extend...
+        self.assertEqual(st, 200)
+        st, d = await self.call("DELETE", {"lease": lease})                 # ...and close it
+        self.assertEqual((st, d["offline"]), (200, False))
+        self.assertFalse(self.restart())                        # a closed window stays closed
+
+    async def test_expired_or_corrupt_state_is_not_restored(self):
+        json.dump({"until": time.time() - 5, "lease": "x", "reason": "old"}, open(self.state, "w"))
+        self.assertFalse(self.restart())
+        open(self.state, "w").write("{not json")
+        self.assertFalse(self.restart())
+        json.dump({"until": time.time() + 99999, "lease": "x"}, open(self.state, "w"))
+        self.assertFalse(self.restart())                        # longer than any window may be: not trusted
+
+    async def test_open_is_refused_while_a_publish_drain_is_up_but_extend_is_not(self):
+        st, d = await self.call("POST", {"ttl_s": 600, "reason": "A", "by": "A"})
+        lease = d["lease"]
+        with patch.object(shim, "_draining", lambda now=None: True):
+            st, d = await self.call("POST", {"lease": lease, "ttl_s": 900})
+            self.assertEqual(st, 200)
+            await self.call("DELETE", {"lease": lease})
+            st, d = await self.call("POST", {"ttl_s": 600, "reason": "B", "by": "B"})
+            self.assertEqual((st, d["code"]), (409, shim.OFFLINE_REFUSED_PUBLISH))
+
+
+class OfflineDrift(unittest.TestCase):
+    """The three tools must agree on the marker and the status field, or the publish-vs-window guard silently fails."""
+
+    def test_marker_and_status_field_agree(self):
+        import importlib.util as ilu
+        here = os.path.dirname(os.path.abspath(shim.__file__))
+        spec = ilu.spec_from_file_location("gw_offline_cli_drift", os.path.join(here, "gateway-offline.py"))
+        cli = ilu.module_from_spec(spec)
+        spec.loader.exec_module(cli)
+        self.assertEqual(cli.OFFLINE_REFUSED_PUBLISH, shim.OFFLINE_REFUSED_PUBLISH)
+        self.assertIn("offline", shim._offline_status())
+        pub_src = open(os.path.join(here, "gateway_safe_publish.py")).read()
+        self.assertIn('st.get("offline")', pub_src)
+        self.assertIn('_refuse_if_offline_window(token, "start")', pub_src)
+        self.assertIn('_refuse_if_offline_window(token, "restart")', pub_src)
+        self.assertIn("_offline_restore()", open(shim.__file__).read())
+
+    def test_cli_waits_out_a_publish_then_opens(self):
+        import importlib.util as ilu
+        here = os.path.dirname(os.path.abspath(shim.__file__))
+        spec = ilu.spec_from_file_location("gw_offline_cli_wait", os.path.join(here, "gateway-offline.py"))
+        cli = ilu.module_from_spec(spec)
+        spec.loader.exec_module(cli)
+        replies = [{"error": '{"code": "publish-in-flight"}', "http": 409}] * 2 + [{"lease": "L1"}]
+        calls = []
+
+        def http(path, method="GET", payload=None):
+            calls.append((path, method))
+            if method == "POST":
+                return replies.pop(0)
+            return {"local_active": 0, "offline": True}
+        with patch.object(cli, "http", http), patch.object(cli.time, "sleep", lambda s: None), \
+                patch.object(cli, "save_lease", lambda *a: None):
+            st, lease = cli.open_window("K5", "K5", 600, 1)
+        self.assertEqual(lease, "L1")
+        self.assertEqual(sum(1 for c in calls if c[1] == "POST"), 3)
