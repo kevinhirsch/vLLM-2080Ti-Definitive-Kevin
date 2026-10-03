@@ -44,6 +44,14 @@ class Rule(unittest.TestCase):
                 patch.object(shim, "QOL_REMOTE_MIN_SAMPLES", 6):
             self.assertIsNone(shim.qol_remote_ttft(60_000, now=now)[0])
 
+    def test_own_tokens_source_order_probe_anchored_model(self):
+        f = shim.qol_own_tokens
+        self.assertEqual(f({"pm_credit_probe": 40_000, "probe_prompt_tokens": 61_000, "pm_credit_anchored": 10_000,
+                            "pm_anchor_age_s": 2.0}, 30_000, 60_000), (21_000, "probe"))
+        self.assertEqual(f({"pm_credit_anchored": 50_000, "pm_anchor_age_s": 2.0}, 30_000, 60_000), (10_000, "anchored"))
+        self.assertEqual(f({"pm_credit_anchored": 50_000, "pm_anchor_age_s": None}, 30_000, 60_000), (30_000, "model"))
+        self.assertEqual(f(None, 30_000, 60_000), (30_000, "model"))
+
     def test_remote_ttft_prefers_the_same_price_period(self):
         now = time.time()
         dq = collections.deque(maxlen=4000)
@@ -69,7 +77,7 @@ class Rule(unittest.TestCase):
                 patch.object(shim, "_QOL_REMOTE", _remote([4.0] * 6)), patch.object(shim, "_QOL_SEEDED", [True]):
             q = shim.qol_decide("kevin", 60_000, 60_000, pm_chain=[("x", 1)])
         self.assertEqual(seen["own"], 10_000)                    # 60K prompt - 50K anchored = 10K uncached, not 60K
-        self.assertEqual(q["qol_anchored"], 50_000)
+        self.assertEqual(q["qol_credit_source"], "anchored")
         self.assertEqual(q["qol_would"], "local")                # 10 s local beats remote-not-much-faster
         with patch.object(shim, "local_first_predicted_ttft", lambda *a, **k: (_ for _ in ()).throw(RuntimeError())):
             self.assertEqual(shim.qol_decide("kevin", 1, 1)["qol_would"], "legacy")   # never raises
