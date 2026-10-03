@@ -175,6 +175,10 @@ def main():
     ap.add_argument("--variants", default="fp16,w4a8")
     ap.add_argument("--layers", type=int, default=R.N_LAYERS)
     ap.add_argument("--windows", type=int, default=0, help="first N windows of ref.pt only (0 = all 12)")
+    ap.add_argument("--device", default="cpu", help="cuda: activations + per-call weights on GPU (K7). Gated per layer on "
+                    "~/projects/lanes/windows/gpuok.sh; on refusal it checkpoints and exits 3 (re-run resumes)")
+    ap.add_argument("--gpu-need-mib", type=int, default=1000)
+    ap.add_argument("--gpu-rows", type=int, default=2048, help="GPU mode: output rows per weight chunk")
     a = ap.parse_args()
     VARS = a.variants.split(",")
     for v in VARS: assert v in VARIANTS, f"unknown variant {v}; have {list(VARIANTS)}"
@@ -183,6 +187,31 @@ def main():
     if a.windows: ids, H0 = ids[:a.windows], H0[:a.windows]
     B, T = ids.shape; D = R.D
     QI, CUR = {}, {"v": None}
+    dev = torch.device(a.device)
+    GPU = dev.type == "cuda"
+    ck = a.out + ".resume.pt"
+
+    def gate_ok():
+        if not GPU:
+            return True
+        import subprocess
+        g = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0] or "0"
+        r = subprocess.run([os.path.expanduser("~/projects/lanes/windows/gpuok.sh"), g, str(a.gpu_need_mib)], capture_output=True, text=True)
+        if r.returncode != 0:
+            log("gpuok refused:", r.stdout.strip())
+        return r.returncode == 0
+
+    class _DevView(dict):  # per-call device view of a linear's CPU tensors; derived caches stay transient (no GPU growth)
+        def __init__(self, src):
+            super().__init__(); self.src = src
+        def __missing__(self, k):
+            v = self.src[k].to(dev); self[k] = v; return v
+        def __contains__(self, k):
+            return dict.__contains__(self, k) or k in ("w", "s", "qz")
+
+    if GPU:
+        _rope = R.rope_cos_sin
+        R.rope_cos_sin = lambda T_: tuple(t.to(dev) for t in _rope(T_))
 
     def load(i):
         W = R.load_layer_weights(i); h = R._sf(R.MAIN_ST); p = f"{R.PFX}.layers.{i}"
@@ -201,19 +230,51 @@ def main():
         info = QI.get(id(w)); v = CUR["v"]
         if info is None or v is None:
             return _lin(x, w, b)
-        pv = info["per_var"].setdefault(v, {"w": info["w"], "s": info["s"], "qz": info["qz"]})
         xs = x.reshape(-1, x.shape[-1])
+        if GPU:  # output-row chunks keep the per-call GPU footprint small (row-wise quantizers are exact under row slicing)
+            R_ = info["w"].shape[0]; rc = a.gpu_rows
+            if R_ <= rc:
+                return VARIANTS[v](info["name"], xs, _DevView(info)).reshape(*x.shape[:-1], -1)
+            ys = []
+            for r0 in range(0, R_, rc):
+                sub = {"w": info["w"][r0:r0 + rc], "s": info["s"][r0:r0 + rc], "qz": info["qz"][r0:r0 + rc]}
+                ys.append(VARIANTS[v](f"{info['name']}#r{r0}", xs, _DevView(sub)))
+            return torch.cat(ys, -1).reshape(*x.shape[:-1], -1)
+        pv = info["per_var"].setdefault(v, {"w": info["w"], "s": info["s"], "qz": info["qz"]})
         return VARIANTS[v](info["name"], xs, pv).reshape(*x.shape[:-1], -1)
 
     R.F = types.SimpleNamespace(**{k: getattr(torch.nn.functional, k) for k in dir(torch.nn.functional) if not k.startswith("__")}); R.F.linear = lin
     xs = {v: R.load_embed()[ids.reshape(-1)].float() for v in VARS}
-    for i in range(a.layers):
+    i0 = 0
+    if GPU and os.path.exists(ck):
+        c = torch.load(ck)
+        if c["variants"] == VARS and c["windows"] == a.windows:
+            xs, i0 = c["xs"], c["next"]; log(f"resumed at layer {i0}")
+    if GPU and not gate_ok():
+        sys.exit(3)
+    xs = {v: t.to(dev) for v, t in xs.items()}
+    for i in range(i0, a.layers):
+        if GPU and i > i0 and not gate_ok():
+            torch.save({"xs": {v: t.cpu() for v, t in xs.items()}, "next": i, "variants": VARS, "windows": a.windows}, ck)
+            log(f"checkpointed at layer {i}; exiting 3 (re-run to resume)"); sys.exit(3)
         tl = time.time(); QI.clear(); W = load(i)
+        if GPU:
+            lin_ids = set(QI)
+            for k_ in list(W):
+                if id(W[k_]) not in lin_ids:
+                    W[k_] = W[k_].to(dev)
         with torch.no_grad():
             for v in VARS:
                 CUR["v"] = v; xs[v] = R.decoder_layer(xs[v], i, W, B, T)
         CUR["v"] = None; del W
+        if GPU:
+            torch.cuda.empty_cache()
         log(f"layer {i:2d} {time.time()-tl:5.1f}s " + " ".join(f"{v}:{xs[v].pow(2).mean().sqrt():.3f}" for v in VARS))
+    if GPU:
+        xs = {v: t.cpu() for v, t in xs.items()}
+        torch.cuda.empty_cache()
+        if os.path.exists(ck):
+            os.remove(ck)
     nw = R._t(R.MAIN_ST, f"{R.PFX}.norm.weight"); Wh = R.load_lm_head().float()
     tgt = torch.full((B, T), -1, dtype=torch.long); tgt[:, :-1] = ids[:, 1:]
     late = torch.arange(T).repeat(B) >= 16; hf0 = H0.reshape(-1, D); tf = tgt.reshape(-1)

@@ -23,6 +23,10 @@ for g in 0 1; do
      --min-free-mib 3000 --cap-mib 2500 --iters 30 --sustain 25 --json $OUT/w4a8_bench_gpu$g.json > $OUT/w4a8_bench_gpu$g.log 2>&1
   echo "bench gpu$g rc=$? :"; grep -E "PER-CHUNK|SUSTAIN|correctness" $OUT/w4a8_bench_gpu$g.log | cut -c1-200
 done
+# ---- Phase A2 (~5-10 min, small idle engine still up): full-model kernel-exact fidelity gate on GPU0 (K7's --device cuda mode)
+GPU_IN_WINDOW=1 CUDA_VISIBLE_DEVICES=0 timeout 900 $PY /home/kevin/Desktop/wt-lp/tools/lp/variant_gate.py --device cuda --gpu-need-mib 1500 \
+   --variants w4a8e3,w4a8g,w4a8 --out $OUT/gate_gpu_win.json > $OUT/gate_gpu_win.log 2>&1; echo "gpu fidelity gate rc=$?"
+grep -E "^\[.*\] (w4a8e3|w4a8g|w4a8) \{" $OUT/gate_gpu_win.log | cut -c1-260
 # ---- Phase B: engine with int8 activations (from the wt-lp tree; everything else = the override that was live) ----
 # Gate: the LP_A8G kernel (per-(row,128) act scales) must match its CPU emulation on every real shape and odd M (rel <= 5e-3);
 # then Phase B runs W4A8G on all linears, else stock per-token W4A8 on all linears.

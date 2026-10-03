@@ -81,41 +81,28 @@ def _quant_g128_kernel(x_ptr, q_ptr, s_ptr, stride_xm, M, K, BM: tl.constexpr, G
 
 
 @triton.jit
-def _quant_e_kernel(x_ptr, q_ptr, e_ptr, r_ptr, gmax_ptr, stride_xm, M, K, wglob, EMAX: tl.constexpr, BM: tl.constexpr,
-                    GB: tl.constexpr):
-    # int-exponent mode: pass 1 = per-(row,group) absmax (to gmax scratch) + row amax; pass 2 = e, q, row scale
+def _quant_e_kernel(x_ptr, q_ptr, e_ptr, amax_ptr, stride_xm, M, K, EMAX: tl.constexpr, BM: tl.constexpr, GB: tl.constexpr):
+    # int-exponent mode, one program = BM rows x GB groups; row amax precomputed (amax_ptr, fp32 [M])
     pm = tl.program_id(0)
+    pg = tl.program_id(1)
     rows = pm * BM + tl.arange(0, BM)
+    cols = pg * GB * 128 + tl.arange(0, GB * 128)
     rmask = rows < M
+    m2 = rmask[:, None] & (cols[None, :] < K)
     G = K // 128
-    amax = tl.zeros((BM,), dtype=tl.float32)
-    for g0 in range(0, G, GB):
-        cols = g0 * 128 + tl.arange(0, GB * 128)
-        m2 = rmask[:, None] & (cols[None, :] < K)
-        x = tl.load(x_ptr + rows[:, None] * stride_xm + cols[None, :], mask=m2, other=0.0).to(tl.float32)
-        gm = tl.max(tl.abs(tl.reshape(x, (BM, GB, 128))), 2)
-        gidx = g0 + tl.arange(0, GB)
-        tl.store(gmax_ptr + rows[:, None] * G + gidx[None, :], gm, mask=rmask[:, None] & (gidx[None, :] < G))
-        amax = tl.maximum(amax, tl.max(gm, 1))
-    amax = tl.maximum(amax, 1e-8)
-    base = amax / 127.0
-    tl.store(r_ptr + rows, base * wglob / (1 << EMAX), mask=rmask)
-    for g0 in range(0, G, GB):
-        cols = g0 * 128 + tl.arange(0, GB * 128)
-        m2 = rmask[:, None] & (cols[None, :] < K)
-        gidx = g0 + tl.arange(0, GB)
-        gmask = rmask[:, None] & (gidx[None, :] < G)
-        gm = tl.load(gmax_ptr + rows[:, None] * G + gidx[None, :], mask=gmask, other=1.0)
-        ratio = amax[:, None] / tl.maximum(gm, 1e-30)
-        e = tl.floor(tl.log2(ratio))
-        e = tl.minimum(tl.maximum(e, 0.0), EMAX * 1.0)
-        sc = base[:, None] / tl.exp2(e)                       # [BM, GB]
-        x = tl.load(x_ptr + rows[:, None] * stride_xm + cols[None, :], mask=m2, other=0.0).to(tl.float32)
-        x3 = tl.reshape(x, (BM, GB, 128))
-        q = tl.extra.cuda.libdevice.rint(x3 / sc[:, :, None])
-        q = tl.minimum(tl.maximum(q, -127.0), 127.0)
-        tl.store(q_ptr + rows[:, None] * K + cols[None, :], tl.reshape(q, (BM, GB * 128)).to(tl.int8), mask=m2)
-        tl.store(e_ptr + rows[:, None] * G + gidx[None, :], e.to(tl.uint8), mask=gmask)
+    gidx = pg * GB + tl.arange(0, GB)
+    gmask = rmask[:, None] & (gidx[None, :] < G)
+    amax = tl.maximum(tl.load(amax_ptr + rows, mask=rmask, other=1.0), 1e-8)
+    x = tl.load(x_ptr + rows[:, None] * stride_xm + cols[None, :], mask=m2, other=0.0).to(tl.float32)
+    x3 = tl.reshape(x, (BM, GB, 128))
+    gm = tl.maximum(tl.max(tl.abs(x3), 2), 1e-30)
+    e = tl.floor(tl.log2(amax[:, None] / gm))
+    e = tl.minimum(tl.maximum(e, 0.0), EMAX * 1.0)
+    sc = (amax[:, None] / 127.0) / tl.exp2(e)
+    q = tl.extra.cuda.libdevice.rint(x3 / sc[:, :, None])
+    q = tl.minimum(tl.maximum(q, -127.0), 127.0)
+    tl.store(q_ptr + rows[:, None] * K + cols[None, :], tl.reshape(q, (BM, GB * 128)).to(tl.int8), mask=m2)
+    tl.store(e_ptr + rows[:, None] * G + gidx[None, :], e.to(tl.uint8), mask=gmask)
 
 
 def _gb(G):
@@ -137,10 +124,11 @@ def quant_e(x: torch.Tensor, wglob: float, e_max: int):
     G = K // 128
     q = torch.empty((M, K), dtype=torch.int8, device=x.device)
     e = torch.empty((M, G), dtype=torch.uint8, device=x.device)
-    r = torch.empty((M,), dtype=torch.float32, device=x.device)
-    gmax = torch.empty((M, G), dtype=torch.float32, device=x.device)
-    if M > 0:
-        _quant_e_kernel[(triton.cdiv(M, 16),)](x, q, e, r, gmax, x.stride(0), M, K, wglob, EMAX=e_max, BM=16, GB=_gb(G))
+    if M == 0:
+        return q, e, torch.empty((0,), dtype=torch.float32, device=x.device)
+    amax = x.abs().amax(dim=-1).float()
+    _quant_e_kernel[(triton.cdiv(M, 16), G // _gb(G))](x, q, e, amax, x.stride(0), M, K, EMAX=e_max, BM=16, GB=_gb(G))
+    r = amax.clamp(min=1e-8) * (wglob / 127.0 / (1 << e_max))
     return q, e, r
 
 
