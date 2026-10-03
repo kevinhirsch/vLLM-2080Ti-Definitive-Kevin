@@ -1630,23 +1630,13 @@ def qol_choice(local_remaining_s, waited_s, remote_s, ttft_target_s=None, min_ga
 
 
 def qol_own_tokens(info, est_computed, ptok, pm_chain=None, now=None):
-    """(own uncached tokens, source) for the QoL prediction, best source first (lane GW2's order): the engine probe
-    (probe_prompt_tokens - pm_credit_probe), the engine-anchored credit (ptok - anchored), the cost model's estimate.
-    Computed ONCE at arrival and reused while waiting: the cache only grows warmer, so it is conservative, and the
-    probe costs a full render+tokenize in the engine's API server."""
-    info = info or {}
+    """(own uncached tokens, source) for the QoL prediction: delegates to lane GW2's own_uncached_tokens() (engine probe
+    > engine-anchored credit > cost model), so QoL follows whatever GW2 makes authoritative. Called ONCE at arrival and
+    reused while waiting (the cache only grows warmer; the probe costs a full render+tokenize). Never raises."""
     try:
-        if info.get("pm_credit_probe") is not None and info.get("probe_prompt_tokens"):
-            return max(0, int(info["probe_prompt_tokens"]) - int(info["pm_credit_probe"])), "probe"
-        if info.get("pm_credit_anchored") and info.get("pm_anchor_age_s") is not None:
-            return max(0, int(ptok or 0) - int(info["pm_credit_anchored"])), "anchored"
-        if pm_chain:
-            ac, _age = anchored_credit(pm_chain, ptok, now=now)
-            if ac:
-                return max(0, int(ptok or 0) - int(ac)), "anchored"
+        return own_uncached_tokens(info, est_computed, ptok, pm_chain=pm_chain, now=now)
     except Exception:
-        pass
-    return max(0, int(est_computed or 0)), "model"
+        return max(0, int(est_computed or 0)), "model"
 
 
 def qol_decide(cls, est_computed, ptok, *, units=1, waited=0.0, pm_chain=None, now=None, own=None):
