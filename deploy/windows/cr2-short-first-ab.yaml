@@ -1,0 +1,76 @@
+# CR2 (L101) prefix-aware short-first A/B -- windowctl's FIRST live window (WQ/main 2026-10-03; k2-quietbench needs
+# more GPU1 headroom than the running engine leaves). Port of /home/kevin/Desktop/wt-cr2/tools/cr2/cr2_win.sh.
+#   BASE: probe the RUNNING engine as-is (no restart; the gateway offline window keeps traffic off it)
+#   CR2:  window-start override + VLLM_SCHED_SHORT_FIRST_PREFIX_AWARE=1 on an immutable RELEASE of cr2/cache-causes
+#         326846fdc2 (= integrate bf46537a45 + 2 scheduler-only commits), not the wt-cr2 tree
+#   RESTORE (framework): override verbatim, restart, health, KV pool >= window start, timers, prod .so, lease, hold
+# PASS (gate step, informational: the window itself succeeds either way):
+#   cr2 warm_p50_s < 0.5 x base, markers_ok == trials in both arms, cr2 cold_p50_s <= base + 4 s, 0 engine errors.
+#   validate:  python3 deploy/bin/windowctl.py validate deploy/windows/cr2-short-first-ab.yaml
+#   run (WQ):  python3 deploy/bin/windowctl.py submit deploy/windows/cr2-short-first-ab.yaml --wait
+lane: cr2
+window: cr2-short-first-ab
+reason: "CR2 L101 prefix-aware short-first A/B (base on running engine, cr2 release arm)"
+by: CR2
+results: /home/kevin/projects/lanes/cr2/win
+max_s: 2400            # base probe ~5 min, 1 boot ~5 min, cr2 probe ~5 min, restore boot ~5 min
+ttl_s: 1800            # renewed every 60 s
+wait_s: 90
+spend_pause_usd: 20
+gpu_gate_wait_s: 300
+conflicts: [trial_guard.sh]
+on_new_xid: abort
+steps:
+  - name: clean
+    timeout_s: 30
+    run: "rm -f {{RESULTS}}/overtake_base.json {{RESULTS}}/overtake_cr2.json {{RESULTS}}/verdict.json {{RESULTS}}/t2.txt {{RESULTS}}/cr2_errors.txt"
+  - name: base-probe
+    timeout_s: 1200
+    run: "python3 {{RELEASE_cr2_boot}}/tools/cr2/warm_overtake_probe.py --label base --out {{RESULTS}} 2>&1 | tail -8"
+    outputs: ["{{RESULTS}}/overtake_base.json"]
+  - name: mark-t2
+    timeout_s: 30
+    run: "date '+%Y-%m-%d %H:%M:%S' > {{RESULTS}}/t2.txt"
+  - name: cr2-boot
+    boot:
+      release: {sha: 326846fdc2, label: cr2, from: /home/kevin/Desktop/wt-integrate}
+      label: cr2
+      env: {VLLM_SCHED_SHORT_FIRST_PREFIX_AWARE: "1"}
+      timeout_s: 1200
+  - name: cr2-verify-running
+    timeout_s: 120
+    run: "python3 /home/kevin/Desktop/vLLM-2080Ti-Definitive/deploy/bin/release.py verify \"$(basename {{RELEASE_cr2_boot}})\" --running | tee {{RESULTS}}/verify_running.json | python3 -c 'import json,sys;v=json.load(sys.stdin);sys.exit(0 if v[\"ok\"] and v[\"engine_runs_this_release\"] else 1)'"
+    on_fail: continue
+  - name: cr2-probe
+    timeout_s: 1200
+    run: "python3 {{RELEASE_cr2_boot}}/tools/cr2/warm_overtake_probe.py --label cr2 --out {{RESULTS}} 2>&1 | tail -8"
+    outputs: ["{{RESULTS}}/overtake_cr2.json"]
+    on_fail: continue
+  - name: cr2-errors
+    timeout_s: 120
+    run: "n=$(journalctl -u vllm-qwen27b --since \"$(cat {{RESULTS}}/t2.txt)\" --no-pager | grep -cE 'Traceback|CUDA error|illegal memory' || true); echo \"$n\" > {{RESULTS}}/cr2_errors.txt; echo \"cr2 errors in journal: $n\""
+    capture:
+      CR2_ERRORS: {cmd: "cat {{RESULTS}}/cr2_errors.txt", default: "unknown"}
+  - name: gate
+    timeout_s: 60
+    on_fail: continue
+    run: |
+      python3 - {{RESULTS}} {{CR2_ERRORS}} <<'PY'
+      import json, os, sys
+      d, errs = sys.argv[1], sys.argv[2]
+      try:
+          b = json.load(open(os.path.join(d, "overtake_base.json")))["summary"]
+          c = json.load(open(os.path.join(d, "overtake_cr2.json")))["summary"]
+      except Exception as e:
+          print("VERDICT FAIL: probe output missing", e); sys.exit(1)
+      g = {"warm_halved": c["warm_p50_s"] < 0.5 * b["warm_p50_s"],
+           "markers_ok": b["markers_ok"] == b["trials"] and c["markers_ok"] == c["trials"],
+           "cold_within_4s": c["cold_p50_s"] <= b["cold_p50_s"] + 4,
+           "no_engine_errors": errs == "0"}
+      out = {"pass": all(g.values()), "gates": g, "base": b, "cr2": c, "cr2_errors": errs}
+      json.dump(out, open(os.path.join(d, "verdict.json"), "w"), indent=1)
+      print("VERDICT", "PASS" if out["pass"] else "FAIL", json.dumps(g))
+      sys.exit(0 if out["pass"] else 1)
+      PY
+    capture:
+      VERDICT: {json: "{{RESULTS}}/verdict.json", key: pass, default: "missing"}

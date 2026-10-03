@@ -555,3 +555,28 @@ def test_run_commands_naming_a_script_run_its_read_only_snapshot(world, tmp_path
     snap = cmd.split("bash ")[1].split()[0]
     assert not os.access(snap, os.W_OK) and open(snap).read() == sh.read_text()
     assert s["steps"][0]["script_snapshots"] == {str(sh): snap}
+
+
+def test_a_gateway_restart_that_forgets_the_window_is_healed_by_the_renewal(world, tmp_path, monkeypatch):
+    """09:13:22 2026-10-03: the shim restarted mid-window and dropped the in-memory offline window; the next renewal
+    POST then opens a NEW window. The framework must adopt the new lease so close/restore still closes it."""
+    saved = []
+    world.save_lease = lambda lease, by, reason, ttl, mode="open": saved.append(lease)
+    monkeypatch.setattr(wc, "http_json", lambda url, method="GET", payload=None, timeout=8: {"lease": "LEASE2"})
+    w = wc.Window(spec(tmp_path))
+    os.makedirs(w.path("steps"), exist_ok=True)
+    w.state["lease"] = "LEASE1"
+    w.renew_once("LEASE1", 600)
+    assert w.state["lease"] == "LEASE2" and saved == ["LEASE2"]
+    assert any("re-opened" in n for n in w.summary["notes"])
+    monkeypatch.setattr(wc, "http_json", lambda url, method="GET", payload=None, timeout=8: {"lease": "LEASE2"})
+    w.renew_once("LEASE2", 600)
+    assert sum("re-opened" in n for n in w.summary["notes"]) == 1
+
+
+def test_the_cr2_spec_validates_and_boots_a_release():
+    s = wc.load_spec(os.path.join(HERE, "..", "windows", "cr2-short-first-ab.yaml"))
+    assert wc.validate(s)
+    boot = next(x for x in s["steps"] if "boot" in x)
+    assert boot["boot"]["release"]["sha"] == "326846fdc2" and boot["boot"]["env"] == {"VLLM_SCHED_SHORT_FIRST_PREFIX_AWARE": "1"}
+    assert [x["name"] for x in s["steps"]][:2] == ["clean", "base-probe"] and s["steps"][-1]["name"] == "gate"

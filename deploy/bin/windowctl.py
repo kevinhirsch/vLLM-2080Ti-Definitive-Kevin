@@ -619,10 +619,28 @@ class Window:
             lease = self.state.get("lease")
             if not lease:
                 return
-            r = http_json(f"{GATEWAY}/gateway/offline", "POST", {"lease": lease, "ttl_s": ttl, "by": self.by,
-                                                                 "reason": self.spec["reason"][:120]})
-            if r.get("error"):
-                self.log(f"lease renew failed: {r.get('error')[:120]}")
+            self.renew_once(lease, ttl)
+
+    def renew_once(self, lease, ttl):
+        """Extend our window. The offline window lives only in the shim's memory: a gateway restart mid-window (seen
+        2026-10-03 09:13:22, during K5's window) silently forgets it, and then the POST OPENS A NEW window with a new
+        lease. Adopt that lease (record it for close/restore/orphan reaping) so the window is never left unfenced."""
+        r = http_json(f"{GATEWAY}/gateway/offline", "POST", {"lease": lease, "ttl_s": ttl, "by": self.by,
+                                                             "reason": f"{self.wid}: {self.spec['reason']}"[:120]})
+        if r.get("error"):
+            self.log(f"lease renew failed: {r.get('error')[:120]}")
+            return r
+        new = r.get("lease")
+        if new and new != lease:
+            self.state["lease"] = new
+            self.save_state()
+            try:
+                gateway_offline_mod().save_lease(new, self.by, self.spec["reason"][:120], ttl, mode="run")
+            except Exception:  # noqa: BLE001
+                pass
+            self.summary["notes"].append(f"{now_iso()} gateway forgot the offline window (restart?); re-opened it")
+            self.log("gateway had forgotten the offline window (gateway restart?): re-opened it with a new lease")
+        return r
 
     def take_hold(self):
         ttl = int(min(28800, max(60, self.max_s + 1800)))
