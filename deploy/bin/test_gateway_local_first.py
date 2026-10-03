@@ -362,6 +362,39 @@ class Routing(Isolated, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await self.route(headers={"X-Gateway-Route-Intent": "remote"}), "local")
             self.assertEqual(await self.route(model="estate-remote"), "remote")
 
+    async def test_stall_brake_never_refuses_work_that_only_remote_can_serve(self):
+        """2026-10-02 lane NO: 35+ 'stuck-intervene-deferred: HTTP 503' and every robot repair call during a
+        planned local-offline window. The stalled-delivery brake guards OPTIONAL overflow (local could serve it,
+        just slower). When local CANNOT serve -- planned offline window or engine down -- the alternative to remote
+        is a refusal, which keeps the estate stalled (stalled -> brake -> no remediation -> stalled). The hard $25
+        authority (_spend_allows_overflow) still governs; the brake does not."""
+        self.ptok = 3_000
+        braked = lambda *a: False
+        with patch.object(shim, "_automatic_remote_budget_allows", braked), patch.object(shim, "LOCAL_FIRST", False):
+            # optional overflow stays braked (unchanged)
+            with patch.object(shim, "perf_breaker_active", lambda: True):
+                self.assertEqual(await self.route(max_tokens=1200), "local")
+            # planned offline window: remote carries it despite the brake
+            with patch.object(shim, "_local_offline", lambda now=None: True):
+                self.assertEqual(await self.route(), "remote")
+                self.assertEqual(self.events, [("remote", "local-offline")])
+                # ... but the hard cap still refuses it
+                with patch.object(shim, "_spend_allows_overflow", lambda p, m: False):
+                    response = await self.route()
+                self.assertEqual(response.status, 503)
+                self.assertEqual(self.events, [("rejected-bg", "local-offline")])
+                # ... and estate-local / pinned callers still wait
+                response = await self.route(model="estate-local")
+                self.assertEqual(response.status, 503)
+            # engine down: remote carries it despite the brake
+            with patch.object(shim, "local_healthy", AsyncMock(return_value=False)), \
+                    patch.object(shim, "_health", {"ok": False}):
+                self.assertEqual(await self.route(), "remote")
+                self.assertEqual(self.events, [("remote", "local-down")])
+                with patch.object(shim, "_spend_allows_overflow", lambda p, m: False):
+                    response = await self.route()
+                self.assertEqual(response.status, 503)
+
     async def test_kept_request_still_overflows_as_cap_if_lanes_fill_during_admission(self):
         # decision saw a free lane; admission (the saturation fallback) finds the lanes full
         with patch.object(shim, "admission_lane_limit", lambda *a, **k: 0):

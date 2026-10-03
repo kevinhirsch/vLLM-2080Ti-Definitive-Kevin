@@ -2424,6 +2424,16 @@ def _automatic_remote_budget_allows(ptok, maxtok):
         return False
 
 
+_STALL_BRAKE_NOT_APPLIED = collections.Counter()
+
+
+def _stall_brake_not_applied(why, client):
+    """The stalled-delivery brake would have refused this request, but remote was the only server (`why`).
+    Counted so the capacity surface shows how much stalled-state traffic the gateway carried rather than refused."""
+    _STALL_BRAKE_NOT_APPLIED[why] += 1
+    log.info("stalled-delivery brake not applied (%s, client=%s): remote is the only place this can be served", why, client)
+
+
 def _spend_hold_for(request, body, prices=None):
     """Hold this paid request's upper-bound cost before forwarding. None = go ahead.
     `prices` ($/Mtok hit, miss, out) for a metered custom endpoint; default provider otherwise."""
@@ -4049,6 +4059,7 @@ def flow_capacity_facts(now=None, cls=None, ptok=None):
         "remote_use": flow_remote_use(now),
         "offline_window": _offline_status(),
         "counters": dict(_FLOW_STATS),
+        "stall_brake_not_applied": dict(_STALL_BRAKE_NOT_APPLIED),
         "cannot_measure": ([] if eng else ["engine /metrics scrape failing: throughput and engine queue unknown"]),
     }
     if cls in FLOW_CLASSES:
@@ -6287,6 +6298,13 @@ async def _route_completions(request, _no_overflow=False):
                          or _automatic_remote_budget_allows(ptok, maxtok))
     overflow_ok = ((not _no_overflow) and automatic_paid_ok and remote_ok()
                    and _spend_allows_overflow(ptok, maxtok))
+    # 2026-10-02 (lane NO): the stalled-delivery brake guards OPTIONAL overflow -- a remote trip taken although local
+    # could serve the request, only slower. It must never refuse work that ONLY remote can serve: during a planned
+    # local-offline window or an engine-down moment the alternative to the valve is a 503, and refusing the estate's
+    # own repair/authoring calls is what keeps it stalled (stalled -> brake -> 503 -> no remediation -> stalled;
+    # 35+ 'stuck-intervene-deferred: HTTP 503' events, 3000+ 503s in one day). There the hard $25 authority alone
+    # governs, exactly as the offline-window design above promises ("inside the daily cap").
+    remote_only_ok = ((not _no_overflow) and remote_ok() and _spend_allows_overflow(ptok, maxtok))
 
     async def _overflow_forward(reentry=True):
         """Forward an overflow; if the spend authority refuses it after all (a race with other
@@ -6412,7 +6430,9 @@ async def _route_completions(request, _no_overflow=False):
     # the daily cap; callers that must stay local (pinned, estate-local) and everything when no remote can take
     # work are told to retry -- the engine is being worked on, so nothing is admitted to it.
     if _local_offline():
-        if overflow_ok and not alias_local_only and not local_pin:
+        if remote_only_ok and not alias_local_only and not local_pin:
+            if not overflow_ok:
+                _stall_brake_not_applied("local-offline", client)
             log.info("route %s planned local-offline window (%s) -> remote(local-offline)", path, _OFFLINE["reason"])
             record_event("remote", "local-offline", request, units, 0, **ev)
             return await _overflow_forward()
@@ -6446,7 +6466,9 @@ async def _route_completions(request, _no_overflow=False):
             # FALL THROUGH: local is healthy again, so every check below (monster bypass, tiny
             # fast-lane, admission wait, relay) runs exactly as it would have if
             # local_healthy() had returned True on the very first check above.
-        elif overflow_ok and not alias_local_only:
+        elif remote_only_ok and not alias_local_only:
+            if not overflow_ok:
+                _stall_brake_not_applied("local-down", client)
             log.info("route %s local unhealthy -> remote(local-down)", path)
             record_event("remote", "local-down", request, units, 0, **ev)
             return await _overflow_forward()
