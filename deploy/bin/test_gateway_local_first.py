@@ -411,3 +411,20 @@ class Routing(Isolated, unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StalledBrakeDoesNotBlockTheRemediator(unittest.TestCase):
+    """2026-10-02: with the outcome alarm 'stalled' and spend above the $2 brake, overflow to Halo's mind was refused
+    during a planned offline window (503 'rejected-bg'), deadlocking the actor that ends the stall."""
+
+    def test_kevin_and_halo_bypass_the_stalled_brake_but_robots_do_not(self):
+        import re
+        src = open(os.path.join(os.path.dirname(__file__), "keepalive-shim.py"), encoding="utf-8").read()
+        m = re.search(r"automatic_paid_ok = \(([^)]*\)[^)]*)\)", src)
+        self.assertIsNotNone(m)
+        rule = m.group(1)
+        self.assertIn('_early_cls == "halo"', rule)
+        self.assertIn("_explicit_kevin", rule)
+        self.assertIn("_automatic_remote_budget_allows(ptok, maxtok)", rule)
+        # the hard spend authority still gates every overflow
+        self.assertRegex(src, r"overflow_ok = \(\(not _no_overflow\) and automatic_paid_ok and remote_ok\(\)\s+and _spend_allows_overflow")

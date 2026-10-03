@@ -6274,7 +6274,17 @@ async def _route_completions(request, _no_overflow=False):
     # engine serves 524K context; latency is acceptable). Only explicit remote -- the
     # estate-remote alias, route-intent remote, the forced window -- gets the 429, because those
     # callers handle refusal themselves. Local genuinely DOWN with no budget -> 503 + Retry-After.
-    automatic_paid_ok = _automatic_remote_budget_allows(ptok, maxtok)
+    # 2026-10-02: the stalled-delivery brake (default $2) must not block the REMEDIATOR. With outcome 'stalled'
+    # and $7.74 spent it refused overflow to Halo's mind during a planned local-offline window -> 'rejected-bg'
+    # 503s, so the one actor that can end the stall could not think (deadlock). Kevin's own turns and Halo's
+    # turns bypass the brake; they remain inside the hard $25 spend authority (_spend_allows_overflow).
+    # Unlabelled callers default to class 'kevin', so only an EXPLICIT Kevin signal counts here: the X-Work-Class
+    # header or his LibreChat client. Halo is recognised by flow_class_of (control turn / client map).
+    _early_cls = flow_class_of(request, body, background, halo_control)
+    _explicit_kevin = ((request.headers.get("X-Work-Class") or "").strip().lower() == "kevin"
+                       or "librechat" in (request.headers.get("X-Client") or "").lower())
+    automatic_paid_ok = (_early_cls == "halo" or _explicit_kevin
+                         or _automatic_remote_budget_allows(ptok, maxtok))
     overflow_ok = ((not _no_overflow) and automatic_paid_ok and remote_ok()
                    and _spend_allows_overflow(ptok, maxtok))
 
