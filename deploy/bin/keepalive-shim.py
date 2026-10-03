@@ -8349,8 +8349,8 @@ def _nonstream_shape_kw(data, body, local):
         return {}
 
 
-async def _prepare_stream_response(resp, request, initial, session):
-    """A disconnected caller must not strand the upstream ClientSession."""
+async def _prepare_stream_response(resp, request, initial, session, up=None):
+    """A disconnected caller must not strand the upstream ClientSession (nor its un-released response: pass `up`)."""
     try:
         try:
             request["gw_stream_prepared"] = True     # lane SH: _router_crash_response must not answer twice
@@ -8362,21 +8362,22 @@ async def _prepare_stream_response(resp, request, initial, session):
         return True
     except (ConnectionResetError, BrokenPipeError):
         _active_set(request, client_disconnected=True)
-        await session.close()
+        await _drop_upstream(session, up)
         return False
     except BaseException:
-        await session.close()
+        await _drop_upstream(session, up)
         raise
 
 
-async def _finish_stream_response(resp, request, session):
-    """Close upstream even when write_eof sees a closed client transport."""
+async def _finish_stream_response(resp, request, session, up=None):
+    """Close upstream even when write_eof sees a closed client transport. `up` (the upstream response) is closed first: a client
+    that hung up mid-stream leaves it un-released, and session.close() alone made its GC log 'Unclosed connection'."""
     try:
         await resp.write_eof()
     except (ConnectionResetError, BrokenPipeError):
         _active_set(request, client_disconnected=True)
     finally:
-        await session.close()
+        await _drop_upstream(session, up)
 
 
 # RS (2026-10-02): one durable record per GATEWAY-layer timeout (first response header, first token, stream idle). Without it a
@@ -8443,6 +8444,19 @@ def _gone_response(request):
     _active_set(request, client_disconnected=True, flow_held="client-gone")
     _FLOW_STATS["client_gone"] += 1
     return web.Response(status=499, text="client closed request")
+
+
+async def _drop_upstream(session, up=None):
+    """Abandon an upstream exchange: close the response FIRST (its pooled Connection is released/aborted, which also aborts the
+    engine's work), then the session. session.close() alone shuts the sockets but leaves the response's Connection wrapper
+    un-released, so its GC logged 'ERROR Unclosed connection' (20/day live on 2026-10-03, local :8001 and the remote provider,
+    right after client-gone / first-token-timeout exits of the first-token gate)."""
+    if up is not None:
+        try:
+            up.close()
+        except Exception as _e:
+            _swallowed("relay:drop_upstream", _e)
+    await session.close()
 
 
 async def _relay(request, base, path, body, key, streaming, concurrency=1, provider_name=None):
@@ -8520,7 +8534,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
                                 headers=_route_receipt())
             return "ok", resp
         except Exception as e:
-            await session.close()
+            await _drop_upstream(session, up)
             return "fail", (up.status, f"streaming 4xx read error: {e}", False)
 
     if streaming and up.status == 200:
@@ -8542,7 +8556,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
             return "ok", web.Response(body=data, status=up.status, content_type=ct,
                                        headers=_route_receipt())
         finally:
-            await session.close()
+            await _drop_upstream(session, up)
 
     # streaming with FIRST-TOKEN GATE: buffer upstream chunks WITHOUT committing to the
     # client until real generation has started. If the upstream dies before that (e.g. an
@@ -8673,15 +8687,15 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
     try:
         phase = await _await_unless_gone(request, _read_until_commit(), timeout=deadline)
     except _ClientGone:
-        await session.close()
+        await _drop_upstream(session, up)
         return "ok", _gone_response(request)
     except asyncio.TimeoutError:
-        await session.close()
+        await _drop_upstream(session, up)
         _timeout_note(request, "gateway:first-token", deadline, base, body, concurrency=concurrency, outcome="failover",
                       bytes_before=len(buf))
         return "fail", (up.status, f"no first token within {deadline:.0f}s (busy/wedged)", False)
     except Exception as e:
-        await session.close()
+        await _drop_upstream(session, up)
         return "fail", (up.status, f"pre-commit stream error: {e}", True)
 
     # TELEMETRY: time to first streamed byte after the upstream POST was issued (excludes the
@@ -8701,9 +8715,9 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
         # upstream finished before any 'meaningful' chunk — deliver as-is (short/empty response),
         # don't fail over (avoids double-generating a real-but-tiny answer).
         resp = _mk_resp()
-        if not await _prepare_stream_response(resp, request, bytes(buf), session):
+        if not await _prepare_stream_response(resp, request, bytes(buf), session, up):
             return "ok", resp
-        await _finish_stream_response(resp, request, session)
+        await _finish_stream_response(resp, request, session, up)
         _outkw = {"outtok_lb": _chunk_ct[0],
                   "content_empty": not _saw_content[0], "has_tool_calls": _saw_tool_call[0]}
         if _exact_outtok[0] is not None:
@@ -8728,7 +8742,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
     # committed to the client: flush buffered first chunk(s), then stream the rest. A mid-stream
     # error past this point can only be reported inline (client already receiving output).
     resp = _mk_resp()
-    if not await _prepare_stream_response(resp, request, bytes(buf), session):
+    if not await _prepare_stream_response(resp, request, bytes(buf), session, up):
         return "ok", resp
     # [GW2 / L95] long-empty-generation watchdog: armed for a LOCAL stream whose request still has thinking on.
     _rw = {"armed": (not _is_remote_relay and REASONING_WATCHDOG in ("shadow", "retry")
@@ -8818,7 +8832,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
             await resp.write(f'data: {{"error":{{"message":"stream interrupted: {e}"}}}}\n\n'.encode())
         except Exception:
             pass
-    await _finish_stream_response(resp, request, session)
+    await _finish_stream_response(resp, request, session, up)
     if _scan_tail[0]:
         _scan_usage(_scan_tail[0])       # a final line the stream ended without a newline on
     _outkw = {"outtok_lb": _chunk_ct[0],
