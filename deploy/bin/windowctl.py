@@ -148,6 +148,29 @@ def release_mod():
     return release
 
 
+def actuator_hold(*args, timeout=60):
+    """Lane LV's engine-liveness hold (`engine-actuator.py hold ...`). While a window holds it the liveness authority
+    and the watchdog take no automatic action, and stops are attributed to the holder. Returns the parsed JSON, or
+    None when the deployed actuator has no `hold` subcommand yet (then the window runs as before)."""
+    try:
+        r = subprocess.run(["/usr/bin/python3", ACTUATOR, "hold", *args], capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode == 2 and "invalid choice" in (r.stderr or ""):
+        return None
+    try:
+        return json.loads((r.stdout or "").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {"error": (r.stderr or r.stdout or "")[-300:], "rc": r.returncode}
+
+
+def restart_argv(by, reason, hold=None):
+    argv = ["/usr/bin/python3", ACTUATOR, "restart", "--by", str(by), "--reason", reason, "--no-drain", "--foreground"]
+    if hold:
+        argv += ["--hold", hold]          # LV: a planned restart is refused while a hold is held unless it names it
+    return argv
+
+
 def admin_token():
     try:
         return open(f"{BASE}/admin.token").read().strip()
@@ -581,6 +604,19 @@ class Window:
             if r.get("error"):
                 self.log(f"lease renew failed: {r.get('error')[:120]}")
 
+    def take_hold(self):
+        ttl = int(min(28800, max(60, self.max_s + 1800)))
+        h = actuator_hold("acquire", "--kind", "engine", "--by", "windowctl", "--reason", f"{self.wid}: {self.spec['reason']}"[:120],
+                          "--ttl", str(ttl), "--owner-pid", str(os.getpid()))
+        if h is None:
+            self.summary["notes"].append("engine-actuator has no `hold` yet (LV not deployed): window runs without a liveness hold")
+            return
+        if not h.get("lease"):
+            raise WindowAbort("refused", f"engine liveness hold not granted: {json.dumps(h)[:300]}")
+        self.state["hold"] = h["lease"]
+        self.save_state()
+        self.log(f"engine liveness hold {h['lease'][:8]}.. until {h.get('until')}")
+
     def arm_deadman(self):
         unit = unitrun.unit_name(self.lane, f"{self.wid}-deadman")
         r = subprocess.run(["systemd-run", "--user", f"--unit={unit}", "--collect", "--quiet",
@@ -626,8 +662,7 @@ class Window:
         gpuguard.set_busy(self.by, f"{self.wid} boot {label}", ttl_s=timeout_s + 300, window=self.wid, phase="boot")
         t_boot = time.time()
         res = unitrun.run(self.lane, f"{self.wid}-boot-{label}",
-                          ["/usr/bin/python3", ACTUATOR, "restart", "--by", self.by, "--reason",
-                           f"window {self.wid} boot {label}", "--no-drain", "--foreground"],
+                          restart_argv(self.by, f"window {self.wid} boot {label}", self.state.get("hold")),
                           timeout_s=timeout_s, out=self.path("steps", f"boot-{label}.log"))
         ok, waited = wait_health(max(30.0, timeout_s - (time.time() - t_boot)))
         gpuguard.set_busy(self.by, f"{self.wid} window", ttl_s=self.max_s + 1800, window=self.wid, phase="window")
@@ -837,6 +872,7 @@ class Window:
                            "started": now_iso(), "deadline": self.state["deadline"]}, fh, indent=1)
             gpuguard.set_busy(self.by, f"{self.wid} window", ttl_s=self.max_s + 1800, window=self.wid, phase="window")
             self.arm_deadman()
+            self.take_hold()
             for t in self.spec.get("pause_timers") or []:
                 if self.snapshot["timers"].get(t) == "active":
                     set_timer(t, False)
@@ -950,9 +986,9 @@ def restore_from(snap, state, spec, log=print, results=None):
                 rep.setdefault("foreign_at_restore", []).append(gpuguard.describe(foreign))
             t_boot = time.time()
             gpuguard.set_busy(state.get("by") or lane, f"{wid} restore boot", ttl_s=1800, window=wid, phase="boot")
-            res = unitrun.run(lane, f"{wid}-restore-{attempt}", ["/usr/bin/python3", ACTUATOR, "restart", "--by",
-                              str(spec.get("by") or lane), "--reason", f"window {wid} restore (attempt {attempt})",
-                              "--no-drain", "--foreground"], timeout_s=1500,
+            res = unitrun.run(lane, f"{wid}-restore-{attempt}",
+                              restart_argv(spec.get("by") or lane, f"window {wid} restore (attempt {attempt})", state.get("hold")),
+                              timeout_s=1500,
                               out=os.path.join(results or "/tmp", "steps", f"restore-{attempt}.log"))
             healthy, _ = wait_health(1200 - min(900, time.time() - t_boot))
             pool = gpuguard.kv_pool_since(t_boot - 5)
@@ -1014,6 +1050,10 @@ def restore_from(snap, state, spec, log=print, results=None):
     rep["planned_offline_after"] = off.get("offline")
     if off.get("offline") and lease and off.get("by") == (spec.get("by") or lane):
         bad("gateway offline window still open after restore")
+    if state.get("hold"):
+        h = actuator_hold("release", "--lease", state["hold"])
+        rep["hold_release"] = h
+        state["hold"] = None
     gpuguard.clear_busy(wid)
     try:
         m = json.load(open(MARKER))
@@ -1063,6 +1103,9 @@ def deadman(state_path):
         with open(os.path.join(results, "window.log"), "a") as fh:
             fh.write(f"{now_iso()} [dead-man] {msg}\n")
     log(f"window process {state['pid']} is gone without restoring: restoring now")
+    if state.get("hold"):
+        log("its engine liveness hold was owner-pid scoped and is void now; restoring without it")
+        state["hold"] = None
     rep = restore_from(snap, state, spec, log=log, results=results)
     state["restored"] = True
     with open(state_path, "w") as fh:

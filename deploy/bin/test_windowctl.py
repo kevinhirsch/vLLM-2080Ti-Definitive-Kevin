@@ -59,7 +59,16 @@ class World:
         mp.setattr(gpuguard, "wait_no_foreign", lambda *a, **k: (not self.foreign, list(self.foreign)))
         mp.setattr(unitrun, "run", self.unit_run)
         mp.setattr(unitrun, "stop_lane", lambda lane, prefix=None, exclude=(): [])
+        self.holds = []
+        self.hold_supported = False
+        mp.setattr(wc, "actuator_hold", self.hold)
         mp.setattr(unitrun, "owner_of_pid", lambda pid, at=None: {"unit": "k2-bench.service", "lane": "k2"} if pid == 777 else None)
+
+    def hold(self, *args, timeout=60):
+        self.holds.append(args)
+        if not self.hold_supported:
+            return None
+        return {"lease": "HOLD1", "kind": "engine", "until": 1} if args[0] == "acquire" else {"released": True}
 
     # gateway-offline.py module surface
     def open_window(self, reason, by, ttl, wait_s, mode="open"):
@@ -433,3 +442,21 @@ def test_the_migration_spec_validates_and_promotes_only_at_the_end():
     assert names[-1] == "identity-gate" and names.index("base-boot") < names.index("rel-boot")
     assert set(s["promote"]["files"]) == set(s["snapshot_files"])
     assert s["promote"]["release"] == {"tree_head": "/home/kevin/Desktop/wt-integrate"}
+
+
+def test_engine_liveness_hold_is_taken_named_on_every_restart_and_released(world, tmp_path):
+    (tmp_path / "rel").mkdir()
+    world.hold_supported = True
+    s = wc.Window(spec(tmp_path)).run()
+    assert s["status"] == "ok" and s["restore"]["ok"]
+    acq = world.holds[0]
+    assert acq[0] == "acquire" and "--owner-pid" in acq and acq[acq.index("--owner-pid") + 1] == str(os.getpid())
+    assert all(c["cmd"][c["cmd"].index("--hold") + 1] == "HOLD1" for c in world.actuator_calls)
+    assert world.holds[-1] == ("release", "--lease", "HOLD1")
+
+
+def test_without_lv_deployed_the_window_runs_and_says_so(world, tmp_path):
+    (tmp_path / "rel").mkdir()
+    s = wc.Window(spec(tmp_path)).run()
+    assert s["status"] == "ok" and any("no `hold` yet" in n for n in s["notes"])
+    assert all("--hold" not in c["cmd"] for c in world.actuator_calls)
