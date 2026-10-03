@@ -15,6 +15,7 @@ Built-in variants:
   w4a8sm     w4a8 with SmoothQuant-style migration on down_proj only (alpha 0.5, weights re-quantized RTN asym g128 from the W4 dequant)
   w4a8gd     w4a8 but down_proj uses per-(row,128-group) activation scales (MX-style int8 epilogue)
   w4a8g      per-(row,128-group) activation scales on every linear
+  w4a8e3     kernel-exact LP_A8E: per-token int8 with a 2^-e (e<=3) exponent per (row,128) + 512-level int weight scales
   w4a8hd     w4a8 but down_proj input block-Hadamard rotated (weights re-quantized RTN asym g128 from the W4 dequant)
   w4a4tok    naive per-token int4 activations (no rotation) on asym W4 -- the "no tricks" W4A4 floor
   w4a4had    QuaRot-style: block-Hadamard(128) on the K dim of act and weight, weights re-quantized RTN asym g128, per-token int4 act
@@ -107,6 +108,23 @@ def v_w4a8g(n, x, info):
     """kernel-exact LP_A8G: per-(row,128) int8 act scales, REAL fp16 weight group scales (no int16 rounding)."""
     if "w16s" not in info: info["w16s"] = (info["qz"] * info["s"].half().float().unsqueeze(-1)).reshape(info["w"].shape)
     return q_grp(x.half().float(), 8) @ info["w16s"].T
+
+
+def q_rel(x, emax, g=G):
+    """LP_A8E activations: per-token int8 scale amax/127 * 2^-e[row,g], e in [0, emax] (int-exponent per 128-group)."""
+    M, K = x.shape; xg = x.view(M, K // g, g)
+    amax = x.abs().amax(-1, keepdim=True).clamp(min=1e-8); gmax = xg.abs().amax(-1).clamp(min=1e-30)
+    e = torch.clamp(torch.floor(torch.log2(amax / gmax)), 0, emax)
+    sc = (amax / 127) / torch.pow(2.0, e)
+    return (torch.clamp(torch.round(xg / sc.unsqueeze(-1)), -127, 127) * sc.unsqueeze(-1)).view(M, K)
+
+
+def v_w4a8e3(n, x, info, emax=3):
+    """kernel-exact LP_A8E (EMAX 3): rel-exponent int8 activations + int weight scales with 4096 >> 3 = 512 levels."""
+    if "we3" not in info:
+        s16 = info["s"].half().float(); smax = s16.max(); s_int = torch.round(s16 / smax * (4096 >> emax))
+        info["we3"] = (info["qz"] * (s_int * smax / (4096 >> emax)).unsqueeze(-1)).reshape(info["w"].shape)
+    return q_rel(x.half().float(), emax) @ info["we3"].T
 
 
 def v_w4a8hd(n, x, info):

@@ -105,6 +105,9 @@ class MarlinLinearKernel(MPLinearKernel):
         padded_n, padded_k = marlin_padded_nk(size_n, size_k, c.group_size)
         if self._lp_g8 and (padded_n, padded_k) != (size_n, size_k):
             self._lp_g8 = False  # LP W4A8G: tile-aligned shapes only; fall back to stock W4A8
+        self._lp_mode, self._lp_emax, self._lp_wglob = lp_w4a8g.mode(), lp_w4a8g.emax(), 1.0
+        if self._lp_g8:
+            lp_w4a8g.load_ext(self._lp_mode, self._lp_emax)  # JIT load (cached build) before graph capture
 
         # Allocate marlin workspace, reusing existing storage on reload.
         self.workspace = marlin_make_workspace_new(
@@ -154,8 +157,13 @@ class MarlinLinearKernel(MPLinearKernel):
                 num_groups = c.partition_weight_shape[0] // c.group_size
 
             if c.act_type == torch.int8 and num_groups > 1 and self._lp_g8:
-                # Lane LP W4A8G: keep the real fp16 group scales (the kernel applies
-                # a_scale[row, group] * w_scale[group, col] to each int32 group partial)
+                # Lane LP W4A8G. mode g: keep the real fp16 group scales (kernel applies
+                # a_scale[row, group] * w_scale[group, col] per int32 group partial).
+                # mode e: stock-style int16 levels (fewer levels keep the int32 headroom
+                # when the kernel shifts them left by EMAX - e[row, group]).
+                if lp_w4a8g.mode() == "e":
+                    x.data, wglob = lp_w4a8g.process_scales_e(x.data, lp_w4a8g.level())
+                    self._lp_wglob = wglob
                 layer.input_global_scale = None
             elif c.act_type == torch.int8 and num_groups > 1:
                 x.data, input_global_scale = marlin_act_int8_process_scales(x.data)
@@ -216,7 +224,8 @@ class MarlinLinearKernel(MPLinearKernel):
             if x2.stride(-1) != 1 or x2.stride(0) % 16 != 0:
                 x2 = x2.contiguous()
             out = torch.ops.lp.w4a8g_gemm(
-                x2, w_q, w_s, w_zp, self.workspace, c.partition_weight_shape[1]
+                x2, w_q, w_s, w_zp, self.workspace, c.partition_weight_shape[1],
+                self._lp_wglob, self._lp_emax, self._lp_mode,
             )
             if bias is not None:
                 out = out + bias

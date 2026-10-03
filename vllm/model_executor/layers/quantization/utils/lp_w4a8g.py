@@ -1,57 +1,125 @@
 # SPDX-License-Identifier: Apache-2.0
 """Lane LP: W4A8-INT8 Marlin with per-(row, 128-K group) activation scales ("MX-style int8", sm_75 IMMA).
 
-Env-gated: VLLM_LP_W4A8G=1 (together with VLLM_MARLIN_INPUT_DTYPE=int8, prefix scope VLLM_LP_INT8_SKIP/ONLY).
-Why: per-token int8 activations lose 10-13% GEMM output accuracy on mlp.down_proj (SwiGLU outliers are dynamic, not static
-channels); a float activation scale per (row, 128-K group) brings it to 1.0-1.4% (better than FP8 E4M3 per-token, 1.4-1.9%),
-and it aligns with the weight group, so the kernel applies a_scale[row,g] * w_scale[g,col] (fp16 scales, no int16 rounding)
-to each int32 group partial in fp32. Kernel: csrc_lp/marlin_g8 (vLLM marlin_template.h + LP_A8G patch), JIT-built once
-into .deps/lp_marlin_g8_build. The activation quantizer is a Triton kernel.
+Env (all default off): VLLM_LP_W4A8G=1 together with VLLM_MARLIN_INPUT_DTYPE=int8 (prefix scope VLLM_LP_INT8_SKIP/ONLY).
+VLLM_LP_W4A8G_MODE = e (default) | g
+  e: int-exponent mode (LP_A8E): act int8 with scale amax_row/127 * 2^-e[row,g], e in [0, EMAX]; the kernel shifts the stock int16
+     weight group scale left by (EMAX - e) before the stock IMAD, so the epilogue costs what stock W4A8 costs. EMAX = VLLM_LP_A8E_EMAX
+     (default 3), int16 weight scale levels = VLLM_LP_A8E_LEVEL (default 4096 >> EMAX, keeps the stock int32 overflow headroom).
+  g: float mode (LP_A8G): fp32 act scale per (row, group) x real fp16 weight scale, fp32 FMA per group partial (more precise, slower).
+Why: per-token int8 (stock W4A8) loses 10-13% GEMM accuracy on mlp.down_proj (dynamic SwiGLU outliers); per-group scales fix it.
+Kernel: csrc_lp/marlin_g8 (vLLM marlin_template.h + LP_A8G/LP_A8E patch), JIT-built once into .deps/lp_marlin_*_build.
 """
 import os
 
 import torch
+import triton
+import triton.language as tl
 
-_ext = None
-_SRC = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../../../csrc_lp/marlin_g8"))
-_BUILD = os.path.realpath(os.environ.get("VLLM_LP_W4A8G_BUILD", os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../../../.deps/lp_marlin_g8_build")))
+_ROOT = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../../.."))
+_SRC = os.path.join(_ROOT, "csrc_lp/marlin_g8")
+_exts = {}
 
 
 def enabled() -> bool:
     return os.environ.get("VLLM_LP_W4A8G", "0") == "1"
 
 
-def _load():
-    global _ext
-    if _ext is None:
+def mode() -> str:
+    return os.environ.get("VLLM_LP_W4A8G_MODE", "e")
+
+
+def emax() -> int:
+    return int(os.environ.get("VLLM_LP_A8E_EMAX", "3"))
+
+
+def level() -> int:
+    return int(os.environ.get("VLLM_LP_A8E_LEVEL", str(4096 >> emax())))
+
+
+def load_ext(m: str | None = None, e: int | None = None):
+    m = m or mode()
+    e = emax() if e is None else e
+    key = (m, e)
+    if key not in _exts:
         from torch.utils.cpp_extension import load
 
-        os.makedirs(_BUILD, exist_ok=True)
-        _ext = load(name="lp_marlin_g8", sources=[os.path.join(_SRC, "lp_marlin_g8.cu")], build_directory=_BUILD,
-                    extra_include_paths=[_SRC], verbose=False,
-                    extra_cuda_cflags=["-O3", "-DLP_A8G", "--expt-relaxed-constexpr", "-std=c++17", "-lineinfo",
-                                       "-U__CUDA_NO_HALF_OPERATORS__", "-U__CUDA_NO_HALF_CONVERSIONS__",
-                                       "-U__CUDA_NO_HALF2_OPERATORS__", "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                                       "-gencode=arch=compute_75,code=sm_75"],
-                    extra_cflags=["-O3", "-std=c++17"])
-    return _ext
-
-
-import triton  # noqa: E402
-import triton.language as tl  # noqa: E402
+        if m == "g":
+            name, src, defs = "lp_marlin_g8", "lp_marlin_g8.cu", ["-DLP_A8G"]
+        else:
+            name, src, defs = f"lp_marlin_e8_x{e}", "lp_marlin_e8.cu", ["-DLP_A8E", f"-DLP_EMAX={e}"]
+        build = os.path.realpath(os.environ.get("VLLM_LP_W4A8G_BUILD", os.path.join(_ROOT, ".deps", name + "_build")))
+        os.makedirs(build, exist_ok=True)
+        _exts[key] = load(name=name, sources=[os.path.join(_SRC, src)], build_directory=build, extra_include_paths=[_SRC],
+                          verbose=False,
+                          extra_cuda_cflags=["-O3", *defs, "--expt-relaxed-constexpr", "-std=c++17", "-lineinfo",
+                                             "-U__CUDA_NO_HALF_OPERATORS__", "-U__CUDA_NO_HALF_CONVERSIONS__",
+                                             "-U__CUDA_NO_HALF2_OPERATORS__", "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                                             "-gencode=arch=compute_75,code=sm_75"],
+                          extra_cflags=["-O3", "-std=c++17"])
+    return _exts[key]
 
 
 @triton.jit
-def _quant_g128_kernel(x_ptr, q_ptr, s_ptr, stride_xm, K, G: tl.constexpr):
-    row = tl.program_id(0)
-    grp = tl.program_id(1)
-    offs = grp * G + tl.arange(0, G)
-    x = tl.load(x_ptr + row * stride_xm + offs).to(tl.float32)
-    s = tl.maximum(tl.max(tl.abs(x), 0), 1e-8) / 127.0
-    q = tl.extra.cuda.libdevice.rint(x / s)
+def _quant_g128_kernel(x_ptr, q_ptr, s_ptr, stride_xm, M, K, BM: tl.constexpr, GB: tl.constexpr):
+    # float mode: one program = BM rows x GB groups of 128; per-(row,group) absmax / 127
+    pm = tl.program_id(0)
+    pg = tl.program_id(1)
+    rows = pm * BM + tl.arange(0, BM)
+    cols = pg * GB * 128 + tl.arange(0, GB * 128)
+    rmask = rows < M
+    m2 = rmask[:, None] & (cols[None, :] < K)
+    x = tl.load(x_ptr + rows[:, None] * stride_xm + cols[None, :], mask=m2, other=0.0).to(tl.float32)
+    x3 = tl.reshape(x, (BM, GB, 128))
+    s = tl.maximum(tl.max(tl.abs(x3), 2), 1e-8) / 127.0
+    q = tl.extra.cuda.libdevice.rint(x3 / s[:, :, None])
     q = tl.minimum(tl.maximum(q, -127.0), 127.0)
-    tl.store(q_ptr + row * K + offs, q.to(tl.int8))
-    tl.store(s_ptr + row * (K // G) + grp, s)
+    tl.store(q_ptr + rows[:, None] * K + cols[None, :], tl.reshape(q, (BM, GB * 128)).to(tl.int8), mask=m2)
+    G = K // 128
+    gidx = pg * GB + tl.arange(0, GB)
+    tl.store(s_ptr + rows[:, None] * G + gidx[None, :], s, mask=rmask[:, None] & (gidx[None, :] < G))
+
+
+@triton.jit
+def _quant_e_kernel(x_ptr, q_ptr, e_ptr, r_ptr, gmax_ptr, stride_xm, M, K, wglob, EMAX: tl.constexpr, BM: tl.constexpr,
+                    GB: tl.constexpr):
+    # int-exponent mode: pass 1 = per-(row,group) absmax (to gmax scratch) + row amax; pass 2 = e, q, row scale
+    pm = tl.program_id(0)
+    rows = pm * BM + tl.arange(0, BM)
+    rmask = rows < M
+    G = K // 128
+    amax = tl.zeros((BM,), dtype=tl.float32)
+    for g0 in range(0, G, GB):
+        cols = g0 * 128 + tl.arange(0, GB * 128)
+        m2 = rmask[:, None] & (cols[None, :] < K)
+        x = tl.load(x_ptr + rows[:, None] * stride_xm + cols[None, :], mask=m2, other=0.0).to(tl.float32)
+        gm = tl.max(tl.abs(tl.reshape(x, (BM, GB, 128))), 2)
+        gidx = g0 + tl.arange(0, GB)
+        tl.store(gmax_ptr + rows[:, None] * G + gidx[None, :], gm, mask=rmask[:, None] & (gidx[None, :] < G))
+        amax = tl.maximum(amax, tl.max(gm, 1))
+    amax = tl.maximum(amax, 1e-8)
+    base = amax / 127.0
+    tl.store(r_ptr + rows, base * wglob / (1 << EMAX), mask=rmask)
+    for g0 in range(0, G, GB):
+        cols = g0 * 128 + tl.arange(0, GB * 128)
+        m2 = rmask[:, None] & (cols[None, :] < K)
+        gidx = g0 + tl.arange(0, GB)
+        gmask = rmask[:, None] & (gidx[None, :] < G)
+        gm = tl.load(gmax_ptr + rows[:, None] * G + gidx[None, :], mask=gmask, other=1.0)
+        ratio = amax[:, None] / tl.maximum(gm, 1e-30)
+        e = tl.floor(tl.log2(ratio))
+        e = tl.minimum(tl.maximum(e, 0.0), EMAX * 1.0)
+        sc = base[:, None] / tl.exp2(e)                       # [BM, GB]
+        x = tl.load(x_ptr + rows[:, None] * stride_xm + cols[None, :], mask=m2, other=0.0).to(tl.float32)
+        x3 = tl.reshape(x, (BM, GB, 128))
+        q = tl.extra.cuda.libdevice.rint(x3 / sc[:, :, None])
+        q = tl.minimum(tl.maximum(q, -127.0), 127.0)
+        tl.store(q_ptr + rows[:, None] * K + cols[None, :], tl.reshape(q, (BM, GB * 128)).to(tl.int8), mask=m2)
+        tl.store(e_ptr + rows[:, None] * G + gidx[None, :], e.to(tl.uint8), mask=gmask)
+
+
+def _gb(G):
+    return 8 if G % 8 == 0 else (4 if G % 4 == 0 else (2 if G % 2 == 0 else 1))
 
 
 def quant_g128(x: torch.Tensor):
@@ -59,17 +127,41 @@ def quant_g128(x: torch.Tensor):
     q = torch.empty((M, K), dtype=torch.int8, device=x.device)
     s = torch.empty((M, K // 128), dtype=torch.float32, device=x.device)
     if M > 0:
-        _quant_g128_kernel[(M, K // 128)](x, q, s, x.stride(0), K, G=128)
+        G = K // 128
+        _quant_g128_kernel[(triton.cdiv(M, 16), G // _gb(G))](x, q, s, x.stride(0), M, K, BM=16, GB=_gb(G))
     return q, s
+
+
+def quant_e(x: torch.Tensor, wglob: float, e_max: int):
+    M, K = x.shape
+    G = K // 128
+    q = torch.empty((M, K), dtype=torch.int8, device=x.device)
+    e = torch.empty((M, G), dtype=torch.uint8, device=x.device)
+    r = torch.empty((M,), dtype=torch.float32, device=x.device)
+    gmax = torch.empty((M, G), dtype=torch.float32, device=x.device)
+    if M > 0:
+        _quant_e_kernel[(triton.cdiv(M, 16),)](x, q, e, r, gmax, x.stride(0), M, K, wglob, EMAX=e_max, BM=16, GB=_gb(G))
+    return q, e, r
+
+
+def process_scales_e(s_perm: torch.Tensor, lvl: int):
+    """stock-style int16 group scales with `lvl` levels at the layer max; returns (int16-as-fp16 scales, float global)."""
+    smax = s_perm.float().max()
+    si = torch.round(s_perm.float() / smax * lvl).clamp(min=0).to(torch.int16).view(torch.float16)
+    return si, float(smax / lvl)
 
 
 @torch.library.custom_op("lp::w4a8g_gemm", mutates_args=())
 def w4a8g_gemm(x: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor, w_zp: torch.Tensor, workspace: torch.Tensor,
-               size_n: int) -> torch.Tensor:
-    q, s = quant_g128(x)
-    return _load().w4a8g_gemm(q, s, w_q, w_s, w_zp, workspace, size_n, True)
+               size_n: int, wglob: float, e_max: int, m: str) -> torch.Tensor:
+    if m == "g":
+        q, s = quant_g128(x)
+        ones = torch.ones((x.shape[0],), dtype=torch.float32, device=x.device)
+        return load_ext("g").gemm(q, ones, s, w_q, w_s, w_zp, workspace, size_n, True)
+    q, e, r = quant_e(x, wglob, e_max)
+    return load_ext("e", e_max).gemm(q, r, e, w_q, w_s, w_zp, workspace, size_n, True)
 
 
 @w4a8g_gemm.register_fake
-def _(x, w_q, w_s, w_zp, workspace, size_n):
+def _(x, w_q, w_s, w_zp, workspace, size_n, wglob, e_max, m):
     return x.new_empty((x.shape[0], size_n), dtype=torch.float16)

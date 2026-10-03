@@ -10,6 +10,11 @@ Correctness: w4a8 kernel output vs a CPU emulation of the same arithmetic (int8 
 Safe next to a live engine: refuses unless >= --min-free-mib free on the chosen GPU; caps its own allocator at --cap-mib.
 Usage: CUDA_VISIBLE_DEVICES=1 PYTHONPATH=/home/kevin/Desktop/wt-lp:/home/kevin/Desktop/wt-integrate/tools/u2 python tools/lp/w4a8_bench.py
 """
+import os as _os, subprocess as _sp, sys as _sys
+_g = _sp.run(["/home/kevin/projects/lanes/windows/gpuok.sh", _os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0], "800"], capture_output=True, text=True)
+if _g.returncode != 0 and _os.environ.get("LP_IN_WINDOW") != "1" and not _os.environ.get("WINDOW_ID"):
+    _sys.exit("gpuok.sh refused: " + _g.stdout.strip() + " " + _g.stderr.strip())
+
 import argparse, json, os, statistics, subprocess, sys, time
 ap = argparse.ArgumentParser()
 ap.add_argument("--Ms", default="16,64,256,512,1024,2048,3632")
@@ -29,11 +34,12 @@ torch.cuda.set_per_process_memory_fraction(a.cap_mib / (torch.cuda.get_device_pr
 from _ctlayer import make_marlin_layer
 from vllm import _custom_ops as ops
 G8 = None
+LPE = int(os.environ.get("LP_EMAX", "3"))
 if os.environ.get("LP_G8", "1") == "1":
     try:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import lp_g8 as G8
-        G8.build()
+        G8.build("g"); G8.build("e", LPE)
         print("LP_A8G extension loaded", flush=True)
     except Exception as ex:  # keep the stock arms running
         print("LP_A8G extension unavailable:", repr(ex)[:300], flush=True); G8 = None
@@ -113,6 +119,7 @@ for name in a.shapes.split(","):
         os.environ.pop("VLLM_MARLIN_INPUT_DTYPE", None)
     assert s8.kernel.config.act_type == torch.int8, "int8 act not engaged"
     g8 = G8.G8Linear({k: v for k, v in t.items()}, N, K) if G8 is not None else None
+    e2 = G8.G8Linear({k: v for k, v in t.items()}, N, K, mode="e", emax=LPE) if G8 is not None else None
     # correctness on 32 rows with outlier channels like post-norm activations
     xc = torch.randn(32, K) ; xc[:, :8] *= 20
     y8 = s8.apply_weights(l8, xc.half().cuda(), None).float().cpu(); y16 = s16.apply_weights(l16, xc.half().cuda(), None).float().cpu()
@@ -124,6 +131,9 @@ for name in a.shapes.split(","):
         corr["rel_w4a8g_vs_emul"] = ((yg - eg).norm() / eg.norm()).item()
         corr["rel_w4a8g_vs_fp32"] = ((yg - e16).norm() / e16.norm()).item()
         corr["rel_w4a8_vs_fp32"] = ((y8 - e16).norm() / e16.norm()).item()
+        from w4a8_bench_emul import emulate_e
+        ye = e2.forward(xc.half().cuda()).float().cpu(); ee = emulate_e(t, xc.half(), N, K, LPE, e2.level)
+        corr["rel_w4a8e2_vs_emul"] = ((ye - ee).norm() / ee.norm()).item(); corr["rel_w4a8e2_vs_fp32"] = ((ye - e16).norm() / e16.norm()).item()
         for Mt in (1, 7, 65, 300):  # odd M: tail rows + M-split paths
             xt = torch.randn(Mt, K) ; xt[:, :8] *= 20
             yt = g8.forward(xt.half().cuda(), G8.quant_act_g128_triton).float().cpu(); et = emulate_g(t, xt.half(), N, K)
@@ -136,6 +146,7 @@ for name in a.shapes.split(","):
         if g8 is not None:
             fns["w4a8g"] = lambda: g8.forward(x, G8.quant_act_g128_triton)
             fns["quant_g"] = lambda: G8.quant_act_g128_triton(x)
+            fns["w4a8e2"] = lambda: e2.forward(x)
         for fn in fns.values():
             for _ in range(a.warmup): fn()
         ts = {k: [] for k in fns}
@@ -148,18 +159,18 @@ for name in a.shapes.split(","):
             r[k] = {"med": statistics.median(ts[k]), "min": min(ts[k]), "p25": sorted(ts[k])[len(ts[k]) // 4]}
             r[k]["tflops_min"] = fl / r[k]["min"] / 1e9
         r["speedup_min"] = r["w4a16"]["min"] / r["w4a8"]["min"]; r["speedup_med"] = r["w4a16"]["med"] / r["w4a8"]["med"]
-        if "w4a8g" in r: r["speedup_g_min"] = r["w4a16"]["min"] / r["w4a8g"]["min"]
+        if "w4a8g" in r: r["speedup_g_min"] = r["w4a16"]["min"] / r["w4a8g"]["min"]; r["speedup_e2_min"] = r["w4a16"]["min"] / r["w4a8e2"]["min"]
         rows.append(r)
         print(f"  M={M:5d} w4a16 {r['w4a16']['min']:7.3f}/{r['w4a16']['med']:7.3f} ms ({r['w4a16']['tflops_min']:5.1f} TF)  "
               f"w4a8 {r['w4a8']['min']:7.3f}/{r['w4a8']['med']:7.3f} ms ({r['w4a8']['tflops_min']:5.1f} TOPS)  quant {r['quant']['min']:.3f}  "
               f"speedup min {r['speedup_min']:.2f}x med {r['speedup_med']:.2f}x" +
-              (f" | w4a8g {r['w4a8g']['min']:7.3f} ms ({r['w4a8g']['tflops_min']:5.1f}) x{r['speedup_g_min']:.2f} quant_g {r['quant_g']['min']:.3f}" if "w4a8g" in r else ""), flush=True)
+              (f" | w4a8g {r['w4a8g']['min']:7.3f} ms ({r['w4a8g']['tflops_min']:5.1f}) x{r['speedup_g_min']:.2f} quant_g {r['quant_g']['min']:.3f} | e2 x{r['speedup_e2_min']:.2f}" if "w4a8g" in r else ""), flush=True)
         del x
-    del l16, l8, g8; torch.cuda.empty_cache()
+    del l16, l8, g8, e2; torch.cuda.empty_cache()
 tot = {}
 for r in rows:
     if r["M"] == max(Ms):
-        for k in ("w4a16", "w4a8", "w4a8g"):
+        for k in ("w4a16", "w4a8", "w4a8g", "w4a8e2"):
             if k in r: tot[k] = tot.get(k, 0) + r[k]["min"] * r["layers"]
 print("PER-CHUNK linear time (min, ms, all layers, M=%d): %s  ratio %.2fx" % (max(Ms), {k: round(v, 1) for k, v in tot.items()}, tot["w4a16"] / tot["w4a8"]))
 sustain = {}

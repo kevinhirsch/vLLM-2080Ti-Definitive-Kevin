@@ -341,6 +341,9 @@ __global__ void Marlin(
 
   // For larger GEMMs we run multiple batchsize 64 versions in parallel for a
   // better partitioning with less reductions
+#if defined(LP_A8G) || defined(LP_A8E)
+  const int lp_prob_m = prob_m;  // Lane LP: total rows of this launch (prob_m is reset to one m-block below)
+#endif
   int parallel = 1;
   if (prob_m > m_block_size) {
     parallel = prob_m / m_block_size;
@@ -376,6 +379,11 @@ __global__ void Marlin(
   int slice_row = 0;
 #ifdef LP_A8G
   int lp_tile = 0;  // Lane LP: global k-tile index of the tile being consumed by matmul_a8
+  float lp_as[2 * thread_m_blocks];  // act scales of this thread's rows for the current group (prefetched at k == 0)
+#endif
+#ifdef LP_A8E
+  int lp_tile = 0;
+  int lp_sh[2 * thread_m_blocks];  // LP_EMAX - e[row, group] for this thread's rows (prefetched at k == 0)
 #endif
   int slice_col_par = blockIdx.x;
   int slice_col;
@@ -500,7 +508,7 @@ __global__ void Marlin(
   };
 
   init_slice();
-#ifdef LP_A8G
+#if defined(LP_A8G) || defined(LP_A8E)
 
   lp_tile = slice_row;
 #endif
@@ -1097,6 +1105,29 @@ __global__ void Marlin(
 
   auto matmul_a8 = [&](int k) {
     int k2 = k % 2;
+#ifdef LP_A8G
+    if (k == 0) {
+      const int lp_G = prob_k / (group_blocks * 16);
+      const int lp_grp = (lp_tile * thread_k_blocks) / group_blocks;
+  #pragma unroll
+      for (int r = 0; r < 2 * thread_m_blocks; r++) {
+        int lp_row = par_id * 16 * thread_m_blocks + r * 8 + (threadIdx.x % 32) / 4;
+        lp_as[r] = lp_row < lp_prob_m ? __ldg(&global_scale_ptr[lp_row * lp_G + lp_grp]) : 0.0f;
+      }
+    }
+#endif
+#ifdef LP_A8E
+    if (k == 0) {
+      const int lp_G = prob_k / (group_blocks * 16);
+      const int lp_grp = (lp_tile * thread_k_blocks) / group_blocks;
+      const uint8_t* lp_e_ptr = reinterpret_cast<const uint8_t*>(global_scale_ptr);
+  #pragma unroll
+      for (int r = 0; r < 2 * thread_m_blocks; r++) {
+        int lp_row = par_id * 16 * thread_m_blocks + r * 8 + (threadIdx.x % 32) / 4;
+        lp_sh[r] = LP_EMAX - (lp_row < lp_prob_m ? (int)__ldg(&lp_e_ptr[lp_row * lp_G + lp_grp]) : 0);
+      }
+    }
+#endif
   #pragma unroll
     for (int j = 0; j < 2; j++) {
       FragB frag_b[2];
@@ -1136,31 +1167,29 @@ __global__ void Marlin(
           if constexpr (a_type == vllm::kS8) {
 #ifdef LP_A8G
             // Lane LP: per-(row, 128-K group) activation scales (MX-style int8). frag_c holds fp32 here:
-            // frag_c += float(int32 group partial) * a_gs[row, grp] * w_scale_fp16[grp, col]
+            // frag_c += float(int32 group partial) * (a_gs[row, grp] * w_scale_fp16[grp, col]).
+            // a_gs was prefetched into lp_as at k == 0 of this tile; int32 -> fp32 via the 2^23 magic add
+            // (exact for |p| < 2^22; a 64-K int8 x int4 partial is <= 127*15*64 = 121,920).
             static_assert(group_blocks == 8, "LP_A8G supports group size 128 only");
-            const int lp_G = prob_k / (group_blocks * 16);
-            const int lp_grp = (lp_tile * thread_k_blocks) / group_blocks;
-            const float* lp_as_ptr = global_scale_ptr;
             float2 lp_ws0 = __half22float2(*reinterpret_cast<half2*>(&frag_s[k2][j * 2][0]));
             float2 lp_ws1 = __half22float2(*reinterpret_cast<half2*>(&frag_s[k2][j * 2 + 1][0]));
   #pragma unroll
             for (int i = 0; i < thread_m_blocks; i++) {
-              float lp_as[2];
-  #pragma unroll
-              for (int h = 0; h < 2; h++) {
-                int lp_row = par_id * 16 * thread_m_blocks + i * 16 + h * 8 + (threadIdx.x % 32) / 4;
-                lp_as[h] = lp_row < prob_m ? __ldg(&lp_as_ptr[lp_row * lp_G + lp_grp]) : 0.0f;
-              }
+              float sc00 = lp_as[i * 2] * lp_ws0.x, sc01 = lp_as[i * 2] * lp_ws0.y;
+              float sc10 = lp_as[i * 2 + 1] * lp_ws0.x, sc11 = lp_as[i * 2 + 1] * lp_ws0.y;
+              float sd00 = lp_as[i * 2] * lp_ws1.x, sd01 = lp_as[i * 2] * lp_ws1.y;
+              float sd10 = lp_as[i * 2 + 1] * lp_ws1.x, sd11 = lp_as[i * 2 + 1] * lp_ws1.y;
+              const float scA[4] = {sc00, sc01, sc10, sc11};
+              const float scB[4] = {sd00, sd01, sd10, sd11};
   #pragma unroll
               for (int g = 0; g < 4; g++) {
-                float ws = reinterpret_cast<float*>(&lp_ws0)[g % 2];
-                frag_c[i][j][0][g] += __int2float_rn(*reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][0][g])) * (lp_as[g / 2] * ws);
+                int p0 = *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][0][g]);
+                int p1 = *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][1][g]);
+                float f0 = __int_as_float(p0 + 0x4B400000) - 12582912.0f;
+                float f1 = __int_as_float(p1 + 0x4B400000) - 12582912.0f;
+                frag_c[i][j][0][g] = __fmaf_rn(f0, scA[g], frag_c[i][j][0][g]);
+                frag_c[i][j][1][g] = __fmaf_rn(f1, scB[g], frag_c[i][j][1][g]);
                 frag_c_tmp[i][j][0][g] = 0.0f;
-              }
-  #pragma unroll
-              for (int g = 0; g < 4; g++) {
-                float ws = reinterpret_cast<float*>(&lp_ws1)[g % 2];
-                frag_c[i][j][1][g] += __int2float_rn(*reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][1][g])) * (lp_as[g / 2] * ws);
                 frag_c_tmp[i][j][1][g] = 0.0f;
               }
             }
@@ -1178,6 +1207,9 @@ __global__ void Marlin(
   #pragma unroll
               for (int g = 0; g < 4; g++) {
                 int scale = reinterpret_cast<int*>(&s_vals[0])[g % 2];
+#ifdef LP_A8E
+                scale <<= lp_sh[i * 2 + g / 2];
+#endif
                 *reinterpret_cast<int32_t*>(&frag_c[i][j][0][g]) +=
                     *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][0][g]) *
                     scale;
@@ -1187,6 +1219,9 @@ __global__ void Marlin(
   #pragma unroll
               for (int g = 0; g < 4; g++) {
                 int scale = reinterpret_cast<int*>(&s_vals[1])[g % 2];
+#ifdef LP_A8E
+                scale <<= lp_sh[i * 2 + g / 2];
+#endif
                 *reinterpret_cast<int32_t*>(&frag_c[i][j][1][g]) +=
                     *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][1][g]) *
                     scale;
@@ -1636,7 +1671,7 @@ __global__ void Marlin(
         }
       }
       slice_iters--;
-#ifdef LP_A8G
+#if defined(LP_A8G) || defined(LP_A8E)
       lp_tile++;
 #endif
       if (slice_iters == 0) {
@@ -1840,7 +1875,7 @@ __global__ void Marlin(
       }
       is_first_matmul_in_slice = true;
       init_slice();
-#ifdef LP_A8G
+#if defined(LP_A8G) || defined(LP_A8E)
       lp_tile = slice_row;
 #endif
 

@@ -371,7 +371,11 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     bool is_a_8bit = a_type.size_bits() == 8;
     A_ptr += prob_m_split * (lda / (is_a_8bit ? 16 : 8));
     a_s_ptr += prob_m_split;
+#ifdef LP_A8E
+    g_s_ptr = reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(g_s_ptr) + (size_t)prob_m_split * (prob_k / group_size));  // [M, K/128] u8 exps
+#else
     g_s_ptr += (size_t)prob_m_split * (prob_k / group_size);  // Lane LP: [M, K/128] act scales
+#endif
     C_ptr += prob_m_split * (prob_n / 8);
     rest_m -= prob_m_split;
   }
@@ -380,23 +384,28 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
 
 }  // namespace marlin_lp
 
-// a: int8 [M,K] (row-major, stride(0)%16==0); a_gs: fp32 [M, K/128]; b_q: Marlin-repacked (is_a_8bit=True) u4;
-// b_s: fp16 [K/128, N] permuted with is_a_8bit=True (REAL fp16 group scales, not the int16 ones of stock W4A8);
-// b_zp: Marlin-permuted u4 zero points (is_a_8bit=True); workspace: int32 >= #SMs.
-torch::Tensor lp_w4a8g_gemm(torch::Tensor a, torch::Tensor a_gs, torch::Tensor b_q, torch::Tensor b_s, torch::Tensor b_zp,
-                            torch::Tensor workspace, int64_t size_n, bool use_fp32_reduce) {
+// a: int8 [M,K] (row-major, stride(0)%16==0); b_q: Marlin-repacked (is_a_8bit=True) u4; b_zp: Marlin-permuted u4 zero points.
+// LP_A8G: a_row = unused (ones), a_grp = fp32 [M, K/128] act scales, b_s = REAL fp16 group scales [K/128, N] (is_a_8bit permuted).
+// LP_A8E: a_row = fp32 [M] per-row scale (amax/127 * 2^-EMAX * w_global), a_grp = uint8 [M, K/128] exponents e in [0, EMAX],
+//         b_s = int16-as-fp16 group scales (stock marlin_act_int8_process_scales levels), kernel uses s_int << (EMAX - e).
+torch::Tensor lp_gemm(torch::Tensor a, torch::Tensor a_row, torch::Tensor a_grp, torch::Tensor b_q, torch::Tensor b_s,
+                      torch::Tensor b_zp, torch::Tensor workspace, int64_t size_n, bool use_fp32_reduce) {
   TORCH_CHECK(a.scalar_type() == torch::kInt8 && a.is_cuda() && a.stride(1) == 1 && a.stride(0) % 16 == 0, "a: int8 cuda row-major, stride(0)%16");
-  TORCH_CHECK(a_gs.scalar_type() == torch::kFloat && a_gs.is_contiguous(), "a_gs fp32 contiguous");
+#ifdef LP_A8E
+  TORCH_CHECK(a_grp.scalar_type() == torch::kUInt8 && a_grp.is_contiguous(), "a_grp uint8 exps contiguous");
+#else
+  TORCH_CHECK(a_grp.scalar_type() == torch::kFloat && a_grp.is_contiguous(), "a_grp fp32 contiguous");
+#endif
+  TORCH_CHECK(a_row.scalar_type() == torch::kFloat && a_row.is_contiguous(), "a_row fp32");
   TORCH_CHECK(b_s.scalar_type() == torch::kHalf && b_s.is_contiguous() && b_zp.is_contiguous() && b_q.is_contiguous(), "b tensors");
   int64_t M = a.size(0), K = a.size(1);
   TORCH_CHECK(K % 128 == 0 && b_s.size(0) == K / 128 && b_s.size(1) == size_n, "b_s must be [K/128, N]");
-  TORCH_CHECK(a_gs.size(0) == M && a_gs.size(1) == K / 128, "a_gs must be [M, K/128]");
+  TORCH_CHECK(a_grp.size(0) == M && a_grp.size(1) == K / 128 && a_row.numel() == M, "a_grp [M, K/128], a_row [M]");
   const at::cuda::OptionalCUDAGuard guard(device_of(a));
   int dev = a.get_device();
   int sms = 0; cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
   auto c = torch::empty({M, size_n}, a.options().dtype(torch::kHalf));
   if (M == 0) return c;
-  auto ones = torch::ones({M}, a.options().dtype(torch::kFloat));
   torch::Tensor c_tmp;
   if (use_fp32_reduce) {
     int max_m_block_size = std::min<int64_t>((M + 15) / 16 * 16, 64);
@@ -405,11 +414,11 @@ torch::Tensor lp_w4a8g_gemm(torch::Tensor a, torch::Tensor a_gs, torch::Tensor b
     c_tmp = torch::empty({0}, a.options().dtype(torch::kFloat));
   }
   auto bias = torch::empty({0}, a.options().dtype(torch::kHalf));
-  marlin_lp::marlin_mm(a.data_ptr(), b_q.data_ptr(), c.data_ptr(), c_tmp.data_ptr(), bias.data_ptr(), ones.data_ptr(),
-                       b_s.data_ptr(), a_gs.data_ptr(), b_zp.data_ptr(), (int)M, (int)size_n, (int)K, (int)a.stride(0),
+  marlin_lp::marlin_mm(a.data_ptr(), b_q.data_ptr(), c.data_ptr(), c_tmp.data_ptr(), bias.data_ptr(), a_row.data_ptr(),
+                       b_s.data_ptr(), a_grp.data_ptr(), b_zp.data_ptr(), (int)M, (int)size_n, (int)K, (int)a.stride(0),
                        workspace.data_ptr(), vllm::kS8, vllm::kU4, vllm::kFloat16, vllm::kFloat16, false, true,
                        (int)(K / 128), 128, dev, at::cuda::getCurrentCUDAStream(dev), -1, -1, sms, false, use_fp32_reduce, false);
   return c;
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("w4a8g_gemm", &lp_w4a8g_gemm, "LP W4A8 int8 Marlin, per-(row,g128) act scales"); }
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("gemm", &lp_gemm, "LP W4A8 int8 Marlin with per-(row,g128) act scales (LP_A8G float / LP_A8E int-exponent)"); }

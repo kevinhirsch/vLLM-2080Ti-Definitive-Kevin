@@ -19,7 +19,7 @@ echo "LP W1 start $(date)  label=$LABEL only='${LP_ONLY:-}'"
 BOOT_TIMEOUT=900 ./boot2.sh ${LABEL}-small "VLLM_GPU_UTIL=0.45" "V02_MAXLEN=65536" || echo "small boot failed; benching anyway if VRAM allows"
 nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv,noheader
 for g in 0 1; do
-  CUDA_VISIBLE_DEVICES=$g PYTHONPATH=/home/kevin/Desktop/wt-lp:/home/kevin/Desktop/wt-integrate/tools/u2 timeout 900 $PY /home/kevin/Desktop/wt-lp/tools/lp/w4a8_bench.py \
+  LP_IN_WINDOW=1 CUDA_VISIBLE_DEVICES=$g PYTHONPATH=/home/kevin/Desktop/wt-lp:/home/kevin/Desktop/wt-integrate/tools/u2 timeout 900 $PY /home/kevin/Desktop/wt-lp/tools/lp/w4a8_bench.py \
      --min-free-mib 3000 --cap-mib 2500 --iters 30 --sustain 25 --json $OUT/w4a8_bench_gpu$g.json > $OUT/w4a8_bench_gpu$g.log 2>&1
   echo "bench gpu$g rc=$? :"; grep -E "PER-CHUNK|SUSTAIN|correctness" $OUT/w4a8_bench_gpu$g.log | cut -c1-200
 done
@@ -28,18 +28,25 @@ done
 # then Phase B runs W4A8G on all linears, else stock per-token W4A8 on all linears.
 G8OK=$(python3 - <<PY
 import json,glob
-ok=True; n=0
+# pick the LP mode for Phase B: e (int-exponent, EMAX ${LP_EMAX:-3}) if its kernel matches emulation and is faster than stock-W4A16 on the chunk;
+# else g (float scales) if correct; else 0 (stock per-token W4A8)
+okg=oke=True; n=0; tot={}
 for f in glob.glob("$OUT/w4a8_bench_gpu*.json"):
-    for r in json.load(open(f))["rows"]:
+    d=json.load(open(f))
+    for r in d["rows"]:
         for k,v in r.items():
-            if k.startswith("corr_rel_w4a8g_vs_emul"): n+=1; ok = ok and v <= 5e-3
-print(1 if ok and n else 0)
+            if k.startswith("corr_rel_w4a8g_vs_emul"): n+=1; okg = okg and v <= 5e-3
+            if k.startswith("corr_rel_w4a8e2_vs_emul"): oke = oke and v <= 5e-3
+    for k,v in d["chunk_ms"].items(): tot[k]=tot.get(k,0)+v
+fe = tot.get("w4a8e2", 9e9) < tot.get("w4a16", 0); fg = tot.get("w4a8g", 9e9) < tot.get("w4a16", 0)
+print("e" if n and oke and fe else ("g" if n and okg and fg else "0"))
 PY
 )
-echo "LP_A8G kernel gate: $G8OK"
+echo "LP mode chosen for Phase B (e/g/0=stock): $G8OK"
 mapfile -t LIVE < <(grep -E '^export ' $OUT/override.before | sed 's/^export //')
 EXTRA=("V02_ROOT=/home/kevin/Desktop/wt-lp" "VLLM_MARLIN_INPUT_DTYPE=int8")
-[ "$G8OK" = "1" ] && { EXTRA+=("VLLM_LP_W4A8G=1"); LABEL=${LABEL}g; }
+if [ "$G8OK" != "0" ]; then EXTRA+=("VLLM_LP_W4A8G=1" "VLLM_LP_W4A8G_MODE=$G8OK" "VLLM_LP_A8E_EMAX=${LP_EMAX:-3}"); LABEL=${LABEL}$G8OK
+else EXTRA+=("VLLM_LP_INT8_ONLY='gate_up_proj|linear_attn|self_attn'"); LABEL=${LABEL}nd; fi   # per-token int8 is unfit for down_proj
 [ -n "${LP_ONLY:-}" ] && EXTRA+=("VLLM_LP_INT8_ONLY='${LP_ONLY}'")
 BOOT_TIMEOUT=900 ./boot2.sh $LABEL "${LIVE[@]}" "${EXTRA[@]}" || { echo "BOOT FAILED"; ./boot2.sh restore-$LABEL "${LIVE[@]}" >/dev/null 2>&1; cp $OUT/override.before $OV; exit 1; }
 echo "booted $(date): $(journalctl -u vllm-qwen27b --since '-15 min' --no-pager | grep -E 'GPU KV cache size|Model loading took|MarlinLinearKernel|int8' | sed 's/.*INFO//' | cut -c1-110 | sort -u | tr '\n' '|')"

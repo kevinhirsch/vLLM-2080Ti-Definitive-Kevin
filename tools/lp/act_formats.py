@@ -17,7 +17,7 @@ import torch
 sys.path.insert(0, "/home/kevin/Desktop/wt-integrate/tools/u2")
 import ref_dump as R
 ap = argparse.ArgumentParser(); ap.add_argument("--layers", type=int, default=8); ap.add_argument("--windows", type=int, default=3)
-ap.add_argument("--rows", type=int, default=256); ap.add_argument("--out", default="/home/kevin/projects/lanes/lp/act_formats.json")
+ap.add_argument("--rows", type=int, default=256); ap.add_argument("--fmts", default=""); ap.add_argument("--out", default="/home/kevin/projects/lanes/lp/act_formats.json")
 a = ap.parse_args()
 ref = torch.load("/home/kevin/projects/lanes/u2-quant/ref.pt"); ids = ref["ids"][: a.windows]
 B, T = ids.shape
@@ -52,8 +52,23 @@ def q_int8_g(x, g=128):
     return (torch.clamp(torch.round(xg / sc), -127, 127) * sc).view_as(x)
 
 
-FMTS = {"int8_tok": q_int8_tok, "int8_g128": q_int8_g, "int8_g32": lambda x: q_int8_g(x, 32), "e4m3_tok": lambda x: q_fp8_tok(x, E4), "e5m2_tok": lambda x: q_fp8_tok(x, E5),
+def q_int8_rel(x, emax, g=128):
+    """int-only LP_A8G variant: per-token int8 scale a_tok/2^e[row,g] with e in [0, emax] chosen per 128-group
+    (group absmax <= amax/2^e). Kernel cost = stock IMAD with s' = s_int << (emax - e)."""
+    M, K = x.shape; xg = x.view(M, K // g, g)
+    amax = x.abs().amax(-1, keepdim=True).clamp(min=1e-12)          # [M,1]
+    gmax = xg.abs().amax(-1).clamp(min=1e-12)                        # [M,G]
+    e = torch.clamp(torch.floor(torch.log2(amax / gmax)), 0, emax)   # [M,G]
+    sc = (amax / 127) / torch.pow(2.0, e)                            # [M,G]
+    return (torch.clamp(torch.round(xg / sc.unsqueeze(-1)), -127, 127) * sc.unsqueeze(-1)).view_as(x)
+
+
+FMTS = {"int8_tok": q_int8_tok, "int8_g128": q_int8_g, "int8_g32": lambda x: q_int8_g(x, 32),
+        "int8_g256": lambda x: q_int8_g(x, 256) if x.shape[-1] % 256 == 0 else q_int8_g(x, 128), "int8_g512": lambda x: q_int8_g(x, 512) if x.shape[-1] % 512 == 0 else q_int8_g(x, 128),
+        "rel_e1": lambda x: q_int8_rel(x, 1), "rel_e2": lambda x: q_int8_rel(x, 2), "rel_e3": lambda x: q_int8_rel(x, 3), "rel_e5": lambda x: q_int8_rel(x, 5), "e4m3_tok": lambda x: q_fp8_tok(x, E4), "e5m2_tok": lambda x: q_fp8_tok(x, E5),
         "mx_int8_b32": lambda x: q_mx(x, "int8"), "mx_e4m3_b32": lambda x: q_mx(x, "e4m3")}
+if a.fmts:
+    FMTS = {k: v for k, v in FMTS.items() if k in a.fmts.split(",")}
 QW = {}
 stats = {}
 _lin = torch.nn.functional.linear
