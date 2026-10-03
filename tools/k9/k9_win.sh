@@ -38,7 +38,7 @@ boot() {  # boot LABEL EXTRA_LINES...   (override = saved override + extra expor
   done
   for p in $(pgrep -f "[w]armup-after-start.sh"); do kill $p; done
   echo "MainPID $pid0 -> $(systemctl show -p MainPID --value vllm-qwen27b)"
-  [ -n "${K9_RELEASE_ID:-}" ] && [ "$lab" = k9 ] && { python3 ${K9_RELEASE_PY:-/home/kevin/projects/lanes/unstick/release.py} verify "$K9_RELEASE_ID" --running 2>&1 | tail -2 || { echo "RELEASE VERIFY FAILED"; ABORT=1; return 1; }; }
+  [ -n "${K9_RELEASE_ID:-}" ] && [ -n "${K9_RELEASE_PY:-}" ] && [ "$lab" = k9 ] && { python3 $K9_RELEASE_PY verify "$K9_RELEASE_ID" --running 2>&1 | tail -2 || { echo "RELEASE VERIFY FAILED"; ABORT=1; return 1; }; }
   echo "booted $lab $(date +%T): $(journalctl -u vllm-qwen27b --since '-15 min' --no-pager | grep -E 'GPU KV cache size|Model loading took|GDN prefill|k9' | sed 's/.*INFO//' | cut -c1-110 | sort -u | tr '\n' '|')"
 }
 measure() {  # measure LABEL
