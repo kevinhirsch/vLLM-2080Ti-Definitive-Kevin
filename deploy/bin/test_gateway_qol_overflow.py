@@ -137,3 +137,19 @@ class QolRouting(RoutingBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ShadowScoring(unittest.TestCase):
+    def test_shadow_report_scores_the_live_predictor(self):
+        import qol_replay as Q
+        base = dict(bg=False, duration=10, stream=True, status=200, qol_mode="shadow")
+        rows = [dict(base, t=100.0, route="local", ttft=4.0, waited=1.0, qol_pred_local_s=6.0, qol_waited_s=0.0,
+                     qol_at="admission", qol_would="local"),                        # predicted 6 vs actual 5
+                dict(base, t=101.0, route="local", ttft=20.0, waited=0.0, qol_pred_local_s=12.0, qol_waited_s=0.0,
+                     qol_at="admission", qol_would="local"),                        # predicted 12 vs actual 20
+                dict(base, t=102.0, route="remote", ttft=2.0, waited=0.0, qol_pred_remote_s=3.0, qol_would="remote"),
+                dict(base, t=103.0, route="local", ttft=1.0, waited=0.0, qol_mode=None)]   # not shadow: ignored
+        r = Q.shadow_report(rows, 0)
+        self.assertEqual((r["rows"], r["local_scored"], r["remote_scored"]), (3, 2, 1))
+        self.assertEqual(r["local_p90_abs_err_s"], 8.0)
+        self.assertEqual(r["actual_vs_would"], {"local->local": 2, "remote->remote": 1})
