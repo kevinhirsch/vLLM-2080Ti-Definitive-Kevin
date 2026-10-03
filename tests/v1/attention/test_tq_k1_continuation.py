@@ -37,7 +37,10 @@ def _impl_and_layer(tqa, D, Hq, Hk, device):
     return impl, layer, cfg
 
 
-@pytest.mark.parametrize("cached_len, q_len, seg_tokens", [(5000, 700, 1024), (4096, 512, 2048), (3000, 1500, 0)])
+@pytest.mark.parametrize(
+    "cached_len, q_len, seg_tokens",
+    [(5000, 700, 1024), (4096, 512, 2048), (3000, 1500, 0), (20000, 512, 8192)],  # last: split-KV pieces too
+)
 def test_k1_continuation_matches_stock_path(monkeypatch, cached_len, q_len, seg_tokens):
     import vllm.v1.attention.backends.turboquant_attn as tqa
     from vllm.v1.attention.ops import fa75_prefill as k1
@@ -71,6 +74,7 @@ def test_k1_continuation_matches_stock_path(monkeypatch, cached_len, q_len, seg_
 
     monkeypatch.setattr(k1, "_ENABLED", True)
     monkeypatch.setattr(k1, "_SEGMENT_TOKENS", seg_tokens)
+    monkeypatch.setattr(k1, "_MIN_SPLIT_KEYS", 2048)  # let the 8K pieces split (wave-balancing path)
     out = impl._continuation_prefill(*args).float()
     err = ((out - ref).norm() / ref.norm()).item()
     assert torch.isfinite(out).all()
