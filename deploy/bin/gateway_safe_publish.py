@@ -207,15 +207,13 @@ def _install_dashboard(source_bytes: bytes | None = None) -> dict:
     """Ship gateway_dashboard.html next to the live shim. Atomic; returns what changed so a failed publish can undo it."""
     new = DASH_SOURCE.read_bytes() if source_bytes is None else source_bytes
     old = DASH_RUNTIME.read_bytes() if DASH_RUNTIME.is_file() else None
-    state = _install_config_schema()
     if old == new:
-        return {"dashboard": "current", "previous": old, "changed": False, **state}
+        return {"dashboard": "current", "previous": old, "changed": False}
     _atomic_write(DASH_RUNTIME, new, 0o644)
-    return {"dashboard": "installed", "previous": old, "changed": True, **state}
+    return {"dashboard": "installed", "previous": old, "changed": True}
 
 
 def _restore_dashboard(state: dict) -> None:
-    _restore_config_schema(state)
     if not state.get("changed"):
         return
     if state.get("previous") is None:
@@ -228,6 +226,18 @@ def _restore_dashboard(state: dict) -> None:
 # its own directory at startup and runs unvalidated without it). Paths derive from SOURCE/RUNTIME at call time so a
 # test that redirects those never touches the production directory.
 CONFIG_SCHEMA_NAME = "gateway_config_schema.py"
+
+
+def _install_gateway_files(dash: bytes) -> dict:
+    """Every file that ships beside the shim (dashboard + config schema), for _publish only. Lane CFG 2026-10-03: the
+    schema install used to ride inside _install_dashboard(), so a test that redirected only DASH_RUNTIME wrote the
+    LIVE gateway_config_schema.py. _install_dashboard() is dashboard-only again; only the publish path ships both."""
+    return {**_install_dashboard(dash), **_install_config_schema()}
+
+
+def _restore_gateway_files(state: dict) -> None:
+    _restore_config_schema(state)
+    _restore_dashboard(state)
 
 
 def _install_config_schema() -> dict:
@@ -534,7 +544,7 @@ def _publish(timeout_s: float, halo_wait_s: float) -> dict:
     previous = RUNTIME.read_bytes()
     if previous == source:
         # Same gateway code: the page alone may still be new. It is read per request, so no drain or restart is needed.
-        state = _install_dashboard(dash)
+        state = _install_gateway_files(dash)
         return {"status": "current", "sha256": _sha(source), "dashboard": state["dashboard"], "dashboard_sha256": _sha(dash),
                 "config_schema": state.get("config_schema")}
     token = os.environ.get("SHIM_ADMIN_TOKEN") or TOKEN_FILE.read_text().strip()
@@ -581,7 +591,7 @@ def _publish(timeout_s: float, halo_wait_s: float) -> dict:
             active = _halo_active_runs()
             if active:
                 raise RuntimeError(f"Halo became active during gateway drain: {active[:6]}")
-            dash_state = _install_dashboard(dash)      # before the restart: the new shim finds its page at once
+            dash_state = _install_gateway_files(dash)  # before the restart: the new shim finds its page at once
             _atomic_write(RUNTIME, source)
             installed = True
             _run("sudo", "-n", "systemctl", "restart", SERVICE)
@@ -607,7 +617,7 @@ def _publish(timeout_s: float, halo_wait_s: float) -> dict:
                    note="new gateway file installed and restarted but NOT verified; roll back from the backup if it is unhealthy")
         else:
             with _shielded():
-                _restore_dashboard(dash_state)
+                _restore_gateway_files(dash_state)
             _audit("terminated-before-install", signal=term.signum)
         raise
     except Exception as publish_error:
@@ -626,10 +636,10 @@ def _publish(timeout_s: float, halo_wait_s: float) -> dict:
                     raise RuntimeError(
                         f"gateway rollback refused while Halo runs are active: {active[:6]}") from publish_error
                 _atomic_write(RUNTIME, previous)
-                _restore_dashboard(dash_state)
+                _restore_gateway_files(dash_state)
                 _run("sudo", "-n", "systemctl", "restart", SERVICE)
         else:
-            _restore_dashboard(dash_state)
+            _restore_gateway_files(dash_state)
         raise
     finally:
         with _shielded():
