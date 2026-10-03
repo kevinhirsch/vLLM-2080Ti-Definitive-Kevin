@@ -119,9 +119,11 @@ def main():
     print("varlen:", json.dumps(vl), flush=True)
     del qs, ks, vs, o, lse, qkv, q, k, v, obuf, lse_ht, ref_o, ref_lse
     torch.cuda.empty_cache()
-    # segmented context (exact LSE merge in the kernel epilogue): pieces [0,a) [a,b) non-causal, [b, Tkv) causal last
+    # segmented context (exact LSE merge in the kernel epilogue): pieces [0,a) [a,b) non-causal, [b, Tkv) causal last.
+    # Valid only when every query row sees all keys of the non-causal pieces: b <= Tkv - Tq (true in the engine:
+    # those pieces are cached rows, the chunk comes last)
     seg = []
-    for Tq, Tkv, cuts, qm in ((1000, 9000, (3000, 6000), 4.0), (3632, 7300, (1856, 3712), 1.0), (64, 20000, (7136, 14272), 8.0)):
+    for Tq, Tkv, cuts, qm in ((1000, 9000, (3000, 6000), 4.0), (3632, 7300, (1856, 3584), 1.0), (64, 20000, (7136, 14272), 8.0)):
         g = torch.Generator(device=dev).manual_seed(Tkv)
         q = torch.randn(Tq, 6, 256, device=dev, generator=g, dtype=torch.half).mul_(qm)
         k = torch.randn(Tkv, 1, 256, device=dev, generator=g, dtype=torch.half)
@@ -136,12 +138,22 @@ def main():
         K1.fa75_prefill(q, k[a:b], v[a:b], scale=scale, causal=False, out=out, acc_o=acc_o, acc_lse=acc_l, acc_mode=2)
         K1.fa75_prefill(q, k[b:], v[b:], scale=scale, causal=True, out=out, lse=lse_o, acc_o=acc_o, acc_lse=acc_l,
                         acc_mode=3)
-        one = K1.fa75_prefill(q, k, v, scale=scale, causal=True)
+        one = K1.fa75_prefill(q, k, v, scale=scale, causal=True, nsplit=1)
+        # the same pieces with split-KV parts + combine kernel on every piece
+        out2 = torch.empty_like(q)
+        lse2 = torch.empty(Tq, 6, device=dev)
+        K1.fa75_prefill(q, k[:a], v[:a], scale=scale, causal=False, out=out2, acc_o=acc_o, acc_lse=acc_l, acc_mode=1, nsplit=3)
+        K1.fa75_prefill(q, k[a:b], v[a:b], scale=scale, causal=False, out=out2, acc_o=acc_o, acc_lse=acc_l, acc_mode=2, nsplit=2)
+        K1.fa75_prefill(q, k[b:], v[b:], scale=scale, causal=True, out=out2, lse=lse2, acc_o=acc_o, acc_lse=acc_l,
+                        acc_mode=3, nsplit=4)
+        sp = [rel(K1.fa75_prefill(q, k, v, scale=scale, causal=True, nsplit=S), ref_o)[0] for S in (2, 3, 4)]
         r = dict(Tq=Tq, Tkv=Tkv, cuts=cuts, seg_vs_ref=rel(out, ref_o), seg_vs_single=rel(out, one),
-                 lse_err=(lse_o - ref_lse).abs().max().item(), finite=bool(torch.isfinite(out).all()))
+                 lse_err=max((lse_o - ref_lse).abs().max().item(), (lse2 - ref_lse).abs().max().item()),
+                 seg_split_vs_ref=rel(out2, ref_o)[0], split_vs_ref=sp,
+                 finite=bool(torch.isfinite(out).all() and torch.isfinite(out2).all()))
         seg.append(r)
         print("segmented:", json.dumps(r), flush=True)
-        del q, k, v, ref_o, ref_lse, acc_o, acc_l, out, lse_o, one
+        del q, k, v, ref_o, ref_lse, acc_o, acc_l, out, lse_o, one, out2, lse2
         torch.cuda.empty_cache()
 
     # long context error growth (K9 saw fp32-P.V + TAU 8 drift to 9e-4 at 131K): real per-rank GQA-6, 128 rows
@@ -164,7 +176,8 @@ def main():
 
     print("WORST normwise rel err (vs_ref, vs_fi, lse_abs) per variant bn16:", json.dumps(worst))
     ok = all(w[0] < 1e-3 and w[1] < 1e-3 and w[2] < 1e-3 for vv, w in worst.items())
-    ok = ok and all(x["seg_vs_ref"][0] < 1e-3 and x["lse_err"] < 1e-3 and x["finite"] for x in seg)
+    ok = ok and all(x["seg_vs_ref"][0] < 1e-3 and x["lse_err"] < 1e-3 and x["finite"] and x["seg_split_vs_ref"] < 1e-3
+                    and max(x["split_vs_ref"]) < 1e-3 for x in seg)
     ok = ok and all(x[f"v{vv}"][0] < 1e-3 for x in longc for vv in (3, 7))
     ok = ok and strided["vs_ref"][0] < 1e-3 and strided["untouched"] and all(x["vs_ref"][0] < 1e-3 for x in vl)
     print("GATE (all variants, strided, varlen, segmented):", "PASS" if ok else "FAIL")
