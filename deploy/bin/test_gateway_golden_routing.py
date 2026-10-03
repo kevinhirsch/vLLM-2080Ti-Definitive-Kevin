@@ -345,6 +345,18 @@ SCENARIOS = {
     "prompt_exceeds_all_providers": dict(req=dict(fields=dict(messages=_msgs(HUGE)))),
     "garbage_body": dict(req=dict(raw=b"not json at all")),
     "json_array_body": dict(req=dict(raw=b"[1,2,3]")),
+    # --- malformed-but-JSON-object bodies: each must get the gateway's own answer, never a bare 500 ------------------
+    "json_string_body": dict(req=dict(raw=b'"hello"')),
+    "messages_is_string": dict(req=dict(fields=dict(messages="hello"))),
+    "messages_items_not_objects": dict(req=dict(fields=dict(messages=["hi", 3]))),
+    "message_content_is_object": dict(req=dict(fields=dict(messages=[{"role": "user", "content": {"text": "hi"}}]))),
+    "message_content_list_of_strings": dict(req=dict(fields=dict(messages=[{"role": "user", "content": ["hi"]}]))),
+    "tools_not_a_list": dict(req=dict(fields=dict(tools="nope"))),
+    "max_tokens_not_a_number": dict(req=dict(fields=dict(max_tokens="lots"))),
+    "max_tokens_negative": dict(req=dict(fields=dict(max_tokens=-5))),
+    "model_not_a_string": dict(req=dict(fields=dict(model={"x": 1}))),
+    "stream_is_string_true": dict(req=dict(fields=dict(stream="yes"))),
+    "empty_body": dict(req=dict(raw=b"")),
     # --- probe synth ----------------------------------------------------------------------------------
     "probe_fresh_engine_synth": dict(req=dict(fields=dict(model="estate-local", messages=PROBE, max_tokens=8)),
                                      setup=dict(a=_fresh_engine)),
@@ -552,7 +564,7 @@ class GoldenRouting(unittest.TestCase):
 
     # Pinned bugs: today these paths give the caller no HTTP response of the gateway's own (an unhandled exception
     # becomes aiohttp's bare 500 and the request never reaches telemetry). Each fix removes its name from this set.
-    KNOWN_NO_RESPONSE = {"json_array_body"}
+    KNOWN_NO_RESPONSE = {"json_array_body", "json_string_body", "messages_is_string", "messages_items_not_objects"}
 
     def test_every_request_gets_a_response(self):
         """A "spins" scenario is a deliberate unbounded wait (no remote to overflow to, interactive never overflows on
