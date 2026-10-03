@@ -1,0 +1,81 @@
+# EF2 (L134/L135) fault-roots A/B + L134 rider, one window (main 2026-10-03: GPU-validate before merging into integrate).
+#   1. engine STOPPED: tools/ef2/l134_rider.sh 1 (queue row 7; race proof + memcheck of FI 0.6.8 vs 0.6.18, ~15 min, GPU1)
+#   2. BASE arm  = the override found at window start on the production root (current default)
+#   3. EF2 arm   = immutable RELEASE of ef2/fault-roots cb393fe4fe (integrate 7004df6ae8 + a9e7fdf6cb TQ plan() private
+#                  indptr copies + cb393fe4fe sampler sentinel guard) with VLLM_SAMPLER_SENTINEL_GUARD=1
+#   each arm: quick.py, 120K-token needle (continuation-chunk path incl. prefix-combine), evalkit long_ctx, engine errors
+#   4. restore (framework): override verbatim, restart, health, KV pool, timers, .so, lease.
+# PASS (informational; the window succeeds either way): ef2 quick within 3% of base, needle ok both arms, evalkit long_ctx
+#   ef2 >= base, 0 Traceback/CUDA error/illegal memory in the ef2 arm, 0 SAMPLER-SENTINEL lines (any line = L135 evidence).
+#   validate:  python3 /home/kevin/Desktop/vLLM-2080Ti-Definitive/deploy/bin/windowctl.py validate /home/kevin/Desktop/wt-ef2/tools/ef2/ef2-fault-roots-ab.yaml
+#   run (WQ):  python3 /home/kevin/Desktop/vLLM-2080Ti-Definitive/deploy/bin/windowctl.py submit /home/kevin/Desktop/wt-ef2/tools/ef2/ef2-fault-roots-ab.yaml --wait
+lane: ef2
+window: ef2-fault-roots-ab
+reason: "EF2 L134/L135: TQ plan-indptr race fix + sampler sentinel guard A/B, L134 memcheck rider"
+by: EF2
+results: /home/kevin/projects/lanes/ef2/win
+max_s: 4200            # rider ~15 min, 2 boots ~5 min each, quick+needle+evalkit long_ctx ~12 min per arm, restore ~5 min
+ttl_s: 1800
+wait_s: 90
+spend_pause_usd: 20
+gpu_gate_wait_s: 300
+conflicts: [trial_guard.sh]
+pause_timers: [vllm-qwen27b-watchdog.timer]
+on_new_xid: continue   # the rider's memcheck runs the race-poisoned wrapper ON PURPOSE (sanitizer catches it before the MMU)
+vars:
+  E: /home/kevin/Desktop/wt-ef2
+  I: /home/kevin/Desktop/wt-integrate
+  EVALKIT: /home/kevin/Desktop/qwen38-evalkit
+steps:
+  - name: clean
+    timeout_s: 30
+    run: "mkdir -p {{RESULTS}} && rm -f {{RESULTS}}/*_base.* {{RESULTS}}/*_ef2.* {{RESULTS}}/t_*.txt"
+
+  # 1. L134 rider with the engine stopped
+  - name: stop-engine
+    engine: stop
+  - name: l134-rider
+    timeout_s: 1500
+    on_fail: continue
+    run: "bash {{E}}/tools/ef2/l134_rider.sh 1 2>&1 | tail -15"
+
+  # 2. BASE arm
+  - name: base-boot
+    boot:
+      default: true
+      label: base
+      timeout_s: 1200
+  - name: base-measure
+    timeout_s: 2400
+    on_fail: continue
+    run: |
+      set -u; date '+%Y-%m-%d %H:%M:%S' > {{RESULTS}}/t_base.txt
+      python3 {{I}}/tools/s2-bench/quick.py 2>&1 | tail -1 | tee {{RESULTS}}/quick_base.json
+      python3 {{I}}/tools/up-bench/needle_long.py --tokens 120000 --depth 0.5 2>&1 | tail -3 | tee {{RESULTS}}/needle_base.txt
+      cd {{EVALKIT}} && timeout 1200 python3 run_eval.py --tag ef2-base --categories long_ctx > {{RESULTS}}/evalkit_base.out 2>&1; tail -3 {{RESULTS}}/evalkit_base.out
+      journalctl -u vllm-qwen27b --since "$(cat {{RESULTS}}/t_base.txt)" --no-pager | grep -cE 'Traceback|CUDA error|illegal memory' > {{RESULTS}}/errors_base.txt || true
+
+  # 3. EF2 arm
+  - name: ef2-boot
+    boot:
+      release: {sha: cb393fe4fe, label: ef2, from: /home/kevin/Desktop/wt-integrate}
+      label: ef2
+      env: {VLLM_SAMPLER_SENTINEL_GUARD: "1"}
+      timeout_s: 1200
+  - name: ef2-verify-running
+    timeout_s: 120
+    on_fail: continue
+    run: "python3 /home/kevin/Desktop/vLLM-2080Ti-Definitive/deploy/bin/release.py verify \"$(basename {{RELEASE_ef2_boot}})\" --running | tee {{RESULTS}}/verify_running.json | tail -3"
+  - name: ef2-measure
+    timeout_s: 2400
+    on_fail: continue
+    run: |
+      set -u; date '+%Y-%m-%d %H:%M:%S' > {{RESULTS}}/t_ef2.txt
+      python3 {{I}}/tools/s2-bench/quick.py 2>&1 | tail -1 | tee {{RESULTS}}/quick_ef2.json
+      python3 {{I}}/tools/up-bench/needle_long.py --tokens 120000 --depth 0.5 2>&1 | tail -3 | tee {{RESULTS}}/needle_ef2.txt
+      cd {{EVALKIT}} && timeout 1200 python3 run_eval.py --tag ef2-fix --categories long_ctx > {{RESULTS}}/evalkit_ef2.out 2>&1; tail -3 {{RESULTS}}/evalkit_ef2.out
+      J=$(journalctl -u vllm-qwen27b --since "$(cat {{RESULTS}}/t_ef2.txt)" --no-pager)
+      printf '%s\n' "$J" | grep -cE 'Traceback|CUDA error|illegal memory' > {{RESULTS}}/errors_ef2.txt || true
+      printf '%s\n' "$J" | grep -c 'SAMPLER-SENTINEL' > {{RESULTS}}/sentinel_ef2.txt || true
+      echo "ef2 errors=$(cat {{RESULTS}}/errors_ef2.txt) sentinel_lines=$(cat {{RESULTS}}/sentinel_ef2.txt) base errors=$(cat {{RESULTS}}/errors_base.txt)"
+# 4. restore: the framework, always.
