@@ -122,6 +122,27 @@ def _fmt_seq(value, sep):
     return sep.join(str(x) for x in items)
 
 
+# Lane CFG (2026-10-03): typed config schema (gateway_config_schema.py, shipped beside this file). It validates every
+# SHIM_* value BEFORE the import-time reads below: a number the reader would crash on is dropped (code default applies,
+# loud warning), booleans are canonicalised to 1/0 (a dashboard-persisted "False" used to come back as ON after a
+# restart), and shim.env duplicates / unknown keys are logged. Fail safe: if the module is missing or raises, the
+# gateway runs exactly as before. Effective values: GET /gateway/config/effective.
+def _load_cfg_schema():
+    try:
+        import importlib.util as _ilu
+        _p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gateway_config_schema.py")
+        _spec = _ilu.spec_from_file_location("gateway_config_schema", _p)
+        _mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        _mod.sanitize_environ(os.environ, env_file=os.environ.get(
+            "SHIM_ENV_FILE", "/home/kevin/.local/share/vllm-qwen27b/shim.env"))
+        return _mod
+    except Exception as _e:
+        print("gateway-shim: config schema unavailable (%r); running unvalidated" % (_e,), file=sys.stderr)
+        return None
+
+
+_cfgschema = _load_cfg_schema()
 PORT         = int(os.environ.get("SHIM_PORT", "8000"))
 LOCAL        = os.environ.get("SHIM_UPSTREAM", "http://127.0.0.1:8001").rstrip("/")
 # where live config edits (via the dashboard) are persisted so they survive a restart
@@ -6065,7 +6086,10 @@ def _config_owner():
     tunable = [(k, v) for k, v in rows if k in _CFG]
     if not tunable:
         return True
-    agree = sum(1 for k, v in tunable if str(os.environ.get(k, "\0")) == v)
+    # Compare against what systemd LOADED (the schema canonicalises booleans in os.environ at startup).
+    _raw = _cfgschema.raw_value if _cfgschema else (lambda k: os.environ.get(k))
+    _same = _cfgschema.same_value if _cfgschema else (lambda k, a, b: a == b)
+    agree = sum(1 for k, v in tunable if _raw(k) is not None and _same(k, str(_raw(k)), v))
     ok = agree >= max(1, int(0.6 * len(tunable)))
     if not ok:
         log.error("_persist_config REFUSED: this process matches only %d/%d tunables in %s, so it did "
@@ -6083,7 +6107,9 @@ def _persist_config():
     # are read back with a comma split, so every save handed the reader one unsplittable
     # token and the policy silently stopped matching anything.
     vals = {env: (_fmt_seq(g[gname], _CFG_SEP.get(env, _CFG_SEP_DEFAULT))
-                  if isinstance(g[gname], (list, tuple, set, frozenset)) else ("auto" if g[gname] is None else str(g[gname])))
+                  if isinstance(g[gname], (list, tuple, set, frozenset)) else ("auto" if g[gname] is None else
+                  # lane CFG: booleans as 1/0 -- str(False) == "False" was read back as ON by the import-time readers
+                  ("1" if g[gname] else "0") if isinstance(g[gname], bool) else str(g[gname])))
             for env, (gname, _) in _CFG.items()}
     vals["SHIM_FORCE_REMOTE_UNTIL_EPOCH"] = str(FORCE_REMOTE_UNTIL_EPOCH)
     try:
@@ -9740,6 +9766,21 @@ async def gateway_config(request):
     return web.json_response({"changed": changed, "config": current_config(masked=True)})
 
 
+async def gateway_config_effective(request):
+    """Lane CFG: every SHIM_* key with its live value, source (env/default/invalid->default/live-edit), default,
+    differs-from-default, and what shim.env holds now (what a restart would load). Secrets masked. Read-only.
+    ?changed=1 -> only keys that are set, differ, or would change on restart; ?key=SUBSTR filters."""
+    if _cfgschema is None:
+        return web.json_response({"error": "config schema module not installed beside the gateway"}, status=503)
+    try:
+        out = _cfgschema.effective(globals(), os.environ, SHIM_ENV_FILE,
+                                   only_changed=request.query.get("changed") in ("1", "true"),
+                                   key_filter=request.query.get("key") or None)
+    except Exception as e:
+        return web.json_response({"error": "effective config failed: %r" % (e,)}, status=500)
+    return web.json_response(out)
+
+
 async def gateway_aliases(request):
     """Manage named OpenAI-compatible remote endpoints.
 
@@ -11188,7 +11229,7 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
     <input id=f_local_budget type=number min=1 max=8></label>
    <label><span class=k>How long should a request wait for a free lane?</span><span class=hint>seconds &middot; used for background during peak hours, and for interactive only if "never overflow" below is off</span>
     <input id=f_local_wait_secs type=number min=0 step=1></label>
-   <label><span class=k>Should interactive traffic ever overflow while waiting?</span><span class=hint>0 = never, it queues until a lane is free (default) &middot; 1 = restores the wait-above-then-overflow behaviour</span>
+   <label><span class=k>Should interactive traffic ever overflow while waiting?</span><span class=hint>1 = never, it queues until a lane is free (default) &middot; 0 = restores the wait-above-then-overflow behaviour</span>
     <input id=f_interactive_never_overflow type=number min=0 max=1></label>
    <label><span class=k>Prompt and output tokens all lanes may reserve</span><span class=hint>estimated tokens &middot; admission memory limit</span>
     <input id=f_token_budget type=number min=0 step=50000></label>
@@ -11950,6 +11991,7 @@ def make_app():
     app.router.add_get("/gateway/models/local", gateway_models_local)
     app.router.add_post("/gateway/models/local", gateway_models_local)
     app.router.add_get("/gateway/config", gateway_config)
+    app.router.add_get("/gateway/config/effective", gateway_config_effective)   # lane CFG: typed effective config
     app.router.add_get("/gateway/spend", gateway_spend)                        # R2 spend authority
     app.router.add_post("/gateway/spend/reserve", gateway_spend_reserve)
     app.router.add_post("/gateway/spend/finalize", gateway_spend_finalize)
