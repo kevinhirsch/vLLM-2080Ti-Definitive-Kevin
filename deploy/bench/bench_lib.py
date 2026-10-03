@@ -6,15 +6,42 @@ gateway so SHIM_LOCAL_BUDGET / guards don't shape the measurements. stdlib +
 requests only (same dependency bar as tools/tool_call_smoke.py).
 """
 import json
+import os
 import re
 import subprocess
+import sys
 import time
+import urllib.request
 from typing import Any
 
 import requests
 
 DEFAULT_BASE = "http://127.0.0.1:8001/v1"
 DEFAULT_MODEL = "qwen-local"
+
+_WINDOW_WARNED = False
+
+
+def warn_if_no_bench_window(base_url: str, gateway: str | None = None) -> bool:
+    """FX2 (2026-10-03): a bench aimed at the ENGINE (:8001) bypasses the gateway's routing, spend ledger and drain, and a
+    planned engine restart used to cut it mid-run (23:18 incident). Warn ONCE on stderr when no gateway offline window is
+    open, with the wrapper to use: `deploy/bin/gateway-offline.py run --reason R --by WHO -- CMD`. Never blocks, never raises;
+    silence with BENCH_DIRECT_OK=1. Returns True when a warning was printed."""
+    global _WINDOW_WARNED
+    if _WINDOW_WARNED or os.environ.get("BENCH_DIRECT_OK") or ":8001" not in base_url:
+        return False
+    _WINDOW_WARNED = True
+    try:
+        gw = gateway or os.environ.get("GATEWAY", "http://127.0.0.1:8000")
+        if json.loads(urllib.request.urlopen(f"{gw}/gateway/offline", timeout=3).read()).get("offline"):
+            return False
+    except Exception:  # noqa: BLE001 -- gateway unreachable: nothing to protect or to warn about
+        return False
+    print("[bench_lib] WARNING: benching the engine directly (:8001) with NO gateway offline window open: estate traffic is "
+          "sharing the engine and a planned restart will not wait for you except via the engine drain. Run under "
+          "`deploy/bin/gateway-offline.py run --reason R --by WHO -- <this command>` (BENCH_DIRECT_OK=1 silences this).",
+          file=sys.stderr)
+    return True
 
 # Degenerate-output signatures, borrowed from tools/tool_call_smoke.py and the
 # 2026-08-14 garble incident logs (mixed-script noise, tag loops).
@@ -34,6 +61,7 @@ def chat(base_url: str, model: str, messages: list[dict[str, Any]], *,
     Streaming so TTFT and decode rate are measured separately -- long-context
     prefill on this box (~850-1600 tok/s) must not pollute the decode number.
     """
+    warn_if_no_bench_window(base_url)
     payload: dict[str, Any] = {
         "model": model,
         "messages": messages,
