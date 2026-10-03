@@ -7,19 +7,16 @@ unbounded array index inside the kernel and dereferenced (Xid 13 / Xid 31 on
 SM75 under hybrid GDN + MTP + prefix caching). The kernels must now treat such
 a row as invalid: zero output, state untouched.
 
-Runs on GPU when one is free, otherwise on CPU under the Triton interpreter
-(``TRITON_INTERPRET=1``, set below before triton is imported). Set
-``WR_TEST_DEVICE=cpu`` to force the interpreter even when CUDA is visible (the
-live 2080 Ti engine owns the GPUs).
+Two ways to run (the Triton interpreter flag must be in the environment before
+Python starts, so it cannot be set from inside this module):
+
+  CPU, no GPU needed (fail-closed cases only; valid-path cases are skipped):
+    TRITON_INTERPRET=1 CUDA_VISIBLE_DEVICES= pytest tests/kernels/test_gdn_accepted_bounds.py
+  GPU (all cases; do NOT run next to the live 2080 Ti engine):
+    pytest tests/kernels/test_gdn_accepted_bounds.py
 """
 
 import os
-
-if os.environ.get("WR_TEST_DEVICE", "").lower() == "cpu" or not (
-    os.environ.get("WR_TEST_DEVICE", "").lower() == "cuda"
-):
-    os.environ.setdefault("TRITON_INTERPRET", "1")
-    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import pytest
 import torch
@@ -30,7 +27,9 @@ from vllm.third_party.flash_linear_attention.ops import (
     fused_sigmoid_gating_delta_rule_update,
 )
 
-DEVICE = "cuda" if os.environ.get("WR_TEST_DEVICE", "").lower() == "cuda" else "cpu"
+DEVICE = "cpu" if os.environ.get("TRITON_INTERPRET") == "1" else "cuda"
+if DEVICE == "cuda" and not torch.cuda.is_available():
+    pytest.skip("needs CUDA or TRITON_INTERPRET=1", allow_module_level=True)
 
 
 def _gdn_inputs(num_tokens=4, hk=2, hv=4, d=16):
