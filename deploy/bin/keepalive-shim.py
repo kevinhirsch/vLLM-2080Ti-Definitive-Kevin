@@ -9051,6 +9051,12 @@ async def _note_remote_response(request, payload, body):
         resp_body = getattr(payload, "body", None)
         if not isinstance(resp_body, (bytes, bytearray)):
             return
+        # A provider ERROR (400 json-mode, 429 concurrency, 402 balance, 5xx) has no content to classify. It used to be logged as
+        # 'remote returned EMPTY content', stamped content_empty=True on the request-log row, and its body written into the
+        # 40-file flight-recorder ring (where the Xid repro payloads live). The failure is already recorded by remote_status/outcome.
+        _st = getattr(payload, "status", None)
+        if isinstance(_st, int) and _st >= 400:
+            return
         try:
             parsed = json.loads(resp_body)
         except Exception:
