@@ -360,9 +360,9 @@ SCENARIOS = {
     # --- probe synth ----------------------------------------------------------------------------------
     "probe_fresh_engine_synth": dict(req=dict(fields=dict(model="estate-local", messages=PROBE, max_tokens=8)),
                                      setup=dict(a=_fresh_engine)),
-    # pinned as-is: kind "native"/"default" (model qwen-local / estate) is never synthesized (see lane SH report)
-    "probe_native_model_not_synth": dict(req=dict(fields=dict(messages=PROBE, max_tokens=8)), setup=dict(a=_fresh_engine)),
-    "probe_estate_default_not_synth": dict(req=dict(fields=dict(model="estate", messages=PROBE, max_tokens=8)),
+    # K4 (0d1ef3c2c6): every local-capable alias kind is synthesized (was estate-local only)
+    "probe_native_model_synth": dict(req=dict(fields=dict(messages=PROBE, max_tokens=8)), setup=dict(a=_fresh_engine)),
+    "probe_estate_default_synth": dict(req=dict(fields=dict(model="estate", messages=PROBE, max_tokens=8)),
                                            setup=dict(a=_fresh_engine)),
     "probe_stale_engine_real": dict(req=dict(fields=dict(model="estate-local", messages=PROBE, max_tokens=8))),
     "probe_fresh_stream_synth": dict(req=dict(fields=dict(model="estate-local", messages=PROBE, max_tokens=8, stream=True)),
