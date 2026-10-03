@@ -53,6 +53,7 @@ from vllm.utils.network_utils import (
     get_ip,
 )
 from vllm.utils.ompmultiprocessing import OMPProcessManager
+from vllm.utils.shutdown_deadline import arm_exit_deadline
 from vllm.utils.system_utils import (
     _maybe_force_spawn,
     decorate_logs,
@@ -864,6 +865,11 @@ class WorkerProc:
                 logger.debug(
                     "WorkerProc handling signal %d, raising SystemExit", signum
                 )
+                # L52: SystemExit can be swallowed (it is "ignored" when raised inside a
+                # weakref/__del__ callback) and NCCL/CUDA teardown can wait on a peer that is
+                # already gone. Either way the worker would outlive the service manager's stop
+                # timeout and be SIGKILLed; bound it instead.
+                arm_exit_deadline("Worker", envs.VLLM_WORKER_EXIT_DEADLINE_S)
                 raise SystemExit()
 
         # Either SIGTERM or SIGINT will terminate the worker

@@ -24,6 +24,7 @@ from vllm.reasoning import ReasoningParserManager
 from vllm.tool_parsers import ToolParserManager
 from vllm.tracing import instrument
 from vllm.utils.network_utils import find_process_using_port, is_valid_ipv6_address
+from vllm.utils.shutdown_deadline import arm_exit_deadline
 from vllm.utils.system_utils import set_ulimit
 from vllm.version import __version__ as VLLM_VERSION
 
@@ -92,6 +93,13 @@ async def serve_http(
     if h11_max_header_count is None:
         h11_max_header_count = H11_MAX_HEADER_COUNT_DEFAULT
 
+    # L52: after the engine client is shut down, nothing can finish the open streams, and uvicorn
+    # waits for them forever ("Waiting for connections to close") until the service manager SIGKILLs
+    # the process. Bound that wait: handlers still running after the grace are cancelled.
+    http_grace = envs.VLLM_HTTP_GRACEFUL_SHUTDOWN_S
+    if http_grace > 0:
+        uvicorn_kwargs.setdefault("timeout_graceful_shutdown", http_grace)
+
     config = uvicorn.Config(app, **uvicorn_kwargs)
     # Set header limits
     config.h11_max_incomplete_event_size = h11_max_incomplete_event_size
@@ -127,6 +135,16 @@ async def serve_http(
         if shutdown_event.is_set():
             return
         logger.info_once("[shutdown] API server: shutdown triggered")
+        # Backstop (L52): whatever hangs below (engine client, executor teardown, uvicorn), this
+        # process exits by itself before the service manager's stop timeout. In drain mode the
+        # configured drain time is added on top.
+        drain_s = 0
+        if engine_client is not None:
+            drain_s = max(0, int(engine_client.vllm_config.shutdown_timeout or 0))
+        exit_deadline = envs.VLLM_API_SERVER_EXIT_DEADLINE_S
+        arm_exit_deadline(
+            "API server", exit_deadline + drain_s if exit_deadline > 0 else 0
+        )
         shutdown_event.set()
 
     async def dummy_shutdown() -> None:

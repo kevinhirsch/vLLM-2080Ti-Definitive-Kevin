@@ -263,6 +263,9 @@ if TYPE_CHECKING:
     VLLM_MQ_MAX_CHUNK_BYTES_MB: int = 16
     VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: int = 300
     VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS: int = 5
+    VLLM_HTTP_GRACEFUL_SHUTDOWN_S: int = 5
+    VLLM_API_SERVER_EXIT_DEADLINE_S: int = 20
+    VLLM_WORKER_EXIT_DEADLINE_S: int = 10
     VLLM_KV_CACHE_LAYOUT: (
         Literal["LBNHC", "LBHNC", "LHBNC", "NHD", "HND", "BLHNC", "BLNHC", "BHLNC"]
         | None
@@ -1855,6 +1858,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS": lambda: int(
         os.getenv("VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS", "5")
     ),
+    # Stop-time backstops (lane FX, L52): bound how long a SIGTERM'd process may take to exit so the
+    # service manager's stop timeout (30 s) is never reached by a hung teardown.
+    # Seconds uvicorn waits for open HTTP connections / running handlers to finish after the engine
+    # client has been shut down, then cancels them. 0 = wait forever (the old behaviour).
+    "VLLM_HTTP_GRACEFUL_SHUTDOWN_S": lambda: int(
+        os.getenv("VLLM_HTTP_GRACEFUL_SHUTDOWN_S", "5")
+    ),
+    # Seconds after the API server is told to stop before it exits unconditionally
+    # (raised automatically above --shutdown-timeout when draining). 0 = disabled.
+    "VLLM_API_SERVER_EXIT_DEADLINE_S": lambda: int(
+        os.getenv("VLLM_API_SERVER_EXIT_DEADLINE_S", "20")
+    ),
+    # Seconds after a worker receives SIGTERM before it exits unconditionally, whatever
+    # teardown (NCCL/CUDA/swallowed SystemExit) it is stuck in. 0 = disabled.
+    "VLLM_WORKER_EXIT_DEADLINE_S": lambda: int(
+        os.getenv("VLLM_WORKER_EXIT_DEADLINE_S", "10")
+    ),
     # KV Cache layout used throughout vllm.
     # Some common values are:
     # - LBNHC
@@ -2400,6 +2420,9 @@ def compile_factors() -> dict[str, object]:
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",
         "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS",
+        "VLLM_HTTP_GRACEFUL_SHUTDOWN_S",
+        "VLLM_API_SERVER_EXIT_DEADLINE_S",
+        "VLLM_WORKER_EXIT_DEADLINE_S",
         "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH",
         "VLLM_IMAGE_FETCH_TIMEOUT",
         "VLLM_VIDEO_FETCH_TIMEOUT",
