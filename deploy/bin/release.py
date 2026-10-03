@@ -42,6 +42,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -352,12 +353,41 @@ if os.path.exists(src):
     hits = sorted(glob.glob(os.path.join(os.environ["TORCH_EXTENSIONS_DIR"], "**", "flash_qla_legacy_gdn.so"), recursive=True))
     so = hits[0] if hits else os.path.join(os.environ["TORCH_EXTENSIONS_DIR"], "flash_qla_legacy_gdn", "flash_qla_legacy_gdn.so")
     out["flashqla_legacy_gdn"] = {"so": os.path.relpath(so, R), "sha256": sha(so), "s": round(time.time() - t, 1)}
+for ext in json.loads(os.environ.get("RL_EXTRA_JIT") or "[]"):
+    # lane extensions: {"module": rel path of the python wrapper, "env": build-dir env var, "dir": rel build dir}
+    t = time.time()
+    os.environ[ext["env"]] = os.path.join(R, ext["dir"])
+    os.makedirs(os.environ[ext["env"]], exist_ok=True)
+    spec = importlib.util.spec_from_file_location("rl_extra_" + ext["env"].lower(), os.path.join(R, ext["module"]))
+    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+    getattr(m, ext.get("loader", "_load"))()
+    import glob
+    hits = sorted(glob.glob(os.path.join(R, ext["dir"], "*.so")))
+    out["extra:" + ext["env"]] = {"so": os.path.relpath(hits[0], R) if hits else None, "sha256": sha(hits[0]) if hits else None,
+                                  "s": round(time.time() - t, 1), "env": ext["env"], "dir": ext["dir"]}
 print("JIT-RESULT " + json.dumps(out))
 """
 
 
-def prebuild_jit(release: str, venv: str) -> dict:
+def parse_extra_jit(specs) -> list[dict]:
+    """--jit-ext MODULE:ENV[:DIR] (repeatable): a lane's torch cpp_extension wrapper (a .py with _load()) whose build dir
+    comes from ENV. Prebuilt inside the release at DIR (default .deps/<basename of the module dir>_build)."""
+    out = []
+    for s in specs or []:
+        parts = s.split(":")
+        if len(parts) not in (2, 3) or not parts[0].endswith(".py") or not re.fullmatch(r"[A-Z_][A-Z0-9_]*", parts[1]):
+            raise ReleaseError(f"--jit-ext wants MODULE.py:ENV_VAR[:DIR], got {s!r}")
+        mod = parts[0]
+        d = parts[2] if len(parts) == 3 else f".deps/{os.path.basename(os.path.dirname(mod)) or 'ext'}_build"
+        if os.path.isabs(d) or ".." in d.split("/"):
+            raise ReleaseError(f"--jit-ext DIR must be relative inside the release: {d!r}")
+        out.append({"module": mod, "env": parts[1], "dir": d})
+    return out
+
+
+def prebuild_jit(release: str, venv: str, extra=None) -> dict:
     env = build_env(release, venv)
+    env["RL_EXTRA_JIT"] = json.dumps(extra or [])
     py = os.path.join(venv, "bin", "python")
     res = {}
     for rnd in ("build", "noop-check"):
@@ -406,8 +436,8 @@ def hash_tree(release: str) -> list[tuple[str, str]]:
     return rows
 
 
-def freeze(release: str) -> None:
-    writable = {os.path.join(release, w) for w in WRITABLE_DIRS}
+def freeze(release: str, extra_writable=()) -> None:
+    writable = {os.path.join(release, w) for w in list(WRITABLE_DIRS) + list(extra_writable)}
     for d, dirs, files in os.walk(release, topdown=True):
         if any(d == w or d.startswith(w + os.sep) for w in writable):
             # caches: keep writable; JIT build dirs: dir writable (torch's lock), the .so itself read-only
@@ -448,8 +478,9 @@ def du_bytes(path: str) -> int:
 
 def build(sha: str, *, label: str | None = None, from_tree: str = DEFAULT_FROM, jit: bool = True, seed_caches: bool = True,
           allow_dirty_source: bool = False, allow_stale_so: bool = False, root: str | None = None, by: str = "cli",
-          log=print) -> dict:
+          log=print, jit_ext=None) -> dict:
     root = root or ROOT
+    extra = parse_extra_jit(jit_ext)
     full = git("rev-parse", "--verify", f"{sha}^{{commit}}")
     os.makedirs(root, exist_ok=True)
     st = os.statvfs(root)
@@ -515,7 +546,10 @@ def build(sha: str, *, label: str | None = None, from_tree: str = DEFAULT_FROM, 
             rel_venv = os.path.join(dest, ".venv")
             if jit:
                 log("[5/7] JIT prebuild at the final path (no GPU visible) + no-op re-load check")
-                jit_res = prebuild_jit(dest, rel_venv)
+                for e in extra:
+                    if not os.path.exists(os.path.join(dest, e["module"])):
+                        raise ReleaseError(f"--jit-ext module {e['module']} is not in {full[:10]}")
+                jit_res = prebuild_jit(dest, rel_venv, extra)
             log("[6/7] pre-compile bytecode, hash, freeze")
             compile_pyc(dest, rel_venv)
             rows = hash_tree(dest)
@@ -536,12 +570,14 @@ def build(sha: str, *, label: str | None = None, from_tree: str = DEFAULT_FROM, 
                 "build_env": {k: benv[k] for k in ("CUDA_HOME", "CC", "CXX", "NVCC_CCBIN", "TORCH_CUDA_ARCH_LIST")} | {
                     "nvcc": nvcc[0] if nvcc else None, "gcc": gcc[0] if gcc else None},
                 "files": len(rows), "files_sha256": sha256_file(os.path.join(dest, "RELEASE.files.sha256")),
-                "writable_dirs": WRITABLE_DIRS,
+                "writable_dirs": list(WRITABLE_DIRS) + [e["dir"] for e in extra],
+                "extra_jit": extra,
+                "boot_env": {e["env"]: os.path.join(dest, e["dir"]) for e in extra},
                 "size_bytes": du_bytes(dest),
             }
             with open(os.path.join(dest, "RELEASE.json"), "w") as fh:
                 json.dump(manifest, fh, indent=1)
-            freeze(dest)
+            freeze(dest, [e["dir"] for e in extra])
             log(f"[7/7] release {rid} built in {round(time.time() - t0)} s, {manifest['size_bytes'] >> 20} MiB "
                 f"(venv shared: {vmeta['path']})")
             return manifest
@@ -806,6 +842,8 @@ def main(argv=None) -> int:
     p.add_argument("--no-seed-caches", action="store_true")
     p.add_argument("--allow-dirty-source", action="store_true")
     p.add_argument("--allow-stale-so", action="store_true")
+    p.add_argument("--jit-ext", action="append", default=[], metavar="MODULE.py:ENV[:DIR]",
+                   help="also prebuild a lane JIT extension inside the release (repeatable)")
     p.add_argument("--by", default=os.environ.get("USER", "cli"))
     sp.add_parser("list")
     p = sp.add_parser("verify")
@@ -829,9 +867,10 @@ def main(argv=None) -> int:
     try:
         if a.cmd == "build":
             m = build(a.sha, label=a.label, from_tree=a.from_tree, jit=not a.no_jit, seed_caches=not a.no_seed_caches,
-                      allow_dirty_source=a.allow_dirty_source, allow_stale_so=a.allow_stale_so, by=a.by,
+                      allow_dirty_source=a.allow_dirty_source, allow_stale_so=a.allow_stale_so, by=a.by, jit_ext=a.jit_ext,
                       log=lambda s: print(s, file=sys.stderr, flush=True))
             print(json.dumps({"id": m["id"], "sha": m["sha"], "dir": os.path.join(ROOT, m["id"]), "so": m["so"],
+                              "boot_env": m.get("boot_env") or {},
                               "jit": m["jit"], "size_mib": m["size_bytes"] >> 20}, indent=1))
         elif a.cmd == "list":
             print(json.dumps({"current": current_id(), "rollback_target": rollback_target(), "running_root": running_root(),

@@ -199,3 +199,23 @@ def test_reason_is_required(world):
     m = _build(world)
     with pytest.raises(release.ReleaseError, match="reason"):
         release.activate(m["id"], reason="x", root=str(world["root"]), restart=False)
+
+
+def test_jit_ext_spec_parsing():
+    e = release.parse_extra_jit(["vllm/model_executor/layers/mamba/gdn/k9_gdn_chunk/__init__.py:VLLM_K9_GDN_BUILD_DIR"])
+    assert e == [{"module": "vllm/model_executor/layers/mamba/gdn/k9_gdn_chunk/__init__.py", "env": "VLLM_K9_GDN_BUILD_DIR",
+                  "dir": ".deps/k9_gdn_chunk_build"}]
+    assert release.parse_extra_jit(["a/b.py:X_DIR:.deps/x"])[0]["dir"] == ".deps/x"
+    for bad in ("a/b.py", "a/b.txt:X", "a/b.py:lower", "a/b.py:X:/abs", "a/b.py:X:../up"):
+        with pytest.raises(release.ReleaseError):
+            release.parse_extra_jit([bad])
+
+
+def test_extra_jit_dir_stays_writable_after_freeze(tmp_path):
+    d = tmp_path / "rel"
+    (d / ".deps" / "k9_build").mkdir(parents=True)
+    (d / ".deps" / "k9_build" / "k9.so").write_bytes(b"so")
+    (d / "vllm").mkdir()
+    release.freeze(str(d), [".deps/k9_build"])
+    assert os.access(d / ".deps" / "k9_build", os.W_OK) and not os.access(d / ".deps" / "k9_build" / "k9.so", os.W_OK)
+    assert not os.access(d / "vllm", os.W_OK)

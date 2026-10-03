@@ -640,3 +640,15 @@ def test_remote_health_unreadable_capacity_is_unhealthy(monkeypatch):
     monkeypatch.setattr(wc, "http_json", lambda *a, **k: {"error": "connection refused"})
     ok, why = wc.remote_health(900)
     assert not ok and "unreadable" in why
+
+
+def test_release_boot_env_from_the_manifest_is_exported_unless_the_spec_overrides(world, tmp_path):
+    rel = tmp_path / "rel"
+    rel.mkdir()
+    (rel / "RELEASE.json").write_text(json.dumps({"boot_env": {"VLLM_K9_GDN_BUILD_DIR": f"{rel}/.deps/k9_build", "VLLM_X_DIR": "/x"}}))
+    sp = spec(tmp_path, steps=[{"name": "arm", "boot": {"release": str(rel), "env": {"VLLM_X_DIR": "/mine"}}}])
+    s = wc.Window(sp).run()
+    ov = [c for c in world.actuator_calls if b"arm arm" in c["override"]][0]["override"].decode()
+    assert f"export VLLM_K9_GDN_BUILD_DIR={rel}/.deps/k9_build" in ov
+    assert "export VLLM_X_DIR=/mine" in ov and "VLLM_X_DIR=/x" not in ov
+    assert s["restore"]["override_verbatim"]

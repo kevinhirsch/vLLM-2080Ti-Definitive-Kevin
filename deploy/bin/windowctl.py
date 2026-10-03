@@ -796,6 +796,12 @@ class Window:
         if "release" in b:
             root = self.resolve_release(b["release"])
             lines.append(f"export V02_ROOT={shlex.quote(root)}\n")
+            try:   # lane JIT build dirs prebuilt inside the release (release.py --jit-ext): point the boot at them
+                for k, v in (json.load(open(os.path.join(root, "RELEASE.json"))).get("boot_env") or {}).items():
+                    if k not in (b.get("env") or {}):
+                        lines.append(f"export {k}={shlex.quote(v)}\n")
+            except (OSError, ValueError):
+                pass
         elif "tree" in b:
             root = os.path.realpath(b["tree"])
             for rel in JIT_DIRS[:1] + [".deps/FlashQLA-SM70-SM75"]:
