@@ -8,7 +8,7 @@ Use this INSTEAD of a /gateway/drain lease; the drain fence stays for gateway co
 
   gateway-offline.py status
   gateway-offline.py open  --reason "EF2 arm D1" --by EF2 [--ttl 1800] [--wait-s 120]   # prints the lease
-  gateway-offline.py close --lease LEASE
+  gateway-offline.py close [--lease LEASE]      # no --lease: closes the lease THIS host recorded in offline-lease.json
   gateway-offline.py run   --reason ... --by ... [--ttl 1800] [--wait-s 120] -- CMD ARGS   # open, run, always close
 """
 import argparse
@@ -21,6 +21,35 @@ import urllib.request
 
 GATEWAY = os.environ.get("GATEWAY", "http://127.0.0.1:8000")
 TOKEN_FILE = os.path.expanduser("~/.local/share/vllm-qwen27b/admin.token")
+# S3 2026-10-02: the lease id lives only in the shim's memory, so a wrapper killed before its `finally` used to strand the window
+# until the TTL (the 21:18 S3 incident). open/run now persist {lease, by, reason, until, pid} (mode 600) and close/run read it back.
+LEASE_FILE = os.environ.get("OFFLINE_LEASE_FILE", os.path.expanduser("~/.local/share/vllm-qwen27b/offline-lease.json"))
+
+
+def save_lease(lease, by, reason, ttl):
+    os.makedirs(os.path.dirname(LEASE_FILE), exist_ok=True)
+    tmp = LEASE_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump({"lease": lease, "by": by, "reason": reason, "until": time.time() + ttl, "pid": os.getpid()}, fh)
+    os.replace(tmp, LEASE_FILE)
+
+
+def load_lease():
+    try:
+        with open(LEASE_FILE) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def drop_lease(lease=None):
+    cur = load_lease()
+    if cur and (lease is None or cur.get("lease") == lease):
+        try:
+            os.unlink(LEASE_FILE)
+        except OSError:
+            pass
 
 
 def http(path, method="GET", payload=None):
@@ -63,17 +92,28 @@ def main():
     if a.cmd == "status":
         print(json.dumps(http("/gateway/offline"), indent=1)); return 0
     if a.cmd == "close":
-        print(json.dumps(http("/gateway/offline", "DELETE", {"lease": a.lease}))); return 0
+        lease = a.lease or (load_lease() or {}).get("lease")
+        if not lease:
+            print(json.dumps({"error": "no --lease given and no recorded lease in " + LEASE_FILE})); return 2
+        r = http("/gateway/offline", "DELETE", {"lease": lease})
+        if not r.get("error") or r.get("http") == 409:          # closed, or already gone/expired/replaced: the record is stale
+            drop_lease(lease)
+        print(json.dumps(r)); return 0
     st, lease = open_window(a.reason, a.by, a.ttl, a.wait_s)
     if not lease:
         print(json.dumps({"opened": False, **st}), file=sys.stderr); return 2
+    save_lease(lease, a.by, a.reason, a.ttl)
     if a.cmd == "open":
         print(json.dumps({"opened": True, "lease": lease, **st})); return 0
     cmd = [x for x in a.rest if x != "--"]
+    import signal
+    for sg in (signal.SIGTERM, signal.SIGHUP):                    # a TERM'd wrapper must still close its window
+        signal.signal(sg, lambda *_: sys.exit(143))
     try:
         return subprocess.call(cmd)
     finally:
         http("/gateway/offline", "DELETE", {"lease": lease})
+        drop_lease(lease)
 
 
 if __name__ == "__main__":
