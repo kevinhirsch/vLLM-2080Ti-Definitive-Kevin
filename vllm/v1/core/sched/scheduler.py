@@ -40,6 +40,7 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+from vllm.v1.core.single_type_kv_cache_manager import copy_mode_tail_boundary
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
@@ -421,6 +422,12 @@ class Scheduler(SchedulerInterface):
             self.mamba_partial_cache_hit
             and self.kv_cache_manager.mamba_fine_grained_prefix_cache
         )
+        # [FORK][LANE CR] a Mamba group publishes prompt tails by copy
+        # (VLLM_GDN_TAIL_PUBLISH=copy): the split stops where it publishes.
+        self.mamba_copy_mode_tail = self.mamba_partial_cache_hit and any(
+            getattr(m, "eager_tail_publish", False)
+            for m in self.kv_cache_manager.coordinator.single_type_managers
+        )
 
         # Counts of non-empty steps scheduled / processed. update_from_output
         # is called once per scheduled step in FIFO order, so these stay in sync.
@@ -653,6 +660,12 @@ class Scheduler(SchedulerInterface):
             # compensate for the drop, and the Mamba manager's matching gate
             # reads the same bit (the coordinator is handed use_eagle_block_drop).
             tail_boundary = max(tail_boundary - self.hash_block_size, 0)
+        if tail_boundary and getattr(self, "mamba_copy_mode_tail", False):
+            # [FORK][LANE CR] keep the scheduler's stop and the copy-mode
+            # publisher on the same position.
+            tail_boundary = copy_mode_tail_boundary(
+                request.num_prompt_tokens, tail_boundary, self.hash_block_size
+            )
         junction = request.shared_prefix_boundary
         # Block-floored: a sub-block junction's state is not separately cacheable.
         block_floored = start + (junction - start) // block_size * block_size

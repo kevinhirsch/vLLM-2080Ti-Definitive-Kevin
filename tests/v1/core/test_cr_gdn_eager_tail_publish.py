@@ -118,6 +118,7 @@ class World:
             hash_block_size=U if partial else B,
             mamba_has_prefill_checkpoint_blocks=False,
             mamba_prefill_checkpoint_alignment=None,
+            mamba_copy_mode_tail=partial and self.mamba.eager_tail_publish,
         )
         self.resumed_from: dict[str, int] = {}
 
@@ -224,8 +225,16 @@ def test_copy_mode_reuses_the_prompt_tail(copy_mode):
     # turn t>0 resumes at the predecessor's last U boundary, not its last B one
     for t in range(1, len(hits)):
         prev = prompts[t - 1]
-        assert hits[t] == (prev // U) * U, (t, hits[t], prev)
-    partial_tails = sum(1 for n in prompts if (n // U) * U % B)
+        tail = (prev // U) * U
+        if 0 < prev - tail <= 8:  # copy mode backs a spec-shaped final chunk off one unit
+            tail -= U
+        tail = max(tail, (prev // B) * B)  # a whole-block state is always there
+        assert hits[t] == tail, (t, hits[t], prev)
+    def _tail(n):
+        t = (n // U) * U
+        return t - U if 0 < n - t <= 8 else t
+
+    partial_tails = sum(1 for n in prompts if _tail(n) > (n // B) * B)
     assert world.mamba.num_eager_tail_published == partial_tails
 
 
@@ -263,7 +272,8 @@ def test_sibling_hits_while_producer_still_decoding(copy_mode):
     world.decode(p, 4)  # producer slot now holds state@(prompt+4)
     c = _req("c", list(p.prompt_token_ids) + _toks(9, 30), U)
     hit = world.admit(c)  # admit() asserts the resumed state matches
-    assert hit == (p.num_prompt_tokens // U) * U
+    n = p.num_prompt_tokens
+    assert hit == ((n // U) * U if n % U > 8 else (n // U) * U - U)
 
 
 def test_publish_dropped_when_pool_is_exhausted(copy_mode):
@@ -296,3 +306,28 @@ def test_env_off_keeps_gdn_gated(monkeypatch):
     assert not eager_tail_publish_enabled()
     world = World(_manager(fine_grained=True), partial=True)
     assert not world.mamba.eager_tail_publish
+
+
+@pytest.mark.parametrize("rem", [1, 4, 8, 9, 15])
+def test_copy_mode_never_leaves_a_spec_shaped_final_chunk(copy_mode, rem):
+    """A final prefill chunk of 1 + num_spec tokens can replay the spec-decode
+    FULL cudagraph with the wrong GDN metadata (vllm#53051); copy mode backs the
+    tail stop off one unit instead of creating one."""
+    world = World(_manager(fine_grained=True), partial=True)
+    n = 3 * B + 2 * U + rem
+    req = _req("p", _toks(11, n), U)
+    world.admit(req)
+    chunks = []
+    while req.num_computed_tokens < req.num_prompt_tokens:
+        k = Scheduler._mamba_block_aligned_split(
+            world.stub, req, req.num_prompt_tokens - req.num_computed_tokens
+        )
+        chunks.append(k)
+        world.step([(req, k)])
+    assert chunks[-1] > 8 or chunks[-1] == n % B, chunks
+    world.decode(req, 2)
+    world.mgr.free(req)
+    c = _req("c", list(req.prompt_token_ids) + _toks(12, 40), U)
+    hit = world.admit(c)  # resumed state verified inside admit()
+    expect = (n // U) * U if rem > 8 else (n // U) * U - U
+    assert hit == expect, (hit, expect)
