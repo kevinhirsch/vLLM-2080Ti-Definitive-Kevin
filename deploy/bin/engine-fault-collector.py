@@ -137,6 +137,23 @@ def classify(journal: str, kernel: str):
     return sig, detail
 
 
+WEDGE_DETAIL = "watchdog-confirmed (models healthy, generation probes timed out)"
+
+
+def wedge_signature(sig: str, detail: str):
+    """EF2 (2026-10-03): signature of a death the watchdog confirmed as a generation wedge and killed.
+
+    A wedge kill is the MECHANISM of the death, not its cause. When the journal already holds a fault (CUDA illegal address
+    with its EF fence, Xid 13, scheduler drift, OOM, a dead engine core) the API process can outlive its dead core; the probes
+    then look like a wedge and the kill comes minutes later. 2026-10-02 12:00:30: 'EF-FENCE ... tq:prefill-portion', with the
+    watchdog kill at 12:05:22, was filed as generation-wedge and the TQ Xid went missing from the ledger. Keep the fault
+    signature and note the kill. Only a death with no fault evidence ('unknown-exit') is a genuine wedge."""
+    if sig == "unknown-exit":
+        return "generation-wedge", WEDGE_DETAIL
+    note = "killed by watchdog wedge confirmation (API alive, engine not generating)"
+    return sig, (detail + "; " + note) if detail else note
+
+
 def boot_failure_cause(journal: str) -> str:
     """The first concrete error line of a failed engine init (what to fix), e.g. 'no-kv-memory' or "KeyError: 'weight'"."""
     if "No available memory for the cache blocks" in journal:
@@ -393,7 +410,8 @@ def main():
     if a.pre_kill and not wedge:
         wedge = {"by": "watchdog", "wedge": True}
     if wedge:
-        sig, detail, planned = "generation-wedge", "watchdog-confirmed (models healthy, generation probes timed out)", False
+        sig, detail = wedge_signature(sig, detail)
+        planned = False
     elif marker or (requested_stop and "Traceback" not in journal):
         planned = True
     if a.reconciled and sig == "unknown-exit" and not wedge and "COMMAND=" in a.cause and re.search(r"systemctl (stop|restart)", a.cause):
