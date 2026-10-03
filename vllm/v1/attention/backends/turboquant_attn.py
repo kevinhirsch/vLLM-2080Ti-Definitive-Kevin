@@ -162,6 +162,36 @@ _TQ_CONTINUATION_PREFIX_COMBINE_MIN_TOKENS = max(
 )
 
 
+# [FORK][LANE K1] FlashInfer returns the attention LSE in base 2 (prefill.cuh: log2(d) + m with the scores
+# pre-scaled by log2(e)); merge_attn_states weights the two partial outputs with exp(lse), i.e. natural log.
+# Without the conversion the prefix/current mix is e^(1.44 dLSE) instead of e^dLSE: 2.5-12% normwise output
+# error measured vs an fp32 reference (tools/k1/test_fa75_prefill.py --pc-only). 0 restores the old behaviour.
+_TQ_PREFIX_COMBINE_LSE_LN2 = os.getenv("VLLM_TURBOQUANT_PREFIX_COMBINE_LSE_LN2", "1") == "1"
+_LN2 = math.log(2.0)
+
+
+def _tq_merge_flashinfer_partials(
+    prefix_out: torch.Tensor,  # (q_len, Hq, D)
+    prefix_lse: torch.Tensor,  # (q_len, Hq) fp32, FlashInfer (base 2)
+    current_out: torch.Tensor,
+    current_lse: torch.Tensor,
+    lse_base2: bool | None = None,
+) -> torch.Tensor:
+    """Merge two FlashInfer partial attentions with merge_attn_states (natural-log LSE)."""
+    if _TQ_PREFIX_COMBINE_LSE_LN2 if lse_base2 is None else lse_base2:
+        prefix_lse = prefix_lse * _LN2
+        current_lse = current_lse * _LN2
+    merged_out = torch.empty_like(prefix_out)
+    merge_attn_states(
+        merged_out,
+        prefix_out,
+        prefix_lse.transpose(0, 1).contiguous(),
+        current_out,
+        current_lse.transpose(0, 1).contiguous(),
+    )
+    return merged_out
+
+
 def _tq_continuation_prefix_combine_enabled(seq_len: int) -> bool:
     if _TQ_CONTINUATION_PREFIX_COMBINE_MODE == "on":
         return True
@@ -2177,13 +2207,8 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 lse=current_lse,
                 return_lse=True,
             )
-            merged_out = torch.empty_like(query)
-            merge_attn_states(
-                merged_out,
-                prefix_out,
-                prefix_lse.transpose(0, 1).contiguous(),
-                current_out,
-                current_lse.transpose(0, 1).contiguous(),
+            merged_out = _tq_merge_flashinfer_partials(
+                prefix_out, prefix_lse, current_out, current_lse
             )
             logger.info_once(
                 "TurboQuant continuation prefix-combine path used: "
