@@ -67,6 +67,11 @@ XID_WINDOW_MIN="${WATCHDOG_XID_WINDOW_MIN:-8}"           # RS: how recent the Xi
 COOLDOWN_SEC="${WATCHDOG_COOLDOWN_SEC:-1800}"        # 30 min minimum between automated restarts
 MAX_RESTARTS_PER_HOUR="${WATCHDOG_MAX_RESTARTS_PER_HOUR:-2}"
 SERVICE="${WATCHDOG_SERVICE:-vllm-qwen27b.service}"
+# FX2/L64: the probe is a POST to the engine every tick (~58/h). When the engine's own generation counter advanced since
+# the previous tick, the engine IS generating (real work finished decoding tokens), so the probe adds nothing and can only
+# queue behind bulk prefill. Skip it, but never more than SKIP_MAX consecutive ticks (a real end-to-end probe at least every
+# SKIP_MAX+1 ticks) and never when the counter is flat, reset, or unreadable. 0 = always probe (the old behaviour).
+SKIP_MAX="${WATCHDOG_SKIP_MAX_TICKS:-9}"
 
 D="/home/kevin/.local/share/vllm-qwen27b"
 STATE_FILE="${WATCHDOG_STATE_FILE:-$D/watchdog-state.json}"
@@ -96,6 +101,10 @@ init_state() {
 }
 
 state_get() { jq -r ".$1" "$STATE_FILE"; }
+
+state_set_gen() {   # $1 = generation_tokens_total seen this tick, $2 = consecutive skipped ticks
+  jq --argjson g "$1" --argjson s "$2" '.last_gen = $g | .skipped_ticks = $s' "$STATE_FILE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+}
 
 state_set_consecutive_failures() {
   local n="$1"
@@ -158,6 +167,23 @@ models_code="${models_result%% *}"
 models_time="${models_result#* }"
 
 progress_before=$(probe_progress) || progress_before=""
+
+# L64: skip the generation POST when the engine demonstrably generated since the last tick (see SKIP_MAX above).
+cur_gen=""
+[ -n "$progress_before" ] && cur_gen=$(printf '%s\n' "$progress_before" | awk '{printf "%d", $2}')
+last_gen=$(state_get last_gen); skipped=$(state_get skipped_ticks)
+case "$last_gen" in ''|null|*[!0-9]*) last_gen="" ;; esac
+case "$skipped" in ''|null|*[!0-9]*) skipped=0 ;; esac
+if [ "$SKIP_MAX" -gt 0 ] && [ "$models_code" = "200" ] && [ -n "$cur_gen" ] && [ -n "$last_gen" ] \
+   && [ "$cur_gen" -gt "$last_gen" ] && [ "$skipped" -lt "$SKIP_MAX" ]; then
+  state_set_gen "$cur_gen" "$((skipped + 1))"
+  prev_failures=$(state_get consecutive_failures)
+  [ "$prev_failures" != "0" ] && state_set_consecutive_failures 0
+  log "SKIP-PROBE models=${models_code}(${models_time}s) engine generated ${last_gen} -> ${cur_gen} tokens since the last tick (skipped ${skipped}/${SKIP_MAX} in a row) -> HEALTHY"
+  exit 0
+fi
+[ -n "$cur_gen" ] && state_set_gen "$cur_gen" 0
+
 gen_result=$(probe_generation)
 gen_code="${gen_result%% *}"
 gen_time="${gen_result#* }"

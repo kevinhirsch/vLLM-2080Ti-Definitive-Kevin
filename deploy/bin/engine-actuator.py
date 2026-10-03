@@ -276,7 +276,84 @@ def drain_and_wait(deadline_s, reason, token, by=None):
     return facts, lease
 
 
-def offline_and_wait(deadline_s, reason, token, by=None):
+def engine_progress(engine=None, timeout=3):
+    """Token progress counter from the engine's own /metrics: generation_tokens_total + prompt_tokens_total summed over
+    label sets (a prefill-only step moves the second one). None when unreadable."""
+    try:
+        txt = urllib.request.urlopen(f"{engine or ENGINE}/metrics", timeout=timeout).read().decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return None
+    tot, seen = 0.0, False
+    for name in ("vllm:generation_tokens_total", "vllm:prompt_tokens_total"):
+        for m in re.finditer(r"^" + re.escape(name) + r"(?:\{[^}]*\})?\s+([0-9.eE+-]+)\s*$", txt, re.M):
+            tot += float(m.group(1)); seen = True
+    return int(tot) if seen else None
+
+
+EXT_POLL_S = 5.0        # polling interval once past the base deadline
+EXT_STALL_POLLS = 3     # consecutive polls with no token progress = a wedge, not work (15 s with EXT_POLL_S)
+
+
+def wait_drained(get_active, deadline_s, *, hard_cap_s=None, get_progress=None, poll_s=2.0, ext_poll_s=None, stall_polls=None,
+                 settle=1, unreadable="continue", sleep=None, clock=None):
+    """Wait for get_active() (int, or None if unreadable) to reach 0 on `settle` consecutive polls.
+    Base budget deadline_s (always >= 1 sample). If still active at the deadline AND hard_cap_s > deadline_s AND get_progress
+    is given, keep waiting while the progress counter advances, until hard_cap_s; stop early when it does not advance for
+    `stall_polls` consecutive polls (a wedge, not work). Returns facts incl. end_reason in
+    idle | deadline | cap | stalled | unreadable, and extended_s (time spent past the deadline)."""
+    sleep, clock = sleep or time.sleep, clock or time.time        # resolved at call time so tests can patch time
+    ext_poll_s = EXT_POLL_S if ext_poll_s is None else ext_poll_s
+    stall_polls = EXT_STALL_POLLS if stall_polls is None else stall_polls
+    t0 = clock()
+    out = {"active_at_start": None, "active_at_end": None, "end_reason": None, "idle": None, "extended_s": 0, "waited_s": 0}
+    zeros = stall = 0
+    last_p = None
+    ext_start = None
+    can_extend = bool(get_progress) and bool(hard_cap_s) and hard_cap_s > deadline_s
+    while True:
+        elapsed = clock() - t0
+        past = elapsed >= deadline_s
+        a = get_active()
+        if a is None:
+            if unreadable == "stop" or past:
+                out["end_reason"] = "unreadable"
+                break
+        else:
+            if out["active_at_start"] is None:
+                out["active_at_start"] = a
+            out["active_at_end"] = a
+            zeros = zeros + 1 if a == 0 else 0
+            if zeros >= settle:
+                out["idle"], out["end_reason"] = True, "idle"
+                break
+            if past:
+                if not can_extend:
+                    out["idle"], out["end_reason"] = False, "deadline"
+                    break
+                if elapsed >= hard_cap_s:
+                    out["idle"], out["end_reason"] = False, "cap"
+                    break
+                p = get_progress()
+                if ext_start is None:
+                    ext_start, last_p, stall = elapsed, p, 0
+                else:
+                    stall = 0 if (p is not None and last_p is not None and p > last_p) else stall + 1
+                    last_p = p if p is not None else last_p
+                    if stall >= stall_polls:
+                        out["idle"], out["end_reason"] = False, "stalled"
+                        break
+        if past:
+            step = max(0.001, min(ext_poll_s, (hard_cap_s or deadline_s) - elapsed))
+        else:
+            step = max(0.001, min(poll_s, deadline_s - elapsed))
+        sleep(step)
+    end = clock() - t0
+    out["waited_s"] = round(end)
+    out["extended_s"] = round(end - deadline_s) if end > deadline_s else 0
+    return out
+
+
+def offline_and_wait(deadline_s, reason, token, by=None, hard_cap_s=None):
     """CF (2026-10-02): open a PLANNED LOCAL-OFFLINE window instead of a drain fence. The gateway routes new work to the
     remote valve (inside the daily cap) rather than refusing it, lets accepted local work finish, and the estate keeps
     flowing during the restart. Returns (facts, lease) or None when the gateway has no such endpoint (older gateway,
@@ -295,18 +372,16 @@ def offline_and_wait(deadline_s, reason, token, by=None):
         facts["active_at_start"] = opened.get("local_active")
     except Exception:  # noqa: BLE001
         return None
-    t0 = time.time()
-    active = facts["active_at_start"]
-    while time.time() - t0 < deadline_s:
+    # FX2/L63: inside an offline window NEW work already goes remote, so the local count can only fall; a longer wait costs
+    # restart latency only. Past deadline_s keep waiting while the engine is still making token progress, up to hard_cap_s.
+    def _active():
         try:
-            active = int(http(f"{GATEWAY}/gateway/offline", token=token).get("local_active") or 0)
-            if active == 0:
-                break
+            return int(http(f"{GATEWAY}/gateway/offline", token=token).get("local_active") or 0)
         except Exception:  # noqa: BLE001
-            pass
-        time.sleep(2)
-    facts["waited_s"] = round(time.time() - t0)
-    facts["active_at_end"] = active
+            return None
+    w = wait_drained(_active, deadline_s, hard_cap_s=hard_cap_s, get_progress=engine_progress)
+    facts.update(waited_s=w["waited_s"], active_at_end=w["active_at_end"] if w["active_at_end"] is not None else facts["active_at_start"],
+                 end_reason=w["end_reason"], extended_s=w["extended_s"], hard_cap_s=hard_cap_s)
     return facts, ("offline", lease)
 
 
@@ -328,34 +403,29 @@ def engine_inflight(engine=None, timeout=3):
     return out
 
 
-def wait_engine_idle(budget_s, engine=None, poll_s=2.0, settle=2):
+def wait_engine_idle(budget_s, engine=None, poll_s=2.0, settle=2, hard_cap_s=None, **kw):
     """Wait until the engine's own running+waiting count is 0 on `settle` consecutive polls (one zero can be the gap between
-    two back-to-back direct requests), for at most budget_s seconds (always at least one sample). Never raises, never
-    blocks on an unreadable /metrics (the engine is then unhealthy and there is nothing to wait for). Returns facts."""
-    t0 = time.time()
-    f = {"checked": True, "idle": None, "waited_s": 0, "running_at_start": None, "waiting_at_start": None,
-         "running_at_end": None, "waiting_at_end": None}
-    zeros = 0
-    first = True
-    while True:
+    two back-to-back direct requests), for at most budget_s seconds (always at least one sample); with hard_cap_s > budget_s
+    keep waiting past the budget while the engine's token counters advance (L63). Never raises, never blocks on an
+    unreadable /metrics (the engine is then unhealthy and there is nothing to wait for). Returns facts."""
+    last = {}
+
+    def _active():
         cur = engine_inflight(engine)
         if cur is None:
-            f["error"] = "engine /metrics unreadable"
-            f["idle"] = None
-            break
-        if first:
-            f["running_at_start"], f["waiting_at_start"] = cur["running"], cur["waiting"]
-            first = False
-        f["running_at_end"], f["waiting_at_end"] = cur["running"], cur["waiting"]
-        zeros = zeros + 1 if cur["running"] + cur["waiting"] == 0 else 0
-        if zeros >= settle:
-            f["idle"] = True
-            break
-        if time.time() - t0 + poll_s > budget_s:
-            f["idle"] = False
-            break
-        time.sleep(poll_s)
-    f["waited_s"] = round(time.time() - t0)
+            return None
+        if "running_at_start" not in last:
+            last["running_at_start"], last["waiting_at_start"] = cur["running"], cur["waiting"]
+        last["running_at_end"], last["waiting_at_end"] = cur["running"], cur["waiting"]
+        return cur["running"] + cur["waiting"]
+    w = wait_drained(_active, budget_s, hard_cap_s=hard_cap_s, get_progress=lambda: engine_progress(engine), poll_s=poll_s,
+                     settle=settle, unreadable="stop", **kw)
+    f = {"checked": True, "idle": w["idle"], "waited_s": w["waited_s"], "running_at_start": last.get("running_at_start"),
+         "waiting_at_start": last.get("waiting_at_start"), "running_at_end": last.get("running_at_end"),
+         "waiting_at_end": last.get("waiting_at_end"), "end_reason": w["end_reason"], "extended_s": w["extended_s"]}
+    if w["end_reason"] == "unreadable":
+        f["error"] = "engine /metrics unreadable"
+        f["idle"] = None
     return f
 
 
@@ -420,13 +490,18 @@ def do_restart(a):
     drain_facts, lease = ({"skipped": "engine unhealthy; nothing to drain"}, None)
     if healthy and not a.no_drain:
         write_job(state="draining")
-        got = None if os.environ.get("ENGINE_ACTUATOR_FORCE_DRAIN") else offline_and_wait(a.drain_s, reason, token, by)
         t_drain = time.time()
+        hard_cap = float(max(a.drain_s, getattr(a, "drain_max_s", 0) or 0))
+        got = None if os.environ.get("ENGINE_ACTUATOR_FORCE_DRAIN") else offline_and_wait(a.drain_s, reason, token, by, hard_cap_s=hard_cap)
         drain_facts, lease = got if got else drain_and_wait(a.drain_s, reason, token, by)
-        # FX2: the fence counts only gateway-accepted requests. Also wait on the engine's own in-flight count, inside the
-        # SAME drain budget (remaining time; at least one sample), so a direct :8001 caller is not cut mid-request.
-        eng = wait_engine_idle(max(0.0, a.drain_s - (time.time() - t_drain)))
+        # FX2: the fence counts only gateway-accepted requests. Also wait on the engine's own in-flight count inside the SAME
+        # budget (what is left of it; at least one sample), so a direct :8001 caller is not cut mid-request. In an offline
+        # window (new work already goes remote) both waits may run past --drain-s while tokens still advance, to the hard cap.
+        offline = drain_facts.get("strategy") == "offline-window"
+        used = time.time() - t_drain
+        eng = wait_engine_idle(max(0.0, a.drain_s - used), hard_cap_s=(hard_cap - used) if offline and hard_cap > a.drain_s else None)
         drain_facts["engine"] = eng
+        drain_facts["total_waited_s"] = round(time.time() - t_drain)
         drain_facts["engine_active_at_end"] = None if eng.get("running_at_end") is None else eng["running_at_end"] + (eng["waiting_at_end"] or 0)
     write_job(state="stopping", drain=drain_facts)
     json.dump({"ts": now_iso(), "by": by, "reason": reason, "drain": drain_facts, "active_at_stop": drain_facts.get("active_at_end")},
@@ -447,14 +522,16 @@ def do_restart(a):
     write_job(state="done" if ok else "failed", finished=now_iso(), result=res)
     emit("outcome", f"planned engine restart by {by} finished: healthy={ok}, stop took {stop_s}s, "
          f"{drain_facts.get('active_at_end')} gateway request(s) and {drain_facts.get('engine_active_at_end')} engine request(s) "
-         f"still active when it stopped (gateway was {drain_facts.get('active_at_start')})",
+         f"still active when it stopped (gateway was {drain_facts.get('active_at_start')}); waited {drain_facts.get('total_waited_s')}s, "
+         f"drain ended: {drain_facts.get('end_reason')}/{(drain_facts.get('engine') or {}).get('end_reason')}"
+         f"{' (extended ' + str(drain_facts.get('extended_s')) + 's past --drain-s)' if drain_facts.get('extended_s') else ''}",
          {"action": "restart-finished", "by": by, "reason": reason, **res})
     print(json.dumps(res))
     return 0 if ok else 1
 
 
 def spawn_detached(a):
-    cmd = [sys.executable, os.path.abspath(__file__), "restart", "--reason", a.reason, "--by", a.by, "--drain-s", str(a.drain_s), "--foreground"]
+    cmd = [sys.executable, os.path.abspath(__file__), "restart", "--reason", a.reason, "--by", a.by, "--drain-s", str(a.drain_s), "--drain-max-s", str(getattr(a, "drain_max_s", 600)), "--foreground"]
     if a.flags is not None:
         cmd += ["--flags", a.flags]
     if a.clear_diag:
@@ -516,6 +593,7 @@ def main():
     p.add_argument("--reason", required=True); p.add_argument("--by", default="cli")
     p.add_argument("--flags", default=None, help="comma list of DIAG names to stage before restarting")
     p.add_argument("--clear-diag", action="store_true"); p.add_argument("--drain-s", type=int, default=120)
+    p.add_argument("--drain-max-s", type=int, default=600, help="hard cap (offline strategy only): keep waiting past --drain-s while token progress continues")
     p.add_argument("--no-drain", action="store_true"); p.add_argument("--foreground", action="store_true")
     p.add_argument("--force", action="store_true", help="restart even when the requested diag flags are already active")
     sp.add_parser("announce-start"); sp.add_parser("restart-status")
