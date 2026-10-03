@@ -90,7 +90,13 @@ def main():
         for vv in variants:
             for bn in bns:
                 arms[f"k1_v{vv}_bn{bn}"] = (lambda vv=vv, bn=bn: K1.fa75_prefill(q, k, v, scale=scale, causal=True,
-                                                                                out=out, variant=vv, bn=bn))
+                                                                                out=out, variant=vv, bn=bn, nsplit=1))
+        S = K1.choose_splits(Tq, Tkv, Hq, q.device)
+        if S > 1 and mem + S * Tq * Hq * 1028 <= (args.budget_mb + 100) * 2**20:
+            po = torch.empty((S, Tq, Hq, 256), dtype=torch.float32, device=dev)
+            pl = torch.empty((S, Tq, Hq), dtype=torch.float32, device=dev)
+            arms[f"k1_v7_split{S}"] = lambda: K1.fa75_prefill(q, k, v, scale=scale, causal=True, out=out, variant=7,
+                                                              nsplit=S, part_o=po, part_lse=pl)
         # warm-up (JIT, plan, clocks) and rep count targeting ~30 ms per arm-round
         for fn in arms.values():
             fn()
@@ -111,6 +117,7 @@ def main():
         rows.append(res)
         print(json.dumps(res), flush=True)
         del q, k, v, out, arms
+        po = pl = None
         torch.cuda.empty_cache()
     print("smi:", smi_free(), flush=True)
     if args.out:
