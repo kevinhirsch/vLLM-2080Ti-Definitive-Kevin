@@ -285,6 +285,13 @@ dl.gl dt{display:inline;font-weight:650} dl.gl dd{display:inline;margin:0 0 0 4p
  <div class="grid g-3" id="health_cards"></div>
  <details class="dd" open><summary>GPUs <span class="sub">per card &middot; live from nvidia-smi</span></summary><div class="in" id="gpu_table"></div></details>
  <div class="grid g-2" style="margin-top:12px" id="health_charts"></div>
+ <details class="dd" id="d-hwlong"><summary>Temperature, power and clocks: 24 hours and 7 days <span class="sub">kept on disk by the gateway &middot; survives restarts</span></summary><div class="in">
+  <div class="rangebar"><span>Range:</span>
+   <div class="seg" id="hw_seg"><button type="button" data-h="24" aria-pressed="true">Last 24 hours</button><button type="button" data-h="168" aria-pressed="false">Last 7 days</button></div>
+   <span class="xs" id="hw_note"></span></div>
+  <div id="hw_summary"></div>
+  <div class="grid g-2" id="hw_charts"></div>
+ </div></details>
  <details class="dd"><summary>Estate watchdog <span class="sub">separate service on 10.0.1.10, not part of this gateway</span></summary><div class="in" id="watchdog"></div></details>
 </section>
 
@@ -893,9 +900,26 @@ function lineChart(spec){
   return '<svg viewBox="0 0 '+W+' '+H+'" role="img" aria-label="'+esc(spec.title+': '+spec.series.map(s=>s.name).join(', '))+'" data-w="'+W+'" data-h="'+H+'" data-ml="'+m.l+'" data-pw="'+pw+'" data-t0="'+t0+'" data-t1="'+t1+'">'+g+'<g class="hov"></g></svg>';
 }
 
+/* ---------- long-range hardware history (/gateway/telemetry/history) ---------- */
+/* One [t, value] series for GPU `i` and stored field `key` (temp, temp_max, power, sm_clock, ...). */
+function hwSeries(data,i,key){return ((data&&data.points)||[]).map(p=>{const g=(p.gpu||[])[i];const v=g?g[key]:null;return [p.t,isNum(v)?v:null];});}
+function hwGpuCount(data){return Math.max(((data&&data.summary&&data.summary.gpu)||[]).length,...((data&&data.points)||[]).map(p=>(p.gpu||[]).length),0);}
+/* How much of the asked-for range the file actually covers (one stored sample per minute). */
+function hwCoverage(data){
+  if(!data||!isNum(data.hours))return null;
+  const want=data.hours*60,have=data.raw_samples||0;
+  return {samples:have,pct:want>0?Math.min(100,100*have/want):0,first_t:data.first_t,last_t:data.last_t,starts_late:isNum(data.first_t)&&isNum(data.from)&&data.first_t-data.from>Math.max(1800,data.hours*3600*0.05)};
+}
+/* Headline row per GPU for the summary table. Minutes -> seconds so fmtDur can print them. */
+function hwSummaryRows(data){
+  return (((data&&data.summary&&data.summary.gpu)||[])).map(g=>({i:g.i,minutes:g.minutes,temp_min:g.temp_min,temp_avg:g.temp_avg,temp_max:g.temp_max,
+    hot_s:(g.hot_minutes||0)*60,thermal_s:g.throttle_known?(g.thermal_throttle_minutes||0)*60:null,cap_s:g.throttle_known?(g.power_cap_minutes||0)*60:null,
+    power_avg:g.power_avg,power_max:g.power_max,sm_avg:g.sm_clock_avg,sm_min:g.sm_clock_min}));
+}
+
 return {CLASSES,DASH,isNum,esc,fmtInt,fmtNum,fmtTok,fmtPct,fmtFrac,fmtUsd,fmtDur,fmtAgo,fmtMiB,get,mean,median,tail,windowMean,windowMedian,windowHitRate,bucketMean,pointsOf,
   effectiveMode,spendView,spendBreakdown,reconView,pricingView,BASIS_TEXT,EXPLICIT,REASONS,reasonInfo,remoteWindows,reasonRows,stillRemoteRows,parseClassMap,classOfClient,activeByClass,workClassRows,remoteByClass,reasonShares,laneStage,gatewayLatency,
-  capacityView,healthIssues,verdict,gpuLevel,niceMax,lineChart};
+  capacityView,healthIssues,verdict,gpuLevel,niceMax,lineChart,hwSeries,hwGpuCount,hwCoverage,hwSummaryRows};
 })();
 /*LIB-END*/
 </script>
@@ -1162,6 +1186,48 @@ reg('health_charts',['series'],()=>{
     chartCard('g_temp','GPU temperature','°C',[ser('GPU 0',1,['gpu',0,'temp_c']),ser('GPU 1',2,['gpu',1,'temp_c'])],{yMin:30,yMax:100,yFmt:v=>v.toFixed(0)+'°',valFmt:v=>L.fmtNum(v,0)+' °C',refLines:[{v:83,label:'hot 83°'}]})+
     chartCard('g_pow','GPU power draw','watts (card limit 280 W)',[ser('GPU 0',1,['gpu',0,'power_w']),ser('GPU 1',2,['gpu',1,'power_w'])],{yMin:0,yMax:300,yFmt:v=>v.toFixed(0)+' W',valFmt:v=>L.fmtNum(v,0)+' W'});
 });
+/* ---- long-range GPU history: fetched on demand while the section is open (24 h = ~360 points, 7 d = ~2,000) ---- */
+const HW={hours:24,data:null,at:0,busy:false,err:null,every:60000};
+async function hwPull(force){
+  const d=$('#d-hwlong');if(!d||(!d.open&&!force)||HW.busy)return;HW.busy=true;
+  const ctl=new AbortController(),to=setTimeout(()=>ctl.abort(),20000),h=HW.hours;
+  try{
+    const r=await fetch('/gateway/telemetry/history?hours='+h,{cache:'no-store',signal:ctl.signal});
+    if(r.status===404)throw new Error('this gateway does not serve /gateway/telemetry/history yet (it needs the newer gateway)');
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const j=await r.json();if(h===HW.hours){HW.data=j;HW.at=Date.now();HW.err=null;}
+  }catch(e){HW.err=String(e&&e.message||e);}
+  finally{clearTimeout(to);HW.busy=false;hwRender();}
+}
+function hwCard(id,title,sub,series,opts){
+  const dt=HW.data,spec=Object.assign({title,series,t0:dt.from,t1:dt.to,yFmt:L.fmtTok,empty:'No stored samples in this range yet'},opts||{});
+  CH[id]=spec;
+  const lg=series.length>1?'<div class="legend">'+series.map(s=>'<span><span class="sw c'+(s.slot||1)+'"></span>'+esc(s.name)+'</span>').join('')+'</div>':'';
+  return '<div class="card"><h3>'+esc(title)+' <span class="sub">'+sub+'</span></h3><div class="chart" data-id="'+id+'">'+L.lineChart(spec)+'<div class="tip"></div></div>'+lg+'<div class="cap">'+esc(opts.cap||'')+'</div></div>';
+}
+function hwRender(){
+  const dt=HW.data,n=$('#hw_note'),sm=$('#hw_summary'),ch=$('#hw_charts');
+  if(!sm)return;
+  if(HW.err&&!dt){n.textContent='';sm.innerHTML='<div class="note bad"><b>History unavailable</b><span class="why">'+esc(HW.err)+'</span></div>';ch.innerHTML='';return;}
+  if(!dt){n.textContent=HW.busy?'loading…':'';sm.innerHTML=empty('Loading the stored history…');ch.innerHTML='';return;}
+  const cov=L.hwCoverage(dt),gn=L.hwGpuCount(dt);
+  n.innerHTML=MEAS(dt.hours>=48?'7 d':'24 h','Stored by the gateway, one sample per minute, in hw-YYYYMMDD.jsonl')+' '+L.fmtInt(dt.raw_samples)+' samples · points are '+L.fmtDur(dt.step_s)+' averages'+(HW.err?' · '+st('warn','refresh failed: '+HW.err):'');
+  if(!dt.raw_samples){sm.innerHTML='<div class="note info"><b>No stored samples in this range yet.</b><span class="why">The gateway writes one line a minute once it has been running a minute with this feature; older hours exist only from then on.</span></div>';ch.innerHTML='';return;}
+  const rows=L.hwSummaryRows(dt);
+  sm.innerHTML='<div class="tw"><table><thead><tr><th>GPU</th><th class="num">Lowest</th><th class="num">Average</th><th class="num">Peak</th><th class="num">Time at or above 83 °C</th><th class="num">Thermally throttled</th><th class="num">Power-capped</th><th class="num">Avg / peak power</th><th class="num">Avg / lowest SM clock</th></tr></thead><tbody>'+
+    rows.map(r=>'<tr><td>GPU '+r.i+'</td><td class="num">'+L.fmtInt(r.temp_min)+' °C</td><td class="num">'+L.fmtNum(r.temp_avg,1)+' °C</td><td class="num"><b>'+L.fmtInt(r.temp_max)+' °C</b></td><td class="num">'+(r.hot_s?L.fmtDur(r.hot_s):'never')+'</td><td class="num">'+(r.thermal_s==null?DASH:r.thermal_s?L.fmtDur(r.thermal_s):'never')+'</td><td class="num">'+(r.cap_s==null?DASH:r.cap_s?L.fmtDur(r.cap_s):'never')+'</td><td class="num">'+L.fmtInt(r.power_avg)+' / '+L.fmtInt(r.power_max)+' W</td><td class="num">'+L.fmtInt(r.sm_avg)+' / '+L.fmtInt(r.sm_min)+' MHz</td></tr>').join('')+
+    '</tbody></table></div><div class="cap">Peak is the hottest 2-second reading in any minute. Throttle columns count minutes in which the driver reported that slowdown at least once'+(rows.some(r=>r.thermal_s==null)?' (— : the driver reported no throttle data in this range)':'')+'. '+(cov&&cov.starts_late?'<b>History starts '+esc(L.fmtAgo(cov.first_t))+'</b>, so the range is only partly covered. ':'')+'Gaps in the lines are times the gateway was not running.</div>';
+  const mk=(key,slotOff,dash,suffix)=>Array.from({length:gn},(_,i)=>({name:'GPU '+i+(suffix||''),slot:i+1+(slotOff||0),dash:!!dash,points:L.hwSeries(dt,i,key)}));
+  const lim=(dt.points.find(p=>(p.gpu||[])[0]&&isNum(p.gpu[0].power_limit))||{gpu:[{}]}).gpu[0].power_limit;
+  ch.innerHTML=
+    hwCard('hw_temp','GPU temperature','°C · solid = average, dashed = peak',mk('temp').concat(mk('temp_max',0,true,' peak')),{yMin:20,yMax:100,yFmt:v=>v.toFixed(0)+' °C',valFmt:v=>L.fmtNum(v,0)+' °C',unit:'°C',refLines:[{v:83,label:'hot 83 °C'}],cap:'Degrees Celsius. Dotted line: this page’s “hot” threshold.'})+
+    hwCard('hw_pow','GPU power draw','watts',mk('power'),{yMin:0,yMax:isNum(lim)?Math.ceil(lim/50)*50:undefined,yFmt:v=>v.toFixed(0)+' W',valFmt:v=>L.fmtNum(v,0)+' W',unit:'W',refLines:isNum(lim)?[{v:lim,label:'limit '+L.fmtInt(lim)+' W'}]:[],cap:'Watts, averaged over each point.'})+
+    hwCard('hw_clk','GPU SM clock','MHz · drops mean the card slowed down',mk('sm_clock'),{yMin:0,yFmt:v=>L.fmtNum(v,0)+' MHz',valFmt:v=>L.fmtNum(v,0)+' MHz',unit:'MHz',cap:'Megahertz of the compute clock, averaged over each point.'})+
+    hwCard('hw_fan','GPU fan','% of max',mk('fan'),{yMin:0,yMax:100,yFmt:v=>v.toFixed(0)+'%',valFmt:v=>L.fmtNum(v,0)+'%',unit:'%',cap:'Fan speed as a percentage of its maximum.'});
+}
+$('#hw_seg').addEventListener('click',ev=>{const b=ev.target.closest('button[data-h]');if(!b)return;HW.hours=+b.dataset.h;HW.data=null;$$('#hw_seg button').forEach(x=>x.setAttribute('aria-pressed',x===b));hwRender();hwPull(true);});
+$('#d-hwlong').addEventListener('toggle',()=>{if($('#d-hwlong').open)hwPull(true);});
+setInterval(()=>{if(!document.hidden&&!paused&&$('#d-hwlong').open&&Date.now()-HW.at>=HW.every)hwPull();},5000);
 reg('watchdog',['lanes'],()=>{
   const H=get(S.lanes,['health'])||{},HC=H.checks||[];
   const col=H.overall==='ok'?'ok':H.overall==='warn'?'warn':'bad';
@@ -1736,6 +1802,10 @@ $('#hostkey').innerHTML=Object.entries(HOSTS).map(([ip,r])=>'<span class="mono">
 document.addEventListener('visibilitychange',()=>{if(!document.hidden){FEEDS.forEach(f=>FS[f.name].due=0);hDue=0;clock();}});
 setInterval(clock,500);setInterval(freshTick,1000);
 setInterval(()=>{ if(!document.hidden&&!paused){VER.series+=0;} },60000);
+// deep link: #some-id inside a collapsed <details> opens it, so a shared URL such as #d-hwlong shows the content
+(function(){const id=(location.hash||'').slice(1),el=id&&document.getElementById(id);if(!el)return;
+  for(let d=el.closest('details');d;d=d.parentElement&&d.parentElement.closest('details'))d.open=true;
+  setTimeout(()=>el.scrollIntoView(),400);})();
 loadLocalModels();clock();freshTick();
 window.__gw={S,FS,VER,R,L,CH};   // for debugging in the console
 })();

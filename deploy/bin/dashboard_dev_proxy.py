@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Preview gateway_dashboard.html against a REAL gateway without publishing anything.
 
-  python3 dashboard_dev_proxy.py [--port 8099] [--upstream http://127.0.0.1:8000] [--file gateway_dashboard.html] [--mock-capacity-model]
+  python3 dashboard_dev_proxy.py [--port 8099] [--upstream http://127.0.0.1:8000] [--file gateway_dashboard.html] [--mock-capacity-model] [--history-upstream http://127.0.0.1:8100]
 
 Serves the dashboard file at /gateway/dashboard (re-read on every request, so edit-and-reload works) and proxies every
 other request to the upstream gateway, so the page is same-origin and needs no CORS. GET only: this tool refuses POST so a
@@ -43,6 +43,9 @@ def main():
     ap.add_argument("--upstream", default="http://127.0.0.1:8000")
     ap.add_argument("--file", default=str(Path(__file__).with_name("gateway_dashboard.html")))
     ap.add_argument("--mock-capacity-model", action="store_true")
+    ap.add_argument("--history-upstream", default=None,
+                    help="send /gateway/telemetry/history here instead of --upstream (preview the long-range charts against a "
+                         "gateway that predates the endpoint, e.g. a harness serving only that route over synthetic hw-*.jsonl)")
     args = ap.parse_args()
 
     class H(http.server.BaseHTTPRequestHandler):
@@ -62,7 +65,8 @@ def main():
             if path in ("/gateway/dashboard", "/"):
                 return self._send(200, Path(args.file).read_bytes(), "text/html; charset=utf-8")
             try:
-                with urllib.request.urlopen(args.upstream + self.path, timeout=15) as r:
+                base = args.history_upstream if (args.history_upstream and path == "/gateway/telemetry/history") else args.upstream
+                with urllib.request.urlopen(base + self.path, timeout=15) as r:
                     body, ctype = r.read(), r.headers.get("Content-Type", "application/json")
             except urllib.error.HTTPError as e:
                 return self._send(e.code, e.read(), e.headers.get("Content-Type", "text/plain"))
