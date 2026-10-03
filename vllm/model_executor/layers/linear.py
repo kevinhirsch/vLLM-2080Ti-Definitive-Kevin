@@ -1725,6 +1725,15 @@ class RowParallelLinear(LinearBase):
             self.register_parameter("bias", None)
         self.update_param_tp_status()
 
+        # Lane K3 (L78): optional GEMM / all-reduce overlap, default OFF.
+        self._k3_overlap_name = None
+        if self.tp_size > 1 and reduce_results:
+            from vllm.distributed import k3_ar_overlap
+
+            if k3_ar_overlap.enabled():
+                self._k3_overlap_name = f"{prefix}#{id(self)}"
+                k3_ar_overlap.register_layer(self._k3_overlap_name, self)
+
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         input_dim = getattr(param, "input_dim", None)
         is_sharded_weight = getattr(param, "is_sharded_weight", False)
@@ -1767,6 +1776,15 @@ class RowParallelLinear(LinearBase):
         # Matrix multiply.
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
+        if self._k3_overlap_name is not None:
+            output = torch.ops.vllm.k3_row_linear_ar(
+                input_parallel, self._k3_overlap_name
+            )
+            if not self.return_bias:
+                return output
+            output_bias = self.bias if self.skip_bias_add else None
+            return output, output_bias
+
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         output_parallel = self.quant_method.apply(self, input_parallel, bias_)
 
