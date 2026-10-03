@@ -8981,6 +8981,24 @@ def _flightrec_dir():
     return os.environ.get("SHIM_FLIGHTREC_DIR", "/home/kevin/.local/share/vllm-qwen27b/flightrec")
 
 
+def _write_private(fn, data):
+    """Create `fn` 0600 from the first byte (prompt bodies: open()+chmod() left a window with the umask's mode, and a chmod of a file a
+    concurrent cleanup already trimmed raised FileNotFoundError)."""
+    fd = os.open(fn, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+
+
+def _trim_flightrec_ring(fr, keep=40):
+    """Keep the newest `keep` files. Runs in the default thread pool, so concurrent writers pick the same stale victims: a file that
+    is already gone is the goal, not an error (live: 14 x 'flightrec: [Errno 2] No such file' warnings on 2026-10-03)."""
+    for o in sorted(os.listdir(fr))[:-keep]:
+        try:
+            os.unlink(os.path.join(fr, o))
+        except FileNotFoundError:
+            pass
+
+
 def _write_remote_flightrec(fr, req_fn, req_body, resp_fn, resp_body):
     """Blocking file I/O for the REMOTE-path flight recorder -- must run off the event loop
     (ASYNC230), exactly like _write_flightrec() below it. Shares that function's directory and
@@ -9005,12 +9023,8 @@ def _write_remote_flightrec(fr, req_fn, req_body, resp_fn, resp_body):
     for fn, data in ((req_fn, req_body), (resp_fn, resp_body)):
         if fn is None or data is None:
             continue
-        with open(fn, "wb") as f:
-            f.write(data)
-        os.chmod(fn, 0o600)
-    olds = sorted(os.listdir(fr))
-    for o in olds[:-40]:
-        os.unlink(os.path.join(fr, o))
+        _write_private(fn, data)
+    _trim_flightrec_ring(fr)
 
 
 async def _note_remote_response(request, payload, body):
@@ -9332,12 +9346,8 @@ def _write_flightrec(fr, fn, body):
         os.makedirs(fr, mode=0o700, exist_ok=True)
     except OSError:
         pass
-    with open(fn, "wb") as f:
-        f.write(body)
-    os.chmod(fn, 0o600)
-    olds = sorted(os.listdir(fr))
-    for o in olds[:-40]:
-        os.unlink(os.path.join(fr, o))
+    _write_private(fn, body)
+    _trim_flightrec_ring(fr)
 
 
 def _bg_reject_response():
