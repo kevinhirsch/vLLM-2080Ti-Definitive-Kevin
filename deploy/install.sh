@@ -11,7 +11,8 @@ D="$HOME/Desktop"
 
 echo "==> [1/5] runtime scripts + templates -> $L"
 mkdir -p "$L/gencfg"
-cp -v "$HERE"/bin/*                          "$L"/
+# runtime files only: tests, caches and benches stay in the repo (AU 2026-10-03: `cp bin/*` shipped 32 test_*.py + __pycache__)
+find "$HERE"/bin -maxdepth 1 -type f ! -name 'test_*' ! -name '*.pyc' -exec cp -v {} "$L"/ \;
 cp -v "$HERE"/templates/*.jinja              "$L"/            2>/dev/null || true
 cp -v "$HERE"/templates/gencfg/*             "$L"/gencfg/     2>/dev/null || true
 cp -rv "$HERE"/templates/froggeric-templates "$L"/            2>/dev/null || true
@@ -31,10 +32,14 @@ cp -v "$HERE"/desktop/swap-model.sh "$HERE"/desktop/*.desktop "$D"/ 2>/dev/null 
 
 echo "==> [4/5] systemd units -> $SYS (sudo)"
 sudo cp -v "$HERE"/systemd/*.service "$HERE"/systemd/*.timer "$SYS"/
-sudo mkdir -p "$SYS/vllm-qwen27b.service.d"
-# every real drop-in ships; *.conf.example files (e.g. mtp-requal) are opt-in
-for f in "$HERE"/systemd/vllm-qwen27b.service.d/*.conf; do
-  sudo cp -v "$f" "$SYS/vllm-qwen27b.service.d/"
+# every real drop-in of every unit ships; *.conf.example files (e.g. mtp-requal) are opt-in
+# (AU 2026-10-03: only vllm-qwen27b.service.d was installed; the shim's drop-ins were live-only)
+for dd in "$HERE"/systemd/*.service.d; do
+  unit="$(basename "$dd")"
+  sudo mkdir -p "$SYS/$unit"
+  for f in "$dd"/*.conf; do
+    [ -e "$f" ] && sudo cp -v "$f" "$SYS/$unit/"
+  done
 done
 sudo systemctl daemon-reload
 

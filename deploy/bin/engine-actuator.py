@@ -245,6 +245,25 @@ def engine_healthy():
         return False
 
 
+#: AU 2026-10-03: how long a planned restart / start announcement waits for /health before calling the boot failed.
+#: Matches warmup-after-start.sh CAP_SECS. The unit is Type=simple, so `systemctl start` returns as soon as the process
+#: forks whenever the warm-up hook skips itself (a frontier-queue window is running) -- measured 10-02..10-03: 66 of 81
+#: restart-finished events said healthy=False and the same second announce-start said "engine is back and healthy",
+#: both read before the API was up. Waiting on /health turns both into measured facts.
+HEALTH_WAIT_S = int(os.environ.get("ENGINE_ACTUATOR_HEALTH_WAIT_S", "420"))
+
+
+def wait_engine_healthy(budget_s, poll_s=5.0):
+    """Poll /health until it answers or budget_s passes. Returns (healthy, waited_s). Always samples at least once."""
+    t0 = time.time()
+    while True:
+        if engine_healthy():
+            return True, round(time.time() - t0, 1)
+        if time.time() - t0 >= budget_s:
+            return False, round(time.time() - t0, 1)
+        time.sleep(poll_s)
+
+
 def unit_view():
     kv = {}
     for l in sh(["systemctl", "show", UNIT, "-p", "ActiveState,SubState,NRestarts,ActiveEnterTimestamp,MainPID,Result"]).splitlines():
@@ -578,11 +597,11 @@ def do_restart(a):
                 with shielded():
                     release_lease(lease, token)
                 lease = None
-            ok = engine_healthy()
-            res = {"restart_rc": r2.returncode, "stop_s": stop_s, "healthy_after": ok, "drain": drain_facts,
-                   "diag_active": active_flags()}
+            ok, health_wait_s = wait_engine_healthy(getattr(a, "health_wait_s", HEALTH_WAIT_S))
+            res = {"restart_rc": r2.returncode, "stop_s": stop_s, "healthy_after": ok, "health_wait_s": health_wait_s,
+                   "drain": drain_facts, "diag_active": active_flags()}
             write_job(state="done" if ok else "failed", finished=now_iso(), result=res)
-            emit("outcome", f"planned engine restart by {by} finished: healthy={ok}, stop took {stop_s}s, "
+            emit("outcome", f"planned engine restart by {by} finished: healthy={ok} (after {health_wait_s}s), stop took {stop_s}s, "
                  f"{drain_facts.get('active_at_end')} gateway request(s) and {drain_facts.get('engine_active_at_end')} engine request(s) "
                  f"still active when it stopped (gateway was {drain_facts.get('active_at_start')}); waited {drain_facts.get('total_waited_s')}s, "
                  f"drain ended: {drain_facts.get('end_reason')}/{(drain_facts.get('engine') or {}).get('end_reason')}"
@@ -629,6 +648,8 @@ def spawn_detached(a):
         cmd += ["--no-drain"]
     if getattr(a, "force", False):
         cmd += ["--force"]
+    if getattr(a, "health_wait_s", None) is not None:
+        cmd += ["--health-wait-s", str(a.health_wait_s)]
     # refuse early (and visibly) if one is running
     try:
         j = json.load(open(JOB))
@@ -648,6 +669,28 @@ def spawn_detached(a):
 
 
 def announce_start(_a):
+    """ExecStartPost hook. Announces "back and healthy" only once /health answers (AU 2026-10-03).
+
+    When the engine is not healthy yet (the warm-up hook skipped itself, or gave up), this records that the process
+    started and hands the wait to a detached waiter, so the unit's start is never held longer than before."""
+    if not getattr(_a, "wait_healthy", False) and not engine_healthy():
+        emit("observation", "engine process started; waiting for /health before announcing it healthy",
+             {"action": "engine-process-started", "unit": unit_view(), "health_wait_s": HEALTH_WAIT_S})
+        try:
+            subprocess.Popen([sys.executable, os.path.abspath(__file__), "announce-start", "--wait-healthy"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, start_new_session=True)
+        except Exception as e:  # noqa: BLE001
+            emit("observation", f"engine start announcement could not wait for health: {e!r}"[:200],
+                 {"action": "engine-start-unconfirmed", "error": repr(e)[:200]})
+        return 0
+    boot_wait_s = 0.0
+    if getattr(_a, "wait_healthy", False):
+        ok, boot_wait_s = wait_engine_healthy(HEALTH_WAIT_S)
+        if not ok:
+            emit("observation", f"engine process started but /health did not answer within {boot_wait_s}s",
+                 {"action": "engine-start-unhealthy", "waited_s": boot_wait_s, "unit": unit_view(),
+                  "faults_24h": faults_summary(24)})
+            return 0
     j = None
     try:
         j = json.load(open(JOB))
@@ -665,7 +708,7 @@ def announce_start(_a):
     flags = active_flags()
     emit("observation", f"engine is back and healthy (flags active: {flags or 'none'}; KV pool {pool}); "
          f"faults in last 24h: {faults_summary(24)['faults']}",
-         {"action": "engine-started", "diag_active": flags, "kv_pool_tokens": pool, "unit": unit_view(),
+         {"action": "engine-started", "diag_active": flags, "kv_pool_tokens": pool, "unit": unit_view(), "health_wait_s": boot_wait_s,
           "faults_24h": faults_summary(24), "planned_restart_job": (j or {}).get("state")})
     return 0
 
@@ -685,7 +728,9 @@ def main():
     p.add_argument("--drain-max-s", type=int, default=600, help="hard cap (offline strategy only): keep waiting past --drain-s while token progress continues")
     p.add_argument("--no-drain", action="store_true"); p.add_argument("--foreground", action="store_true")
     p.add_argument("--force", action="store_true", help="restart even when the requested diag flags are already active")
-    sp.add_parser("announce-start"); sp.add_parser("restart-status")
+    p.add_argument("--health-wait-s", type=int, default=HEALTH_WAIT_S, help="after start, wait this long for /health before calling the restart failed")
+    p = sp.add_parser("announce-start"); p.add_argument("--wait-healthy", action="store_true", help=argparse.SUPPRESS)
+    sp.add_parser("restart-status")
     a = ap.parse_args()
     if a.cmd == "status":
         print(json.dumps(status(), default=str))
