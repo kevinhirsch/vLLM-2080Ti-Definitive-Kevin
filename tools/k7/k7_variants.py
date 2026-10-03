@@ -23,21 +23,52 @@ STATS = {}
 
 
 def _wq(n, info, kind):
+    """Rotated (and re-quantized) weight on the device of info["w"].  Caches only CPU int8 codes + fp32 scales per layer,
+    so the GPU mode of variant_gate never accumulates per-layer weight copies on the GPU."""
+    w = info["w"]
     layer = n.split(".")[0]
     if _cache["layer"] != layer:
         _cache["layer"], _cache["w"] = layer, {}
+    wr = RQ.rotate_weight(w, HB)
+    if kind == "rx":
+        return wr
     key = (n, kind)
+    g = 128 if kind == "g128" else 0
     if key not in _cache["w"]:
-        wr = RQ.rotate_weight(info["w"], HB)
-        if kind == "rx":
-            _cache["w"][key] = wr
+        if kind == "gpc":
+            c, s = _gptq_load(n)
         else:
-            g = 0 if kind == "pc" else 128
             c, s = RQ.sym_quant(wr, 4, g)
-            d = RQ.dequant(c, s, g)
-            STATS.setdefault(n, {})[f"w_{kind}_sqnr_db"] = (10 * torch.log10(wr.pow(2).sum() / (d - wr).pow(2).sum())).item()
-            _cache["w"][key] = d
-    return _cache["w"][key]
+        c, s = c.cpu(), s.cpu()
+        d = RQ.dequant(c.to(wr.device), s.to(wr.device), g)
+        STATS.setdefault(n, {})[f"w_{kind}_sqnr_db"] = (10 * torch.log10(wr.pow(2).sum() / (d - wr).pow(2).sum())).item()
+        _cache["w"][key] = (c, s)
+        return d
+    c, s = _cache["w"][key]
+    return RQ.dequant(c.to(wr.device), s.to(wr.device), g)
+
+
+GPTQ_DIR = os.environ.get("K7_GPTQ_DIR", "")
+_gq = {}
+
+
+def _gptq_load(n):
+    """n = 'L<i>.<linear>' -> (codes int8 [N,K], scale fp32 [N]) from gptq_requant.py output."""
+    from safetensors import safe_open
+    li, ln = n.split(".", 1)
+    ln, _, r0 = ln.partition("#r")
+    f = os.path.join(GPTQ_DIR, f"layer_{int(li[1:]):02d}.safetensors")
+    import time as _t
+    t0 = _t.time()
+    while not os.path.exists(f) or _t.time() - os.path.getmtime(f) < 5:  # gate may trail a running gptq_requant.py
+        if _t.time() - t0 > float(os.environ.get("K7_GPTQ_WAIT_S", "3600")):
+            raise FileNotFoundError(f)
+        _t.sleep(5)
+    with safe_open(f, "pt") as h:
+        c, s = RQ.unpack_s4(h.get_tensor(f"{ln}.codes")), h.get_tensor(f"{ln}.scale")
+    if r0:
+        r0 = int(r0); c, s = c[r0:r0 + 2048], s[r0:r0 + 2048]  # must match variant_gate --gpu-rows (default 2048)
+    return c, s
 
 
 def _aq(n, x, grp):
@@ -80,8 +111,25 @@ def v_k7_agpcin(n, x, info):
     return v_k7_agpc(n, x, info) if _short(n) in IN_PROJ else _w4a16(x, info)
 
 
+# GPTQ weights (K7_GPTQ_DIR = gptq_requant.py output) instead of RTN
+def v_k7_gpc(n, x, info):
+    return _aq(n, x, 0) @ _wq(n, info, "gpc").T
+
+
+def v_k7_gagpc(n, x, info):
+    return _aq_g_int(n, x) @ _wq(n, info, "gpc").T
+
+
+def v_k7_gagpcin(n, x, info):
+    return v_k7_gagpc(n, x, info) if _short(n) in IN_PROJ else _w4a16(x, info)
+
+
+def v_k7_gw4r(n, x, info):  # GPTQ weight error alone (fp activations)
+    return RQ.block_had(x.half().float(), HB) @ _wq(n, info, "gpc").T
+
+
 def _short(n):
-    return n.split(".", 1)[1]
+    return n.split(".", 1)[1].split("#", 1)[0]
 
 
 def v_k7_a4x(n, x, info):

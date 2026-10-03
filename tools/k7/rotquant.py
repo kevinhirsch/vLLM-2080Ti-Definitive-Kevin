@@ -33,7 +33,7 @@ def block_had(x: torch.Tensor, hb: int) -> torch.Tensor:
     if hb <= 1:
         return x
     K = x.shape[-1]
-    H = hadamard(hb, x.dtype)
+    H = hadamard(hb, x.dtype).to(x.device)
     return (x.reshape(*x.shape[:-1], K // hb, hb) @ H.T).reshape(x.shape)
 
 
@@ -51,8 +51,8 @@ def sym_quant(W: torch.Tensor, bits: int = 4, group: int = 0, clip_grid=(1.0, 0.
     qmin = -(qmax + 1) if qneg else -qmax
     R, K = W.shape
     g = K if group == 0 else group
-    codes = torch.empty(R, K, dtype=torch.int8)
-    scale = torch.empty(R, K // g)
+    codes = torch.empty(R, K, dtype=torch.int8, device=W.device)
+    scale = torch.empty(R, K // g, device=W.device)
     for r0 in range(0, R, chunk):
         Wg = W[r0:r0 + chunk].float().reshape(-1, K // g, g)
         amax = Wg.abs().amax(-1, keepdim=True).clamp_min(1e-12)
@@ -72,6 +72,7 @@ def sym_quant(W: torch.Tensor, bits: int = 4, group: int = 0, clip_grid=(1.0, 0.
 
 
 def dequant(codes: torch.Tensor, scale: torch.Tensor, group: int = 0) -> torch.Tensor:
+    scale = scale.to(codes.device)
     R, K = codes.shape
     if group == 0:
         return codes.float() * scale.float().view(R, 1)
@@ -111,19 +112,19 @@ def gptq_sym(W: torch.Tensor, H: torch.Tensor, bits: int = 4, group: int = 0, bl
     qmax = 2 ** (bits - 1) - 1
     W = W.clone().float()
     N, K = W.shape
-    H = H.clone().double()
+    H = H.clone().float()  # fp32 like reference GPTQ (fp64 tripled RAM: ~7 GB peak on down_proj)
     dead = torch.diag(H) == 0
     H[dead, dead] = 1
     W[:, dead] = 0
-    perm = torch.argsort(torch.diag(H), descending=True) if act_order else torch.arange(K)
+    perm = torch.argsort(torch.diag(H), descending=True) if act_order else torch.arange(K, device=H.device)
     if group == 0:
         _, scale = sym_quant(W, bits, 0)
         sc_col = None
     else:
-        scale = torch.zeros(N, K // group)
+        scale = torch.zeros(N, K // group, device=W.device)
     W = W[:, perm]
     H = H[perm][:, perm]
-    H += percdamp * torch.mean(torch.diag(H)) * torch.eye(K, dtype=H.dtype)
+    H += percdamp * torch.mean(torch.diag(H)) * torch.eye(K, dtype=H.dtype, device=H.device)
     L = torch.linalg.cholesky(H)
     Hinv = torch.cholesky_inverse(L)
     Hinv = torch.linalg.cholesky(Hinv, upper=True).float()
