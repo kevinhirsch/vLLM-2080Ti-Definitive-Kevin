@@ -652,3 +652,13 @@ def test_release_boot_env_from_the_manifest_is_exported_unless_the_spec_override
     assert f"export VLLM_K9_GDN_BUILD_DIR={rel}/.deps/k9_build" in ov
     assert "export VLLM_X_DIR=/mine" in ov and "VLLM_X_DIR=/x" not in ov
     assert s["restore"]["override_verbatim"]
+
+
+def test_refused_while_the_remote_balance_is_exhausted(world, tmp_path):
+    """GW2/L172: with the remote balance empty, an engine window would leave the estate with no serving path."""
+    world.cap.update(remote_balance_exhausted=True)
+    s = wc.Window(spec(tmp_path)).run()
+    assert s["status"] == "refused" and any("balance exhausted" in p for p in s["why"])
+    assert not world.units
+    s = wc.Window(spec(tmp_path, results=str(tmp_path / "r2"), allow_no_remote=True)).run()
+    assert s["status"] != "refused" or not any("balance exhausted" in p for p in s["why"])

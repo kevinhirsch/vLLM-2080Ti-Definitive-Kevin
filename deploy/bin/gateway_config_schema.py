@@ -124,6 +124,7 @@ _k("SHIM_REMOTE_PROVIDER", "str", None, "Provider id for pricing (default derive
 _k("SHIM_REMOTE_CONTEXT_LIMIT", "int", "128000", "Remote provider context window admitted against.", unit="tokens", gname="REMOTE_CONTEXT_LIMIT", tunable=True)
 _k("SHIM_REMOTE_NO_THINK", "bool", "1", "Force non-thinking on the remote failover.", gname="REMOTE_NO_THINK", kill=True)
 _k("SHIM_REMOTE_VISION", "bool", "0", "Declare that the default remote accepts images.", gname="REMOTE_VISION", tunable=True, owner="GW")
+_k("SHIM_REMOTE_BALANCE_PROBE_SECS", "float", "120", "While the provider balance is exhausted (402), probe its free balance endpoint at most this often; only a probe or a remote 200 re-enables remote.", unit="s", gname="REMOTE_BALANCE_PROBE_SECS", owner="GW2")
 _k("SHIM_REMOTE_DEAD_SECS", "float", "300", "After a hard provider refusal, treat remote as unavailable this long.", unit="s", gname="REMOTE_DEAD_SECS")
 _k("SHIM_FORCE_REMOTE", "bool", "0", "Send everything remote (lease-bounded; see FORCE_REMOTE_UNTIL_EPOCH).", gname="FORCE_REMOTE", tunable=True, money=True, kill=True)
 _k("SHIM_FORCE_REMOTE_UNTIL_EPOCH", "float", "0", "Expiry of the force-remote lease (written by the gateway).", unit="epoch s", gname="FORCE_REMOTE_UNTIL_EPOCH", money=True)

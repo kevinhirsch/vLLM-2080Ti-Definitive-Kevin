@@ -193,6 +193,8 @@ def remote_health(quiet_s: float = 0.0, now=None):
         why.append("remote not configured")
     if not cap.get("remote_usable"):
         why.append("remote not usable" + (f" ({'; '.join(cap.get('why') or [])[:160]})" if cap.get("why") else ""))
+    if cap.get("remote_balance_exhausted"):
+        why.append("remote provider balance exhausted (402)")
     if cap.get("remote_budget_ok") is False:
         why.append("remote budget exhausted")
     if cap.get("remote_dead_for_s"):
@@ -587,7 +589,7 @@ class Window:
         spec = self.spec
         problems = []
         ok, why = remote_health(float(spec.get("remote_quiet_s", 900)))
-        if not ok:
+        if not ok and not spec.get("allow_no_remote"):
             problems.append(f"remote valve unhealthy, refusing to take local offline: {why}")
         hits = find_conflicts(spec.get("conflicts") or [])
         if hits:
@@ -597,6 +599,11 @@ class Window:
         sp = spend_usd()
         if sp is not None and sp >= float(spec.get("spend_pause_usd", 20)):
             problems.append(f"spend ${sp:.2f} >= pause threshold ${spec.get('spend_pause_usd', 20)}")
+        cap = http_json(f"{GATEWAY}/gateway/capacity")
+        if cap.get("remote_balance_exhausted") and not spec.get("allow_no_remote"):
+            # GW2/L172: with the provider balance empty the remote valve is gone; an engine window would leave the
+            # estate with no serving path at all. Kevin tops up; the gateway's balance probe re-enables remote.
+            problems.append("remote provider balance exhausted (402): an engine window would leave no serving path")
         off = http_json(f"{GATEWAY}/gateway/offline")
         if off.get("offline"):
             problems.append(f"another gateway offline window is open (by {off.get('by')}: {off.get('reason')})")

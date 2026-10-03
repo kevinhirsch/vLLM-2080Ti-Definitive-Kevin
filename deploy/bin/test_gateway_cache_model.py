@@ -243,7 +243,8 @@ class Units(Base):
 class RemoteBreaker(Base):
     def test_402_turns_remote_overflow_off_then_lets_a_probe_through(self):
         with patch.object(shim, "REMOTE_ENABLED", True), patch.object(shim, "LOCAL_ONLY", 0), \
-                patch.object(shim, "_remote_dead_until", 0.0), patch.object(shim, "REMOTE_DEAD_SECS", 300.0):
+                patch.object(shim, "_remote_dead_until", 0.0), patch.object(shim, "REMOTE_DEAD_SECS", 300.0), \
+                patch.dict(shim._REMOTE_BALANCE, {"exhausted": False, "since": None, "count": 0, "probe_at": 0.0}):
             self.assertTrue(shim.remote_ok())
             shim._note_remote_status(shim.LOCAL, 402)                 # local 402 is not the provider
             self.assertTrue(shim.remote_ok())
@@ -252,7 +253,11 @@ class RemoteBreaker(Base):
             shim._note_remote_status("https://api.example.invalid", 402)
             self.assertFalse(shim.remote_ok())
             with patch.object(shim.time, "time", return_value=shim._remote_dead_until + 1):
-                self.assertTrue(shim.remote_ok())                      # window over: next request probes
+                # GW2/L172 (intended change): a 402 is a BALANCE refusal and persistent -- the timer running out no
+                # longer reopens remote (it did at 09:51:58 on 10-03 while the balance was still empty).
+                self.assertFalse(shim.remote_ok())
+            shim._note_remote_status("https://api.example.invalid", 200)   # proof (a remote 200 or a balance probe)
+            self.assertTrue(shim.remote_ok())
 
 
 class Window(Base):
