@@ -4171,7 +4171,10 @@ def _note_payload_outcome(request, payload, stream):
         kw = {"http_status": getattr(payload, "status", None)}
         if not stream:
             body = getattr(payload, "body", None)
-            if isinstance(body, (bytes, bytearray)):
+            # usage lives only in a JSON object answer; a plain-text/empty error body has none and is not a failure to count
+            # (A6: it made _note_payload_outcome the loudest entry of /gateway/internal-errors, 20 hits of pure noise)
+            ok_status = not isinstance(kw["http_status"], int) or kw["http_status"] < 400
+            if isinstance(body, (bytes, bytearray)) and ok_status and bytes(body[:64]).lstrip()[:1] == b"{":
                 u = (json.loads(body).get("usage") or {})
                 if "completion_tokens" in u:
                     kw["outtok"] = int(u["completion_tokens"])
