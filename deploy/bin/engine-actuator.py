@@ -1318,6 +1318,12 @@ def _act(action, cause, by, evidence, f, dry_run=False):
                 # RS: record the death BEFORE the kill (journal intact; ExecStopPost then dedupes)
                 steps.append(("pre-kill", subprocess.run([sys.executable, f"{BASE}/engine-fault-collector.py", "--pre-kill"],
                                                          capture_output=True, text=True, timeout=60).returncode))
+            else:
+                try:   # the collector reads this marker: a FAULT (stuck boot / dead API) recovered by us, not an operator stop
+                    with open(f"{BASE}/liveness-recover.json", "w") as fh:
+                        json.dump({"ts": now_iso(), "id": aid, "cause": cause, "by": by, "evidence": evidence}, fh)
+                except OSError:
+                    pass
             steps.append(("reset-failed", _sudo(["reset-failed", UNIT])))
             # a confirmed wedge / stuck boot has never honoured SIGTERM (2026-09-02, 09-05): kill the control group up front
             steps.append(("kill", _sudo(["kill", "-s", "KILL", UNIT])))

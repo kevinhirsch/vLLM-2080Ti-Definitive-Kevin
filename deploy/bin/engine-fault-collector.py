@@ -381,7 +381,7 @@ def main():
     since = datetime.fromtimestamp(since_t).strftime("%Y-%m-%d %H:%M:%S")
     until = datetime.fromtimestamp(now + 45).strftime("%Y-%m-%d %H:%M:%S")
     journal = sh(f'journalctl -u {UNIT} --no-pager --since "{since}" --until "{until}"')
-    kernel = sh(f'journalctl -k --no-pager -o short-iso --since "{since}" --until "{until}" | grep -i "xid\\|NVRM"')
+    kernel = sh(f'journalctl -k --no-pager -o short-iso --since "{since}" --until "{until}" | grep "NVRM"')
     result = os.environ.get("SERVICE_RESULT", "") or "backfill"
     sig, detail = classify(journal, kernel)
     planned = (sig == "unknown-exit" and not a.at and result in ("success", "") and "Traceback" not in journal)
@@ -405,12 +405,31 @@ def main():
         os.rename(f"{BASE}/wedge-restart.json", f"{BASE}/wedge-restart.last.json")
     except Exception:  # noqa: BLE001
         pass
+    # LV 2026-10-03: the liveness authority killed a STUCK_BOOT / UNRESPONSIVE engine (not a generation wedge). Its kill is
+    # followed by `systemctl restart`, whose "Stopping" line would otherwise read as an operator stop -> planned-stop, hiding
+    # a boot that never came up behind "planned". It is a FAULT whose mechanism was the authority's recovery.
+    recovered = None
+    try:
+        if a.at:
+            raise FileNotFoundError
+        recovered = json.load(open(f"{BASE}/liveness-recover.json"))
+        os.rename(f"{BASE}/liveness-recover.json", f"{BASE}/liveness-recover.last.json")
+    except Exception:  # noqa: BLE001
+        pass
     if a.wedge and a.at:
         wedge = {"by": "watchdog", "wedge": True, "backfilled": True}
     if a.pre_kill and not wedge:
         wedge = {"by": "watchdog", "wedge": True}
     if wedge:
         sig, detail = wedge_signature(sig, detail)
+        planned = False
+    elif recovered:
+        cause = str(recovered.get("cause") or "liveness-recover").replace("_", "-")
+        note = f"killed by the liveness authority ({cause}: {str(recovered.get('evidence') or '')[:160]})"
+        if sig == "unknown-exit":
+            sig, detail = cause, note
+        else:
+            detail = (detail + "; " + note) if detail else note
         planned = False
     elif marker or (requested_stop and "Traceback" not in journal):
         planned = True
@@ -440,6 +459,8 @@ def main():
         row["recorded_by"] = "watchdog-pre-kill"
     if wedge:
         row["wedge"] = {k: wedge.get(k) for k in ("by", "consecutive_failures", "ts")}
+    if recovered:
+        row["liveness_recover"] = {k: recovered.get(k) for k in ("id", "cause", "by", "ts")}
     hold = None if a.at else engine_hold(now)
     if hold:
         row["during_hold"] = hold

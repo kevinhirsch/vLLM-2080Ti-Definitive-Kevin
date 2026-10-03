@@ -45,5 +45,19 @@ class HoldAttribution(unittest.TestCase):
             self.assertNotIn("during_hold", row)
 
 
+    def test_authority_recovery_is_a_fault_not_a_planned_stop(self):
+        """LV: a STUCK_BOOT kill is followed by `systemctl restart` ("Stopping ...") -- it must still be a FAULT."""
+        with tempfile.TemporaryDirectory() as base:
+            json.dump({"ts": "x", "id": "lv-1", "cause": "stuck_boot", "by": "watchdog-tick",
+                       "evidence": "process up 950s and /health never answered"}, open(f"{base}/liveness-recover.json", "w"))
+            r = run(base, "--stop-post", SERVICE_RESULT="signal", EXIT_STATUS="KILL")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            row = json.loads(open(f"{base}/incidents/ledger.jsonl").read().splitlines()[-1])
+            self.assertEqual(row["kind"], "FAULT")
+            self.assertEqual(row["liveness_recover"]["cause"], "stuck_boot")
+            self.assertIn("liveness authority", row["detail"])
+            self.assertFalse(os.path.exists(f"{base}/liveness-recover.json"))     # consumed once
+
+
 if __name__ == "__main__":
     unittest.main()
