@@ -11,7 +11,7 @@ Actions (every one writes an event to the estate event log, source "engine", so 
   flags                       the diagnostic flags that exist (the allow-list) and which are staged
   stage-diag --flags a,b      stage diagnostic flags for the NEXT start (any start, planned or unplanned). --clear removes all.
   restart --reason R [...]    planned restart: stage flags (optional) -> DRAIN the gateway fence -> wait for accepted
-                              requests to finish (bounded) -> stop -> release the fence -> start. Detached by default.
+                              requests AND the engine's own num_requests_running/waiting (:8001/metrics, catches direct callers) to finish (bounded) -> stop -> release the fence -> start. Detached by default.
   announce-start              (ExecStartPost) emit a "engine is back" observation with the flags that are active
   restart-status              state of the last/running planned restart
 
@@ -310,6 +310,55 @@ def offline_and_wait(deadline_s, reason, token, by=None):
     return facts, ("offline", lease)
 
 
+def engine_inflight(engine=None, timeout=3):
+    """Requests the ENGINE itself holds, read from its own /metrics: {"running": n, "waiting": n}, or None if unreadable.
+    The gateway fence/offline window only counts requests the gateway accepted; callers that go straight to :8001
+    (bypassing routing, the spend ledger and the drain) are visible only here. FX2 2026-10-03: the 23:18 planned restart
+    stopped the engine under one such caller."""
+    try:
+        txt = urllib.request.urlopen(f"{engine or ENGINE}/metrics", timeout=timeout).read().decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return None
+    out = {}
+    for key, name in (("running", "vllm:num_requests_running"), ("waiting", "vllm:num_requests_waiting")):
+        m = re.search(r"^" + re.escape(name) + r"(?:\{[^}]*\})?\s+([0-9.eE+-]+)\s*$", txt, re.M)
+        if not m:
+            return None
+        out[key] = int(float(m.group(1)))
+    return out
+
+
+def wait_engine_idle(budget_s, engine=None, poll_s=2.0, settle=2):
+    """Wait until the engine's own running+waiting count is 0 on `settle` consecutive polls (one zero can be the gap between
+    two back-to-back direct requests), for at most budget_s seconds (always at least one sample). Never raises, never
+    blocks on an unreadable /metrics (the engine is then unhealthy and there is nothing to wait for). Returns facts."""
+    t0 = time.time()
+    f = {"checked": True, "idle": None, "waited_s": 0, "running_at_start": None, "waiting_at_start": None,
+         "running_at_end": None, "waiting_at_end": None}
+    zeros = 0
+    first = True
+    while True:
+        cur = engine_inflight(engine)
+        if cur is None:
+            f["error"] = "engine /metrics unreadable"
+            f["idle"] = None
+            break
+        if first:
+            f["running_at_start"], f["waiting_at_start"] = cur["running"], cur["waiting"]
+            first = False
+        f["running_at_end"], f["waiting_at_end"] = cur["running"], cur["waiting"]
+        zeros = zeros + 1 if cur["running"] + cur["waiting"] == 0 else 0
+        if zeros >= settle:
+            f["idle"] = True
+            break
+        if time.time() - t0 + poll_s > budget_s:
+            f["idle"] = False
+            break
+        time.sleep(poll_s)
+    f["waited_s"] = round(time.time() - t0)
+    return f
+
+
 def release_lease(lease, token):
     if not lease:
         return
@@ -372,7 +421,13 @@ def do_restart(a):
     if healthy and not a.no_drain:
         write_job(state="draining")
         got = None if os.environ.get("ENGINE_ACTUATOR_FORCE_DRAIN") else offline_and_wait(a.drain_s, reason, token, by)
+        t_drain = time.time()
         drain_facts, lease = got if got else drain_and_wait(a.drain_s, reason, token, by)
+        # FX2: the fence counts only gateway-accepted requests. Also wait on the engine's own in-flight count, inside the
+        # SAME drain budget (remaining time; at least one sample), so a direct :8001 caller is not cut mid-request.
+        eng = wait_engine_idle(max(0.0, a.drain_s - (time.time() - t_drain)))
+        drain_facts["engine"] = eng
+        drain_facts["engine_active_at_end"] = None if eng.get("running_at_end") is None else eng["running_at_end"] + (eng["waiting_at_end"] or 0)
     write_job(state="stopping", drain=drain_facts)
     json.dump({"ts": now_iso(), "by": by, "reason": reason, "drain": drain_facts, "active_at_stop": drain_facts.get("active_at_end")},
               open(PLANNED, "w"))
@@ -391,7 +446,8 @@ def do_restart(a):
            "diag_active": active_flags()}
     write_job(state="done" if ok else "failed", finished=now_iso(), result=res)
     emit("outcome", f"planned engine restart by {by} finished: healthy={ok}, stop took {stop_s}s, "
-         f"{drain_facts.get('active_at_end')} request(s) still active when it stopped (was {drain_facts.get('active_at_start')})",
+         f"{drain_facts.get('active_at_end')} gateway request(s) and {drain_facts.get('engine_active_at_end')} engine request(s) "
+         f"still active when it stopped (gateway was {drain_facts.get('active_at_start')})",
          {"action": "restart-finished", "by": by, "reason": reason, **res})
     print(json.dumps(res))
     return 0 if ok else 1
