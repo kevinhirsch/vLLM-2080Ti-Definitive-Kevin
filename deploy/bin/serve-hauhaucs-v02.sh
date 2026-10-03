@@ -12,6 +12,14 @@
 set -euo pipefail
 # experiment overrides (V02_* variables), written by the UP lane; absent = production defaults
 [ -f /home/kevin/.local/share/vllm-qwen27b/v02.override.env ] && . /home/kevin/.local/share/vllm-qwen27b/v02.override.env
+# lane S3/U2b (2026-10-02, Kevin approved 23:03): DEFAULT STACK = text-only (--language-model-only: no vision tower, image/video requests 400) + int4 lm_head +
+# int4 MTP block (load-time RTN+MSE-clip quantization cached in <model>-u2cache; fidelity top-1 93.2% / KL 0.009 vs bf16 over 3,636 estate rows).
+# Measured vs the bf16/vision build: weights 9.6 -> 7.97 GiB/rank, KV pool 711,996 -> 919,122 tokens (+29%), natural decode 64-68 -> 81-84 tok/s,
+# 12-body estate pass 18.3-18.6 s (no run-2 cliff), evalkit 60/60, 483K needle correct.  ROLLBACK: export V02_STACK=0 in v02.override.env + engine-actuator restart.
+if [ "${V02_STACK:-1}" = "1" ]; then
+  export VLLM_U2_INT4_HEAD=${VLLM_U2_INT4_HEAD:-1} VLLM_U2_INT4_MTP=${VLLM_U2_INT4_MTP:-1}
+  case " ${VLLM_SERVE_EXTRA_ARGS:-} " in *" --language-model-only "*) ;; *) VLLM_SERVE_EXTRA_ARGS="--language-model-only ${VLLM_SERVE_EXTRA_ARGS:-}"; export VLLM_SERVE_EXTRA_ARGS;; esac
+fi
 V02_ROOT=${V02_ROOT:-/home/kevin/Desktop/wt-integrate}
 cd "$V02_ROOT"
 export PATH="/home/kevin/.local/share/shim-gcc15:$V02_ROOT/.venv/bin:/usr/local/cuda-13/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin"
