@@ -7,8 +7,15 @@ versus dense fp16 cuBLAS on a dequantized scratch weight, and what does fp16-ACC
 Turing GeForce rates (2080 Ti, 68 SM): fp16 tensor with fp32 accumulate = 1/2 rate (53.8 TF/s at 1545 MHz, RF's roof);
 fp16 accumulate = full rate (107.5 TF/s).  Prefill measured: 1,279 tok/s = 68% of the fp32-acc roof (RF).
 
+FINDING (code-read, csrc/libtorch_stable/quantization/marlin/marlin_template.h): on sm_75 Marlin ALREADY accumulates in fp16
+(`use_fp16_accum` is true for fp16 activations with group-quantized int4), so the "fp16-accumulate" arm is mostly already unlocked inside
+Marlin; what is left is (1) how close Marlin gets to the 107.5 TF/s fp16-acc roof at M=3584 (dequant ALU per 64-row block), (2) dense cuBLAS
+on a dequantized scratch, (3) W4A8-INT8 (2x the fp16 roof).  Hence the arms below.
+
 Arms (per shape, per M):
   marlin       production kernel: CompressedTensorsWNA16 -> MarlinLinearKernel (real vLLM objects, same packing as the engine)
+  marlin_int8  (speed potential only: needs SYMMETRIC int4 weights, the checkpoint is asymmetric) W4A8-INT8 Marlin (VLLM_MARLIN_INPUT_DTYPE=int8, per-token int8 activations, int8 tensor cores: 215 TOPS peak on Turing = 2x the
+               fp16-acc roof).  NOTE the engine reads that env GLOBALLY (decode too).  Naive per-token int8 with outlier channels is the quality risk.
   cublas32     dense fp16 weight, torch.matmul (cuBLAS, fp16 inputs, fp32 accumulate)           -- GEMM only
   cublas16acc  dense fp16 weight, cublasGemmEx(CUBLAS_COMPUTE_16F, GEMM_DEFAULT_TENSOR_OP)       -- GEMM only (fp16 accumulate)
   deq          int4 -> fp16 scratch dequant cost (torch ops here = upper bound; a fused kernel is bytes/BW:  0.5*N*K read + 2*N*K write)
@@ -22,7 +29,8 @@ Model shapes (TP=2 per GPU, K=input features, N=output features per partition):
 
 Quality gate for the fp16-accumulate arm (run by this script, micro level, reported as PASS/FAIL):
   (a) no inf/nan in outputs for inputs drawn like real post-norm activations incl. outlier channels (--outlier-scale);
-  (b) rel L2 error vs fp32-accumulate  <= 4x the fp16-rounding floor of the fp32-accumulate result, per shape;
+  (b) rel L2 error of the fp16-accumulate output vs an fp32 reference <= 4e-3 (= half a bf16 ulp, i.e. no worse than the rounding the
+      model already applies between layers; the int4 weights' own error is ~10% rel, 25x larger), per shape; the ratio to the fp32-acc floor is printed;
   (c) max |y| headroom: max|y| < 20000 (fp16 max 65504) -- accumulate overflow risk grows with K and outlier channels.
   Engine-level gate (S3 does this, only if (a)-(c) PASS and speedup >= 1.15x on gate_up/down at M=3584):
   evalkit tool_call+code_exec+long_ctx must stay 60/60-equivalent (>=59/60: tool_call_020 is a known 95% item), needle_long.py --tokens 131000 and
@@ -50,7 +58,7 @@ ROOT32, ROOT16 = 53.8, 107.5  # TF/s at 1545 MHz, 68 SMs
 ap = argparse.ArgumentParser()
 ap.add_argument("--Ms", default="512,1024,2048,3584"); ap.add_argument("--iters", type=int, default=40); ap.add_argument("--warmup", type=int, default=10)
 ap.add_argument("--json"); ap.add_argument("--smoke", action="store_true"); ap.add_argument("--outlier-scale", type=float, default=30.0)
-ap.add_argument("--arms", default="marlin,cublas32,cublas16acc,deq")
+ap.add_argument("--arms", default="marlin,marlin_int8,cublas32,cublas16acc,deq")
 a = ap.parse_args()
 arms = a.arms.split(",")
 Ms = [64] if a.smoke else [int(m) for m in a.Ms.split(",")]
@@ -123,6 +131,17 @@ for (name, K, N, nlayers) in shapes:
     if "marlin" in arms:
         from _ctlayer import make_marlin_layer
         layer, scheme = make_marlin_layer({k: v.cpu() for k, v in t.items()}, N, K, device="cuda")
+    layer8 = None
+    if "marlin_int8" in arms:
+        from _ctlayer import make_marlin_layer
+        os.environ["VLLM_MARLIN_INPUT_DTYPE"] = "int8"  # W4A8-INT8 Marlin (sm75 s8 kernels are compiled into this build); act_type is fixed at layer build
+        try:
+            # the int8-activation Marlin path asserts weight_type == uint4b8 (SYMMETRIC int4): the shipped checkpoint is asymmetric (zero points), so this arm
+            # measures raw kernel SPEED on a symmetric re-quantization of the same random weights; using it for real needs a sym re-quant of every layer.
+            t8 = hq.quantize_linear(W.cpu(), device="cuda", symmetric=True)
+            layer8, scheme8 = make_marlin_layer({k: v.cpu() for k, v in t8.items()}, N, K, device="cuda", symmetric=True)
+        finally:
+            os.environ.pop("VLLM_MARLIN_INPUT_DTYPE", None)
     Wd = deq_to_fp16(t, N, K, torch.empty(N, K, device=dev, dtype=torch.float16))
     for M in Ms:
         x = torch.randn(M, K, device=dev).half()
@@ -136,6 +155,10 @@ for (name, K, N, nlayers) in shapes:
         if "marlin" in arms:
             from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import CompressedTensorsWNA16
             rec("marlin", lambda: scheme.apply_weights(layer, x, None))
+        if layer8 is not None:
+            rec("marlin_int8", lambda: scheme8.apply_weights(layer8, x, None))
+            ref8 = torch.matmul(x.float(), Wd.float().T); y8 = scheme8.apply_weights(layer8, x, None).float()
+            row["marlin_int8_rel_err"] = ((y8 - ref8).norm() / ref8.norm()).item()
         if "cublas32" in arms:
             rec("cublas32", lambda: torch.matmul(x, Wd.T))
             rec("cublas32_ex", lambda: gemm_ex(x, Wd, y32, CUBLAS_COMPUTE_32F))
@@ -149,11 +172,11 @@ for (name, K, N, nlayers) in shapes:
         y32 = gemm_ex(x, Wd, y32, CUBLAS_COMPUTE_32F).float(); y16f = gemm_ex(x, Wd, y16, CUBLAS_COMPUTE_16F).float()
         floor = ((y32 - ref).norm() / ref.norm()).item(); e16 = ((y16f - ref).norm() / ref.norm()).item()
         row["quality"] = {"rel_fp32acc": floor, "rel_fp16acc": e16, "finite": bool(torch.isfinite(y16f).all()), "max_abs_y": float(y16f.abs().max()),
-                          "PASS": bool(torch.isfinite(y16f).all() and e16 <= 4 * max(floor, 1e-4) and float(y16f.abs().max()) < 20000)}
+                          "PASS": bool(torch.isfinite(y16f).all() and e16 <= 4e-3 and float(y16f.abs().max()) < 20000)}
         res.append(row)
         f = lambda arm: f"{row[arm]['ms']:7.3f}ms {row[arm]['tflops']:5.1f}TF" if arm in row else "   -   "
         print(f"{name:9s} M={M:5d} K={K:5d} N={N:5d} | marlin {f('marlin')} | cublas32 {f('cublas32')} | 16acc {f('cublas16acc')} | "
-              f"deq(torch) {row.get('deq_torch',{}).get('ms',0):6.3f}ms | q16: rel {e16:.2e} (floor {floor:.2e}) maxy {row['quality']['max_abs_y']:.0f} {'PASS' if row['quality']['PASS'] else 'FAIL'}", flush=True)
+              f"int8 {f('marlin_int8')} | deq(torch) {row.get('deq_torch',{}).get('ms',0):6.3f}ms | q16: rel {e16:.2e} (floor {floor:.2e}) maxy {row['quality']['max_abs_y']:.0f} {'PASS' if row['quality']['PASS'] else 'FAIL'}", flush=True)
     del W, Wd, t, layer
     torch.cuda.empty_cache()
 
@@ -163,7 +186,7 @@ tot = {}
 for r in res:
     if r["M"] != Mtop:
         continue
-    for arm in ("marlin", "cublas32", "cublas16acc"):
+    for arm in ("marlin", "marlin_int8", "cublas32", "cublas16acc"):
         if arm in r:
             tot[arm] = tot.get(arm, 0) + r[arm]["ms"] * r["layers"]
     if "deq_fused_bound_ms" in r and "cublas32" in r:
