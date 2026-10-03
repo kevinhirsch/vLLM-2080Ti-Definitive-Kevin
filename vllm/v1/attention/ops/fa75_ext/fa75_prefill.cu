@@ -7,6 +7,10 @@
 //   * variable-length batch (cu_seqlens_q / cu_seqlens_k, one request per grid.z), bottom-right causal per request
 //   * strided output, compile-time variants (P V accumulate fp16-per-slice or fp32, causal)
 //   * lazy O rescale (warp-uniform skip when no row max moved), wider key tiles (BN template)
+//   * (Lane K9) QKC > 0: Q K^T on the full-rate fp16-accumulate HMMA (GeForce Turing runs f32-accumulate HMMA at
+//     half rate: measured 512 vs 256 MAC/clk/SM) with two-level accumulation - fp16 partial sums over QKC head dims,
+//     promoted into the fp32 score registers at each chunk end (DeepSeek-V3-style promotion). Q is pre-scaled by the
+//     softmax scale at staging (exact for hd256: 1/16) so fp16 partials hold scaled logits (16x overflow headroom).
 //
 // Layout: q [Tq_total, Hq, 256], k/v [Tkv_total, Hkv, 256] (row and head strides, last dim contiguous),
 // o [Tq_total, Hq, 256] (row/head strides), lse [Tq_total, Hq] fp32 (row/head strides) or null.
@@ -24,6 +28,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp16.h>
 #include <stdint.h>
+#include <type_traits>
 
 #define HD 256
 #define BM 64
@@ -64,7 +69,7 @@ static __device__ __forceinline__ uint32_t pack_h2(float a, float b) {
 // PV16: P V accumulates each BN-key slice in fp16 then adds into fp32 O (fa75's scheme), else straight fp32.
 // LAZY: rescale O only when some row max of the warp grows by more than LAZY_TAU (log2 units); P is then bounded
 // by 2^LAZY_TAU instead of 1 (the running max that defines the exponent is kept stale).
-template <int BN, bool CAUSAL, bool PV16, bool LAZY>
+template <int BN, bool CAUSAL, bool PV16, bool LAZY, int QKC>
 __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
     const half* __restrict__ q, int64_t q_row, int64_t q_head,
     const half* __restrict__ k, int64_t k_row, int64_t k_head,
@@ -72,7 +77,8 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
     half* __restrict__ o, int64_t o_row, int64_t o_head,
     float* __restrict__ lse, int64_t lse_row, int64_t lse_head,
     const int* __restrict__ cu_q, const int* __restrict__ cu_k,
-    int Hq, int Hkv, float scale_log2) {
+    int Hq, int Hkv, float scale_log2, float q_prescale) {
+  static_assert(QKC == 0 || (QKC % 16 == 0 && HD % QKC == 0), "QKC: 0 or a multiple of 16 dividing 256");
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 750)
   __trap();
 #else
@@ -118,6 +124,12 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
       int r = idx / ROW_CHUNKS, c = idx % ROW_CHUNKS;
       uint4 val = make_uint4(0, 0, 0, 0);
       if (m0 + r < Tq) val = *reinterpret_cast<const uint4*>(q_ + (int64_t)(m0 + r) * q_row + c * 8);
+      if (QKC > 0) {
+        const half2 ps = __float2half2_rn(q_prescale);
+        half2* hv = reinterpret_cast<half2*>(&val);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) hv[e] = __hmul2(hv[e], ps);
+      }
       if (c < ROW_CHUNKS / 2) *reinterpret_cast<uint4*>(sm + ql_off(r, c)) = val;
       else *reinterpret_cast<uint4*>(sm + (qh_off(QH_BASE, r, c - ROW_CHUNKS / 2))) = val;
     }
@@ -185,6 +197,9 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
     for (int nt = 0; nt < NT8; ++nt)
 #pragma unroll
       for (int i = 0; i < 4; ++i) s[nt][i] = 0.0f;
+    uint32_t sh[NT8][2];  // QKC > 0: fp16 partial scores of the current head-dim chunk
+#pragma unroll
+    for (int nt = 0; nt < NT8; ++nt) { sh[nt][0] = 0u; sh[nt][1] = 0u; }
     if (warp_active) {
 #pragma unroll
       for (int kk = 0; kk < HD / 8; kk += 2) {
@@ -199,10 +214,26 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
           // matrices: (keys 16np+0-7, chunk kk), (16np+8-15, kk), (16np+0-7, kk+1), (16np+8-15, kk+1)
           uint32_t bb[4];
           ldsm_x4(bb, sK + tile_off(16 * np + 8 * (lm & 1) + lr, kk + (lm >> 1)));
-          mma1688(s[2 * np], a[0], a[1], bb[0]);
-          mma1688(s[2 * np + 1], a[0], a[1], bb[1]);
-          mma1688(s[2 * np], a[2], a[3], bb[2]);
-          mma1688(s[2 * np + 1], a[2], a[3], bb[3]);
+          if (QKC > 0) {
+            mma1688h(sh[2 * np], a[0], a[1], bb[0]);
+            mma1688h(sh[2 * np + 1], a[0], a[1], bb[1]);
+            mma1688h(sh[2 * np], a[2], a[3], bb[2]);
+            mma1688h(sh[2 * np + 1], a[2], a[3], bb[3]);
+          } else {
+            mma1688(s[2 * np], a[0], a[1], bb[0]);
+            mma1688(s[2 * np + 1], a[0], a[1], bb[1]);
+            mma1688(s[2 * np], a[2], a[3], bb[2]);
+            mma1688(s[2 * np + 1], a[2], a[3], bb[3]);
+          }
+        }
+        if (QKC > 0 && ((kk + 2) % (QKC / 8)) == 0) {  // promote the fp16 chunk partials into fp32 scores
+#pragma unroll
+          for (int nt = 0; nt < NT8; ++nt) {
+            const float2 lo = __half22float2(*reinterpret_cast<half2*>(&sh[nt][0]));
+            const float2 hi = __half22float2(*reinterpret_cast<half2*>(&sh[nt][1]));
+            s[nt][0] += lo.x; s[nt][1] += lo.y; s[nt][2] += hi.x; s[nt][3] += hi.y;
+            sh[nt][0] = 0u; sh[nt][1] = 0u;
+          }
         }
       }
     }
@@ -329,12 +360,12 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
 #endif
 }
 
-template <int BN, bool CAUSAL, bool PV16, bool LAZY>
+template <int BN, bool CAUSAL, bool PV16, bool LAZY, int QKC>
 static void launch(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, at::Tensor& o,
                    float* lse_ptr, int64_t lse_row, int64_t lse_head,
-                   const at::Tensor& cu_q, const at::Tensor& cu_k, int max_q, float scale_log2) {
+                   const at::Tensor& cu_q, const at::Tensor& cu_k, int max_q, float scale_log2, float q_prescale) {
   constexpr uint32_t SMEM = 2 * BN * HD * 2 + BM * HD;
-  auto kern = k1fa_kernel<BN, CAUSAL, PV16, LAZY>;
+  auto kern = k1fa_kernel<BN, CAUSAL, PV16, LAZY, QKC>;
   static bool attr_set[64] = {};
   const int dev = q.get_device();
   if (!attr_set[dev]) {
@@ -350,11 +381,11 @@ static void launch(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v
       (const half*)v.data_ptr(), v.stride(0), v.stride(1),
       (half*)o.data_ptr(), o.stride(0), o.stride(1),
       lse_ptr, lse_row, lse_head,
-      cu_q.data_ptr<int>(), cu_k.data_ptr<int>(), Hq, Hkv, scale_log2);
+      cu_q.data_ptr<int>(), cu_k.data_ptr<int>(), Hq, Hkv, scale_log2, q_prescale);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-// variant: bit0 = PV16, bit1 = LAZY; bn in {16, 32}
+// variant: bit0 = PV16, bit1 = LAZY, bits3-5 = QK16 chunk code (K9); bn in {16, 32}
 void k1fa_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, c10::optional<at::Tensor> lse,
               at::Tensor cu_q, at::Tensor cu_k, int64_t max_q, double scale, bool causal, int64_t bn,
               int64_t variant) {
@@ -382,29 +413,41 @@ void k1fa_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, c10::optio
   }
   if (max_q <= 0) return;
   const float sl2 = (float)(scale * 1.4426950408889634);
-#define K1_DISPATCH(BNV, C, P, L) \
-  launch<BNV, C, P, L>(q, k, v, o, lse_ptr, lse_row, lse_head, cu_q, cu_k, (int)max_q, sl2)
+  // K9: variant bits 3..5 = QK chunk code (0 off, 1:32, 2:64, 3:128, 4:256, 5:16 head dims per fp16 partial). With QK16 the
+  // softmax scale is folded into Q at staging (prescale) and the score multiplier becomes log2(e).
+  const int qkc = (int)((variant >> 3) & 7);
+  const float qps = (float)scale, sl2q = 1.4426950408889634f;
   const bool pv16 = variant & 1, lazy = variant & 2;
-  if (bn == 16) {
-    if (causal) {
-      if (pv16) { if (lazy) K1_DISPATCH(16, true, true, true); else K1_DISPATCH(16, true, true, false); }
-      else { if (lazy) K1_DISPATCH(16, true, false, true); else K1_DISPATCH(16, true, false, false); }
-    } else {
-      if (pv16) { if (lazy) K1_DISPATCH(16, false, true, true); else K1_DISPATCH(16, false, true, false); }
-      else { if (lazy) K1_DISPATCH(16, false, false, true); else K1_DISPATCH(16, false, false, false); }
+  TORCH_CHECK(qkc <= 5 && (qkc == 0 || bn == 16), "QK16 chunk code 0..5, bn 16 only");
+  auto go = [&](auto bnc, auto cc, auto pc, auto lc) {
+    constexpr int BNV = decltype(bnc)::value;
+    constexpr bool C = decltype(cc)::value, P = decltype(pc)::value, L = decltype(lc)::value;
+    if constexpr (BNV == 16) {
+      switch (qkc) {
+        case 1: launch<BNV, C, P, L, 32>(q, k, v, o, lse_ptr, lse_row, lse_head, cu_q, cu_k, (int)max_q, sl2q, qps); return;
+        case 2: launch<BNV, C, P, L, 64>(q, k, v, o, lse_ptr, lse_row, lse_head, cu_q, cu_k, (int)max_q, sl2q, qps); return;
+        case 3: launch<BNV, C, P, L, 128>(q, k, v, o, lse_ptr, lse_row, lse_head, cu_q, cu_k, (int)max_q, sl2q, qps); return;
+        case 4: launch<BNV, C, P, L, 256>(q, k, v, o, lse_ptr, lse_row, lse_head, cu_q, cu_k, (int)max_q, sl2q, qps); return;
+        case 5: launch<BNV, C, P, L, 16>(q, k, v, o, lse_ptr, lse_row, lse_head, cu_q, cu_k, (int)max_q, sl2q, qps); return;
+        default: break;
+      }
     }
-  } else if (bn == 32) {
+    launch<BNV, C, P, L, 0>(q, k, v, o, lse_ptr, lse_row, lse_head, cu_q, cu_k, (int)max_q, sl2, 1.0f);
+  };
+  using T = std::true_type; using F = std::false_type;
+  auto go2 = [&](auto bnc) {
     if (causal) {
-      if (pv16) { if (lazy) K1_DISPATCH(32, true, true, true); else K1_DISPATCH(32, true, true, false); }
-      else { if (lazy) K1_DISPATCH(32, true, false, true); else K1_DISPATCH(32, true, false, false); }
+      if (pv16) { if (lazy) go(bnc, T{}, T{}, T{}); else go(bnc, T{}, T{}, F{}); }
+      else { if (lazy) go(bnc, T{}, F{}, T{}); else go(bnc, T{}, F{}, F{}); }
     } else {
-      if (pv16) { if (lazy) K1_DISPATCH(32, false, true, true); else K1_DISPATCH(32, false, true, false); }
-      else { if (lazy) K1_DISPATCH(32, false, false, true); else K1_DISPATCH(32, false, false, false); }
+      if (pv16) { if (lazy) go(bnc, F{}, T{}, T{}); else go(bnc, F{}, T{}, F{}); }
+      else { if (lazy) go(bnc, F{}, F{}, T{}); else go(bnc, F{}, F{}, F{}); }
     }
-  } else {
-    TORCH_CHECK(false, "bn must be 16 or 32");
-  }
-#undef K1_DISPATCH
+  };
+  if (bn == 16) go2(std::integral_constant<int, 16>{});
+  else if (bn == 32) go2(std::integral_constant<int, 32>{});
+  else TORCH_CHECK(false, "bn must be 16 or 32");
+
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("fwd", &k1fa_fwd, "K1 fa75 prefill attention (sm_75, hd256)"); }

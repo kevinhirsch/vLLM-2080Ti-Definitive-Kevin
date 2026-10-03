@@ -17,7 +17,8 @@ import torch
 
 _EXT = None
 _ENABLED = os.getenv("VLLM_TQ_FA75_PREFILL", "0") == "1"
-# variant bits: 1 = P V accumulates per key slice in fp16 (fa75 scheme, 2x HMMA rate), 2 = lazy O rescale
+# variant bits: 1 = P V accumulates per key slice in fp16 (fa75 scheme, 2x HMMA rate), 2 = lazy O rescale,
+# 8*c (K9) = Q K^T on fp16-accumulate HMMA promoted to fp32 every {0:off,1:32,2:64,3:128,4:256,5:16}[c] head dims (bn 16)
 _VARIANT = int(os.getenv("VLLM_TQ_FA75_VARIANT", "2"))
 _BN = int(os.getenv("VLLM_TQ_FA75_BN", "16"))
 
