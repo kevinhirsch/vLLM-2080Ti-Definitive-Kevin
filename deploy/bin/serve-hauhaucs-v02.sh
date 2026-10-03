@@ -10,8 +10,14 @@
 #   * speculative-config gains disable_eagle_block_drop=true: upstream #53388 supersedes our
 #     VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK retention patch (keeps the trailing aligned Mamba block under MTP).
 set -euo pipefail
-# experiment overrides (V02_* variables), written by the UP lane; absent = production defaults
-[ -f /home/kevin/.local/share/vllm-qwen27b/v02.override.env ] && . /home/kevin/.local/share/vllm-qwen27b/v02.override.env
+# experiment overrides (V02_* variables), written by window frameworks/lanes; absent = production defaults
+V02_OVERRIDE_ENV=${V02_OVERRIDE_ENV:-/home/kevin/.local/share/vllm-qwen27b/v02.override.env}
+V02_RELEASES=${V02_RELEASES:-/home/kevin/.local/share/vllm-releases}
+# RL/L107 (2026-10-03): remember PYTHONPATH as inherited so an override that sets it is HONORED below. It used to be
+# re-exported as "$V02_ROOT:$FLASHQLA_ROOT" after sourcing, silently dropping e.g. K3's PYTHONPATH=wt-k3.
+_pp_in=${PYTHONPATH-__unset__}
+[ -f "$V02_OVERRIDE_ENV" ] && . "$V02_OVERRIDE_ENV"
+if [ "${PYTHONPATH-__unset__}" != "$_pp_in" ] && [ -n "${PYTHONPATH:-}" ]; then V02_PYTHONPATH=${V02_PYTHONPATH:-$PYTHONPATH}; fi
 # lane S3/U2b (2026-10-02, Kevin approved 23:03): DEFAULT STACK = text-only (--language-model-only: no vision tower, image/video requests 400) + int4 lm_head +
 # int4 MTP block (load-time RTN+MSE-clip quantization cached in <model>-u2cache; fidelity top-1 93.2% / KL 0.009 vs bf16 over 3,636 estate rows).
 # Measured vs the bf16/vision build: weights 9.6 -> 7.97 GiB/rank, KV pool 711,996 -> 919,122 tokens (+29%), natural decode 64-68 -> 81-84 tok/s,
@@ -20,15 +26,30 @@ if [ "${V02_STACK:-1}" = "1" ]; then
   export VLLM_U2_INT4_HEAD=${VLLM_U2_INT4_HEAD:-1} VLLM_U2_INT4_MTP=${VLLM_U2_INT4_MTP:-1}
   case " ${VLLM_SERVE_EXTRA_ARGS:-} " in *" --language-model-only "*) ;; *) VLLM_SERVE_EXTRA_ARGS="--language-model-only ${VLLM_SERVE_EXTRA_ARGS:-}"; export VLLM_SERVE_EXTRA_ARGS;; esac
 fi
-V02_ROOT=${V02_ROOT:-/home/kevin/Desktop/wt-integrate}
+# RL/L104: production boots the immutable release `current` (deploy/bin/release.py) once it exists; the legacy dev tree
+# wt-integrate is only the fallback. Resolved ONCE here: a pointer flip during a boot cannot mix two releases, and the
+# JIT build dirs see the same concrete path they were prebuilt at (a different path = a rebuild).
+if [ -z "${V02_ROOT:-}" ]; then
+  if [ -L "$V02_RELEASES/current" ]; then V02_ROOT="$V02_RELEASES/current"; else V02_ROOT=/home/kevin/Desktop/wt-integrate; fi
+fi
+V02_ROOT=$(readlink -f "$V02_ROOT")
+# the venv is invoked through $V02_ROOT/.venv (NOT resolved): Python derives sys.prefix from that path, torch JIT builds embed it,
+# and release.py prebuilds the JIT .so through exactly this path -- any other spelling would rebuild them at boot.
+V02_VENV="$V02_ROOT/.venv"
 cd "$V02_ROOT"
-export PATH="/home/kevin/.local/share/shim-gcc15:$V02_ROOT/.venv/bin:/usr/local/cuda-13/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin"
+_rel=legacy-tree; [ -f "$V02_ROOT/RELEASE.json" ] && _rel=$(python3 -c 'import json,sys;m=json.load(open(sys.argv[1]));print(m["id"]+" sha="+m["sha"][:12])' "$V02_ROOT/RELEASE.json" 2>/dev/null || echo release-unreadable)
+echo "serve-hauhaucs-v02: V02_ROOT=$V02_ROOT ($_rel) venv=$V02_VENV -> $(readlink -f "$V02_VENV")${V02_PYTHONPATH:+ PYTHONPATH-override=$V02_PYTHONPATH}" >&2
+# a lane tree whose .deps JIT dirs are symlinks into ANOTHER tree would rebuild that tree's .so (path-keyed ninja): say so loudly
+for _d in .deps/tq_gqa_build .deps/FlashQLA-SM70-SM75; do
+  if [ -L "$V02_ROOT/$_d" ]; then echo "serve-hauhaucs-v02: WARNING $V02_ROOT/$_d is a symlink to $(readlink -f "$V02_ROOT/$_d"): a JIT rebuild here writes into that tree. Build a release instead (deploy/bin/release.py build)." >&2; fi
+done
+export PATH="/home/kevin/.local/share/shim-gcc15:$V02_VENV/bin:/usr/local/cuda-13/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin"
 export CUDA_HOME=/usr/local/cuda-13 CUDA_PATH=/usr/local/cuda-13
 export CC=/usr/bin/gcc-15 CXX=/usr/bin/g++-15 CUDAHOSTCXX=/usr/bin/g++-15 NVCC_CCBIN=/usr/bin/g++-15
 export TORCH_EXTENSIONS_DIR="$V02_ROOT/.deps/FlashQLA-SM70-SM75/.torch_extensions_vllm_flashqla_legacy"
 export TORCHINDUCTOR_CACHE_DIR="$V02_ROOT/torchinductor-cache"
 export FLASHQLA_ROOT="$V02_ROOT/.deps/FlashQLA-SM70-SM75"
-export PYTHONPATH="$V02_ROOT:$FLASHQLA_ROOT" PYTHONSAFEPATH=1 PYTHONUNBUFFERED=1
+export PYTHONPATH="${V02_PYTHONPATH:+$V02_PYTHONPATH:}$V02_ROOT:$FLASHQLA_ROOT" PYTHONSAFEPATH=1 PYTHONUNBUFFERED=1
 export FLASHINFER_ENABLE_AOT=${FLASHINFER_ENABLE_AOT:-1} FLASHINFER_WORKSPACE_BASE="$V02_ROOT" TRITON_CACHE_DIR="$V02_ROOT/triton-cache"
 # retired 0.1.x-only knobs: make sure a stale env file cannot leak them into the new tree
 # Model Runner V2 is the 0.2.x default but is 5-6x slower on TurboQuant+hybrid GDN+MTP here (10-15 vs 64-68 tok/s natural text, 2026-10-02); this script defaults to the V1 runner (V02_RUNNER=v2 to override).
@@ -42,7 +63,7 @@ CC_DEFAULT='{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[4,
 unset VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK VLLM_PREFIX_CACHE_USE_RETAINED_MTP_BLOCK VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS || true
 SPEC_DEFAULT='{"method":"mtp","num_speculative_tokens":3,"disable_eagle_block_drop":true}'
 ARGS=(
-  "$V02_ROOT/.venv/bin/python"
+  "$V02_VENV/bin/python"
   -m vllm.entrypoints.openai.api_server
   --host 0.0.0.0 --port 8001
   --model /home/kevin/Desktop/models/Qwen3.8-27B-HauhauCS-Aggressive-W4A16-twolven
@@ -84,7 +105,7 @@ ARGS=(
 # Optional upstream #243 SSD prefix-KV persistence (experimental, opt-in): V02_SSD_KV_DIR=/path V02_SSD_KV_CPU_BYTES=N
 if [ -n "${V02_SSD_KV_DIR:-}" ]; then
   export PYTHONHASHSEED=0
-  FP=$("$V02_ROOT/.venv/bin/python" "$V02_ROOT/tools/checkpoint_fingerprint.py" /home/kevin/Desktop/models/Qwen3.8-27B-HauhauCS-Aggressive-W4A16-twolven "")
+  FP=$("$V02_VENV/bin/python" "$V02_ROOT/tools/checkpoint_fingerprint.py" /home/kevin/Desktop/models/Qwen3.8-27B-HauhauCS-Aggressive-W4A16-twolven "")
   ARGS+=( --kv-transfer-config "$(python3 -c 'import json,os,sys;print(json.dumps({"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":int(sys.argv[2]),"spec_name":"TieringOffloadingSpec","secondary_tiers":[{"type":"fs","root_dir":os.path.join(sys.argv[1],"checkpoint-"+sys.argv[3])}]}},separators=(",",":")))' "$V02_SSD_KV_DIR" "${V02_SSD_KV_CPU_BYTES:-8589934592}" "$FP")" )
 fi
 if [ -n "${VLLM_SERVE_EXTRA_ARGS:-}" ]; then
