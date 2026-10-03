@@ -202,6 +202,21 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
   __syncthreads();
 
   constexpr int NT8 = BN / 8;  // n8 score tiles per warp per key tile
+  // Swizzled ldmatrix addresses, hoisted: every read row r has r & 7 == lr, and for a chunk c = 8m + j (+ the lane's
+  // 0/1 or 0..3 sub-chunk) (c ^ lr) == 8m + ((j + sub) ^ lr), so only the j pattern needs a register; 8m becomes an
+  // immediate offset (16 B per chunk). Saves ~4 integer ops per ldmatrix and frees the compiler to prefetch fragments.
+  uint32_t kad[4], qad[4], vad[2];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    kad[i] = sK + (uint32_t)((8 * (lm & 1) + lr) * ROW_CHUNKS * 16 + (((2 * i + (lm >> 1)) ^ lr) * 16));
+    qad[i] = sQH + (uint32_t)((16 * warp + lr + 8 * (lm & 1)) * 16 * 16 + (((2 * i + (lm >> 1)) ^ lr) * 16));
+  }
+#pragma unroll
+  for (int p = 0; p < 2; ++p) vad[p] = sV + (uint32_t)(lr * ROW_CHUNKS * 16 + (((4 * p + lm) ^ lr) * 16));
+  // K tile chunk kk (even) for key group np; Q-high chunk kq (even, 0..14); V tile chunk group dn (multiple of 4)
+#define K_ADDR(np, kk) (kad[((kk) >> 1) & 3] + (uint32_t)(((kk) >> 3) * 128 + (np) * 16 * ROW_CHUNKS * 16))
+#define Q_ADDR(kq) (qad[((kq) >> 1) & 3] + (uint32_t)(((kq) >> 3) * 128))
+#define V_ADDR(j, dn) (vad[((dn) >> 2) & 1] + (uint32_t)(((dn) >> 3) * 128 + (j) * 8 * ROW_CHUNKS * 16))
   for (int kt = 0; kt < n_tiles; ++kt) {
     const int n0 = kv_lo + kt * BN;
     if (!(ABL & 1)) load_tile(v_, v_row, n0, stage);  // V(kt) in flight during Q K^T
@@ -228,12 +243,12 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
         for (int kk = 0; kk < HD / 16; kk += 2) {
           const int kh = kk + HD / 16;
           uint32_t ah[4];
-          ldsm_x4(ah, qh_off(sQH, 16 * warp + lr + (lm & 1) * 8, kk + (lm >> 1)));
+          ldsm_x4(ah, Q_ADDR(kk));
 #pragma unroll
           for (int np = 0; np < BN / 16; ++np) {
             uint32_t bl[4], bh[4];
-            ldsm_x4(bl, sK + tile_off(16 * np + 8 * (lm & 1) + lr, kk + (lm >> 1)));
-            ldsm_x4(bh, sK + tile_off(16 * np + 8 * (lm & 1) + lr, kh + (lm >> 1)));
+            ldsm_x4(bl, K_ADDR(np, kk));
+            ldsm_x4(bh, K_ADDR(np, kh));
             mma1688(s[2 * np], qf[kk][0], qf[kk][1], bl[0]);
             mma1688(s2[2 * np], ah[0], ah[1], bh[0]);
             mma1688(s[2 * np + 1], qf[kk][0], qf[kk][1], bl[1]);
@@ -255,13 +270,13 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
         if (kk < HD / 16) {
           a[0] = qf[kk][0]; a[1] = qf[kk][1]; a[2] = qf[kk + 1][0]; a[3] = qf[kk + 1][1];
         } else {
-          ldsm_x4(a, qh_off(sQH, 16 * warp + lr + (lm & 1) * 8, kk - HD / 16 + (lm >> 1)));
+          ldsm_x4(a, Q_ADDR(kk - HD / 16));
         }
 #pragma unroll
         for (int np = 0; np < BN / 16; ++np) {
           // matrices: (keys 16np+0-7, chunk kk), (16np+8-15, kk), (16np+0-7, kk+1), (16np+8-15, kk+1)
           uint32_t bb[4];
-          ldsm_x4(bb, sK + tile_off(16 * np + 8 * (lm & 1) + lr, kk + (lm >> 1)));
+          ldsm_x4(bb, K_ADDR(np, kk));
           if (QKC > 0) {  // (Lane K9) full-rate fp16-accumulate HMMA, promoted to fp32 every QKC head dims
             mma1688h(sh[2 * np], a[0], a[1], bb[0]);
             mma1688h(sh[2 * np + 1], a[0], a[1], bb[1]);
@@ -362,7 +377,7 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
 #pragma unroll
           for (int j = 0; j < NT8; ++j) {
             uint32_t bb[4];
-            ldsm_x4_t(bb, sV + tile_off(8 * j + lr, dn + lm));
+            ldsm_x4_t(bb, V_ADDR(j, dn));
 #pragma unroll
             for (int x = 0; x < 4; ++x) mma1688h(t[x], pa[j][0], pa[j][1], bb[x]);
           }
@@ -377,7 +392,7 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
 #pragma unroll
           for (int j = 0; j < NT8; ++j) {
             uint32_t bb[4];
-            ldsm_x4_t(bb, sV + tile_off(8 * j + lr, dn + lm));
+            ldsm_x4_t(bb, V_ADDR(j, dn));
 #pragma unroll
             for (int x = 0; x < 4; ++x) mma1688(oacc[dn + x], pa[j][0], pa[j][1], bb[x]);
           }
@@ -452,6 +467,9 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
       }
     }
   }
+#undef K_ADDR
+#undef Q_ADDR
+#undef V_ADDR
 #endif
 }
 

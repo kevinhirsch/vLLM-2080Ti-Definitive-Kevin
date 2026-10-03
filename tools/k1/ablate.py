@@ -20,7 +20,7 @@ def main():
     k = torch.randn(Tkv, 2, 256, device="cuda", dtype=torch.half)
     o = torch.empty_like(q)
     fl = causal_flops(Tq, Tkv, 12)
-    fns = {a: (lambda v=v: K1.fa75_prefill(q, k, k, scale=0.0625, causal=True, out=o, variant=v)) for a, v in ARMS.items()}
+    fns = {a: (lambda v=v: K1.fa75_prefill(q, k, k, scale=0.0625, causal=True, out=o, variant=v, nsplit=1)) for a, v in ARMS.items()}
     for f in fns.values():
         f()
     torch.cuda.synchronize()
@@ -49,7 +49,7 @@ def gqa_proxy(Tq=3632, Tkv=16384):
     res = {}
     for hk in (2, 12):
         k = torch.randn(Tkv, hk, 256, device="cuda", dtype=torch.half)
-        f = lambda: K1.fa75_prefill(q, k, k, scale=0.0625, causal=True, out=o, variant=7)
+        f = lambda: K1.fa75_prefill(q, k, k, scale=0.0625, causal=True, out=o, variant=7, nsplit=1)
         f(); torch.cuda.synchronize()
         res[hk] = statistics.median(timeit(f, 5) for _ in range(7))
         del k
