@@ -28,6 +28,11 @@ __device__ __forceinline__ void imma_u8(int* c, uint32_t a, uint32_t b) {
                : "+r"(c[0]), "+r"(c[1]) : "r"(a), "r"(b));
 }
 
+// int32 -> fp32 on the full-rate ALU (I2F is quarter rate on sm_75); exact for |x| < 2^22
+__device__ __forceinline__ float i2f_small(int x) { return __int_as_float(x + 0x4B400000) - 12582912.f; }
+// round-to-nearest of 0 <= x < 2^22, result in the low byte(s) of the returned bits (F2I is quarter rate on sm_75)
+__device__ __forceinline__ uint32_t f2u_small(float x) { return (uint32_t)__float_as_int(x + 12582912.f); }
+
 // 8 packed 3-bit codes (24 bits) -> 8 nibbles (32 bits): byte_perm selectors.
 __device__ __forceinline__ uint32_t spread3(uint32_t x) {
   uint32_t y = (x & 0x000FFFu) | ((x & 0xFFF000u) << 4);         // fields 0-3 @0..11, 4-7 @16..27
@@ -434,6 +439,24 @@ struct Pref2 {
 __device__ __forceinline__ void load_chunk2(Pref2& R, const uint8_t* __restrict__ KV, const ChunkAddr& A, int nvalid,
                                             int bs, long scp, int lane, int warp) {
   R.shb = 0u;
+  const int o0 = A.off0 + warp * 8;
+  // fast path: the warp's 8 positions sit in one page and the position stride keeps 4-byte phase (scp % 4 == 0)
+  if ((scp & 3) == 0 && (o0 + 7 < bs || o0 >= bs) && warp * 8 + 8 <= nvalid) {
+    const uint8_t* b = KV + ((o0 < bs) ? A.base0 : A.base1m) + (long)o0 * scp;
+    const uint32_t s = (uint32_t)((uintptr_t)b >> 1) & 1u;
+    const unsigned int* a0 = reinterpret_cast<const unsigned int*>(b - 2 * s);
+    const int sw = (int)(scp >> 2);  // position stride in words
+    R.shb = s ? 0xFFu : 0u;
+    const bool tail16 = (lane == 25 && s == 0u);
+#pragma unroll
+    for (int u = 0; u < 8; u++) {
+      const unsigned int* p = a0 + u * sw;
+      R.w0[u] = __ldg(p + lane);
+      R.w1[u] = 0u;
+      if (lane < 26) R.w1[u] = tail16 ? (uint32_t)__ldg(reinterpret_cast<const unsigned short*>(p + 57)) : __ldg(p + 32 + lane);
+    }
+    return;
+  }
 #pragma unroll
   for (int u = 0; u < 8; u++) {
     const int tk = warp * 8 + u;
@@ -455,12 +478,13 @@ __device__ __forceinline__ void load_chunk2(Pref2& R, const uint8_t* __restrict_
   }
 }
 
-template <int MT, bool QSPLIT>
+template <int MT, bool QSPLIT, bool QF16 = false>
 __global__ void __launch_bounds__(NTHR, 2) tq_imma2_stage1(
     const int8_t* __restrict__ Q8, const float* __restrict__ QS, const uint8_t* __restrict__ KV,
     const int* __restrict__ BT, const int* __restrict__ RL, float* __restrict__ Mid, long sq8r, long sq8h,
     long scb, long scp, long sch, long sbt, long smr, long smh, long sms, int QL, int G, int bs, int NS,
-    float attn_scale, float cscale, int norm_corr, int nbt, uint32_t lut_lo, uint32_t lut_hi) {
+    float attn_scale, float cscale, int norm_corr, int nbt, uint32_t lut_lo, uint32_t lut_hi,
+    const __half* __restrict__ Qh = nullptr, long sqhr = 0, long sqhh = 0) {
   constexpr int MR = MT * 8;
   static_assert(MR * 8 * 4 <= 8 * KW * 4, "score tile must fit in the warp's raw-K rows");
   extern __shared__ __align__(16) unsigned char smem[];
@@ -503,6 +527,75 @@ __global__ void __launch_bounds__(NTHR, 2) tq_imma2_stage1(
     return;
   }
 
+  if (QF16) {  // fused: Hadamard rotation (FWHT, natural order, /16) + int8 hi/lo quantization of the fp16 query rows
+    const int row = tid >> 3, part = tid & 7;
+    float x[32];
+    const bool ok = row < R;
+    {
+      const int qi = ok ? row / G : 0, h = ok ? row % G : 0;
+      const __half* src = Qh + (long)(seq * QL + qi) * sqhr + (long)(kvh * G + h) * sqhh + part * 32;
+#pragma unroll
+      for (int v = 0; v < 4; v++) {
+        uint4 w = ok ? *reinterpret_cast<const uint4*>(src + 8 * v) : make_uint4(0, 0, 0, 0);
+        const __half2* hp = reinterpret_cast<const __half2*>(&w);
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+          const float2 f = __half22float2(hp[e]);
+          x[8 * v + 2 * e] = f.x;
+          x[8 * v + 2 * e + 1] = f.y;
+        }
+      }
+    }
+#pragma unroll
+    for (int s = 1; s < 32; s <<= 1)
+#pragma unroll
+      for (int k = 0; k < 32; k++)
+        if (!(k & s)) {
+          const float a0 = x[k], b0 = x[k + s];
+          x[k] = a0 + b0;
+          x[k + s] = a0 - b0;
+        }
+#pragma unroll
+    for (int s = 1; s < 8; s <<= 1)
+#pragma unroll
+      for (int k = 0; k < 32; k++) {
+        const float y = __shfl_xor_sync(0xffffffffu, x[k], s);
+        x[k] = (part & s) ? (y - x[k]) : (x[k] + y);
+      }
+    float am = 0.f;
+#pragma unroll
+    for (int k = 0; k < 32; k++) {
+      x[k] *= (1.f / 16.f);
+      am = fmaxf(am, fabsf(x[k]));
+    }
+    am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 1));
+    am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 2));
+    am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 4));
+    const float inv = am > 0.f ? 127.f / am : 0.f;
+    uint32_t hw[8], lw[8];
+#pragma unroll
+    for (int wv = 0; wv < 8; wv++) {
+      hw[wv] = 0u;
+      lw[wv] = 0u;
+#pragma unroll
+      for (int e = 0; e < 4; e++) {
+        const float t = x[4 * wv + e] * inv;
+        const int hi = __float2int_rn(t);
+        const int lo = max(-127, min(127, __float2int_rn((t - (float)hi) * 254.f)));
+        hw[wv] |= ((uint32_t)hi & 0xFFu) << (8 * e);
+        lw[wv] |= ((uint32_t)lo & 0xFFu) << (8 * e);
+      }
+    }
+    if (row < MR) {
+      *reinterpret_cast<uint4*>(Qs + kq_off(row, 2 * part)) = make_uint4(hw[0], hw[1], hw[2], hw[3]);
+      *reinterpret_cast<uint4*>(Qs + kq_off(row, 2 * part + 1)) = make_uint4(hw[4], hw[5], hw[6], hw[7]);
+      if (QSPLIT) {
+        *reinterpret_cast<uint4*>(Qs2 + kq_off(row, 2 * part)) = make_uint4(lw[0], lw[1], lw[2], lw[3]);
+        *reinterpret_cast<uint4*>(Qs2 + kq_off(row, 2 * part + 1)) = make_uint4(lw[4], lw[5], lw[6], lw[7]);
+      }
+      if (part == 0) qs_s[row] = ok ? am / 127.f : 0.f;
+    }
+  } else
   {  // stage int8 Q
     const int row = tid >> 3, part = tid & 7;
     if (row < MR) {
@@ -798,10 +891,8 @@ __global__ void __launch_bounds__(NTHR, 1) tq_imma_prefill(
   int8_t* Ks = reinterpret_cast<int8_t*>(smem);                    // [T][256] swizzled int8 K
   uint32_t* Vraw = reinterpret_cast<uint32_t*>(Ks + T * HD);       // [T][VW]
   uint2* Vt = reinterpret_cast<uint2*>(Vraw + T * VW);             // [64 jp][16 tq] swizzled
-  float* f_s = reinterpret_cast<float*>(Vt + 64 * 16);             // [T]
-  float* vs_s = f_s + T;
-  float* vz_s = vs_s + T;
-  uint32_t* Kraw = reinterpret_cast<uint32_t*>(vz_s + T);         // [T][KRW]
+  float4* tm_s = reinterpret_cast<float4*>(Vt + 64 * 16);          // [T] {score factor * log2(e), v_scale, v_zero, -}
+  uint32_t* Kraw = reinterpret_cast<uint32_t*>(tm_s + T);         // [T][KRW]
 
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int g = lane >> 2, t4 = lane & 3;
@@ -887,8 +978,8 @@ __global__ void __launch_bounds__(NTHR, 1) tq_imma_prefill(
       if (i1 <= 31) Vraw[tk * VW + i1] = __funnelshift_r(r1, n1, vsh);
       if (i1 == 32) {
         const uint32_t meta = __funnelshift_r(r1, n1, vsh);
-        vs_s[tk] = __half2float(__ushort_as_half((unsigned short)(meta & 0xFFFFu)));
-        vz_s[tk] = __half2float(__ushort_as_half((unsigned short)(meta >> 16)));
+        tm_s[tk].y = __half2float(__ushort_as_half((unsigned short)(meta & 0xFFFFu)));
+        tm_s[tk].z = __half2float(__ushort_as_half((unsigned short)(meta >> 16)));
       }
     }
     TQP(7);
@@ -922,10 +1013,10 @@ __global__ void __launch_bounds__(NTHR, 1) tq_imma_prefill(
       ss += __shfl_xor_sync(0xffffffffu, ss, 2);
       ss += __shfl_xor_sync(0xffffffffu, ss, 4);
       if (k == 0)
-        f_s[tk] = (tk < nvalid && ss > 0)
-                      ? __half2float(__ushort_as_half((unsigned short)Kraw[tk * KRW + 24])) * attn_scale *
-                            (norm_corr ? rsqrtf((float)ss) : cscale)
-                      : 0.f;
+        tm_s[tk].x = (tk < nvalid && ss > 0)
+                         ? __half2float(__ushort_as_half((unsigned short)Kraw[tk * KRW + 24])) * attn_scale *
+                               (norm_corr ? rsqrtf((float)ss) : cscale) * 1.4426950408889634f
+                         : 0.f;
     }
     if (c0 + T < t1)
       load_chunk2(cur, KV, chunk_addr(BT, 0, nbt, c0 + T, bs, scb, scp, koff), min(T, t1 - c0 - T), bs, scp, lane, warp);
@@ -970,12 +1061,14 @@ __global__ void __launch_bounds__(NTHR, 1) tq_imma_prefill(
           }
         }
       }
+      const float qsc2 = QSPLIT ? qsc * (1.f / 254.f) : qsc;
 #pragma unroll
       for (int n = 0; n < 8; n++)
 #pragma unroll
         for (int i = 0; i < 2; i++) {
           const int tk = tau_tok(n, 2 * t4 + i);
-          const float v = ((float)acc[n][i] + (QSPLIT ? (float)acc2[n][i] * (1.f / 254.f) : 0.f)) * qsc * f_s[tk];
+          const int a = QSPLIT ? acc[n][i] * 254 + acc2[n][i] : acc[n][i];  // |a| < 2^31: 127*88*256*254 + ...
+          const float v = (float)a * qsc2 * tm_s[tk].x;                      // log2-domain logit
           s[n][i] = (tk < nvalid) ? v : -INFINITY;
         }
     }
@@ -990,17 +1083,17 @@ __global__ void __launch_bounds__(NTHR, 1) tq_imma_prefill(
       cmax = fmaxf(cmax, __shfl_xor_sync(0xffffffffu, cmax, 1));
       cmax = fmaxf(cmax, __shfl_xor_sync(0xffffffffu, cmax, 2));
       const float m_new = fmaxf(m_run, cmax);
-      alpha = (m_run == -INFINITY) ? 0.f : __expf(m_run - m_new);
+      alpha = (m_run == -INFINITY) ? 0.f : exp2f(m_run - m_new);
       float psum = 0.f, zsum = 0.f, amax = 0.f;
 #pragma unroll
       for (int n = 0; n < 8; n++)
 #pragma unroll
         for (int i = 0; i < 2; i++) {
-          const int tk = tau_tok(n, 2 * t4 + i);
-          const float p = (m_new == -INFINITY) ? 0.f : __expf(s[n][i] - m_new);
+          const float4 tmv = tm_s[tau_tok(n, 2 * t4 + i)];
+          const float p = (m_new == -INFINITY) ? 0.f : exp2f(s[n][i] - m_new);
           psum += p;
-          zsum += p * vz_s[tk];
-          s[n][i] = p * vs_s[tk];
+          zsum = fmaf(p, tmv.z, zsum);
+          s[n][i] = p * tmv.y;
           amax = fmaxf(amax, s[n][i]);
         }
 #pragma unroll
@@ -1016,8 +1109,9 @@ __global__ void __launch_bounds__(NTHR, 1) tq_imma_prefill(
       zs = zsum;
 #pragma unroll
       for (int kk = 0; kk < 4; kk++)
-        pa[kk] = __float2uint_rn(s[2 * kk][0] * inv) | (__float2uint_rn(s[2 * kk][1] * inv) << 8) |
-                 (__float2uint_rn(s[2 * kk + 1][0] * inv) << 16) | (__float2uint_rn(s[2 * kk + 1][1] * inv) << 24);
+        pa[kk] = __byte_perm(__byte_perm(f2u_small(s[2 * kk][0] * inv), f2u_small(s[2 * kk][1] * inv), 0x0040),
+                             __byte_perm(f2u_small(s[2 * kk + 1][0] * inv), f2u_small(s[2 * kk + 1][1] * inv), 0x0040),
+                             0x5410);
     }
     TQP(5);
     // ---- PV: 8 jp-tiles x 4 dims, k = 64 tokens (quad 4*kk + t4 = tokens 16*kk + 4*t4 .. +3)
@@ -1036,8 +1130,8 @@ __global__ void __launch_bounds__(NTHR, 1) tq_imma_prefill(
       }
 #pragma unroll
       for (int n = 0; n < 4; n++) {
-        O[p][n][0] = fmaf(O[p][n][0], alpha, fmaf(sa, (float)Cc[n][0], zs));
-        O[p][n][1] = fmaf(O[p][n][1], alpha, fmaf(sa, (float)Cc[n][1], zs));
+        O[p][n][0] = fmaf(O[p][n][0], alpha, fmaf(sa, i2f_small(Cc[n][0]), zs));  // |C| <= 64*255*15 < 2^22
+        O[p][n][1] = fmaf(O[p][n][1], alpha, fmaf(sa, i2f_small(Cc[n][1]), zs));
       }
     }
     TQP(6);
@@ -1045,7 +1139,7 @@ __global__ void __launch_bounds__(NTHR, 1) tq_imma_prefill(
 
   if (!row_ok) return;
   const float il = l_run > 0.f ? 1.f / l_run : 0.f;
-  const float lse = l_run > 0.f ? m_run + logf(l_run) : -INFINITY;
+  const float lse = l_run > 0.f ? m_run * 0.6931471805599453f + logf(l_run) : -INFINITY;
   if (NS == 1) {
     __half* o = Out + (long)tq * sor + (long)hq * soh;
 #pragma unroll
@@ -1075,7 +1169,7 @@ __global__ void __launch_bounds__(NTHR, 1) tq_imma_prefill(
   }
 }
 
-static inline size_t tq_imma_prefill_smem_bytes() { return (size_t)T * HD + T * VW * 4 + 64 * 16 * 8 + 3 * T * 4 + T * KRW * 4; }
+static inline size_t tq_imma_prefill_smem_bytes() { return (size_t)T * HD + T * VW * 4 + 64 * 16 * 8 + 4 * T * 4 + T * KRW * 4; }
 
 // Reduce over KV splits using only the per-split lse (-inf = empty). grid (R*Hq), block HD threads.
 __global__ void tq_imma_stage2(const float* __restrict__ Mid, __half* __restrict__ Out, float* __restrict__ Lse, int Hq,

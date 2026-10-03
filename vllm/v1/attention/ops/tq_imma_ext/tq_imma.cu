@@ -18,20 +18,21 @@
 #include "tq_imma_kernels.cuh"
 
 
-template <int MT, bool SP>
+template <int MT, bool SP, bool QF>
 static void launch2(dim3 grid, size_t smem, cudaStream_t st, const int8_t* q8, const float* qs, const uint8_t* kv,
                     const int* bt, const int* rl, float* mid, long sq8r, long sq8h, long scb, long scp, long sch,
                     long sbt, long smr, long smh, long sms, int QL, int G, int bs, int NS, float scale, float cscale,
-                    int nc, int nbt, uint32_t lo, uint32_t hi) {
+                    int nc, int nbt, uint32_t lo, uint32_t hi, const __half* qh, long sqhr, long sqhh) {
   static int attr_dev = -1;
   int dev;
   cudaGetDevice(&dev);
   if (attr_dev != dev) {
-    cudaFuncSetAttribute(tq_imma2_stage1<MT, SP>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+    cudaFuncSetAttribute(tq_imma2_stage1<MT, SP, QF>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
     attr_dev = dev;
   }
-  tq_imma2_stage1<MT, SP><<<grid, NTHR, smem, st>>>(q8, qs, kv, bt, rl, mid, sq8r, sq8h, scb, scp, sch, sbt, smr, smh,
-                                                     sms, QL, G, bs, NS, scale, cscale, nc, nbt, lo, hi);
+  tq_imma2_stage1<MT, SP, QF><<<grid, NTHR, smem, st>>>(q8, qs, kv, bt, rl, mid, sq8r, sq8h, scb, scp, sch, sbt, smr,
+                                                         smh, sms, QL, G, bs, NS, scale, cscale, nc, nbt, lo, hi, qh,
+                                                         sqhr, sqhh);
 }
 
 // q_rot [S*QL, Hq, D] fp32 (rotated, contiguous); kv [nb, bs, Hk, slot] u8 (any B/N/H strides); bt [S or expanded, nbt]
@@ -41,6 +42,9 @@ void tq_imma_decode(torch::Tensor q_rot, torch::Tensor kv, torch::Tensor bt, tor
                     torch::Tensor qs, torch::Tensor mid, torch::Tensor out, torch::Tensor lse, int64_t S, int64_t QL,
                     int64_t NS, double scale, double cscale, int64_t norm_corr, int64_t lut_lo, int64_t lut_hi,
                     int64_t qsplit) {
+  // q_rot may instead be the UN-rotated fp16 query: the kernel then does the Hadamard rotation + int8 quantization
+  // itself (no cuBLAS rotation, no quant kernel)
+  const bool fused = q_rot.scalar_type() == at::kHalf;
   const c10::cuda::CUDAGuard guard(q_rot.device());
   TORCH_CHECK(q_rot.size(2) == HD && q_rot.stride(2) == 1 && q_rot.stride(1) == HD, "q_rot layout");
   TORCH_CHECK(kv.size(3) >= 230 && kv.stride(3) == 1, "kv layout");
@@ -55,24 +59,30 @@ void tq_imma_decode(torch::Tensor q_rot, torch::Tensor kv, torch::Tensor bt, tor
   TORCH_CHECK(q8.size(2) >= 2 * HD && q8.is_contiguous(), "q8 workspace");
   auto st = at::cuda::getCurrentCUDAStream();
   const int sp = qsplit ? 1 : 0;
-  tq_imma_qquant<<<R * Hq, 64, 0, st>>>(q_rot.data_ptr<float>(), q8.data_ptr<int8_t>(), qs.data_ptr<float>(), Hq, sp,
-                                         q_rot.stride(0), q_rot.stride(1));
+  if (!fused)
+    tq_imma_qquant<<<R * Hq, 64, 0, st>>>(q_rot.data_ptr<float>(), q8.data_ptr<int8_t>(), qs.data_ptr<float>(), Hq,
+                                           sp, q_rot.stride(0), q_rot.stride(1));
+  const __half* qhp = fused ? reinterpret_cast<const __half*>(q_rot.data_ptr<at::Half>()) : nullptr;
+  const long sqhr = fused ? q_rot.stride(0) : 0, sqhh = fused ? q_rot.stride(1) : 0;
   const int MT = (rows + 7) / 8;
   const size_t smem = tq_imma2_smem_bytes(MT, sp);
   const long qh = sp ? 2 * HD : HD;
   dim3 grid((unsigned)S, Hk, (unsigned)NS);
 #define L2(mt, spv)                                                                                                    \
-  launch2<mt, spv>(grid, smem, st, q8.data_ptr<int8_t>(), qs.data_ptr<float>(), kv.data_ptr<uint8_t>(),                \
+  if (fused) L3(mt, spv, true) else L3(mt, spv, false)
+#define L3(mt, spv, qf)                                                                                                \
+  launch2<mt, spv, qf>(grid, smem, st, q8.data_ptr<int8_t>(), qs.data_ptr<float>(), kv.data_ptr<uint8_t>(),                \
                    bt.data_ptr<int>(), row_lens.data_ptr<int>(), mid.data_ptr<float>(), (long)Hq * qh, qh,             \
                    kv.stride(0), kv.stride(1), kv.stride(2), bt.stride(0), mid.stride(0), mid.stride(1), mid.stride(2), \
                    (int)QL, G, (int)kv.size(1), (int)NS, (float)scale, (float)cscale, (int)norm_corr, (int)bt.size(1),  \
-                   (uint32_t)lut_lo, (uint32_t)lut_hi)
+                   (uint32_t)lut_lo, (uint32_t)lut_hi, qhp, sqhr, sqhh);
   if (sp) {
     switch (MT) { case 1: L2(1, true); break; case 2: L2(2, true); break; case 3: L2(3, true); break; default: L2(4, true); }
   } else {
     switch (MT) { case 1: L2(1, false); break; case 2: L2(2, false); break; case 3: L2(3, false); break; default: L2(4, false); }
   }
 #undef L2
+#undef L3
   tq_imma_stage2<<<R * Hq, HD, NS * sizeof(float), st>>>(mid.data_ptr<float>(),
                                                          reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
                                                          lse.data_ptr<float>(), Hq, (int)NS, mid.stride(0),
