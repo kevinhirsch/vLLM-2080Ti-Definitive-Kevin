@@ -88,6 +88,7 @@ from vllm.v1.fault_tolerance.engine_core_sentinel import (
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import SchedulerIterationDetails, SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
+from vllm.sampling_params import SamplingParams
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 from vllm.v1.structured_output import StructuredOutputManager
@@ -100,6 +101,53 @@ logger = init_logger(__name__)
 HANDSHAKE_TIMEOUT_MINS = 5
 
 _R = TypeVar("_R")  # Return type for collective_rpc
+
+
+# [FORK][LANE GW2 2026-10-03] Read-only prefix-cache probe for the gateway's routing.
+# The gateway's cache-credit model guesses how much of a prompt the engine has cached;
+# measured over 7,687 local requests the guess is off by -14.3K..+3.6K tokens (p05..p95)
+# and that error drives its local-vs-remote threshold decisions. This answers the
+# question from the engine's own block table instead. Default off.
+FORK_PREFIX_PROBE = os.environ.get("VLLM_FORK_PREFIX_PROBE", "0") == "1"
+FORK_PROBE_METHOD = "fork_probe_prefix_cache"
+
+
+def fork_prefix_probe(core, prompt_token_ids, cache_salt=None) -> dict:
+    """Probe ``core``'s scheduler prefix cache for ``prompt_token_ids``.
+
+    Safe to call from the engine's input thread while the busy loop runs: it hashes
+    the prompt into a throwaway Request (never added to the scheduler) and does dict
+    lookups only (no block refs, no LRU moves, no events, no stats). A concurrent
+    cache update can make one lookup race; that is retried, and the answer is
+    advisory in any case (blocks can be evicted or cached before admission)."""
+    t0 = time.perf_counter()
+    if not FORK_PREFIX_PROBE:
+        return {"enabled": False}
+    ids = [int(t) for t in prompt_token_ids]
+    out = {"enabled": True, "prompt_tokens": len(ids), "cached_tokens": 0}
+    kvm = getattr(core.scheduler, "kv_cache_manager", None)
+    if core.request_block_hasher is None or kvm is None or not ids:
+        out["enabled"] = core.request_block_hasher is not None
+        return out
+    req = Request(
+        request_id="fork-prefix-probe",
+        prompt_token_ids=ids,
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        cache_salt=cache_salt,
+        block_hasher=core.request_block_hasher,
+    )
+    last = None
+    for _ in range(3):
+        try:
+            out["cached_tokens"] = int(kvm.probe_prefix_cache_hit(req))
+            break
+        except RuntimeError as e:  # dict changed size during a concurrent update
+            last = e
+    else:
+        raise RuntimeError(f"prefix probe raced the scheduler 3x: {last}")
+    out["probe_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+    return out
 
 
 class EngineCore:
@@ -795,6 +843,15 @@ class EngineCore:
         return self.scheduler.reset_prefix_cache(
             reset_running_requests, reset_connector
         )
+
+    def fork_probe_prefix_cache(
+        self, prompt_token_ids: list[int], cache_salt: str | None = None
+    ) -> dict:
+        """[FORK][LANE GW2] Tokens a fresh admission of this prompt would take
+        from the local prefix cache right now (KVCacheManager.
+        probe_prefix_cache_hit: the reconciled hit, no events/stats/refs).
+        Read-only and advisory. Off unless VLLM_FORK_PREFIX_PROBE=1."""
+        return fork_prefix_probe(self, prompt_token_ids, cache_salt)
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
@@ -1791,6 +1848,21 @@ class EngineCoreProc(EngineCore):
                         if method == FT_UTILITY_METHOD:
                             self.ft_sentinel.handle_command(
                                 client_idx, call_id, args[0]
+                            )
+                            continue
+                        if method == FORK_PROBE_METHOD and FORK_PREFIX_PROBE:
+                            # [FORK][LANE GW2] answered here, on the input thread, so
+                            # the gateway's routing probe never waits out an engine
+                            # step (a cold prefill chunk is ~3 s on this box).
+                            uo = UtilityOutput(call_id)
+                            try:
+                                uo.result = UtilityResult(
+                                    fork_prefix_probe(self, *args)
+                                )
+                            except Exception as e:  # advisory: report, never raise
+                                uo.failure_message = f"fork probe failed: {e}"
+                            self.output_queue.put_nowait(
+                                (client_idx, EngineCoreOutputs(utility_output=uo))
                             )
                             continue
                     else:

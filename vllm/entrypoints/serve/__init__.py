@@ -39,6 +39,16 @@ def register_vllm_serve_api_routers(app: FastAPI):
 
     attach_tokenize_router(app)
 
+    # [FORK][LANE GW2] read-only prefix-cache probe for the gateway (default off)
+    import os
+
+    if os.environ.get("VLLM_FORK_PREFIX_PROBE", "0") == "1":
+        from vllm.entrypoints.serve.fork_probe.api_router import (
+            attach_router as attach_fork_probe_router,
+        )
+
+        attach_fork_probe_router(app)
+
 
 def register_vllm_dev_api_routers(app: FastAPI):
     logger.warning(
