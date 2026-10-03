@@ -939,9 +939,14 @@ def _remote_dead_load():
     global _remote_dead_until
     try:
         with open(_REMOTE_DEAD_FILE) as fh:
-            until = float(json.load(fh).get("until") or 0)
+            row = json.load(fh)
+        until = float(row.get("until") or 0)
         if until > time.time():
             _remote_dead_until = max(_remote_dead_until, until)
+        bal = row.get("balance") or {}
+        if bal.get("exhausted"):                 # [GW2 / L172] persistent: a restart must not forget an empty balance
+            _REMOTE_BALANCE.update(exhausted=True, since=bal.get("since"), detail=bal.get("detail"),
+                                   count=int(bal.get("count") or 0), probe_at=0.0)   # probe soon after startup
     except Exception:
         pass
 
@@ -952,7 +957,8 @@ def _remote_dead_save():
     try:
         tmp = _REMOTE_DEAD_FILE + ".tmp"
         with open(tmp, "w") as fh:
-            json.dump({"until": _remote_dead_until, "count": _remote_dead_count}, fh)
+            json.dump({"until": _remote_dead_until, "count": _remote_dead_count,
+                       "balance": {k: _REMOTE_BALANCE[k] for k in ("exhausted", "since", "detail", "count")}}, fh)
         os.replace(tmp, _REMOTE_DEAD_FILE)
     except Exception as _e:
         _swallowed("_remote_dead_save", _e)
@@ -960,20 +966,137 @@ def _remote_dead_save():
 
 _REMOTE_DEAD_PERSIST = False       # armed by _on_startup only: importing the module (tests) must never read or write live state
 
+# [GW2 / L172 2026-10-03] BALANCE breaker. A 402 Insufficient Balance is persistent, not transient: the timer breaker
+# above reopened the remote at 09:51:58 with zero remote 200s while a 5-token probe at 09:55 still got 402. A 402 now
+# opens a breaker that ONLY closes on evidence: a remote 200 (an explicit-alias call that went through) or a half-open
+# probe of the provider's free balance endpoint (GET /user/balance, DeepSeek) showing is_available with a positive
+# balance -- at most one probe per SHIM_REMOTE_BALANCE_PROBE_SECS. It costs nothing (a 402 is not billed and the balance
+# endpoint is free). A provider without that endpoint falls back to the timer (the previous behaviour), and says so.
+REMOTE_BALANCE_PROBE_SECS = float(os.environ.get("SHIM_REMOTE_BALANCE_PROBE_SECS", "120"))
+_REMOTE_BALANCE = {"exhausted": False, "since": None, "detail": None, "count": 0, "probe_at": 0.0, "probes": 0,
+                   "probe_status": None, "available": None, "balance": None, "probe_supported": None,
+                   "closed_at": None, "closed_by": None}
 
-def _note_remote_status(base, status):
+
+def _balance_open(detail=None, now=None):
+    now = time.time() if now is None else now
+    b = _REMOTE_BALANCE
+    b["count"] += 1
+    if not b["exhausted"]:
+        b.update(exhausted=True, since=now, detail=(str(detail)[:200] if detail else None), closed_at=None,
+                 closed_by=None, probe_at=now)          # first probe one interval after the refusal
+        log.error("remote provider balance exhausted (402): remote overflow OFF until a balance probe or a remote 200 "
+                  "proves it is back -- needs Kevin: top up the provider")
+    _remote_dead_save()
+
+
+def _balance_close(by, now=None):
+    now = time.time() if now is None else now
+    b = _REMOTE_BALANCE
+    if b["exhausted"]:
+        log.warning("remote provider balance breaker CLOSED by %s after %ds", by, now - (b["since"] or now))
+        b.update(exhausted=False, closed_at=now, closed_by=by)
+        _remote_dead_save()
+
+
+def _balance_url():
+    base = str(REMOTE_BASE or "").rstrip("/")
+    if base.lower().endswith("/v1"):
+        base = base[:-3]
+    return base + "/user/balance"
+
+
+def _balance_parse(d):
+    """(available, total_balance) from a DeepSeek /user/balance body, or None if it is not that shape."""
+    if not isinstance(d, dict) or "is_available" not in d:
+        return None
+    total = 0.0
+    for bi in d.get("balance_infos") or []:
+        try:
+            total += float((bi or {}).get("total_balance") or 0)
+        except (TypeError, ValueError):
+            pass
+    return bool(d.get("is_available")), round(total, 4)
+
+
+async def remote_balance_probe(now=None):
+    """One half-open probe. Returns True when it closed the breaker. Never raises; never prints the key."""
+    now = time.time() if now is None else now
+    b = _REMOTE_BALANCE
+    if not b["exhausted"] or not REMOTE_BASE or not REMOTE_KEY:
+        return False
+    b["probe_at"], b["probes"] = now, b["probes"] + 1
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
+            async with s.get(_balance_url(), headers={"Authorization": "Bearer " + REMOTE_KEY}) as r:
+                b["probe_status"] = r.status
+                d = await r.json(content_type=None) if r.status == 200 else None
+    except Exception as e:
+        b["probe_status"] = "error: %s" % str(e)[:80]
+        return False
+    parsed = _balance_parse(d) if d is not None else None
+    if b["probe_status"] in (404, 405) or (b["probe_status"] == 200 and parsed is None):
+        b["probe_supported"] = False          # no free balance endpoint here: the timer decides (old behaviour)
+        if time.time() >= _remote_dead_until:
+            _balance_close("timer (provider has no balance endpoint)")
+            return True
+        return False
+    if parsed is None:
+        return False
+    b["probe_supported"] = True
+    b["available"], b["balance"] = parsed
+    if parsed[0] and parsed[1] > 0:
+        _balance_close("balance probe (available, balance %s)" % parsed[1])
+        return True
+    return False
+
+
+async def _remote_balance_prober():
+    """Half-open prober: while the balance breaker is open, one probe per REMOTE_BALANCE_PROBE_SECS."""
+    while True:
+        try:
+            await asyncio.sleep(5)
+            b = _REMOTE_BALANCE
+            if b["exhausted"] and time.time() - b["probe_at"] >= REMOTE_BALANCE_PROBE_SECS:
+                await remote_balance_probe()
+        except asyncio.CancelledError:
+            raise
+        except Exception as _e:
+            _swallowed("_remote_balance_prober", _e)
+
+
+def remote_balance_facts():
+    b = _REMOTE_BALANCE
+    out = {"remote_balance_exhausted": bool(b["exhausted"]),
+           "remote_balance": {k: b[k] for k in ("since", "detail", "count", "probes", "probe_status", "available",
+                                                "balance", "probe_supported", "closed_at", "closed_by")},
+           "kevin_needs": []}
+    if b["exhausted"]:
+        out["remote_balance"]["next_probe_in_s"] = max(0, round(b["probe_at"] + REMOTE_BALANCE_PROBE_SECS - time.time()))
+        out["kevin_needs"].append({
+            "need": "top up the remote provider balance",
+            "why": "provider answered 402 Insufficient Balance (%d times) since %s; remote overflow is OFF and the estate "
+                   "runs local-only" % (b["count"], time.strftime("%H:%M:%S", time.localtime(b["since"] or time.time()))),
+            "clears": "by itself: a balance probe every %ds re-enables remote when the provider reports it available"
+                      % int(REMOTE_BALANCE_PROBE_SECS)})
+    return out
+
+
+def _note_remote_status(base, status, detail=None):
     """Called with every upstream HTTP status; arms the remote breaker on 402 (balance exhausted)."""
     global _remote_dead_until, _remote_dead_count
     try:
         if status == 402 and str(base).rstrip("/") != str(LOCAL).rstrip("/"):
+            _balance_open(detail)
             _remote_dead_count += 1
             if time.time() >= _remote_dead_until:
                 log.error("remote provider refused with 402 (balance): remote overflow OFF for %ds; "
                           "requests wait for local until it recovers", int(REMOTE_DEAD_SECS))
             _remote_dead_until = time.time() + REMOTE_DEAD_SECS
             _remote_dead_save()
-        elif status == 200 and str(base).rstrip("/") != str(LOCAL).rstrip("/") and _remote_dead_until:
+        elif status == 200 and str(base).rstrip("/") != str(LOCAL).rstrip("/") and (_remote_dead_until or _REMOTE_BALANCE["exhausted"]):
             _remote_dead_until = 0.0
+            _balance_close("remote 200")
             _remote_dead_save()
     except Exception as _e:
         _swallowed("_note_remote_status", _e)
@@ -988,7 +1111,8 @@ def remote_ok():
     instead (the queue-first wait loop already treats "no remote" as an unbounded deadline).
     Reading the globals live is deliberate: both flags are hot-reloadable from the dashboard,
     so the mode changes without a restart and without dropping in-flight work."""
-    return bool(REMOTE_ENABLED) and not LOCAL_ONLY and time.time() >= _remote_dead_until
+    return (bool(REMOTE_ENABLED) and not LOCAL_ONLY and time.time() >= _remote_dead_until
+            and not _REMOTE_BALANCE["exhausted"])
 
 
 def routing_mode():
@@ -5525,12 +5649,13 @@ def flow_mode_now():
     dead_s = max(0, int(_remote_dead_until - time.time()))
     forced = bool(effective_force_remote())
     budget_ok = None
-    if remote_cfg and not LOCAL_ONLY and not dead_s:
+    if remote_cfg and not LOCAL_ONLY and not dead_s and not _REMOTE_BALANCE["exhausted"]:
         try:
             budget_ok = bool(_spend_allows_overflow(20000, 2000))
         except Exception:
             budget_ok = None
-    remote_usable = bool(remote_cfg and not LOCAL_ONLY and not dead_s and budget_ok is not False)
+    bal_out = bool(_REMOTE_BALANCE["exhausted"])
+    remote_usable = bool(remote_cfg and not LOCAL_ONLY and not dead_s and not bal_out and budget_ok is not False)
     offline = _local_offline()
     if offline:
         mode = "remote-only" if remote_usable else "none"
@@ -5549,7 +5674,10 @@ def flow_mode_now():
         why.append("SHIM_LOCAL_ONLY (full-local mode)")
     if not remote_cfg:
         why.append("no remote provider configured")
-    if dead_s:
+    if bal_out:
+        why.append("remote provider balance exhausted (402 since %s): needs Kevin to top up; re-enabled by a balance probe"
+                   % time.strftime("%H:%M:%S", time.localtime(_REMOTE_BALANCE["since"] or time.time())))
+    elif dead_s:
         why.append("remote provider refused (402), breaker open %ds" % dead_s)
     if budget_ok is False:
         why.append("daily remote spend cap has no room")
@@ -5562,7 +5690,7 @@ def flow_mode_now():
         why.append("local engine unhealthy")
     return {"planned_offline": offline, "mode": mode, "local_up": local_up, "remote_configured": remote_cfg, "remote_usable": remote_usable,
             "remote_dead_for_s": dead_s, "remote_budget_ok": budget_ok, "forced_remote": forced,
-            "full_local_flag": bool(LOCAL_ONLY), "why": why}
+            "full_local_flag": bool(LOCAL_ONLY), "why": why, **remote_balance_facts()}
 
 
 def flow_note_mode(now=None):
@@ -8336,7 +8464,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
             data = await up.read()
             log.warning("upstream %s returned streaming %d: %s", base, up.status,
                         data[:500].decode("utf-8", "replace"))
-            _note_remote_status(base, up.status)
+            _note_remote_status(base, up.status, data[:200].decode("utf-8", "replace"))
             ct = up.headers.get("Content-Type", "application/json").split(";")[0]
             await session.close()
             resp = web.Response(body=data, status=up.status, content_type=ct,
@@ -8346,6 +8474,8 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
             await session.close()
             return "fail", (up.status, f"streaming 4xx read error: {e}", False)
 
+    if streaming and up.status == 200:
+        _note_remote_status(base, 200)        # [GW2 / L172] a streamed remote 200 is proof the balance is back
     if not streaming:
         try:
             data = await up.read()
@@ -8354,7 +8484,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
                 # "model provider failed after retries" the client shows). 5xx already handled above.
                 log.warning("upstream %s returned %d: %s", base, up.status,
                             data[:400].decode("utf-8", "replace"))
-            _note_remote_status(base, up.status)
+            _note_remote_status(base, up.status, data[:200].decode("utf-8", "replace") if up.status >= 400 else None)
             if up.status < 400:     # [GW2 / L94] finish_reason + tool-arg validity for buffered responses
                 _skw = _nonstream_shape_kw(data, body, local=(base.rstrip("/") == LOCAL.rstrip("/")))
                 if _skw:
@@ -10098,6 +10228,7 @@ async def gateway_stats(request):
         "inflight_computed": _inflight_computed,
         "remote_dead_for_s": max(0, int(_remote_dead_until - time.time())),
         "remote_402_count": _remote_dead_count,
+        "remote_balance_exhausted": bool(_REMOTE_BALANCE["exhausted"]),   # [GW2 / L172]
         "prefill_backlog_secs": round(_prefill_backlog_secs(), 1),
         "cache_model": _pm_summary(),
         "response_shape": _shape_stats_summary(),      # [GW2 / L94+L95]
@@ -12704,6 +12835,7 @@ async def _on_startup(app):
         log.warning("micro-lane history restore failed: %s", e)
     _spend()   # R2: load (and, for a mid-day ledger, import today's recorded spend) before serving
     app["saver"] = asyncio.create_task(_stats_saver())
+    app["balance_prober"] = asyncio.create_task(_remote_balance_prober())   # [GW2 / L172]
     await _hw_seed_slow()                                                  # Lane TL: refill the slow ring from disk
     app["telemetry_sampler"] = asyncio.create_task(_telemetry_sampler())   # TELEMETRY
     app["jsonl_flusher"] = asyncio.create_task(_jsonl_flusher())           # TELEMETRY-HISTORY
@@ -12712,6 +12844,9 @@ async def _on_cleanup(app):
     t = app.get("saver")
     if t:
         t.cancel()
+    bp = app.get("balance_prober")      # [GW2 / L172]
+    if bp:
+        bp.cancel()
     ts = app.get("telemetry_sampler")   # TELEMETRY
     if ts:
         ts.cancel()

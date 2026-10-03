@@ -87,6 +87,8 @@ class World:
             if method == "POST":
                 return {"lease": payload.get("lease")}
             return {"offline": self.offline, "by": "K5" if self.offline else None}
+        if url.endswith("/gateway/capacity"):
+            return {"remote_balance_exhausted": getattr(self, "balance_out", False)}
         return {}
 
     def unit_run(self, lane, job, cmd, timeout_s=None, env=None, cwd=None, out=None, wait=True, **kw):
@@ -580,3 +582,13 @@ def test_the_cr2_spec_validates_and_boots_a_release():
     boot = next(x for x in s["steps"] if "boot" in x)
     assert boot["boot"]["release"]["sha"] == "326846fdc2" and boot["boot"]["env"] == {"VLLM_SCHED_SHORT_FIRST_PREFIX_AWARE": "1"}
     assert [x["name"] for x in s["steps"]][:2] == ["clean", "base-probe"] and s["steps"][-1]["name"] == "gate"
+
+
+def test_refused_while_the_remote_balance_is_exhausted(world, tmp_path):
+    """GW2/L172: with the remote balance empty, an engine window would leave the estate with no serving path."""
+    world.balance_out = True
+    s = wc.Window(spec(tmp_path)).run()
+    assert s["status"] == "refused" and any("balance exhausted" in p for p in s["why"])
+    assert not world.units
+    s = wc.Window(spec(tmp_path, results=str(tmp_path / "r2"), allow_no_remote=True)).run()
+    assert s["status"] != "refused" or not any("balance exhausted" in p for p in s["why"])
