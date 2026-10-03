@@ -66,6 +66,7 @@ from vllm.v1.attention.ops.flydsl_turboquant_decode import (
 )
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.ops import tq_gqa_cuda as _gqa_cuda
+from vllm.v1.attention.ops import fa75_prefill as _k1fa  # [FORK][LANE K1] sm_75 hd256 flash prefill
 from vllm.v1.attention.ops.triton_turboquant_decode import (
     _fp8_format_code,
     _tq_full_dequant_kv,
@@ -981,6 +982,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # FlyDSL decode state. Auto-enabled on gfx950 when FlyDSL is available.
         self.sliding_window = sliding_window
         self.sinks = kwargs.get("sinks")
+        if _k1fa.enabled() and head_size == 256:
+            # [FORK][LANE K1] build/load the JIT extension at init, never inside a request
+            _k1fa._load()
+            logger.info_once("TurboQuant prefill attention: K1 sm_75 fa75 kernel (VLLM_TQ_FA75_PREFILL=1)")
         # Cache max_model_len now (config is available at __init__ but NOT
         # during CUDA-graph capture when _ensure_on_device is re-entered).
         self._max_model_len = vllm_config.model_config.max_model_len
@@ -1622,6 +1627,16 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
     # ------------------------------------------------------------------ #
     #  Prefill: SDPA on raw Q/K/V with causal mask                        #
     # ------------------------------------------------------------------ #
+    def _k1fa_ok(self, query: torch.Tensor, key: torch.Tensor) -> bool:
+        """[FORK][LANE K1] VLLM_TQ_FA75_PREFILL=1: run prefill attention with the sm_75 fa75-derived kernel
+        (exact softmax attention, bottom-right causal, GQA) instead of FlashInfer / flash_attn / SDPA."""
+        return (
+            _k1fa.enabled()
+            and self.sinks is None
+            and self.sliding_window is None
+            and _k1fa.eligible(query, key)
+        )
+
     def _prefill_attention(
         self,
         query: torch.Tensor,  # (N, Hq, D)
@@ -1640,6 +1655,18 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # forward only launches the prepared kernel, preserving CUDA-graph
         # capture for decode/spec-decode.
         if attn_metadata.flashinfer_first_chunk_wrapper is not None:
+            if self._k1fa_ok(query, key):
+                # Same precondition as the batched plan: every request is a complete first chunk.
+                return _k1fa.fa75_prefill(
+                    query,
+                    key,
+                    value,
+                    scale=self.scale,
+                    causal=True,
+                    cu_seqlens_q=attn_metadata.query_start_loc,
+                    cu_seqlens_k=attn_metadata.query_start_loc,
+                    max_seqlen_q=attn_metadata.max_query_len,
+                )
             return attn_metadata.flashinfer_first_chunk_wrapper.run(query, key, value)
 
         if (
@@ -1721,7 +1748,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     if attn_metadata.flashinfer_first_chunk_wrappers
                     else None
                 )
-                if first_chunk_wrapper is not None:
+                if self._k1fa_ok(q_seq, k_seq):
+                    out = _k1fa.fa75_prefill(
+                        q_seq, k_seq, v_seq, scale=self.scale, causal=True
+                    )
+                elif first_chunk_wrapper is not None:
                     out = first_chunk_wrapper.run(q_seq, k_seq, v_seq)
                 elif _HAS_FLASH_ATTN:
                     # Assign to slice to avoid gpu/cpu sync.
@@ -2180,6 +2211,13 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             v_full[cached_len:] = val_chunk
             k_cached_trim = k_full[:cached_len]
             v_cached_trim = v_full[:cached_len]
+
+        if self._k1fa_ok(query, k_full):
+            # One exact causal call over [dequantised cache | current chunk] (bottom-right aligned): no
+            # prefix/current split and no LSE merge needed.
+            return _k1fa.fa75_prefill(
+                query, k_full, v_full, scale=self.scale, causal=True
+            )
 
         if flashinfer_prefix_combine_wrappers is not None:
             prefix_wrapper, current_wrapper = flashinfer_prefix_combine_wrappers
