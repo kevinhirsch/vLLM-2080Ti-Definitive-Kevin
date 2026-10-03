@@ -190,7 +190,7 @@ def test_the_ported_k5_spec_validates():
     names = [x["name"] for x in s["steps"]]
     assert names[:3] == ["clean", "stop-engine", "gdn-test"] and "k5-boot" in names
     k5 = next(x for x in s["steps"] if x["name"] == "k5-boot")
-    assert k5["boot"]["release"]["sha"].startswith("6235bb4956")     # the lane arm is a release, not the tree
+    assert k5["boot"]["release"]["sha"].startswith("40b3467c1d")     # the lane arm is a release, not the tree
     assert "trial_guard.sh" in s["conflicts"] and "vllm-qwen27b-watchdog.timer" in wc.pause_timers_of(s)
     tq = next(x for x in s["steps"] if x["name"] == "tq-test")
     assert s["vars"]["K5"] == "/home/kevin/Desktop/wt-k5"

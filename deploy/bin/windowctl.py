@@ -704,7 +704,7 @@ class Window:
 
     def arm_deadman(self):
         unit = unitrun.unit_name(self.lane, f"{self.wid}-deadman")
-        r = subprocess.run(["systemd-run", "--user", f"--unit={unit}", "--collect", "--quiet",
+        r = subprocess.run(["systemd-run", "--user", f"--unit={unit}", "--collect", "--quiet", "--expand-environment=no",
                             "--on-active=120", "--on-unit-active=120", "--timer-property=AccuracySec=10s",
                             sys.executable, os.path.abspath(__file__), "deadman", "--state", self.path("state.json")],
                            capture_output=True, text=True, timeout=60)
@@ -1336,7 +1336,7 @@ def main(argv=None):
         spec = load_spec(a.spec)
         validate(spec)
         unit = unitrun.unit_name(f"win-{spec['lane']}", spec["window"])
-        argv = ["systemd-run", "--user", f"--unit={unit}", "--collect", "-p", "TimeoutStopSec=1800",
+        argv = ["systemd-run", "--user", f"--unit={unit}", "--collect", "--expand-environment=no", "-p", "TimeoutStopSec=1800",
                 "-p", "KillMode=mixed", f"--setenv=PATH={os.environ.get('PATH', '/usr/bin:/bin')}", f"--setenv=HOME={HOME}"]
         if a.wait:
             argv.append("--wait")

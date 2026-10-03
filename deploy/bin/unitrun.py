@@ -220,7 +220,9 @@ def build_cmd(unit: str, cmd: list[str], *, timeout_s=None, env=None, cwd=None, 
     status_file = _state_path(unit, "status")
     if re.search(r"[\s'\"\\$]", status_file):
         raise ValueError(f"unit state path must not contain whitespace/quotes: {status_file}")
-    argv = [SYSTEMD_RUN, "--user", f"--unit={unit}", "--collect", "--service-type=exec",
+    # --expand-environment=no: systemd otherwise rewrites $VAR / $$ in the COMMAND LINE before bash sees it
+    # (`bash -c 'echo $$'` ran as `echo $`): every lane's shell snippet would be silently altered
+    argv = [SYSTEMD_RUN, "--user", f"--unit={unit}", "--collect", "--service-type=exec", "--expand-environment=no",
             "-p", "KillMode=control-group", "-p", "TimeoutStopSec=20",
             "-p", f"ExecStopPost=/bin/sh -c 'echo $SERVICE_RESULT $EXIT_CODE $EXIT_STATUS > {status_file}'"]
     if wait:
@@ -274,7 +276,7 @@ def run(lane: str, job: str, cmd: list[str], *, timeout_s=None, env=None, cwd=No
             _write_json(_state_path(unit, "json"), rec)
             return {"unit": unit, "rc": None, "result": "start-failed", "error": (r.stderr or "")[-400:]}
         # the pid sampler is itself a unit (attributable, and it outlives this caller)
-        subprocess.run([SYSTEMD_RUN, "--user", f"--unit={unit}--sampler", "--collect", "--quiet",
+        subprocess.run([SYSTEMD_RUN, "--user", f"--unit={unit}--sampler", "--collect", "--quiet", "--expand-environment=no",
                         f"--setenv=UNITRUN_STATE_DIR={STATE_DIR}", sys.executable, os.path.abspath(__file__), "sample", unit, "--every", str(sample_s)],
                        capture_output=True, text=True, timeout=60)
         return {"unit": unit, "rc": None, "result": "started", "started": rec["started"]}
