@@ -66,7 +66,7 @@ def _time_proxy(clock, real_time):
     return ns
 
 
-class _Spin(Exception):
+class _Spin(BaseException):          # not Exception: the router crash guard must not swallow it
     pass
 
 
@@ -263,7 +263,7 @@ def _run_scenario(sc, n, tmp):
     try:
         resp = asyncio.run(m.handle_completions(req))
         outcome["response"] = _resp_summary(resp)
-    except _Spin:
+    except _Spin:                                            # noqa
         outcome["response"] = {"kind": "spins", "note": f"still queued after {MAX_SLEEPS} polls"}
     except Exception as e:                                   # pinned too: today's unhandled paths
         outcome["response"] = {"kind": "raised", "exc": type(e).__name__, "msg": str(e)[:120]}
@@ -564,7 +564,7 @@ class GoldenRouting(unittest.TestCase):
 
     # Pinned bugs: today these paths give the caller no HTTP response of the gateway's own (an unhandled exception
     # becomes aiohttp's bare 500 and the request never reaches telemetry). Each fix removes its name from this set.
-    KNOWN_NO_RESPONSE = {"json_array_body", "json_string_body", "messages_is_string", "messages_items_not_objects"}
+    KNOWN_NO_RESPONSE = set()         # lane SH fixed the 4 pinned here (non-object bodies): now 400 invalid_body
 
     def test_every_request_gets_a_response(self):
         """A "spins" scenario is a deliberate unbounded wait (no remote to overflow to, interactive never overflows on
