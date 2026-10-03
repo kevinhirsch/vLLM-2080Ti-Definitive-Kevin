@@ -76,11 +76,11 @@ def v_w4a8(n, x, info):
 
 
 def v_w4a8nd(n, x, info):
-    return v_fp16(n, x, info) if n.endswith("down_proj") else v_w4a8(n, x, info)
+    return v_fp16(n, x, info) if n.split("#")[0].endswith("down_proj") else v_w4a8(n, x, info)
 
 
 def v_w4a8sm(n, x, info, alpha=0.5):
-    if not n.endswith("down_proj"):
+    if not n.split("#")[0].endswith("down_proj"):
         return v_w4a8(n, x, info)
     if "sm" not in info:  # smoothing factors from this call's activations (calibration = first batch seen; one batch per layer here)
         ax = x.abs().amax(0).clamp(min=1e-5); aw = info["w"].abs().amax(0).clamp(min=1e-5)
@@ -99,7 +99,7 @@ def q_grp(x, bits, g=G):
 
 
 def v_w4a8gd(n, x, info):
-    if not n.endswith("down_proj"):
+    if not n.split("#")[0].endswith("down_proj"):
         return v_w4a8(n, x, info)
     if "wq8" not in info: info["wq8"] = int_scales(info)
     return q_grp(x.half().float(), 8) @ info["wq8"].T
@@ -131,7 +131,7 @@ def v_w4a8e3(n, x, info, emax=3):
 def v_w8x(n, x, info):
     """kernel-exact LP W8X (prefill path): gate/up + GDN in_proj_qkv/z: W8 per-output-channel grid expanded from the W4
     (s_ch = max_g s * 15/127, round half away) x per-token int8 activations; every other linear stays W4A16 (fp16 act)."""
-    if not any(n.endswith(t) for t in ("gate_proj", "up_proj", "in_proj_qkv", "in_proj_z")):
+    if not any(n.split("#")[0].endswith(t) for t in ("gate_proj", "up_proj", "in_proj_qkv", "in_proj_z")):
         return v_fp16(n, x, info)
     if "w8x" not in info:
         s16 = info["s"].half().float(); sch = s16.amax(1, keepdim=True) * 15.0 / 127.0
@@ -142,7 +142,7 @@ def v_w8x(n, x, info):
 
 
 def v_w4a8hd(n, x, info):
-    if not n.endswith("down_proj"):
+    if not n.split("#")[0].endswith("down_proj"):
         return v_w4a8(n, x, info)
     if "wh" not in info: info["wh"] = int4_rtn_asym(blk_had(info["w"]))
     return q_tok(blk_had(x.half().float()), 8) @ info["wh"].T
