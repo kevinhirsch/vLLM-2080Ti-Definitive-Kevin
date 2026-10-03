@@ -22,9 +22,10 @@
 # WEDGE-ROOTCAUSE-2026-08-10.md, which documents this exact false-positive risk being
 # reproduced live. That is why this script requires several consecutive failures, not one.
 #
-# Safety rails:
-#   - COOLDOWN_SEC: minimum gap between automated restarts (default 1800s / 30 min).
-#   - MAX_RESTARTS_PER_HOUR: hard cap on restarts/hour (default 2).
+# Safety rails (LV 2026-10-03): the rate limit, backoff and circuit breaker for EVERY automatic engine action live in the one
+# liveness authority (engine-actuator.py recover/tick; deploy/docs/engine-liveness-authority.md). This script DETECTS the wedge;
+# the authority decides whether acting is allowed and acts.
+#   - COOLDOWN_SEC / MAX_RESTARTS_PER_HOUR: used ONLY by the legacy fallback when the authority is missing or crashes.
 #   - --dry-run: never actually restarts; logs "[DRY-RUN] would restart ..." instead.
 #     State mutations related to restart bookkeeping are skipped in dry-run so testing never
 #     pollutes the cooldown/rate-limit state the real (future, enabled) watchdog depends on.
@@ -162,6 +163,26 @@ probe_progress() {
 # ---------- main ----------
 init_state
 
+# LV (2026-10-03): ONE liveness authority. Each tick first runs the authority's cycle (engine-actuator.py tick): it publishes the
+# declared engine state (liveness-state.json) and itself takes the exits no probe here covers (an unowned DOWN engine, a boot whose
+# API never came up, an API that died while the process lives). When a holder owns the engine (a window's TTL-bounded hold, a
+# gateway planned-offline window, a planned restart, the kill switch) this watchdog neither probes nor counts -- that is what
+# windows used to stop this timer for (DFT left it stopped 4.5 h on 10-02). If the authority cannot run, probing continues.
+ACTUATOR="${WATCHDOG_ACTUATOR:-$(dirname "$STATE_FILE")/engine-actuator.py}"
+lstate=""
+if [ -f "$ACTUATOR" ]; then
+  tick_args=(tick --by watchdog-tick); [ "$DRY_RUN" = "1" ] && tick_args+=(--no-act)
+  tick_out=$(timeout 60 /usr/bin/python3 "$ACTUATOR" "${tick_args[@]}" 2>>"$ACTION_LOG") || tick_out=""
+  lstate=$(printf '%s' "$tick_out" | jq -r '.state // empty' 2>/dev/null)
+  lprobe=$(printf '%s' "$tick_out" | jq -r 'if .probe == false then "no" else "yes" end' 2>/dev/null)
+  if [ -n "$lstate" ] && [ "$lprobe" = "no" ]; then
+    log "DEFER liveness=${lstate}: $(printf '%s' "$tick_out" | jq -r '.reason // ""' 2>/dev/null) -> no probe, consecutive_failures reset"
+    [ "$(state_get consecutive_failures)" != "0" ] && state_set_consecutive_failures 0
+    exit 0
+  fi
+  [ -z "$lstate" ] && log "LIVENESS authority tick produced no state (see stderr above); probing anyway"
+fi
+
 models_result=$(probe_models)
 models_code="${models_result%% *}"
 models_time="${models_result#* }"
@@ -255,7 +276,26 @@ if [ "$new_failures" -lt "$CONSEC_EFFECTIVE" ]; then
   exit 0
 fi
 
-# Threshold reached -> confirmed wedge. Check safety rails before acting.
+# Threshold reached -> confirmed wedge. LV: the decision to ACT (holds, windows, planned restarts, the one rate limit with backoff
+# and breaker, the pre-kill fault record, SIGKILL, restart) belongs to the liveness authority. This script only reports the wedge.
+if [ -f "$ACTUATOR" ]; then
+  rargs=(recover --cause wedge --by watchdog --evidence "consecutive_failures=${new_failures}/${CONSEC_EFFECTIVE} models=${models_code} gen=${gen_code}(${gen_time}s) xid_recent=${xid_recent:-0}")
+  [ "$DRY_RUN" = "1" ] && rargs+=(--dry-run)
+  rout=$(timeout 150 /usr/bin/python3 "$ACTUATOR" "${rargs[@]}" 2>>"$ACTION_LOG"); rrc=$?
+  if printf '%s' "$rout" | jq -e . >/dev/null 2>&1; then
+    if [ "$(printf '%s' "$rout" | jq -r '.acted // false')" = "true" ]; then
+      state_record_restart "$(now_epoch)"
+      state_set_consecutive_failures 0
+      log "DECISION wedge CONFIRMED (consecutive_failures=${new_failures}) -> liveness authority ACTED: $(printf '%s' "$rout" | jq -c '{id,action,steps}')"
+    else
+      log "DECISION wedge CONFIRMED (consecutive_failures=${new_failures}) -> liveness authority did not act: $(printf '%s' "$rout" | jq -r '.refused // (if .dry_run then "[DRY-RUN] would recover" else "?" end)')"
+    fi
+    exit 0
+  fi
+  log "LIVENESS authority recover failed (rc=${rrc}, no JSON) -> legacy fallback below"
+fi
+
+# Legacy fallback: ONLY when the authority is missing or crashed, so a broken actuator can never leave a wedge without an exit.
 t=$(now_epoch)
 last_restart=$(state_get last_restart_epoch)
 since_last=$((t - last_restart))
@@ -277,31 +317,17 @@ if [ "$DRY_RUN" = "1" ]; then
   exit 0
 fi
 
-log "DECISION wedge CONFIRMED (consecutive_failures=${new_failures}, models healthy, gen timed out ${new_failures}x consecutively) -> RESTARTING ${SERVICE}"
-# Clear any StartLimitBurst latch FIRST. systemd stops honouring `restart` once a unit has
-# failed too many times in the interval, and a latched unit silently ignores the command --
-# the watchdog then logs a successful restart that never happened. This is not hypothetical:
-# it stranded the engine on 2026-08-14 during the quantization window.
+log "DECISION wedge CONFIRMED (consecutive_failures=${new_failures}) -> LEGACY FALLBACK RESTARTING ${SERVICE}"
 sudo -n systemctl reset-failed "$SERVICE" >> "$ACTION_LOG" 2>&1 || true
-# 2026-09-05 (wedge RCA): a CONFIRMED wedge has never honoured SIGTERM (0-for-2: 2026-09-02 and
-# 2026-09-05 both sat out the full TimeoutStopSec=180 before systemd's SIGKILL). Kill the whole
-# control group up front so the restart starts immediately; the 180 s grace stays for operator
-# restarts, where a clean TP=2 teardown is worth waiting for.
-# EF2: tell the fault collector this death is a confirmed generation wedge (a FAULT for Halo, not a planned stop).
 printf '{"ts":"%s","by":"watchdog","wedge":true,"consecutive_failures":%s}\n' "$(date -Is)" "${new_failures}" > "$(dirname "$STATE_FILE")/wedge-restart.json" 2>/dev/null || true
-# RS (2026-10-02): record the death BEFORE killing. Two wedge kills (10:39, 12:05) never reached the fault ledger: the
-# ExecStopPost collector raced the `systemctl restart` issued 3 s after this kill and its record was lost. --pre-kill writes
-# ledger + incident dir + Halo hand-off now, with the journal still intact, and drops a dedupe marker so the later ExecStopPost
-# does not double-count. Bounded (timeout) and best-effort: a collector failure never delays recovery beyond the bound.
 timeout 60 /usr/bin/python3 "$(dirname "$STATE_FILE")/engine-fault-collector.py" --pre-kill >> "$ACTION_LOG" 2>&1 || true
 sudo -n systemctl kill -s KILL "$SERVICE" >> "$ACTION_LOG" 2>&1 || true
 sleep 3
-log "ACTION SIGKILL sent to ${SERVICE} control group (wedged engines never exit on SIGTERM); restarting now"
-if sudo -n systemctl restart "$SERVICE" >> "$ACTION_LOG" 2>&1; then
+if sudo -n systemctl restart --no-block "$SERVICE" >> "$ACTION_LOG" 2>&1; then
   state_record_restart "$t"
   state_set_consecutive_failures 0
-  log "ACTION restart of ${SERVICE} issued successfully (sudo systemctl restart exit 0)"
+  log "ACTION legacy restart of ${SERVICE} queued (SIGKILL + systemctl restart --no-block)"
 else
   rc=$?
-  log "ACTION restart of ${SERVICE} FAILED (sudo systemctl restart exit ${rc}) -- state NOT updated, will retry next cycle if still wedged"
+  log "ACTION legacy restart of ${SERVICE} FAILED (exit ${rc}) -- state NOT updated, will retry next cycle if still wedged"
 fi

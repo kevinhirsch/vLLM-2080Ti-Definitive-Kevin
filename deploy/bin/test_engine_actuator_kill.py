@@ -65,7 +65,7 @@ class KilledRestart(unittest.TestCase):
             self.systemctl.append(cmd[3:])
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
-        for p in (patch.object(ea, "LOCK", f"{d}/restart.lock"), patch.object(ea, "JOB", f"{d}/job.json"),
+        for p in (patch.object(ea, "LOCK", f"{d}/restart.lock"), patch.object(ea, "JOB", f"{d}/job.json"), patch.object(ea, "HOLDS", f"{d}/holds.json"),
                   patch.object(ea, "PLANNED", f"{d}/planned.json"), patch.object(ea, "http", self.gw),
                   patch.object(ea, "admin_token", return_value="t"), patch.object(ea, "engine_healthy", return_value=True),
                   patch.object(ea, "status", return_value={"gateway": {}}), patch.object(ea, "staged_flags", return_value=[]),

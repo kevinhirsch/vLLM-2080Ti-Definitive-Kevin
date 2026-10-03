@@ -35,13 +35,14 @@ class SafePublish(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(pub, "HALO_INCIDENTS", Path(directory)):
             path = Path(directory) / "one.json"
-            path.write_text(json.dumps({"id": "one", "status": "running",
+            lease = {"expires_at_epoch": time.time() + 600}
+            path.write_text(json.dumps({"id": "one", "status": "running", "lease": lease,
                                         "halo_run": {"status": "running", "run_id": "run-1"}}))
             self.assertEqual(pub._halo_active_runs(), ["one"])
             with patch.object(pub.time, "monotonic", side_effect=[0, 2]):
                 with self.assertRaisesRegex(TimeoutError, "one"):
                     pub._wait_halo_quiet(1)
-            path.write_text(json.dumps({"id": "one", "status": "recovered",
+            path.write_text(json.dumps({"id": "one", "status": "recovered", "lease": lease,
                                         "halo_run": {"status": "running", "run_id": "run-1"}}))
             self.assertEqual(pub._halo_active_runs(), [])
             path.write_text("{")
@@ -139,7 +140,7 @@ class TerminationReleasesEverything(unittest.TestCase):
                       "SOURCE": d / "keepalive-shim.py", "DASH_SOURCE": d / "dash.html",
                       "DASH_RUNTIME": d / "live-dash.html", "RUNTIME": d / "live-shim.py",
                       "HALO_SUPERVISOR_LOCK": d / "supervisor.lock", "DROPIN": d / "dropin.conf",
-                      "DROPIN_LIVE": d / "dropin-live.conf"}
+                      "DROPIN_LIVE": d / "dropin-live.conf", "ACTUATOR": d / "no-actuator.py"}
         self.gw = FakeGateway()
 
         def check_output(args, **kw):
@@ -246,7 +247,8 @@ class TerminationReleasesEverything(unittest.TestCase):
                 time.sleep(60)
             for k, v in {{"HALO_START_PAUSE": d/"pause.json", "DRAIN_STATE": d/"drain.json", "AUDIT_LOG": d/"audit.log",
                          "HALO_INCIDENTS": d/"incidents", "SOURCE": d/"keepalive-shim.py", "DASH_SOURCE": d/"dash.html",
-                         "DASH_RUNTIME": d/"live-dash.html", "RUNTIME": d/"live-shim.py", "DROPIN": d/"x", "DROPIN_LIVE": d/"y"}}.items():
+                         "DASH_RUNTIME": d/"live-dash.html", "RUNTIME": d/"live-shim.py", "DROPIN": d/"x", "DROPIN_LIVE": d/"y",
+                         "ACTUATOR": d/"no-actuator.py"}}.items():
                 setattr(pub, k, v)
             pub._http, pub._run, pub._wait_empty = http, lambda *a: None, wait_empty
             pub._assert_halo_quiesce_live = lambda t: None

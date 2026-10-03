@@ -310,6 +310,19 @@ def reconcile(hours: float):
     print(json.dumps({"reconciled": done}))
 
 
+def engine_hold(now: float):
+    """LV 2026-10-03: the engine hold (a window that owns the engine) live at `now`, from the liveness authority's hold file, or None.
+    A stop inside a hold is the holder's; a crash inside one is still a FAULT but is tagged with the window that ran it."""
+    try:
+        rows = json.load(open(f"{BASE}/liveness-holds.json"))
+    except Exception:  # noqa: BLE001
+        return None
+    for h in rows if isinstance(rows, list) else []:
+        if h.get("kind") == "engine" and float(h.get("acquired") or 0) <= now < float(h.get("until") or 0):
+            return {k: h.get(k) for k in ("by", "reason", "lease", "acquired", "until")}
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stop-post", action="store_true")
@@ -409,9 +422,14 @@ def main():
         row["recorded_by"] = "watchdog-pre-kill"
     if wedge:
         row["wedge"] = {k: wedge.get(k) for k in ("by", "consecutive_failures", "ts")}
+    hold = None if a.at else engine_hold(now)
+    if hold:
+        row["during_hold"] = hold
     if planned:
-        row["planned_by"] = (marker or {}).get("by") or "systemctl"
-        row["planned_reason"] = (marker or {}).get("reason")
+        row["planned_by"] = (marker or {}).get("by") or (hold or {}).get("by") or "systemctl"
+        if not marker and hold:
+            row["planned_reason"] = hold.get("reason")
+        row.setdefault("planned_reason", (marker or {}).get("reason"))
         row["killed_after_stop_timeout"] = killed_after_timeout  # in-flight work was cut at the stop timeout (drain didn't finish)
         row["drain"] = (marker or {}).get("drain")
     os.makedirs(INC, exist_ok=True)

@@ -15,6 +15,7 @@ Run:  python -m pytest -q test_gateway_gw2_shape.py
 """
 import asyncio
 import json
+import time
 import unittest
 from unittest.mock import patch
 
@@ -357,3 +358,136 @@ class Watchdog(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TokenizeMemo(unittest.IsolatedAsyncioTestCase):
+    """~7 _est_tokens calls per request were each a synchronous /tokenize round trip on the event loop."""
+
+    async def test_one_round_trip_per_prompt_and_off_the_loop(self):
+        calls = []
+
+        class R:
+            def __init__(self, n):
+                self.n = n
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self, *a):
+                return json.dumps({"count": self.n}).encode()
+
+        def urlopen(req, timeout=None):
+            calls.append(shim.threading.current_thread() is shim.threading.main_thread())
+            return R(1234)
+
+        body = json.dumps({"messages": [{"role": "user", "content": "x" * 20000}]}).encode()
+        with patch.object(shim, "EXACT_TOKENS", True), patch.object(shim, "_TOK_MEMO", shim.collections.OrderedDict()), \
+                patch.object(shim, "_TOK_STATS", shim.collections.Counter()), patch.object(shim, "_tok_fail_until", 0.0), \
+                patch.object(shim.urllib.request, "urlopen", urlopen), patch.object(shim, "_min_decision_threshold", lambda: 100):
+            await shim._warm_token_estimate(body)
+            for _ in range(7):
+                self.assertEqual(shim._est_tokens(body), 1234)
+            self.assertEqual(calls, [False])                 # exactly one call, on a worker thread
+            self.assertEqual((shim._TOK_STATS["calls"], shim._TOK_STATS["calls_on_loop"], shim._TOK_STATS["memo_hits"]),
+                             (1, 0, 7))
+
+
+class CreditProbe(unittest.IsolatedAsyncioTestCase):
+    """The gateway's client for the engine's /v1/fork/prefix_cache_probe (real local HTTP server as the engine)."""
+
+    async def asyncSetUp(self):
+        self.mode, self.delay, self.seen = "ok", 0.0, []
+
+        async def h(request):
+            self.seen.append(await request.json())
+            if self.delay:
+                await asyncio.sleep(self.delay)
+            if self.mode == "absent":
+                return web.Response(status=404)
+            if self.mode == "disabled":
+                return web.json_response({"enabled": False})
+            return web.json_response({"enabled": True, "prompt_tokens": 30000, "cached_tokens": 26000})
+
+        app = web.Application()
+        app.router.add_post("/v1/fork/prefix_cache_probe", h)
+        self.runner = web.AppRunner(app)
+        await self.runner.setup()
+        site = web.TCPSite(self.runner, "127.0.0.1", 0)
+        await site.start()
+        self._p = [patch.object(shim, "LOCAL", "http://127.0.0.1:%d" % self.runner.addresses[0][1]),
+                   patch.dict(shim._PROBE, {"disabled_until": 0.0, "why": None, "session": None}),
+                   patch.object(shim, "_PROBE_STATS", shim.collections.Counter()),
+                   patch.object(shim, "_PROBE_ERR", shim.collections.deque(maxlen=2000)),
+                   patch.object(shim, "CREDIT_PROBE_TIMEOUT_S", 0.3), patch.object(shim, "_local_offline", lambda now=None: False)]
+        for p in self._p:
+            p.start()
+        self.active = {}
+
+    async def asyncTearDown(self):
+        if shim._PROBE.get("session"):
+            await shim._PROBE["session"].close()
+        for p in self._p:
+            p.stop()
+        await self.runner.cleanup()
+
+    def body(self):
+        return json.dumps({"model": "estate", "stream": True, "messages": [{"role": "user", "content": "q"}],
+                           "tools": TOOLS, "chat_template_kwargs": {"enable_thinking": True}}).encode()
+
+    async def test_ok_sends_only_render_fields(self):
+        cached, pt, ms = await shim.credit_probe(self.body())
+        self.assertEqual((cached, pt), (26000, 30000))
+        self.assertEqual(set(self.seen[0]), {"model", "messages", "tools", "chat_template_kwargs"})
+
+    async def test_absent_and_disabled_back_off_and_timeout_is_bounded(self):
+        self.mode = "absent"
+        self.assertIsNone(await shim.credit_probe(self.body()))
+        self.assertIsNone(await shim.credit_probe(self.body()))
+        self.assertEqual(len(self.seen), 1)                   # backed off: no second call
+        self.assertEqual(shim._PROBE_STATS["skipped_backoff"], 1)
+        shim._PROBE["disabled_until"] = 0.0
+        self.mode = "disabled"
+        self.assertIsNone(await shim.credit_probe(self.body()))
+        self.assertGreater(shim._PROBE["disabled_until"], time.time() + 500)
+        shim._PROBE["disabled_until"] = 0.0
+        self.mode, self.delay = "ok", 2.0
+        t = time.time()
+        self.assertIsNone(await shim.credit_probe(self.body()))
+        self.assertLess(time.time() - t, 1.0)
+        self.assertEqual(shim._PROBE_STATS["timeout"], 1)
+
+    async def sources(self, probe, anchor, chain_anchor=None):
+        pm = {"credit": 3568, "computed": 26432, "est": 30000, "chain": [(b"k", 1)]}
+        with patch.object(shim, "CREDIT_PROBE", probe), patch.object(shim, "CREDIT_ANCHOR", anchor), \
+                patch.object(shim, "_active_set", lambda r, **kw: self.active.update(kw)), \
+                patch.object(shim, "anchored_credit", lambda chain, est, now=None: chain_anchor or (0, None)):
+            src = await shim._credit_sources(object(), pm, self.body(), 30000)
+        return src, pm
+
+    async def test_shadow_logs_and_routes_on_the_model(self):
+        src, pm = await self.sources("shadow", "shadow")
+        self.assertEqual((src, pm["credit"], pm["computed"]), ("model", 3568, 26432))
+        self.assertEqual(self.active["pm_credit_probe"], 26000)
+        self.assertEqual(shim._PROBE_ERR[-1], (3568, 26000, None))
+        self.assertEqual(shim._credit_probe_summary()["model_minus_probe"]["p50"], 3568 - 26000)
+
+    async def test_live_uses_probe_then_anchor_then_model(self):
+        src, pm = await self.sources("live", "live")
+        self.assertEqual((src, pm["credit"], pm["computed"]), ("probe", 26000, 4000))
+        self.assertEqual(self.active["pm_credit_model"], 3568)
+        self.mode = "absent"
+        src, pm = await self.sources("live", "live", chain_anchor=(21408, 12.0))
+        self.assertEqual((src, pm["credit"], pm["computed"]), ("anchor", 21408, 8592))
+        src, pm = await self.sources("live", "live")
+        self.assertEqual((src, pm["credit"]), ("model", 3568))
+
+    async def test_small_prompts_and_offline_windows_are_not_probed(self):
+        with patch.object(shim, "CREDIT_PROBE", "shadow"), patch.object(shim, "CREDIT_ANCHOR", "off"), \
+                patch.object(shim, "_active_set", lambda r, **kw: None):
+            await shim._credit_sources(object(), {"credit": 0, "computed": 100, "chain": []}, self.body(), 100)
+            with patch.object(shim, "_local_offline", lambda now=None: True):
+                await shim._credit_sources(object(), {"credit": 0, "computed": 9000, "chain": []}, self.body(), 9000)
+        self.assertEqual(self.seen, [])

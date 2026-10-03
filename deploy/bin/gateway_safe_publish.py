@@ -55,6 +55,9 @@ ESTATE_RUNTIME = Path("/home/kevin/.local/share/estate-overseer")
 DRAIN_STATE = Path("/home/kevin/.local/share/vllm-qwen27b/gateway-publish-drain.json")
 AUDIT_LOG = Path("/home/kevin/.local/share/vllm-qwen27b/gateway-publish-audit.log")
 HALO_LEASE_OWNER = "gateway-safe-publish"
+# LV 2026-10-03: the engine-liveness authority's quiesce hold. While it is held no PLANNED engine restart can start (its offline
+# window / drain would collide with this drain); automatic wedge recovery still runs (a wedged engine would never let the drain end).
+ACTUATOR = Path(os.environ.get("ENGINE_ACTUATOR", "/home/kevin/.local/share/vllm-qwen27b/engine-actuator.py"))
 _TERMINATION_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 
 
@@ -249,19 +252,57 @@ def _restore_config_schema(state: dict) -> None:
         _atomic_write(dst, state["schema_previous"], 0o644)
 
 
+# LV 2026-10-03: "is a Halo run live?" is the incident SUPERVISOR's question, answered by its lease-backed occupancy, not by this
+# file's own reading of status labels. The 08:01 GW2 publish aborted because two incidents finished their runs DURING the drain and
+# became repair-requested with run status "stopping": the supervisor counts "stopping" as TERMINAL (the run has ended; the next round
+# waits for capacity, which the start pause holds), this file counted it as ACTIVE. Same names, same sets, same lease rule as
+# tools/halo_incident_supervisor.py (_active_execution_incidents); test_gateway_safe_publish_halo_predicate.py fails on any drift.
+HALO_TERMINAL_RUN_STATUSES = frozenset({
+    "completed", "complete", "failed", "interrupted", "stopping", "stopped",
+    "cancelled", "canceled", "expired", "done", "error",
+})
+HALO_OPEN_STATES = ("assigned", "running", "investigate", "escalated", "repair-requested", "repair-running")
+HALO_ACTIVE_EXECUTION_STATES = ("running", "repair-requested", "repair-running")
+
+
+def _halo_lease_live(row: dict, now: float) -> bool:
+    lease = row.get("lease")
+    if not isinstance(lease, dict):
+        return False
+    try:
+        if now >= float(lease.get("expires_at_epoch", 0)):
+            return False
+        used, cap = int(lease.get("tool_calls_used", 0)), int(lease.get("tool_calls_max", 0))
+    except (TypeError, ValueError):
+        return True                      # unreadable budget: treat as live (fail toward waiting, bounded by halo_wait_s)
+    return not (cap and used >= cap)
+
+
+def halo_run_live(row: dict, now: float | None = None) -> bool:
+    """A Halo run that can still make a gateway turn: the supervisor's slot occupancy, plus any open incident whose run is in a
+    non-terminal state under a live lease (an investigation run is a live run too)."""
+    now = time.time() if now is None else now
+    if not _halo_lease_live(row, now):
+        return False
+    status = row.get("status")
+    run_status = str((row.get("halo_run") or {}).get("status") or "")
+    if status in HALO_ACTIVE_EXECUTION_STATES:
+        return not (status == "repair-requested" and run_status in HALO_TERMINAL_RUN_STATUSES)
+    return status in HALO_OPEN_STATES and bool(run_status) and run_status not in HALO_TERMINAL_RUN_STATUSES
+
+
 def _halo_active_runs() -> list[str]:
     """Do not restart the gateway between turns of an active Halo repair."""
     if not HALO_INCIDENTS.is_dir():
         raise RuntimeError("Halo incident authority is unreadable")
     active = []
+    now = time.time()
     for path in HALO_INCIDENTS.glob("*.json"):
         try:
             row = json.loads(path.read_text())
         except (OSError, ValueError) as exc:
             raise RuntimeError(f"unreadable Halo incident: {path.name}") from exc
-        run = row.get("halo_run") or {}
-        if (row.get("status") in {"assigned", "running", "repair-requested"}
-                and run.get("status") in {"pending", "started", "queued", "running", "unknown", "stopping"}):
+        if halo_run_live(row, now):
             active.append(str(row.get("id") or path.stem))
     return active
 
@@ -289,6 +330,47 @@ def _begin_halo_quiesce(halo_wait_s: float, drain_timeout_s: float) -> str:
              "expires_at_epoch": now + min(3550, halo_wait_s + drain_timeout_s + 180)}
     _atomic_write(HALO_START_PAUSE, (json.dumps(lease, sort_keys=True) + "\n").encode(), 0o644)
     return token
+
+
+def _mark_halo_quiesce_phase(token: str, phase: str) -> None:
+    """Record the release phase on the start-pause lease (quiet-wait -> draining -> swapping). The supervisor reads the lease; a
+    phase lets it hold even its exempt (restoration/control) starts during the short drain+swap, and only then."""
+    try:
+        row = json.loads(HALO_START_PAUSE.read_text())
+    except (OSError, ValueError):
+        return
+    if row.get("owner") != HALO_LEASE_OWNER or row.get("token") != token:
+        return
+    row["phase"], row["phase_at_epoch"] = phase, time.time()
+    _atomic_write(HALO_START_PAUSE, (json.dumps(row, sort_keys=True) + "\n").encode(), 0o644)
+
+
+def _liveness_hold(ttl_s: float) -> str | None:
+    """Best effort: take the liveness authority's quiesce hold, owned by this process (void the moment it dies)."""
+    if not ACTUATOR.is_file():
+        _audit("liveness-hold-skipped", reason="engine-actuator.py not installed")
+        return None
+    try:
+        out = subprocess.run(["/usr/bin/python3", str(ACTUATOR), "hold", "acquire", "--kind", "quiesce", "--by", HALO_LEASE_OWNER,
+                              "--reason", f"governed gateway publish by {_BY}", "--ttl", str(int(max(60, min(ttl_s, 28800)))),
+                              "--owner-pid", str(os.getpid())], capture_output=True, text=True, timeout=30)
+        row = json.loads(out.stdout.strip().splitlines()[-1])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError) as exc:
+        _audit("liveness-hold-failed", error=repr(exc)[:200])
+        return None
+    if not row.get("lease"):
+        _audit("liveness-hold-refused", detail=json.dumps(row)[:300])
+        return None
+    return row["lease"]
+
+
+def _liveness_release(lease: str | None) -> None:
+    if not lease:
+        return
+    try:
+        subprocess.run(["/usr/bin/python3", str(ACTUATOR), "hold", "release", "--lease", lease], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        _audit("liveness-release-failed", error=repr(exc)[:200])     # owned by this pid: void when this process exits anyway
 
 
 def _end_halo_quiesce(token: str | None) -> None:
@@ -466,6 +548,7 @@ def _publish(timeout_s: float, halo_wait_s: float) -> dict:
         raise RuntimeError("another publisher already holds the drain lease")
 
     halo_pause = None
+    live_hold = None
     lease = None
     rollback_lease = None
     backup = None
@@ -474,6 +557,7 @@ def _publish(timeout_s: float, halo_wait_s: float) -> dict:
     try:
         halo_pause = _begin_halo_quiesce(halo_wait_s, timeout_s)
         _assert_halo_quiesce_live(halo_pause)
+        live_hold = _liveness_hold(halo_wait_s + timeout_s + 300)
         _wait_halo_quiet(halo_wait_s)
         # Unit readiness is installed without stopping the current process.
         _run("sudo", "-n", "install", "-D", "-m", "0644", str(DROPIN), str(DROPIN_LIVE))
@@ -487,6 +571,7 @@ def _publish(timeout_s: float, halo_wait_s: float) -> dict:
         opened = _http("/gateway/drain", "POST", {"ttl_s": 1800, "reason": "governed gateway publish", "by": _BY}, token)
         lease = opened["lease"]
         _record_drain(lease)
+        _mark_halo_quiesce_phase(halo_pause, "draining")
         _wait_empty(token, timeout_s)
         # The minute scheduler and ten-second enforcer share this lock. Hold
         # it only across the final active-run check and quick restart, never
@@ -551,6 +636,7 @@ def _publish(timeout_s: float, halo_wait_s: float) -> dict:
             release_errors = []
             for held in (lease, rollback_lease):
                 _release_drain(token, held)
+            _liveness_release(live_hold)
             if backup is not None and not installed:
                 with contextlib.suppress(OSError):
                     backup.unlink(missing_ok=True)       # a publish that never swapped the file has no use for its backup

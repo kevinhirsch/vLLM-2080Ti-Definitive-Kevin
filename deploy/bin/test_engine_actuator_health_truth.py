@@ -60,7 +60,7 @@ class RestartOutcome(unittest.TestCase):
         def run(cmd, **kw):
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
-        for p in (patch.object(ea, "LOCK", f"{d}/l"), patch.object(ea, "JOB", f"{d}/j.json"), patch.object(ea, "PLANNED", f"{d}/p.json"),
+        for p in (patch.object(ea, "LOCK", f"{d}/l"), patch.object(ea, "JOB", f"{d}/j.json"), patch.object(ea, "PLANNED", f"{d}/p.json"), patch.object(ea, "HOLDS", f"{d}/holds.json"),
                   patch.object(ea, "admin_token", return_value="t"), patch.object(ea, "engine_healthy", lambda: next(self.health)),
                   patch.object(ea, "status", return_value={"gateway": {}}), patch.object(ea, "staged_flags", return_value=[]),
                   patch.object(ea, "active_flags", return_value=[]), patch.object(ea, "faults_summary", return_value={"faults": 0}),
