@@ -137,6 +137,23 @@ def classify(journal: str, kernel: str):
     return sig, detail
 
 
+WEDGE_DETAIL = "watchdog-confirmed (models healthy, generation probes timed out)"
+
+
+def wedge_signature(sig: str, detail: str):
+    """EF2 (2026-10-03): signature of a death the watchdog confirmed as a generation wedge and killed.
+
+    A wedge kill is the MECHANISM of the death, not its cause. When the journal already holds a fault (CUDA illegal address
+    with its EF fence, Xid 13, scheduler drift, OOM, a dead engine core) the API process can outlive its dead core; the probes
+    then look like a wedge and the kill comes minutes later. 2026-10-02 12:00:30: 'EF-FENCE ... tq:prefill-portion', with the
+    watchdog kill at 12:05:22, was filed as generation-wedge and the TQ Xid went missing from the ledger. Keep the fault
+    signature and note the kill. Only a death with no fault evidence ('unknown-exit') is a genuine wedge."""
+    if sig == "unknown-exit":
+        return "generation-wedge", WEDGE_DETAIL
+    note = "killed by watchdog wedge confirmation (API alive, engine not generating)"
+    return sig, (detail + "; " + note) if detail else note
+
+
 def boot_failure_cause(journal: str) -> str:
     """The first concrete error line of a failed engine init (what to fix), e.g. 'no-kv-memory' or "KeyError: 'weight'"."""
     if "No available memory for the cache blocks" in journal:
@@ -364,7 +381,7 @@ def main():
     since = datetime.fromtimestamp(since_t).strftime("%Y-%m-%d %H:%M:%S")
     until = datetime.fromtimestamp(now + 45).strftime("%Y-%m-%d %H:%M:%S")
     journal = sh(f'journalctl -u {UNIT} --no-pager --since "{since}" --until "{until}"')
-    kernel = sh(f'journalctl -k --no-pager -o short-iso --since "{since}" --until "{until}" | grep -i "xid\\|NVRM"')
+    kernel = sh(f'journalctl -k --no-pager -o short-iso --since "{since}" --until "{until}" | grep "NVRM"')
     result = os.environ.get("SERVICE_RESULT", "") or "backfill"
     sig, detail = classify(journal, kernel)
     planned = (sig == "unknown-exit" and not a.at and result in ("success", "") and "Traceback" not in journal)
@@ -388,12 +405,32 @@ def main():
         os.rename(f"{BASE}/wedge-restart.json", f"{BASE}/wedge-restart.last.json")
     except Exception:  # noqa: BLE001
         pass
+    # LV 2026-10-03: the liveness authority killed a STUCK_BOOT / UNRESPONSIVE engine (not a generation wedge). Its kill is
+    # followed by `systemctl restart`, whose "Stopping" line would otherwise read as an operator stop -> planned-stop, hiding
+    # a boot that never came up behind "planned". It is a FAULT whose mechanism was the authority's recovery.
+    recovered = None
+    try:
+        if a.at:
+            raise FileNotFoundError
+        recovered = json.load(open(f"{BASE}/liveness-recover.json"))
+        os.rename(f"{BASE}/liveness-recover.json", f"{BASE}/liveness-recover.last.json")
+    except Exception:  # noqa: BLE001
+        pass
     if a.wedge and a.at:
         wedge = {"by": "watchdog", "wedge": True, "backfilled": True}
     if a.pre_kill and not wedge:
         wedge = {"by": "watchdog", "wedge": True}
     if wedge:
-        sig, detail, planned = "generation-wedge", "watchdog-confirmed (models healthy, generation probes timed out)", False
+        sig, detail = wedge_signature(sig, detail)
+        planned = False
+    elif recovered:
+        cause = str(recovered.get("cause") or "liveness-recover").replace("_", "-")
+        note = f"killed by the liveness authority ({cause}: {str(recovered.get('evidence') or '')[:160]})"
+        if sig == "unknown-exit":
+            sig, detail = cause, note
+        else:
+            detail = (detail + "; " + note) if detail else note
+        planned = False
     elif marker or (requested_stop and "Traceback" not in journal):
         planned = True
     if a.reconciled and sig == "unknown-exit" and not wedge and "COMMAND=" in a.cause and re.search(r"systemctl (stop|restart)", a.cause):
@@ -422,6 +459,8 @@ def main():
         row["recorded_by"] = "watchdog-pre-kill"
     if wedge:
         row["wedge"] = {k: wedge.get(k) for k in ("by", "consecutive_failures", "ts")}
+    if recovered:
+        row["liveness_recover"] = {k: recovered.get(k) for k in ("id", "cause", "by", "ts")}
     hold = None if a.at else engine_hold(now)
     if hold:
         row["during_hold"] = hold

@@ -19,7 +19,7 @@ gen = os.environ.get("FAKE_GEN", "000")
 if url.endswith("/metrics"):
     print("vllm:prompt_tokens_total 100\nvllm:generation_tokens_total 50")
 elif "-w" in a and url.endswith("/v1/models"):
-    print("200 0.01", end="")
+    print(os.environ.get("FAKE_MODELS", "200") + " 0.01", end="")
 elif "-w" in a:
     print(f"{gen} 20.0", end="")
 elif url.endswith("/v1/models"):
@@ -53,6 +53,8 @@ class WatchdogDelegation(unittest.TestCase):
         os.makedirs(self.bin)
         self._exe("curl", FAKE_CURL)
         self._exe("journalctl", "#!/bin/sh\nexit 0\n")
+        # EF2/L136: the watchdog reads the engine MainPID; never the real host's unit in a test
+        self._exe("systemctl", "#!/bin/sh\necho \"${FAKE_MAINPID:-4242}\"\n")
         self._exe("sudo", "#!/bin/sh\necho \"$@\" >> \"$FAKE_SUDO_LOG\"\nexit 0\n")
         self.act = os.path.join(d, "engine-actuator.py")
         open(self.act, "w").write(FAKE_ACTUATOR)
@@ -60,8 +62,8 @@ class WatchdogDelegation(unittest.TestCase):
         self.log = os.path.join(d, "watchdog.log")
         self.actlog = os.path.join(d, "act.log")
         self.sudolog = os.path.join(d, "sudo.log")
-        json.dump({"consecutive_failures": 4, "last_restart_epoch": 0, "restart_timestamps": [], "last_gen": 50, "skipped_ticks": 0},
-                  open(self.state, "w"))
+        json.dump({"consecutive_failures": 4, "last_restart_epoch": 0, "restart_timestamps": [], "last_gen": 50, "skipped_ticks": 0,
+                   "engine_pid": 4242}, open(self.state, "w"))
 
     def _exe(self, name, body):
         p = os.path.join(self.bin, name)
@@ -107,7 +109,8 @@ class WatchdogDelegation(unittest.TestCase):
     def test_dry_run_passes_through(self):
         calls, sudo, log, st = self.run_wd()
         os.remove(self.actlog)
-        json.dump({"consecutive_failures": 4, "last_restart_epoch": 0, "restart_timestamps": [], "last_gen": 50}, open(self.state, "w"))
+        json.dump({"consecutive_failures": 4, "last_restart_epoch": 0, "restart_timestamps": [], "last_gen": 50, "engine_pid": 4242},
+                  open(self.state, "w"))
         e = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}", WATCHDOG_STATE_FILE=self.state, WATCHDOG_ACTION_LOG=self.log,
                  WATCHDOG_ACTUATOR=self.act, FAKE_ACT_LOG=self.actlog, FAKE_SUDO_LOG=self.sudolog, WATCHDOG_SKIP_MAX_TICKS="0",
                  FAKE_RECOVER="refused")
@@ -115,6 +118,28 @@ class WatchdogDelegation(unittest.TestCase):
         calls = [json.loads(l) for l in open(self.actlog)]
         self.assertIn("--no-act", calls[0])
         self.assertIn("--dry-run", calls[1])
+
+
+
+class WedgeStreakIsPerEngineGeneration(WatchdogDelegation):
+    """EF2/L136 (ported by LV): failures of a previous engine generation never count toward a wedge of the next one."""
+
+    def test_api_down_breaks_the_streak(self):
+        calls, sudo, log, st = self.run_wd(FAKE_MODELS="000")
+        self.assertEqual(st["consecutive_failures"], 0)
+        self.assertIn("consecutive_failures reset (was 4)", log)
+        self.assertEqual([c[0] for c in calls], ["tick"])          # no recover request
+
+    def test_new_mainpid_resets_before_counting(self):
+        calls, sudo, log, st = self.run_wd(FAKE_MAINPID="5555")
+        self.assertIn("MainPID 4242 -> 5555", log)
+        self.assertEqual(st["consecutive_failures"], 1)            # this tick's failure only: 4 stale ones dropped
+        self.assertEqual(st["engine_pid"], 5555)
+        self.assertEqual([c[0] for c in calls], ["tick"])
+
+    def test_same_generation_still_counts_to_the_wedge(self):
+        calls, sudo, log, st = self.run_wd()
+        self.assertEqual(calls[1][0], "recover")
 
 
 if __name__ == "__main__":

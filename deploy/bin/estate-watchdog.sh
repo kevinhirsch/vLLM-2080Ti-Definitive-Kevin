@@ -504,9 +504,9 @@ check_gpu_count() {
 # (g2) no Xid kernel errors in the last 10 minutes.
 check_kernel_xid() {
   local hits newest marker archived=""
-  hits=$(journalctl -k --since "-10 min" 2>/dev/null | grep -ci "xid")
+  hits=$(journalctl -k --since "-10 min" 2>/dev/null | grep -c "NVRM: Xid")
   case "$hits" in ''|*[!0-9]*) hits=0 ;; esac
-  newest=$(journalctl -k -o short-iso --since "-10 min" 2>/dev/null | grep -i "xid" | tail -n1 | awk '{print $1}')
+  newest=$(journalctl -k -o short-iso --since "-10 min" 2>/dev/null | grep "NVRM: Xid" | tail -n1 | awk '{print $1}')
   if [ "${WATCHDOG_XID_TEST:-0}" = "1" ]; then hits=1; newest="TEST-$(date +%s)"; fi   # self-test hook, inert otherwise
   if [ "$hits" -gt 0 ]; then
     CHECK_STATUS="WARN"; CHECK_DETAIL="${hits} Xid line(s) in journalctl -k --since -10min"
@@ -518,7 +518,7 @@ check_kernel_xid() {
       local inc="$HOME/.local/share/vllm-qwen27b/incidents/xid-$(date +%Y%m%d-%H%M%S)"
       mkdir -p "$inc/flightrec"
       ls -t "$HOME/.local/share/vllm-qwen27b/flightrec"/*.json 2>/dev/null | head -n 30 | xargs -r -I{} cp -p {} "$inc/flightrec/" 2>/dev/null || true
-      journalctl -k -o short-iso --since "-20 min" 2>/dev/null | grep -i "xid" > "$inc/kernel-xid.txt" || true
+      journalctl -k -o short-iso --since "-20 min" 2>/dev/null | grep -E "NVRM: (Xid|GPU at PCI)" > "$inc/kernel-xid.txt" || true
       journalctl -u vllm-qwen27b --since "-20 min" --no-pager 2>/dev/null | tail -n 3000 > "$inc/engine-journal.txt" || true
       nvidia-smi -q 2>/dev/null | head -n 400 > "$inc/nvidia-smi-q.txt" || true
       ( cd "$HOME/.local/share/vllm-qwen27b/telemetry" 2>/dev/null && ls -t requests-*.jsonl 2>/dev/null | head -n 2 | xargs -r cat | jq -c --argjson t0 "$(( $(date +%s) - 1200 ))" 'select((.t // 0) >= $t0)' > "$inc/telemetry-last20min.jsonl" 2>/dev/null ) || true

@@ -213,6 +213,14 @@ class Exits(Base):
         self.assertIn(["kill", "-s", "KILL", ea.UNIT], self.sudo)
         self.assertIn(["restart", "--no-block", ea.UNIT], self.sudo)
 
+    def test_stuck_boot_recover_leaves_the_collector_a_marker(self):
+        self.healthy = False
+        self.unit.update(ActiveState="activating", ExecMainStartTimestamp=self.now - ea.BOOT_DEADLINE_S - 5)
+        ea.tick()
+        m = json.load(open(os.path.join(ea.BASE, "liveness-recover.json")))
+        self.assertEqual(m["cause"], "stuck_boot")
+        self.assertFalse(os.path.exists(os.path.join(ea.BASE, "wedge-restart.json")))
+
     def test_unresponsive_after_being_up_this_boot(self):
         ea.tick()                               # healthy: last_healthy recorded
         self.healthy = False

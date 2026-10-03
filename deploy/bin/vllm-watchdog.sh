@@ -183,6 +183,17 @@ if [ -f "$ACTUATOR" ]; then
   [ -z "$lstate" ] && log "LIVENESS authority tick produced no state (see stderr above); probing anyway"
 fi
 
+# EF2/L136: the wedge streak belongs to ONE engine generation. A different MainPID (restart by anyone, crash loop, window)
+# resets it, so failures of a previous generation can never be added to a probe of the next one.
+eng_pid=$(systemctl show -p MainPID --value "$SERVICE" 2>/dev/null || echo "")
+case "$eng_pid" in ''|0|*[!0-9]*) eng_pid="" ;; esac
+prev_pid=$(state_get engine_pid); case "$prev_pid" in ''|null|*[!0-9]*) prev_pid="" ;; esac
+if [ -n "$eng_pid" ] && [ "$eng_pid" != "$prev_pid" ]; then
+  pf=$(state_get consecutive_failures)
+  jq --argjson p "$eng_pid" '.engine_pid = $p | .consecutive_failures = 0' "$STATE_FILE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+  [ -n "$prev_pid" ] && [ "$pf" != "0" ] && log "GENERATION engine MainPID ${prev_pid} -> ${eng_pid}: consecutive_failures reset (was ${pf})"
+fi
+
 models_result=$(probe_models)
 models_code="${models_result%% *}"
 models_time="${models_result#* }"
@@ -226,7 +237,11 @@ if [ "$models_ok" != "1" ]; then
   # Router itself isn't answering /v1/models either -> not the "alive-but-not-generating"
   # signature this watchdog targets (could be a full outage, a fresh cold-load in progress,
   # or a network blip). Do not count it toward the wedge threshold; just log it.
-  log "PROBE fail models=${models_code}(${models_time}s) gen=${gen_code}(${gen_time}s) -> NOT the targeted wedge signature (models also down); no action, consecutive_failures unchanged (${prev_failures})"
+  # EF2/L136 (2026-10-03): a tick with the API down BREAKS the streak. "Consecutive" means consecutive ticks of the wedge
+  # signature on a live API; keeping the count across an outage let 4 failures of a dead engine generation plus ONE slow
+  # probe of the next (freshly booted, torch-profiled) generation "confirm" a wedge and SIGKILL it (ledger 2026-10-02 15:08:21).
+  log "PROBE fail models=${models_code}(${models_time}s) gen=${gen_code}(${gen_time}s) -> NOT the targeted wedge signature (models also down); no action, consecutive_failures reset (was ${prev_failures})"
+  [ "$prev_failures" != "0" ] && state_set_consecutive_failures 0
   exit 0
 fi
 
