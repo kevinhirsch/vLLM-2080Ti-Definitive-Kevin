@@ -810,6 +810,7 @@ def _causal_conv1d_update_kernel(
 
     # ruff: noqa: E501
     idx_seq = tl.program_id(0)
+    max_seqlen = seqlen  # launch-time query length (before varlen shrinks seqlen)
     if idx_seq >= batch:
         if launch_pdl:
             tl.extra.cuda.gdc_launch_dependents()
@@ -871,9 +872,29 @@ def _causal_conv1d_update_kernel(
         # - accept 1 tokens: [history2, ..., historyM, draft1]
         # - accept 2 tokens: [history3, ..., historyM, draft1, draft2]
         # - and so on.
-        conv_state_token_offset = (
-            tl.load(num_accepted_tokens_ptr + idx_seq).to(tl.int64) - 1
-        )
+        # WR (vllm-project/vllm#50021): bound the accepted-count-derived offset
+        # to the physical conv-state window. ``state_len`` is
+        # ``width - 1 + (max_seqlen - 1)``, so the sliding-window reads below
+        # stay inside the row only for ``1 <= num_accepted <= max_seqlen``
+        # (``max_seqlen`` = the launch-time query length, captured before the
+        # varlen branch shrinks ``seqlen`` to this sequence). A stale or zero
+        # count would otherwise read before/after the row (Xid 13 / Xid 31).
+        # An invalid row produces zero output and leaves its state untouched.
+        num_accepted = tl.load(num_accepted_tokens_ptr + idx_seq).to(tl.int64)
+        if (num_accepted < 1) | (num_accepted > max_seqlen):
+            zero = tl.zeros((BLOCK_N,), dtype=tl.float32)
+            for idx_token in tl.range(seqlen):
+                o_ptrs = (
+                    o_ptr
+                    + o_offset
+                    + idx_token * stride_o_token
+                    + idx_feats * stride_o_dim
+                )
+                tl.store(o_ptrs, zero, mask=idx_feats < dim)
+            if launch_pdl:
+                tl.extra.cuda.gdc_launch_dependents()
+            return
+        conv_state_token_offset = num_accepted - 1
     else:
         conv_state_token_offset = 0
 
