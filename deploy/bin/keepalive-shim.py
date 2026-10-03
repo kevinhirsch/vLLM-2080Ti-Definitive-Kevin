@@ -392,6 +392,9 @@ REP_GUARD       = os.environ.get("SHIM_REP_GUARD", "1") not in ("0", "false", ""
 REP_MIN_PATTERN = int(os.environ.get("SHIM_REP_MIN_PATTERN", "8"))
 REP_MAX_PATTERN = int(os.environ.get("SHIM_REP_MAX_PATTERN", "64"))
 REP_MIN_COUNT   = int(os.environ.get("SHIM_REP_MIN_COUNT", "6"))
+# [LANE RA / L143] cross-turn identical tool-call loop note (see repeated_tool_call_note()).
+REPEAT_NOTE     = os.environ.get("SHIM_REPEAT_NOTE", "1") not in ("0", "false", "")
+REPEAT_NOTE_MIN = int(os.environ.get("SHIM_REPEAT_NOTE_MIN", "3"))
 THINK_BUDGET_FRAC = float(os.environ.get("SHIM_THINK_BUDGET_FRAC", "0.5"))
 THINK_BUDGET_MIN  = int(os.environ.get("SHIM_THINK_BUDGET_MIN", "128"))
 THINK_BUDGET_MAX  = int(os.environ.get("SHIM_THINK_BUDGET_MAX", "4096"))
@@ -539,6 +542,8 @@ _CFG = {
     "SHIM_REP_MIN_PATTERN":  ("REP_MIN_PATTERN", int),
     "SHIM_REP_MAX_PATTERN":  ("REP_MAX_PATTERN", int),
     "SHIM_REP_MIN_COUNT":    ("REP_MIN_COUNT", int),
+    "SHIM_REPEAT_NOTE":      ("REPEAT_NOTE",  lambda v: str(v).lower() not in ("0","false","")),
+    "SHIM_REPEAT_NOTE_MIN":  ("REPEAT_NOTE_MIN", int),
     "SHIM_THINK_BUDGET_FRAC":("THINK_BUDGET_FRAC", float),
     "SHIM_THINK_BUDGET_MIN": ("THINK_BUDGET_MIN", int),
     "SHIM_THINK_BUDGET_MAX": ("THINK_BUDGET_MAX", int),
@@ -4045,6 +4050,8 @@ def _telemetry_note_request(info, resp=None):
             "context_prompt_tokens": info.get("context_prompt_tokens"),
             "context_compacted": bool(info.get("context_compacted")),
             "context_omitted": info.get("context_omitted", 0),
+            # [RA / L143] identical-call loop note: present only when it fired (keeps every other row byte-identical)
+            **({"repeat_tool_note": info["repeat_tool_note"]} if info.get("repeat_tool_note") else {}),
             "stream_watchdog": bool(info.get("stream_watchdog")),
             "stream_idle_timeout_s": info.get("stream_idle_timeout_s"),
             "duration": duration,
@@ -6999,6 +7006,9 @@ def _prepare_local_body(request, body, background):
     except Exception:
         pass
     prepared = repetition_guard(nonthinking_sampling_profile(thinking_budget_guard(bound_local_output(body))))
+    prepared, repeat_n = repeated_tool_call_note(prepared)
+    if repeat_n:
+        _active_set(request, repeat_tool_note=repeat_n)
     if halo_control or _no_think_policy(request, background):
         prepared = strip_thinking(prepared)
     return prepared
@@ -7051,6 +7061,106 @@ def repetition_guard(body):
         "min_count": REP_MIN_COUNT,
     }
     return json.dumps(j).encode()
+
+
+#: [LANE RA / L143] marker that makes repeated_tool_call_note() idempotent (the local prep chain can run twice
+#: on one request: once on the body, once on its compacted form).
+REPEAT_NOTE_MARKER = "[gateway note: repeated identical tool call]"
+
+
+def _tool_exchange_tail(messages):
+    """PURE. Split `messages` into trailing (assistant tool_calls -> tool results) exchanges, newest first.
+
+    Each exchange is (key, last_tool_index) where key = (calls, results): the calls as sorted
+    (function name, canonical arguments) pairs and the results as the tool contents in call order. Stops at
+    the first message that is not part of such an exchange (a user turn, a plain assistant answer, ...)."""
+    out = []
+    i = len(messages) - 1
+    while i >= 0:
+        tools = []
+        while i >= 0 and isinstance(messages[i], dict) and messages[i].get("role") == "tool":
+            tools.append(messages[i])
+            i -= 1
+        if not tools or i < 0:
+            break
+        asst = messages[i]
+        calls = asst.get("tool_calls") if isinstance(asst, dict) and asst.get("role") == "assistant" else None
+        if not calls or len(calls) != len(tools):
+            break
+        tools.reverse()
+        by_id = {t.get("tool_call_id"): t for t in tools}
+        sig, res = [], []
+        for n, c in enumerate(calls):
+            fn = (c or {}).get("function") or {}
+            raw = fn.get("arguments")
+            try:
+                args = json.dumps(json.loads(raw) if isinstance(raw, str) else raw, sort_keys=True)
+            except Exception:
+                args = str(raw)
+            sig.append((str(fn.get("name")), args))
+            t = by_id.get((c or {}).get("id"), tools[n])
+            content = t.get("content")
+            res.append(content if isinstance(content, str) else json.dumps(content, sort_keys=True))
+        # results are compared without a note this gateway may have appended to them on an earlier turn
+        res = [r.split("\n\n" + REPEAT_NOTE_MARKER)[0] for r in res]
+        out.append(((tuple(sorted(sig)), tuple(res)), i + len(tools)))
+        i -= 1
+    return out
+
+
+def repeated_tool_call_note(body):
+    """Tell the model, inside the newest tool result, that it is looping on one identical tool call.
+
+    ROOT (L143, measured on the runner's pi transcripts 2026-10-03): Qwen 27B can re-issue the SAME tool call
+    with the SAME arguments, get the SAME result, and do it again -- 21 times in a row mid-task (repair-c93dd3e57b,
+    `grep ... | head -20` x21), and 7-54 times at the end of finished work ("final git status" loops) in 11 of
+    514 PASS attempts; 55 of 2825 runner attempts had >=4 consecutive identical calls. Nothing in the request
+    tells it so: presence/repetition penalties act within ONE generation, not across turns, and the harness
+    feeds the identical result back verbatim, which reinforces the loop.
+
+    Fires only when the newest REPEAT_NOTE_MIN (default 3) tool exchanges are byte-identical in BOTH the calls
+    (name + canonical arguments) and their results, so a re-run whose output changed (tests after an edit, a
+    poll that progressed) never counts. It appends one short factual note to the last tool result; it never
+    drops, reorders or rewrites anything else, never blocks the call, and is idempotent. Returns
+    (body, repeats) where repeats is 0 when nothing was changed. Disable with SHIM_REPEAT_NOTE=0."""
+    if not REPEAT_NOTE or REPEAT_NOTE_MIN < 2:
+        return body, 0
+    try:
+        j = json.loads(body)
+        messages = j.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return body, 0
+        last = messages[-1]
+        if not isinstance(last, dict) or last.get("role") != "tool":
+            return body, 0
+        tail = _tool_exchange_tail(messages)
+        if len(tail) < REPEAT_NOTE_MIN:
+            return body, 0
+        first = tail[0][0]
+        n = 1
+        for key, _ in tail[1:]:
+            if key != first:
+                break
+            n += 1
+        if n < REPEAT_NOTE_MIN:
+            return body, 0
+        content = last.get("content")
+        flat = content if isinstance(content, str) else json.dumps(content)
+        if REPEAT_NOTE_MARKER in (flat or ""):
+            return body, 0
+        note = (REPEAT_NOTE_MARKER + " You have now made this exact tool call %d times in a row and received "
+                "exactly the same result each time. Running it again will return the same result. Use the result "
+                "above: take a different next step, or, if the task is complete, stop calling tools and give your "
+                "final answer." % n)
+        if isinstance(content, str):
+            last["content"] = content + "\n\n" + note
+        elif isinstance(content, list):
+            last["content"] = content + [{"type": "text", "text": "\n\n" + note}]
+        else:
+            return body, 0
+        return json.dumps(j).encode(), n
+    except Exception:
+        return body, 0
 
 
 def thinking_budget_guard(body):
