@@ -45,6 +45,8 @@ Spec (YAML):
   pause_timers: []              # stopped for the window, restarted by restore AND by the dead-man. The engine watchdog
                                 # timer is added automatically when any step stops the engine (keep_watchdog_timer: true opts out)
   on_new_xid: abort             # abort | continue
+  remote_quiet_s: 900           # refuse to open unless the remote valve is healthy AND had no breaker/402/429 for this
+                                # long; during the window it is polled every 15 s and 2 bad polls abort + restore local
   snapshot_files: []            # extra files restored verbatim (e.g. a deployed serve script)
   promote: {release: ID, files: [...]}   # ONLY when every step passed: becomes the new restore target (prod default)
   vars: {L: /home/kevin/projects/lanes/k5}
@@ -173,6 +175,37 @@ def restart_argv(by, reason, hold=None):
     if hold:
         argv += ["--hold", hold]          # LV: a planned restart is refused while a hold is held unless it names it
     return argv
+
+
+REMOTE_TROUBLE = ("remote provider refused", "breaker open", "(402)", "(429)", "remote dead")
+
+
+def remote_health(quiet_s: float = 0.0, now=None):
+    """Is the remote valve able to carry the estate while local is offline? (2026-10-03 09:41: DeepSeek 402 = balance
+    exhausted, breaker open, while K6's window had local stopped -> gateway mode "none", nothing could serve.)
+    Healthy = capacity readable, remote configured + usable + inside budget, not dead, mode != none, and (quiet_s > 0)
+    no breaker-open / 402 / 429 mode change within the last quiet_s seconds. Returns (ok, why)."""
+    cap = http_json(f"{GATEWAY}/gateway/capacity")
+    if not isinstance(cap, dict) or cap.get("error"):
+        return False, f"gateway capacity unreadable: {str((cap or {}).get('error'))[:120]}"
+    why = []
+    if not cap.get("remote_configured"):
+        why.append("remote not configured")
+    if not cap.get("remote_usable"):
+        why.append("remote not usable" + (f" ({'; '.join(cap.get('why') or [])[:160]})" if cap.get("why") else ""))
+    if cap.get("remote_budget_ok") is False:
+        why.append("remote budget exhausted")
+    if cap.get("remote_dead_for_s"):
+        why.append(f"remote dead for {cap['remote_dead_for_s']} s")
+    if cap.get("mode") == "none":
+        why.append("gateway mode is none (nothing can serve)")
+    if quiet_s:
+        now = time.time() if now is None else now
+        for ch in cap.get("mode_changes") or []:
+            if now - float(ch.get("t") or 0) <= quiet_s and any(k in r for r in ch.get("why") or [] for k in REMOTE_TROUBLE):
+                why.append(f"remote trouble {int(now - float(ch['t']))} s ago: {'; '.join(ch.get('why'))[:120]}")
+                break
+    return not why, "; ".join(why)
 
 
 def admin_token():
@@ -488,7 +521,11 @@ class Window:
                         "results": self.results, "spec": spec_path, "started": now_iso(), "status": "running",
                         "steps": self.steps, "boots": [], "xids": [], "notes": []}
         self._lease_stop = threading.Event()
-        self.renew_s = 60.0       # gateway TTL is capped at 3600 s: windows longer than that live on these renewals
+        self.renew_s = 60.0
+        self._remote_stop = threading.Event()
+        self.remote_poll_s = 15.0
+        self._remote_strikes = 0
+        self.remote_bad = None       # gateway TTL is capped at 3600 s: windows longer than that live on these renewals
         self._xid_count = None
 
     # -- bookkeeping
@@ -549,6 +586,9 @@ class Window:
     def preflight(self):
         spec = self.spec
         problems = []
+        ok, why = remote_health(float(spec.get("remote_quiet_s", 900)))
+        if not ok:
+            problems.append(f"remote valve unhealthy, refusing to take local offline: {why}")
         hits = find_conflicts(spec.get("conflicts") or [])
         if hits:
             problems.append("conflicting processes running: " + "; ".join(f"pid {h['pid']} ({h['pattern']}) unit={h['unit']}" for h in hits))
@@ -667,7 +707,36 @@ class Window:
         else:
             self.summary["notes"].append(f"dead-man timer NOT armed: {r.stderr.strip()[:200]}")
 
+    def remote_tick(self):
+        """One poll of the remote watch: two consecutive unhealthy polls (~30 s) = abort. The running step's unit is
+        stopped at once so the window reaches its step boundary and restores local now, not after a 20-minute bench."""
+        if self.remote_bad:
+            return
+        ok, why = remote_health(0)
+        if ok:
+            self._remote_strikes = 0
+            return
+        self._remote_strikes += 1
+        self.log(f"remote valve unhealthy ({self._remote_strikes}/2): {why}")
+        if self._remote_strikes >= 2:
+            self.remote_bad = why
+            self.log("remote valve down while local is offline: stopping the running step, restoring local")
+            unitrun.stop_lane(self.lane, prefix=self.wid,
+                              exclude=(unitrun.unit_name(self.lane, f"{self.wid}-deadman") + ".service",))
+
+    def _remote_watch_loop(self):
+        while not self._remote_stop.wait(self.remote_poll_s):
+            try:
+                self.remote_tick()
+            except Exception as e:  # noqa: BLE001
+                self.log(f"remote watch error: {e!r}")
+
     def check_between_steps(self):
+        if self.remote_bad:
+            raise WindowAbort("aborted-remote", f"remote valve unhealthy while local was offline: {self.remote_bad}")
+        ok, why = remote_health(0)
+        if not ok:
+            raise WindowAbort("aborted-remote", f"remote valve unhealthy while local was offline: {why}")
         if time.time() - self.t0 > self.max_s:
             raise WindowAbort("budget", f"window budget max_s={self.max_s:.0f} spent")
         sp = spend_usd()
@@ -881,6 +950,8 @@ class Window:
             self.log(f"step {name}: rc={res.get('rc')} {res.get('result') or ''} {res.get('error') or ''} "
                      f"({row['duration_s']} s){' captured ' + json.dumps(row.get('captured')) if row.get('captured') else ''}")
             self.save_summary()
+            if self.remote_bad:
+                raise WindowAbort("aborted-remote", f"remote valve unhealthy during step {name}: {self.remote_bad}")
             if res.get("rc") not in (0, None) and st.get("on_fail", "abort") == "abort":
                 raise WindowAbort("failed-step", f"step {name} failed rc={res.get('rc')} {res.get('error') or res.get('result') or ''}")
 
@@ -964,6 +1035,7 @@ class Window:
                     set_timer(t, False)
                     self.log(f"paused timer {t} (restore + dead-man restart it)")
             self.open_gateway()
+            threading.Thread(target=self._remote_watch_loop, daemon=True).start()
             self.run_steps()
             self.summary["status"] = "ok"
             if self.spec.get("promote"):
@@ -985,6 +1057,7 @@ class Window:
                 signal.signal(sg, signal.SIG_IGN)       # the restore is not interrupted halfway
             try:
                 self._lease_stop.set()
+                self._remote_stop.set()          # the watch must never stop the restore's own units
                 if not self.dry and self.snapshot:
                     self.summary["restore"] = self.restore()
             finally:

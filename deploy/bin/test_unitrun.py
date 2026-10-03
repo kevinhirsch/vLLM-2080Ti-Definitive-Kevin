@@ -147,3 +147,12 @@ def test_live_second_start_of_a_running_unit_is_refused_and_stop_kills_it(state)
     finally:
         unitrun.stop(f"rltest-{job}")
         unitrun.stop(f"rltest-{job}--sampler")
+
+
+@needs_systemd
+def test_cli_run_uses_the_callers_cwd_for_relative_paths(state, tmp_path, monkeypatch):
+    (tmp_path / "rel.txt").write_text("found\n")
+    monkeypatch.chdir(tmp_path)
+    job = "cwd" + uuid.uuid4().hex[:6]
+    rc = unitrun.main(["run", "--lane", "rltest", "--job", job, "--out", "o.log", "--", "cat", "rel.txt"])
+    assert rc == 0 and (tmp_path / "o.log").read_text().strip() == "found"

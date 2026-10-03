@@ -59,6 +59,8 @@ class World:
         mp.setattr(gpuguard, "wait_no_foreign", lambda *a, **k: (not self.foreign, list(self.foreign)))
         mp.setattr(unitrun, "run", self.unit_run)
         mp.setattr(unitrun, "stop_lane", lambda lane, prefix=None, exclude=(): [])
+        self.cap = {"remote_configured": True, "remote_usable": True, "remote_budget_ok": True, "remote_dead_for_s": 0,
+                    "mode": "local+remote", "mode_changes": []}
         self.holds = []
         self.hold_supported = False
         mp.setattr(wc, "actuator_hold", self.hold)
@@ -87,6 +89,8 @@ class World:
             if method == "POST":
                 return {"lease": payload.get("lease")}
             return {"offline": self.offline, "by": "K5" if self.offline else None}
+        if url.endswith("/gateway/capacity"):
+            return dict(self.cap)
         return {}
 
     def unit_run(self, lane, job, cmd, timeout_s=None, env=None, cwd=None, out=None, wait=True, **kw):
@@ -580,3 +584,59 @@ def test_the_cr2_spec_validates_and_boots_a_release():
     boot = next(x for x in s["steps"] if "boot" in x)
     assert boot["boot"]["release"]["sha"] == "326846fdc2" and boot["boot"]["env"] == {"VLLM_SCHED_SHORT_FIRST_PREFIX_AWARE": "1"}
     assert [x["name"] for x in s["steps"]][:2] == ["clean", "base-probe"] and s["steps"][-1]["name"] == "gate"
+
+
+
+def test_refuses_to_open_when_the_remote_valve_is_unhealthy_or_recently_tripped(world, tmp_path):
+    world.cap.update(remote_usable=False, why=["remote provider refused (402), breaker open 297s"])
+    s = wc.Window(spec(tmp_path)).run()
+    assert s["status"] == "refused" and any("remote valve unhealthy" in p and "402" in p for p in s["why"])
+    assert not world.units and not world.offline
+    world.cap.update(remote_usable=True, why=[], mode_changes=[{"t": time.time() - 300, "why": ["remote provider refused (402), breaker open 44s"]}])
+    s = wc.Window(spec(tmp_path, results=str(tmp_path / "r2"))).run()
+    assert s["status"] == "refused" and any("remote trouble" in p for p in s["why"])
+    world.cap["mode_changes"] = [{"t": time.time() - 2000, "why": ["remote provider refused (402)"]}]   # older than 900 s
+    (tmp_path / "rel").mkdir()
+    assert wc.Window(spec(tmp_path, results=str(tmp_path / "r3"))).run()["status"] == "ok"
+
+
+def test_remote_going_down_mid_window_aborts_at_the_boundary_and_restores_local(world, tmp_path, monkeypatch):
+    (tmp_path / "rel").mkdir()
+    orig = world.unit_run
+
+    def run(*a, **k):
+        res = orig(*a, **k)
+        if a[1] == "t5-ab-mk":
+            world.cap.update(remote_usable=False, mode="none", why=["remote provider refused (402), breaker open 299s"])
+        return res
+    monkeypatch.setattr(unitrun, "run", run)
+    s = wc.Window(spec(tmp_path)).run()
+    assert s["status"] == "aborted-remote" and "402" in s["why"]
+    assert [x["name"] for x in s["steps"]] == ["mk"]                 # nothing after the boundary ran
+    assert s["restore"]["override_verbatim"] and world.lease_closed == ["LEASE1"] and world.health == 200
+
+
+def test_remote_watch_stops_the_running_step_after_two_bad_polls(world, tmp_path, monkeypatch):
+    stopped = []
+    monkeypatch.setattr(unitrun, "stop_lane", lambda lane, prefix=None, exclude=(): stopped.append((lane, prefix, exclude)) or [])
+    w = wc.Window(spec(tmp_path))
+    os.makedirs(w.path("steps"), exist_ok=True)
+    world.cap.update(remote_usable=False, mode="none")
+    w.remote_tick()
+    assert not stopped and w.remote_bad is None                        # one bad poll is not enough (flap)
+    world.cap.update(remote_usable=True, mode="remote-only")
+    w.remote_tick()
+    world.cap.update(remote_usable=False, mode="none")
+    w.remote_tick()
+    assert not stopped                                                 # the good poll reset the count
+    w.remote_tick()
+    assert w.remote_bad and stopped == [("t5", "t5-ab", ("t5-t5-ab-deadman.service",))]
+    with pytest.raises(wc.WindowAbort) as e:
+        w.check_between_steps()
+    assert e.value.status == "aborted-remote"
+
+
+def test_remote_health_unreadable_capacity_is_unhealthy(monkeypatch):
+    monkeypatch.setattr(wc, "http_json", lambda *a, **k: {"error": "connection refused"})
+    ok, why = wc.remote_health(900)
+    assert not ok and "unreadable" in why

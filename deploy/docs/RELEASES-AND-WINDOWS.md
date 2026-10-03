@@ -61,6 +61,7 @@ framework owns everything else:
 - **Liveness hold:** when Lane LV's `engine-actuator.py hold` is deployed, the window holds the engine (scoped to its owner pid) and names the hold on every restart.
 - **Gateway lease:** renewed every 60 s, so a window can run longer than the gateway's 3600 s TTL cap.
 - **snaprun:** `submit` runs the framework, and the dead-man it arms, from a read-only snapshot of its code and the spec. A `script: [path, args]` step runs a lane script from a read-only snapshot taken at step start.
+- **Remote valve gate:** a window opens only if the remote valve is healthy (configured, usable, inside budget, not dead, mode != none) and had no breaker / 402 / 429 trip in the last `remote_quiet_s` (default 900 s). During the window it is polled every 15 s. Two bad polls stop the running step's unit, the window aborts as `aborted-remote`, and local is restored at once. Why: at 09:41, DeepSeek 402 hit while K6 had local stopped, and gateway mode went to "none".
 - **Outputs:** a results dir with `summary.json`, `snapshot.json`, `state.json`, `window.log` and `steps/*.log`.
 
 ```

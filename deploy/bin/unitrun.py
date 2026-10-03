@@ -469,7 +469,9 @@ def main(argv=None) -> int:
             print(json.dumps({"error": "run needs a command after --"}))
             return 2
         env = dict(kv.split("=", 1) for kv in a.env if "=" in kv)
-        res = run(a.lane, a.job, tail, timeout_s=a.timeout, env=env, cwd=a.cwd, out=a.out, wait=not a.no_wait)
+        # default cwd = the caller's: a user unit otherwise starts in $HOME and relative paths silently resolve there
+        res = run(a.lane, a.job, tail, timeout_s=a.timeout, env=env, cwd=a.cwd or os.getcwd(),
+                  out=os.path.abspath(a.out) if a.out else None, wait=not a.no_wait)
         print(json.dumps(res))
         if res.get("result") in ("refused", "start-failed"):
             return 2
