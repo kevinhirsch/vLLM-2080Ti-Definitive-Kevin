@@ -3,6 +3,7 @@
 with per-position speculative acceptance read from /metrics deltas. usage: live_ab.py LABEL OUT.json  (ESTATE_FR must point at s2-speed/fr)"""
 import json, http.client, os, subprocess, sys, time, statistics
 label, out = sys.argv[1], sys.argv[2]
+import bench_guard; bench_guard.require()   # FX2: refuse engine-direct inference without a gateway offline window (BENCH_DIRECT_OK=1 overrides)
 ESTATE = "/home/kevin/Desktop/wt-integrate/tools/s2-bench/estate_load.py"
 FR = os.path.expanduser("~/projects/lanes/s2-speed/fr")
 def get(path, body=None, timeout=900):

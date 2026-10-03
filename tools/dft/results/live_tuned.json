@@ -1,0 +1,156 @@
+{
+ "label": "tuned",
+ "t": "2026-10-03 03:36:21",
+ "natural_tok_s": [
+  85.7,
+  81.4,
+  78.3
+ ],
+ "natural_accept": {
+  "drafts": 487,
+  "pos_abs": [
+   0.77,
+   0.4559,
+   0.2361
+  ],
+  "pos_cond": [
+   0.77,
+   0.592,
+   0.518
+  ],
+  "accept_len": 2.462
+ },
+ "estate_wall_s": [
+  18.6,
+  18.7,
+  18.7
+ ],
+ "estate_agg_tok_s": [
+  132.4,
+  131.6,
+  131.6
+ ],
+ "estate_med_dec_tps": [
+  26.8,
+  23.2,
+  23.4
+ ],
+ "estate_accept": [
+  {
+   "drafts": 701,
+   "pos_abs": [
+    0.9358,
+    0.8445,
+    0.7404
+   ],
+   "pos_cond": [
+    0.9358,
+    0.9024,
+    0.8767
+   ],
+   "accept_len": 3.521
+  },
+  {
+   "drafts": 703,
+   "pos_abs": [
+    0.9275,
+    0.8464,
+    0.7368
+   ],
+   "pos_cond": [
+    0.9275,
+    0.9126,
+    0.8706
+   ],
+   "accept_len": 3.511
+  },
+  {
+   "drafts": 708,
+   "pos_abs": [
+    0.9153,
+    0.8305,
+    0.7359
+   ],
+   "pos_cond": [
+    0.9153,
+    0.9074,
+    0.8861
+   ],
+   "accept_len": 3.482
+  }
+ ],
+ "estate_reps": [
+  {
+   "n": 12,
+   "ok": 12,
+   "wall_s": 18.6,
+   "agg_out_tok_s": 132.4,
+   "total_prompt_tok": 367586,
+   "med_dec_tps": 26.8,
+   "med_ttft": 9.2,
+   "errors": [],
+   "accept": {
+    "drafts": 701,
+    "pos_abs": [
+     0.9358,
+     0.8445,
+     0.7404
+    ],
+    "pos_cond": [
+     0.9358,
+     0.9024,
+     0.8767
+    ],
+    "accept_len": 3.521
+   }
+  },
+  {
+   "n": 12,
+   "ok": 12,
+   "wall_s": 18.7,
+   "agg_out_tok_s": 131.6,
+   "total_prompt_tok": 367586,
+   "med_dec_tps": 23.2,
+   "med_ttft": 7.7,
+   "errors": [],
+   "accept": {
+    "drafts": 703,
+    "pos_abs": [
+     0.9275,
+     0.8464,
+     0.7368
+    ],
+    "pos_cond": [
+     0.9275,
+     0.9126,
+     0.8706
+    ],
+    "accept_len": 3.511
+   }
+  },
+  {
+   "n": 12,
+   "ok": 12,
+   "wall_s": 18.7,
+   "agg_out_tok_s": 131.6,
+   "total_prompt_tok": 367586,
+   "med_dec_tps": 23.4,
+   "med_ttft": 7.6,
+   "errors": [],
+   "accept": {
+    "drafts": 708,
+    "pos_abs": [
+     0.9153,
+     0.8305,
+     0.7359
+    ],
+    "pos_cond": [
+     0.9153,
+     0.9074,
+     0.8861
+    ],
+    "accept_len": 3.482
+   }
+  }
+ ]
+}

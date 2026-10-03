@@ -17,6 +17,8 @@ import json;d=json.load(open('/home/kevin/.local/share/vllm-qwen27b/gateway-spen
 P
 }
 say "DFT window start; spend: $(spend)"
+python3 $L/renew_lease.py ${DFT_MAX_S:-14400} >> $R/renew.log 2>&1 &
+RENEW=$!
 cp -p $SV/v02.override.env $L/override.baseline.$START; cp -p $SV/active-serve $L/active-serve.baseline.$START
 say "baseline override: $(tr '\n' ';' < $SV/v02.override.env)"; say "baseline active-serve: $(cat $SV/active-serve)"
 rm -f $L/override.saved
@@ -30,12 +32,13 @@ restore_base(){   # restore the exact baseline override + active-serve, restart,
   sudo -n systemctl start vllm-qwen27b-watchdog.timer >/dev/null 2>&1
   say "restored health: $(curl -s -m3 -o /dev/null -w '%{http_code}' localhost:8001/health) $(journalctl -u vllm-qwen27b --since '-10 min' --no-pager | grep 'GPU KV cache size' | tail -1 | sed 's/.*size: //' | cut -c1-24)"
 }
-finish_trap(){ if ! curl -s -m3 -o /dev/null -w '%{http_code}' localhost:8001/health | grep -q 200; then restore_base; fi; say "DFT window end; spend: $(spend)"; }
+finish_trap(){ kill $RENEW 2>/dev/null; if ! curl -s -m3 -o /dev/null -w '%{http_code}' localhost:8001/health | grep -q 200; then restore_base; fi; say "DFT window end; spend: $(spend)"; }
 trap finish_trap EXIT
 
 if ! curl -s -m3 -o /dev/null -w '%{http_code}' localhost:8001/health | grep -q 200; then say "engine NOT healthy at start; booting baseline"; BOOT_TIMEOUT=900 $L/boot_cfg.sh start0 || { say "cannot boot baseline"; exit 1; }; fi
 
 # ---------- P1: base live A/B + greedy reference
+if [ -z "${DFT_SKIP_BASE:-}" ]; then
 say "P1 base live A/B"; $PY $L/live_ab.py base $R/live_base.json 2>&1 | tail -2
 say "P1 det base cold/warm"; python3 $S2/det.py $R/det_base_cold.json | tail -1; python3 $S2/det.py $R/det_base_warm.json | tail -1; python3 $S2/det.py --cmp $R/det_base_cold.json $R/det_base_warm.json | tail -1
 say "spend: $(spend)"
@@ -43,6 +46,7 @@ say "spend: $(spend)"
 # ---------- P2: on-policy generation on the live engine
 say "P2 on-policy gen"; $PY $L/gen_onpolicy.py --n 100 --budget-s 840 2>&1 | tail -3
 say "spend: $(spend)"
+fi
 
 # ---------- P3: stop engine, free GPUs
 say "P3 stop engine"
@@ -51,18 +55,20 @@ nvidia-smi --query-gpu=memory.used --format=csv,noheader | tr '\n' ' '
 # ---------- P4: hidden-state extraction (deadline 40 min)
 say "P4 extract"
 DL=$(( $(date +%s) + ${DFT_EXTRACT_S:-2400} ))
-$L/run_extract.sh $L/data/manifest.json $L/data/hid --deadline $DL > $R/extract.log 2>&1; tail -3 $R/extract.log
+[ -n "${DFT_SKIP_EXTRACT:-}" ] || $L/run_extract.sh $L/data/manifest.json $L/data/hid --deadline $DL > $R/extract.log 2>&1; tail -3 $R/extract.log
 NH=$(ls $L/data/hid/*.npy 2>/dev/null | wc -l); say "extracted $NH sequences"
 if [ "$NH" -lt 40 ]; then say "EXTRACTION FAILED/too small ($NH)"; restore_base; exit 2; fi
 
 # ---------- P5: offline base eval (sanity against live)
 say "P5 offline base eval (sanity)"
+if [ -z "${DFT_SKIP_EXTRACT:-}" ]; then
 CUDA_VISIBLE_DEVICES=0 $PY $L/eval_mtp.py --hid-dir $L/data/hid --mtp base=/home/kevin/Desktop/models/Qwen3.8-27B-HauhauCS-Aggressive-W4A16-twolven/model-mtp.safetensors --out $R/offline_base_only.json 2>&1 | grep -v Warn | tail -4
+fi
 
 # ---------- P6: train (2 GPUs)
 say "P6 train"
 rm -rf $L/out; mkdir -p $L/out
-cd $L; CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 --master_port 29517 $L/train_mtp.py --hid-dir $L/data/hid --out-dir $L/out --budget-min ${DFT_TRAIN_MIN:-45} > $R/train.log 2>&1
+cd $L; CUDA_VISIBLE_DEVICES=0,1 $PY -m torch.distributed.run --nproc_per_node=2 --master_port 29517 $L/train_mtp.py --hid-dir $L/data/hid --out-dir $L/out --budget-min ${DFT_TRAIN_MIN:-45} > $R/train.log 2>&1
 grep -E "VAL|FINAL|WROTE|Error|error" $R/train.log | tail -15
 [ -f $L/out/model-mtp.safetensors ] || { say "TRAIN FAILED"; tail -20 $R/train.log; restore_base; exit 3; }
 
@@ -93,7 +99,7 @@ say "P9 evalkit"; (cd /home/kevin/Desktop/qwen38-evalkit && python3 run_eval.py 
 say "spend: $(spend)"
 
 # ---------- P10: decide
-python3 $L/decide.py $R/live_base.json $R/live_tuned.json | tee $R/verdict.json; V=$?
+python3 $L/decide.py $R/live_base.json $R/live_tuned.json > $R/verdict.json; V=$?; cat $R/verdict.json
 EK=$(grep -oE '[0-9]+/60' $R/evalkit.txt | tail -1); EKN=${EK%%/*}
 say "verdict exit=$V evalkit=${EK:-none}"
 if [ "$V" -eq 0 ] && [ "${EKN:-0}" -ge 59 ]; then say "KEEP tuned drafter (engine stays on the tuned variant; rollback = dft_cfg.sh off + restart)"; echo KEEP > $R/final.txt
