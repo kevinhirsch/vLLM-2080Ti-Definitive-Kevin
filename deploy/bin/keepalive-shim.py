@@ -128,13 +128,39 @@ def _fmt_seq(value, sep):
 # loud warning), booleans are canonicalised to 1/0 (a dashboard-persisted "False" used to come back as ON after a
 # restart), and shim.env duplicates / unknown keys are logged. Fail safe: if the module is missing or raises, the
 # gateway runs exactly as before. Effective values: GET /gateway/config/effective.
+# Lane SH (2026-10-03): every module that ships beside this file (gateway_safe_publish.GATEWAY_MODULES) is loaded
+# through _load_gateway_module(): from THIS file's directory by path (the live dir is never put on sys.path -- it
+# holds many stray .py files), executing exactly the bytes it hashed, so GET /gateway/modules can prove which code
+# the running process loaded and the publisher can verify it after a restart.
+_GATEWAY_MODULES_LOADED = {}      # filename -> {"sha256", "loaded", "required", "error"}; one row per manifest file
+
+
+def _load_gateway_module(fname, modname, required=True):
+    import importlib.util as _ilu
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), fname)
+    rec = _GATEWAY_MODULES_LOADED[fname] = {"sha256": None, "loaded": False, "required": bool(required), "error": None}
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+        rec["sha256"] = hashlib.sha256(data).hexdigest()
+        spec = _ilu.spec_from_file_location(modname, path)
+        mod = _ilu.module_from_spec(spec)
+        sys.modules[modname] = mod          # dataclasses/typing resolve their module by name during exec
+        exec(compile(data, path, "exec"), mod.__dict__)
+        rec["loaded"] = True
+        return mod
+    except Exception as e:
+        rec["error"] = repr(e)[:240]
+        if required:
+            raise RuntimeError("gateway module %s could not be loaded from %s: %r" % (fname, path, e)) from e
+        return None
+
+
 def _load_cfg_schema():
     try:
-        import importlib.util as _ilu
-        _p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gateway_config_schema.py")
-        _spec = _ilu.spec_from_file_location("gateway_config_schema", _p)
-        _mod = _ilu.module_from_spec(_spec)
-        _spec.loader.exec_module(_mod)
+        _mod = _load_gateway_module("gateway_config_schema.py", "gateway_config_schema", required=False)
+        if _mod is None:
+            raise RuntimeError(_GATEWAY_MODULES_LOADED["gateway_config_schema.py"]["error"])
         _mod.sanitize_environ(os.environ, env_file=os.environ.get(
             "SHIM_ENV_FILE", "/home/kevin/.local/share/vllm-qwen27b/shim.env"))
         return _mod
@@ -10342,6 +10368,12 @@ def _prom_line(name, value, labels=None):
     return f"{name} {value}"
 
 
+async def gateway_modules(request):
+    """Lane SH: which code this process is running -- its own file's sha256 and every module it loaded beside itself
+    (sha256 of the exact bytes executed). gateway_safe_publish verifies these against the sources after a restart."""
+    return web.json_response({"gateway_sha256": GATEWAY_SHA256, "modules": _GATEWAY_MODULES_LOADED})
+
+
 async def gateway_internal_errors(request):
     """Lane SH: every suppressed exception (per source site: count, last time, last error) and every router crash
     since start. Read-only; empty objects mean nothing has been swallowed."""
@@ -12899,6 +12931,7 @@ def make_app():
     app.router.add_get("/gateway/config", gateway_config)
     app.router.add_get("/gateway/config/effective", gateway_config_effective)   # lane CFG: typed effective config
     app.router.add_get("/gateway/internal-errors", gateway_internal_errors)    # lane SH: swallowed exceptions
+    app.router.add_get("/gateway/modules", gateway_modules)                    # lane SH: loaded code (publish readback)
     app.router.add_get("/gateway/spend", gateway_spend)                        # R2 spend authority
     app.router.add_post("/gateway/spend/reserve", gateway_spend_reserve)
     app.router.add_post("/gateway/spend/finalize", gateway_spend_finalize)
