@@ -415,7 +415,8 @@ class DashLibMapping(unittest.TestCase):
         self.assertEqual([x["key"] for x in i if x["key"].startswith("stale")], ["stale-stats"])
 
     def test_no_data_at_all_is_not_reported_as_healthy(self):
-        i = self.issues(stats=None, cap=None, cfg=None, telem=None, spend=None)
+        self.assertEqual(self.issues(stats=None, cap=None, cfg=None, telem=None, spend=None), [])      # still connecting
+        i = self.issues(stats=None, cap=None, cfg=None, telem=None, spend=None, failing=True)
         self.assertEqual(i[0]["key"], "nodata")
         self.assertEqual(self.js("L.verdict([],false).level"), "unk")
 

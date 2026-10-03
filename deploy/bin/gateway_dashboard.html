@@ -158,7 +158,7 @@ tr:last-child td{border-bottom:0}
 td.wrapc{white-space:normal;min-width:160px}
 th.sortable{cursor:pointer;user-select:none} th.sortable:hover{color:var(--ink)}
 .empty{color:var(--ink2);padding:10px 4px;font-size:13px}
-.pill{display:inline-block;padding:0 7px;border-radius:999px;font-size:11.5px;font-weight:650;border:1px solid var(--axis);background:var(--raised);color:var(--ink2);white-space:nowrap}
+.pill{display:inline-block;max-width:100%;padding:0 7px;border-radius:999px;font-size:11.5px;font-weight:650;border:1px solid var(--axis);background:var(--raised);color:var(--ink2)}
 .pill.local{border-color:var(--s3);background:transparent;color:var(--ink)} .pill.remote{border-color:var(--s2);background:transparent;color:var(--ink)}
 .pill.held{border-color:var(--s1);color:var(--ink)} .pill.reject{border-color:var(--bad);color:var(--bad-ink)}
 .pill.ok{color:var(--good-ink);border-color:var(--good)} .pill.warn{color:var(--warn-ink);border-color:var(--warn)} .pill.bad{color:var(--bad-ink);border-color:var(--bad)}
@@ -735,7 +735,7 @@ function capacityView(stats,cap,cfg){
 function healthIssues(ctx){
   const {stats,cap,cfg,telem,spend,feedAges}=ctx;const out=[];
   const add=(level,key,text,why,section)=>out.push({level,key,text,why:why||'',section:section||'summary'});
-  if(!stats&&!cap){add('bad','nodata','Cannot reach the gateway API','No data has loaded. Is the gateway process running?','telemetry');return out;}
+  if(!stats&&!cap){if(ctx.failing)add('bad','nodata','Cannot reach the gateway API','No data has loaded. Is the gateway process running?','telemetry');return out;}
   if(stats&&stats.local_healthy===false)add('bad','engine','Local engine is DOWN','New work goes to the paid provider until it recovers.','health');
   const m=effectiveMode(cap,stats,cfg);
   if(m.key==='none')add('bad','mode','Nothing can serve requests','Local is unavailable and the remote provider is unusable.','routing');
@@ -939,9 +939,9 @@ function derived(){
 
 /* ====================== HEADER, BANNER, SUMMARY ====================== */
 function feedAges(){return FEEDS.filter(f=>['stats','capacity','telemetry','spend','lanes'].includes(f.name)).map(f=>[f.name,FS[f.name].at?(Date.now()-FS[f.name].at)/1000:null,f.every/1000]);}
-function currentIssues(){return L.healthIssues({stats:S.stats,cap:S.cap,cfg:S.cfg,telem:S.telem,spend:S.spend,feedAges:feedAges()});}
+function currentIssues(){return L.healthIssues({stats:S.stats,cap:S.cap,cfg:S.cfg,telem:S.telem,spend:S.spend,feedAges:feedAges(),failing:FEEDS.some(f=>FS[f.name].fails>=2)});}
 reg('header',['stats','capacity','telemetry','spend','lanes','config'],()=>{
-  const issues=currentIssues(),loaded=!!(S.stats||S.cap);
+  const issues=currentIssues(),loaded=!!(S.stats||S.cap)||issues.some(i=>i.key==='nodata');
   const v=L.verdict(issues,loaded),el=$('#verdict');
   el.className='verdict '+v.level;el.innerHTML='<span aria-hidden="true">'+v.icon+'</span> '+esc(v.text);
   document.title=(v.level==='ok'?'✔ ':v.level==='bad'?'✖ ':v.level==='warn'?'▲ ':'')+'vLLM Gateway';
@@ -966,11 +966,11 @@ reg('summary',['stats','capacity','telemetry','spend','config','series'],()=>{
   t.push(tile({label:'Local engine',tag:LIVE('Gateway health probe of the vLLM engine on :8001'),value:up==null?DASH:up?'Up':'Down',level:up==null?'':up?'ok':'bad',
     status:up==null?'':st(up?'ok':'bad',up?'Answering health checks':'Not answering'),sub:esc(S.models&&get(S.models,['data',0,'id'])||'')+(get(S.models,['data',0,'input_modalities'])?' · '+esc(S.models.data[0].input_modalities.join('+'))+' in':'')}));
   t.push(tile({label:'Where new requests go',tag:m.source==='capacity'?LIVE('Derived by the gateway from the same flags the router reads'):CONF('This gateway version does not publish the effective mode; showing the configured one'),
-    value:esc(m.label),level:m.level==='unk'?'':m.level,status:st(m.level==='ok'?'ok':m.level==='bad'?'bad':'warn',m.level==='ok'?'Normal':'Overriding normal routing'),
+    value:esc(m.label),level:m.level==='unk'?'':m.level,status:m.level==='unk'?'':st(m.level==='ok'?'ok':m.level==='bad'?'bad':'warn',m.level==='ok'?'Normal':'Overriding normal routing'),
     sub:esc((m.why||[]).join('; ')||('configured mode: '+m.configured)),help:'Local + remote = local first, paid provider as a valve. Remote only = local is out of action (offline window, forced, or down).'}));
   const ow=get(c,['offline_window'])||{};
-  t.push(tile({label:'Planned offline window',tag:LIVE(),value:ow.offline?esc(L.fmtDur(ow.remaining_s))+' <small>left</small>':'None',level:ow.offline?'warn':'ok',
-    status:st(ow.offline?'warn':'ok',ow.offline?'Local work paused by plan':'Local is in service'),sub:ow.offline?esc((ow.by||'?')+': '+(ow.reason||'')):'No benchmark or restart is holding local offline',
+  t.push(tile({label:'Planned offline window',tag:LIVE(),value:!c?DASH:ow.offline?esc(L.fmtDur(ow.remaining_s))+' <small>left</small>':'None',level:!c?'':ow.offline?'warn':'ok',
+    status:!c?'':st(ow.offline?'warn':'ok',ow.offline?'Local work paused by plan':'Local is in service'),sub:ow.offline?esc((ow.by||'?')+': '+(ow.reason||'')):'No benchmark or restart is holding local offline',
     help:'While a window is open, new work goes to the paid provider instead of being refused. It ends by itself when its lease runs out.'}));
   t.push(tile({label:'Engine busy',tag:LIVE('vllm:num_requests_running / waiting from the engine'),value:(isNum(d.thr.engine_running)?L.fmtInt(d.thr.engine_running):L.fmtInt(d.e.running))+' <small>running</small> · '+(isNum(d.thr.engine_waiting)?L.fmtInt(d.thr.engine_waiting):L.fmtInt(d.e.waiting))+' <small>waiting</small>',
     sub:'gateway lanes '+L.fmtInt(cv.lanes.inflight)+' of '+L.fmtInt(cv.lanes.budget)+' in use'+(cv.lanes.waiting?' · '+cv.lanes.waiting+' queued at the gateway':'')+(isNum(d.e.running)&&isNum(cv.lanes.inflight)&&d.e.running>cv.lanes.inflight+2?'<div>'+st('info','Engine is busy with work that did not come through the gateway (a direct benchmark?)')+'</div>':''),
@@ -988,7 +988,7 @@ reg('summary',['stats','capacity','telemetry','spend','config','series'],()=>{
     sub:'slowest 1 in 20: '+L.fmtNum(isNum(d.ttft95_5)?d.ttft95_5:get(d.pct,['ttft','cumulative_p95']),1)+' s',help:'How long until the answer starts appearing (p50 typical, p95 slow case).'}));
   const sub1=isNum(sv.available)?L.fmtUsd(sv.available)+' left today · '+L.fmtPct(sv.pct,0)+' of cap':'';
   t.push(tile({label:'Spend today',tag:LIVE('Gateway spend ledger (/gateway/spend), the enforcing authority'),value:L.fmtUsd(sv.spent)+' <small>of '+L.fmtUsd(sv.cap)+'</small>',level:sv.level==='unk'?'':sv.level,
-    status:st(sv.level==='bad'?'bad':sv.level==='warn'?'warn':'ok',sv.level==='bad'?'At the cap':sv.level==='warn'?'Close to the cap':'Within cap'),
+    status:sv.level==='unk'?'':st(sv.level==='bad'?'bad':sv.level==='warn'?'warn':'ok',sv.level==='bad'?'At the cap':sv.level==='warn'?'Close to the cap':'Within cap'),
     sub:esc(sub1)+(isNum(sv.pct)?bar([{pct:Math.min(100,sv.pct),c:'c1',label:'committed'}],'thin'):''),help:'Remote spend since midnight ('+(sv.tz||'gateway timezone')+') against the hard daily cap.'}));
   const w15=get(c,['remote_use','windows','15m'])||{};
   t.push(tile({label:'Sent to paid provider',tag:MEAS('last 15 min'),value:isNum(w15.remote_share)?L.fmtFrac(w15.remote_share,0):DASH,unit:'of requests',
@@ -1059,14 +1059,14 @@ reg('health',['stats','capacity','telemetry','models','config'],()=>{
     gen&&isNum(gen.age_s)?['Engine process age',L.fmtDur(gen.age_s)+' '+LIVE('Via process_start_time_seconds')+(gen.settled===false?' · <span class="pill warn">settling</span>':'')]:null,
   ];
   const guards=[
-    ['Performance breaker',s.perf_breaker?st('warn','OPEN — sending new work remote')+'<div class="xs mut">'+esc(s.perf_breaker_reason||'')+'</div>':st('ok','Closed')],
-    ['Out-of-memory backoff',s.backoff>0?st('warn',s.backoff+' s left'):st('ok','None')],
+    ['Performance breaker',!S.stats?DASH:s.perf_breaker?st('warn','OPEN — sending new work remote')+'<div class="xs mut">'+esc(s.perf_breaker_reason||'')+'</div>':st('ok','Closed')],
+    ['Out-of-memory backoff',!S.stats?DASH:s.backoff>0?st('warn',s.backoff+' s left'):st('ok','None')],
     ['Overflow provider',esc(s.remote_model||DASH)+(s.remote_enabled===false?' · '+st('warn','disabled'):'')+(s.remote_dead_for_s>0?'<div>'+st('bad','refused; breaker open '+s.remote_dead_for_s+' s')+'</div>':'')+(s.remote_402_count?'<div class="xs mut">'+s.remote_402_count+' payment-required responses seen</div>':'')],
     ['Routing flow control',esc(s.flow_mode||DASH)+' '+CONF('off / shadow / enforce')],
     ['Local-first policy',get(s,['local_first','enabled'])?'on for: '+esc((s.local_first.reasons||[]).join(', '))+' '+CONF():'off'],
     ['Lane budget',L.fmtInt(s.budget)+(s.configured_budget!==s.budget?' <span class="mut">(configured '+L.fmtInt(s.configured_budget)+')</span>':'')+' '+LIVE('Reduced during an out-of-memory backoff')],
     ['Gateway process up for',isNum(s.process_uptime)?L.fmtDur(s.process_uptime)+' '+LIVE():NR],
-    ['Counters running since',s.stats_since?new Date(s.stats_since*1000).toLocaleDateString(undefined,{year:'numeric',month:'short',day:'numeric'})+' ('+L.fmtDur(s.uptime)+' ago)':DASH],
+    ['Counters running since',s.stats_since?new Date(s.stats_since*1000).toLocaleDateString(undefined,{year:'numeric',month:'short',day:'numeric'})+' ('+L.fmtDur(s.uptime)+' ago)':NR],
   ];
   const h=get(S.telem,['latest','host'])||{};
   const host=[
@@ -1168,11 +1168,11 @@ reg('capacity',['stats','capacity','telemetry','config'],()=>{
         ['Longest single request allowed',L.fmtInt(cfg.max_local_tokens)+' tokens '+CONF()]])+'</div>';
   const pf=cv.prefill;
   const dr=cv.demandRatio;
-  const pre='<div class="card"><h3>Prefill pressure '+srcTag(pf.source==='measured'?'measured':'configured','last '+(pf.validMin||'?')+' min')+'<span class="sub">is prompt work arriving faster than the engine can read it?</span></h3>'+
+  const pre='<div class="card"><h3>Prefill pressure '+srcTag(pf.source==='measured'?'measured':'configured',(pf.validMin||'?')+' min')+'<span class="sub">is prompt work arriving faster than the engine can read it?</span></h3>'+
     '<div class="bigv">'+L.fmtNum(cv.backlog,1)+' <small class="dim">s of prompt work queued (target '+L.fmtNum(cv.backlogTarget,0)+' s)</small></div>'+
     (isNum(cv.backlog)&&cv.backlogTarget?bar([{pct:Math.min(100,100*cv.backlog/cv.backlogTarget),c:cv.backlog>cv.backlogTarget?'bad':cv.backlog>0.75*cv.backlogTarget?'warn':'c1',label:'backlog'}]):'')+
     kv([['Demand vs capacity',isNum(dr)?'<b>'+L.fmtNum(dr,2)+'×</b> '+MEAS('last 5 min')+' '+(dr>1?st('bad','arriving faster than it can be computed'):st('ok','keeping up')):DASH],
-        ['Prefill rate used for planning',L.fmtNum(pf.effective,0)+' tok/s '+srcTag(pf.source==='measured'?'measured':'configured','p75 of per-minute rates')+'<div class="xs mut">'+esc(pf.detail||'')+'</div>'],
+        ['Prefill rate used for planning',L.fmtNum(pf.effective,0)+' tok/s '+srcTag(pf.source==='measured'?'measured':'configured','p75')+'<div class="xs mut">'+esc(pf.detail||'')+'</div>'],
         pf.configured!=null?['Configured fallback',L.fmtNum(pf.configured,0)+' tok/s '+CONF()]:null,
         pf.range?['Measured range',esc(JSON.stringify(pf.range))+' tok/s']:null])+'</div>';
   $('#cap_cards').innerHTML=lanes+tokens+pool+pre;
