@@ -61,18 +61,29 @@ static __device__ __forceinline__ uint32_t pack_h2(float a, float b) {
   return *reinterpret_cast<uint32_t*>(&h);
 }
 
+// Segment accumulation (attention over a context processed in pieces, merged exactly by LSE in the epilogue):
+// mode 0 = plain (o fp16 [+ lse]); 1 = first piece (write acc_o fp32 = O, acc_lse); 2 = middle piece (merge into
+// acc_o / acc_lse); 3 = last piece (merge with acc and write the final o fp16 [+ lse]). acc_* use natural-log LSE.
+struct AccArgs {
+  float* o;
+  float* lse;
+  int64_t o_row, o_head, lse_row, lse_head;
+  int mode;
+};
+
 // PV16: P V accumulates each BN-key slice in fp16 then adds into fp32 O (fa75's scheme), else straight fp32.
 // LAZY: rescale O only when some row max of the warp grows by more than LAZY_TAU (log2 units); P is then bounded
 // by 2^LAZY_TAU instead of 1 (the running max that defines the exponent is kept stale).
-template <int BN, bool CAUSAL, bool PV16, bool LAZY, bool QK4, int ABL = 0>
+template <int BN, bool CAUSAL, bool PV16, bool LAZY, bool QK4, int ABL = 0, int QKC = 0>
 __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
     const half* __restrict__ q, int64_t q_row, int64_t q_head,
     const half* __restrict__ k, int64_t k_row, int64_t k_head,
     const half* __restrict__ v, int64_t v_row, int64_t v_head,
     half* __restrict__ o, int64_t o_row, int64_t o_head,
-    float* __restrict__ lse, int64_t lse_row, int64_t lse_head,
+    float* __restrict__ lse, int64_t lse_row, int64_t lse_head, AccArgs acc,
     const int* __restrict__ cu_q, const int* __restrict__ cu_k,
-    int Hq, int Hkv, float scale_log2) {
+    int Hq, int Hkv, float scale_log2, float q_prescale) {
+  static_assert(QKC == 0 || (QKC % 16 == 0 && HD % QKC == 0 && !QK4), "QKC: 0 or a multiple of 16 dividing 256");
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 750)
   __trap();
 #else
@@ -118,6 +129,12 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
       int r = idx / ROW_CHUNKS, c = idx % ROW_CHUNKS;
       uint4 val = make_uint4(0, 0, 0, 0);
       if (m0 + r < Tq) val = *reinterpret_cast<const uint4*>(q_ + (int64_t)(m0 + r) * q_row + c * 8);
+      if (QKC > 0) {  // (Lane K9) fold the softmax scale into Q so fp16 partial scores hold scaled logits
+        const half2 ps = __float2half2_rn(q_prescale);
+        half2* hv = reinterpret_cast<half2*>(&val);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) hv[e] = __hmul2(hv[e], ps);
+      }
       if (c < ROW_CHUNKS / 2) *reinterpret_cast<uint4*>(sm + ql_off(r, c)) = val;
       else *reinterpret_cast<uint4*>(sm + (qh_off(QH_BASE, r, c - ROW_CHUNKS / 2))) = val;
     }
@@ -185,6 +202,9 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
     for (int nt = 0; nt < NT8; ++nt)
 #pragma unroll
       for (int i = 0; i < 4; ++i) s[nt][i] = 0.0f;
+    uint32_t sh[NT8][2];  // QKC > 0: fp16 partial scores of the current head-dim chunk
+#pragma unroll
+    for (int nt = 0; nt < NT8; ++nt) { sh[nt][0] = 0u; sh[nt][1] = 0u; }
     if (warp_active && !(ABL & 2)) {
       if (QK4) {
         // two independent accumulator sets (dims 0..127 from registers, 128..255 from smem), interleaved:
@@ -232,10 +252,26 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
           // matrices: (keys 16np+0-7, chunk kk), (16np+8-15, kk), (16np+0-7, kk+1), (16np+8-15, kk+1)
           uint32_t bb[4];
           ldsm_x4(bb, sK + tile_off(16 * np + 8 * (lm & 1) + lr, kk + (lm >> 1)));
-          mma1688(s[2 * np], a[0], a[1], bb[0]);
-          mma1688(s[2 * np + 1], a[0], a[1], bb[1]);
-          mma1688(s[2 * np], a[2], a[3], bb[2]);
-          mma1688(s[2 * np + 1], a[2], a[3], bb[3]);
+          if (QKC > 0) {  // (Lane K9) full-rate fp16-accumulate HMMA, promoted to fp32 every QKC head dims
+            mma1688h(sh[2 * np], a[0], a[1], bb[0]);
+            mma1688h(sh[2 * np + 1], a[0], a[1], bb[1]);
+            mma1688h(sh[2 * np], a[2], a[3], bb[2]);
+            mma1688h(sh[2 * np + 1], a[2], a[3], bb[3]);
+          } else {
+            mma1688(s[2 * np], a[0], a[1], bb[0]);
+            mma1688(s[2 * np + 1], a[0], a[1], bb[1]);
+            mma1688(s[2 * np], a[2], a[3], bb[2]);
+            mma1688(s[2 * np + 1], a[2], a[3], bb[3]);
+          }
+        }
+        if (QKC > 0 && ((kk + 2) % (QKC / 8)) == 0) {
+#pragma unroll
+          for (int nt = 0; nt < NT8; ++nt) {
+            const float2 lo = __half22float2(*reinterpret_cast<half2*>(&sh[nt][0]));
+            const float2 hi = __half22float2(*reinterpret_cast<half2*>(&sh[nt][1]));
+            s[nt][0] += lo.x; s[nt][1] += lo.y; s[nt][2] += hi.x; s[nt][3] += hi.y;
+            sh[nt][0] = 0u; sh[nt][1] = 0u;
+          }
         }
       }
       }
@@ -342,7 +378,7 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
     if (!(ABL & 16)) __syncthreads();  // K(kt+1) visible, V(kt) no longer read
   }
 
-  // Normalize, store O and LSE
+  // Normalize, store O and LSE (optionally merged with / into the segment accumulator)
 #pragma unroll
   for (int hh = 0; hh < 2; ++hh) {
     float l = lrow[hh];
@@ -350,27 +386,60 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
     l += __shfl_xor_sync(0xffffffff, l, 2);
     const float inv = l > 0.0f ? 1.0f / l : 0.0f;
     const int row = row0 + hh * 8;
+    // scores were in log2 units: lse_e = (m + log2 l) * ln 2
+    const float lse_new = l > 0.0f ? (mrow[hh] + __log2f(l)) * 0.6931471805599453f : -INFINITY;
+    float wa = 0.0f, wn = inv, lse_tot = lse_new;  // final value = acc_o * wa + oacc * wn
+    float* ao = nullptr;
+    float* al = nullptr;
+    if (acc.mode != 0 && row < Tq) {
+      ao = acc.o + (int64_t)(q_beg + row) * acc.o_row + (int64_t)hq * acc.o_head;
+      al = acc.lse + (int64_t)(q_beg + row) * acc.lse_row + (int64_t)hq * acc.lse_head;
+      if (acc.mode >= 2) {
+        const float la = *al;
+        const float mx = fmaxf(la, lse_new);
+        if (mx == -INFINITY) {
+          wa = 0.0f; wn = 0.0f; lse_tot = -INFINITY;
+        } else {
+          const float ea = __expf(la - mx), en = __expf(lse_new - mx);
+          const float den = ea + en;
+          wa = ea / den; wn = inv * en / den; lse_tot = mx + __logf(den);
+        }
+      }
+    }
+    __syncwarp();  // every lane of the quad has read acc_lse before lane cq == 0 rewrites it
     if (row < Tq) {
-      half* o_ = o + (int64_t)(q_beg + row) * o_row + (int64_t)hq * o_head;
+      if (acc.mode == 1 || acc.mode == 2) {
 #pragma unroll
-      for (int dn = 0; dn < HD / 8; ++dn)
-        *reinterpret_cast<uint32_t*>(o_ + 8 * dn + 2 * cq) = pack_h2(oacc[dn][2 * hh] * inv, oacc[dn][2 * hh + 1] * inv);
-      if (lse != nullptr && cq == 0) {
-        // scores were in log2 units: lse_e = (m + log2 l) * ln 2
-        lse[(int64_t)(q_beg + row) * lse_row + (int64_t)hq * lse_head] =
-            l > 0.0f ? (mrow[hh] + __log2f(l)) * 0.6931471805599453f : -INFINITY;
+        for (int dn = 0; dn < HD / 8; ++dn) {
+          float2* p2 = reinterpret_cast<float2*>(ao + 8 * dn + 2 * cq);
+          float2 a2 = acc.mode == 2 ? *p2 : make_float2(0.0f, 0.0f);
+          *p2 = make_float2(a2.x * wa + oacc[dn][2 * hh] * wn, a2.y * wa + oacc[dn][2 * hh + 1] * wn);
+        }
+        if (cq == 0) *al = lse_tot;
+      } else {
+        half* o_ = o + (int64_t)(q_beg + row) * o_row + (int64_t)hq * o_head;
+#pragma unroll
+        for (int dn = 0; dn < HD / 8; ++dn) {
+          float x0 = oacc[dn][2 * hh] * wn, x1 = oacc[dn][2 * hh + 1] * wn;
+          if (acc.mode == 3) {
+            const float2 a2 = *reinterpret_cast<const float2*>(ao + 8 * dn + 2 * cq);
+            x0 += a2.x * wa; x1 += a2.y * wa;
+          }
+          *reinterpret_cast<uint32_t*>(o_ + 8 * dn + 2 * cq) = pack_h2(x0, x1);
+        }
+        if (lse != nullptr && cq == 0) lse[(int64_t)(q_beg + row) * lse_row + (int64_t)hq * lse_head] = lse_tot;
       }
     }
   }
 #endif
 }
 
-template <int BN, bool CAUSAL, bool PV16, bool LAZY, bool QK4, int ABL = 0>
+template <int BN, bool CAUSAL, bool PV16, bool LAZY, bool QK4, int ABL = 0, int QKC = 0>
 static void launch(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, at::Tensor& o,
-                   float* lse_ptr, int64_t lse_row, int64_t lse_head,
-                   const at::Tensor& cu_q, const at::Tensor& cu_k, int max_q, float scale_log2) {
+                   float* lse_ptr, int64_t lse_row, int64_t lse_head, const AccArgs& acc,
+                   const at::Tensor& cu_q, const at::Tensor& cu_k, int max_q, float scale_log2, float q_prescale = 1.0f) {
   constexpr uint32_t SMEM = 2 * BN * HD * 2 + BM * HD;
-  auto kern = k1fa_kernel<BN, CAUSAL, PV16, LAZY, QK4, ABL>;
+  auto kern = k1fa_kernel<BN, CAUSAL, PV16, LAZY, QK4, ABL, QKC>;
   static bool attr_set[64] = {};
   const int dev = q.get_device();
   if (!attr_set[dev]) {
@@ -385,15 +454,16 @@ static void launch(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v
       (const half*)k.data_ptr(), k.stride(0), k.stride(1),
       (const half*)v.data_ptr(), v.stride(0), v.stride(1),
       (half*)o.data_ptr(), o.stride(0), o.stride(1),
-      lse_ptr, lse_row, lse_head,
-      cu_q.data_ptr<int>(), cu_k.data_ptr<int>(), Hq, Hkv, scale_log2);
+      lse_ptr, lse_row, lse_head, acc,
+      cu_q.data_ptr<int>(), cu_k.data_ptr<int>(), Hq, Hkv, QKC > 0 ? 1.4426950408889634f : scale_log2, q_prescale);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-// variant: bit0 = PV16, bit1 = LAZY, bit2 = QK4 (two interleaved QK accumulator sets); bn = 16
+// variant: bit0 = PV16, bit1 = LAZY, bit2 = QK4 (two interleaved QK accumulator sets); 8/9 = K9 QK16 c64/c32;
+// 64*k = timing ablations; bn = 16
 void k1fa_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, c10::optional<at::Tensor> lse,
               at::Tensor cu_q, at::Tensor cu_k, int64_t max_q, double scale, bool causal, int64_t bn,
-              int64_t variant) {
+              int64_t variant, c10::optional<at::Tensor> acc_o, c10::optional<at::Tensor> acc_lse, int64_t acc_mode) {
   const at::cuda::OptionalCUDAGuard guard(q.device());
   TORCH_CHECK(q.dtype() == at::kHalf && k.dtype() == at::kHalf && v.dtype() == at::kHalf && o.dtype() == at::kHalf,
               "fp16 q/k/v/o");
@@ -416,11 +486,23 @@ void k1fa_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, c10::optio
     lse_row = lse->stride(0);
     lse_head = lse->stride(1);
   }
+  AccArgs acc{nullptr, nullptr, 0, 0, 0, 0, (int)acc_mode};
+  if (acc_mode != 0) {
+    TORCH_CHECK(acc_mode >= 1 && acc_mode <= 3 && acc_o.has_value() && acc_lse.has_value(), "acc_mode needs acc_o/acc_lse");
+    TORCH_CHECK(acc_o->dtype() == at::kFloat && acc_o->dim() == 3 && acc_o->size(0) == q.size(0) &&
+                    acc_o->size(1) == q.size(1) && acc_o->size(2) == HD && acc_o->stride(2) == 1 &&
+                    acc_o->stride(0) % 2 == 0 && acc_o->stride(1) % 2 == 0, "acc_o fp32 [Tq, Hq, 256]");
+    TORCH_CHECK(acc_lse->dtype() == at::kFloat && acc_lse->dim() == 2 && acc_lse->size(0) == q.size(0) &&
+                    acc_lse->size(1) == q.size(1), "acc_lse fp32 [Tq, Hq]");
+    acc = AccArgs{acc_o->data_ptr<float>(), acc_lse->data_ptr<float>(), acc_o->stride(0), acc_o->stride(1),
+                  acc_lse->stride(0), acc_lse->stride(1), (int)acc_mode};
+  }
   if (max_q <= 0) return;
   const float sl2 = (float)(scale * 1.4426950408889634);
 #define K1_DISPATCH(C, P, L, Q) \
-  launch<16, C, P, L, Q>(q, k, v, o, lse_ptr, lse_row, lse_head, cu_q, cu_k, (int)max_q, sl2)
+  launch<16, C, P, L, Q>(q, k, v, o, lse_ptr, lse_row, lse_head, acc, cu_q, cu_k, (int)max_q, sl2)
   TORCH_CHECK(bn == 16, "bn must be 16");
+  TORCH_CHECK(variant >= 0 && variant <= 7, "variant 0..7, 8/9 (QK16), or 64*k (ablations)");
   const int vv = (int)variant & 7;
 #define K1_V(C)                                                  \
   switch (vv) {                                                  \
@@ -433,12 +515,24 @@ void k1fa_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, c10::optio
     case 6: K1_DISPATCH(C, false, true, true); break;            \
     default: K1_DISPATCH(C, true, true, true); break;            \
   }
-  if (variant >= 8) {
+  if (variant == 8 || variant == 9) {
+    // (Lane K9) QK16: v3 base (fp16-slice P.V, lazy rescale) + Q K^T on fp16-accumulate HMMA, promoted to fp32
+    // every 64 head dims (8) or 32 (9); Q pre-scaled by the softmax scale. Normwise error ~1e-3: default off.
+    if (causal) {
+      if (variant == 8) launch<16, true, true, true, false, 0, 64>(q, k, v, o, lse_ptr, lse_row, lse_head, acc, cu_q, cu_k, (int)max_q, sl2, (float)scale);
+      else launch<16, true, true, true, false, 0, 32>(q, k, v, o, lse_ptr, lse_row, lse_head, acc, cu_q, cu_k, (int)max_q, sl2, (float)scale);
+    } else {
+      if (variant == 8) launch<16, false, true, true, false, 0, 64>(q, k, v, o, lse_ptr, lse_row, lse_head, acc, cu_q, cu_k, (int)max_q, sl2, (float)scale);
+      else launch<16, false, true, true, false, 0, 32>(q, k, v, o, lse_ptr, lse_row, lse_head, acc, cu_q, cu_k, (int)max_q, sl2, (float)scale);
+    }
+    return;
+  }
+  if (variant >= 64) {
     // timing ablations (results are wrong on purpose), causal v7 base: bit3 no global loads, bit4 no QK,
     // bit5 no PV, bit6 no exp, bit7 no barriers
     TORCH_CHECK(causal, "ablations are causal only");
-    switch ((int)(variant >> 3)) {
-#define K1_ABL(A) case A: launch<16, true, true, true, true, A>(q, k, v, o, lse_ptr, lse_row, lse_head, cu_q, cu_k, (int)max_q, sl2); break;
+    switch ((int)(variant >> 6)) {
+#define K1_ABL(A) case A: launch<16, true, true, true, true, A>(q, k, v, o, lse_ptr, lse_row, lse_head, acc, cu_q, cu_k, (int)max_q, sl2); break;
       K1_ABL(1) K1_ABL(2) K1_ABL(4) K1_ABL(8) K1_ABL(16) K1_ABL(6) K1_ABL(3) K1_ABL(5) K1_ABL(17)
 #undef K1_ABL
       default: TORCH_CHECK(false, "unknown ablation");

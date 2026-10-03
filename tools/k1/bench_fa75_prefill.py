@@ -16,7 +16,7 @@ import time
 
 import torch
 
-from k1_common import K1, flashinfer_run, gpu_guard, smi_free
+from k1_common import K1, flashinfer_run, gpu_guard, preflight, smi_free
 
 
 def causal_flops(Tq, Tkv, Hq, D=256, causal=True):
@@ -69,6 +69,7 @@ def main():
     print("smi:", smi_free(), flush=True)
     rows = []
     for Tq, Tkv in grid:
+        preflight()  # re-check the shared gate between shapes
         Hq, Hk = args.hq, args.hk
         mem = (2 * Tq * Hq + Tkv * Hk) * 512
         while mem > args.budget_mb * 2**20 and Hk > 1:

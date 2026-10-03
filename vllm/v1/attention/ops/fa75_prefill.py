@@ -17,32 +17,76 @@ import torch
 
 _EXT = None
 _ENABLED = os.getenv("VLLM_TQ_FA75_PREFILL", "0") == "1"
-# variant bits: 1 = P V accumulates per key slice in fp16 (fa75 scheme, 2x HMMA rate), 2 = lazy O rescale
-_VARIANT = int(os.getenv("VLLM_TQ_FA75_VARIANT", "2"))
+# variant bits: 1 = P V accumulates per key slice in fp16 (fa75 scheme, 2x HMMA rate), 2 = lazy O rescale,
+# 4 = two interleaved Q K^T accumulator sets. Default 7 (fastest; passes the 1e-3 gate)
+_VARIANT = int(os.getenv("VLLM_TQ_FA75_VARIANT", "7"))
 _BN = int(os.getenv("VLLM_TQ_FA75_BN", "16"))
+# Continuation prefill over the TurboQuant cache in pieces of this many cached tokens (rounded up to whole blocks),
+# merged exactly by LSE inside the kernel. Bounds the dequant workspace to ~(segment + chunk) rows instead of
+# max_model_len (1.07 GB/GPU at 524K for 2 KV heads). 0 = one piece (needs the max_model_len workspace).
+_SEGMENT_TOKENS = int(os.getenv("VLLM_TQ_FA75_SEGMENT_TOKENS", "32768"))
 
 
 def enabled() -> bool:
     return _ENABLED
 
 
-def _load():
-    global _EXT
-    if _EXT is None:
-        from torch.utils.cpp_extension import load
+def segment_rows(block_size: int) -> int:
+    """Cached rows per continuation piece (whole blocks); 0 when segmentation is off or K1 is disabled."""
+    if not _ENABLED or _SEGMENT_TOKENS <= 0:
+        return 0
+    return -(-_SEGMENT_TOKENS // block_size) * block_size
 
-        src = os.path.join(os.path.dirname(__file__), "fa75_ext", "fa75_prefill.cu")
-        bd = os.environ.get("VLLM_TQ_FA75_BUILD_DIR", os.path.expanduser("~/.cache/vllm-k1fa"))
-        os.makedirs(bd, exist_ok=True)
-        _EXT = load(
-            name="k1fa_sm75",
-            sources=[src],
-            extra_cuda_cflags=["-O3", "-gencode=arch=compute_75,code=sm_75", "--use_fast_math"]
-            + (["-lineinfo"] if os.getenv("VLLM_TQ_FA75_LINEINFO") else [])
-            + (["-Xptxas=-v"] if os.getenv("VLLM_TQ_FA75_PTXAS_V") else []),
-            build_directory=bd,
-            verbose=bool(os.getenv("VLLM_TQ_FA75_VERBOSE")),
-        )
+
+def workspace_rows(block_size: int, max_num_batched_tokens: int) -> int:
+    """Dequant workspace rows the segmented continuation needs: one piece plus the largest chunk."""
+    seg = segment_rows(block_size)
+    return seg + -(-max_num_batched_tokens // block_size) * block_size if seg else 0
+
+
+def _load():
+    """Load the extension. A prebuilt .so whose stamp matches the source hash is imported directly (no nvcc/ninja
+    in the serving process); otherwise JIT-build it once and stamp it. Prebuild before a boot with
+    ``python -c "from vllm.v1.attention.ops import fa75_prefill as f; f._load()"`` (CUDA_VISIBLE_DEVICES='' is fine)."""
+    global _EXT
+    if _EXT is not None:
+        return _EXT
+    import hashlib
+    import importlib.util
+
+    src = os.path.join(os.path.dirname(__file__), "fa75_ext", "fa75_prefill.cu")
+    bd = os.environ.get("VLLM_TQ_FA75_BUILD_DIR", os.path.expanduser("~/.cache/vllm-k1fa"))
+    os.makedirs(bd, exist_ok=True)
+    flags = ["-O3", "-gencode=arch=compute_75,code=sm_75", "--use_fast_math"]
+    flags += ["-lineinfo"] if os.getenv("VLLM_TQ_FA75_LINEINFO") else []
+    with open(src, "rb") as f:
+        digest = hashlib.sha256(f.read() + " ".join(flags).encode() + torch.__version__.encode()).hexdigest()
+    flags += ["-Xptxas=-v"] if os.getenv("VLLM_TQ_FA75_PTXAS_V") else []  # log only, not in the stamp
+    so = os.path.join(bd, "k1fa_sm75.so")
+    stamp = os.path.join(bd, "k1fa_sm75.stamp")
+    try:
+        with open(stamp) as f:
+            fresh = f.read().strip() == digest and os.path.exists(so)
+    except OSError:
+        fresh = False
+    if fresh:
+        spec = importlib.util.spec_from_file_location("k1fa_sm75", so)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _EXT = mod
+        return _EXT
+    from torch.utils.cpp_extension import load
+
+    _EXT = load(
+        name="k1fa_sm75",
+        sources=[src],
+        extra_cuda_cflags=flags,
+        build_directory=bd,
+        verbose=bool(os.getenv("VLLM_TQ_FA75_VERBOSE")),
+    )
+    with open(stamp + ".tmp", "w") as f:
+        f.write(digest)
+    os.replace(stamp + ".tmp", stamp)
     return _EXT
 
 
@@ -89,11 +133,18 @@ def fa75_prefill(
     max_seqlen_q: int | None = None,
     variant: int | None = None,
     bn: int | None = None,
+    acc_o: torch.Tensor | None = None,
+    acc_lse: torch.Tensor | None = None,
+    acc_mode: int = 0,
 ):
     """Attention of q over k/v. Single request unless cu_seqlens_* (int32, on device) are given.
 
     lse, if requested, is fp32 [Tq, Hq] (any strides: pass ``lse=buf.transpose(0, 1)`` to fill an [Hq, Tq] buffer)
     in natural-log units.
+
+    Segmented context (exact): acc_mode 1 = first piece writes acc_o (fp32 [Tq, Hq, 256]) and acc_lse (fp32 [Tq, Hq]);
+    2 = middle piece merges into them; 3 = last piece merges and writes ``out`` (fp16). Pieces may come in any order;
+    only the last one may be causal.
     """
     ext = _load()
     if out is None:
@@ -117,6 +168,9 @@ def fa75_prefill(
         bool(causal),
         int(bn if bn is not None else _BN),
         int(variant if variant is not None else _VARIANT),
+        acc_o,
+        acc_lse,
+        int(acc_mode),
     )
     if return_lse:
         return out, lse
