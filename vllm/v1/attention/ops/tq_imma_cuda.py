@@ -115,6 +115,11 @@ def _lut_for(centroids: torch.Tensor, norm_correction: bool):
     return v
 
 
+def fusedq_enabled() -> bool:
+    # in-kernel Hadamard rotation + int8 quantization of the fp16 query (saves a cuBLAS GEMM + a launch per call)
+    return os.getenv("VLLM_TQ_IMMA_FUSEDQ", "1") == "1"
+
+
 def qsplit_enabled() -> bool:
     # hi/lo int8 query planes: LSE error ~15x lower (needed when the LSE is merged with another partial), +8% time
     return os.getenv("VLLM_TQ_IMMA_QSPLIT", "1") == "1"
@@ -144,7 +149,11 @@ def tq_imma_decode_attention(
     if PiT is None:
         PiT = Pi.T.contiguous()
     ns = num_splits or default_splits(S, Hk, max_len_hint)
-    q_rot = (query.float() @ PiT).contiguous()
+    if fusedq_enabled():
+        # the kernel rotates (FWHT == the TurboQuant Hadamard) and quantizes the fp16 query itself
+        q_rot = query if (query.stride(2) == 1 and query.stride(1) == D) else query.contiguous()
+    else:
+        q_rot = (query.float() @ PiT).contiguous()
     dev = query.device
     q8 = torch.empty(R, Hq, 2 * D, dtype=torch.int8, device=dev)
     qs = torch.empty(R, Hq, dtype=torch.float32, device=dev)
@@ -164,7 +173,7 @@ def prefill_splits(Lq: int, Hq: int, Hk: int, C: int) -> int:
     if env:
         return int(env)
     ctas = (Lq * (Hq // Hk) + 63) // 64 * Hk
-    ns = max(1, (2 * 68 + ctas - 1) // ctas)
+    ns = max(1, (4 * 68 + ctas - 1) // ctas)  # >= 4 waves: wave quantization costs ~2x at 1.4 waves (measured)
     return max(1, min(ns, (C + 1023) // 1024, 32))
 
 
