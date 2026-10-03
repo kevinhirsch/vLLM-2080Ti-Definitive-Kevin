@@ -10,10 +10,16 @@ accepted call to make a release finish on schedule.
 Halo's separate bounded start lease pauses new incident runs while its fast
 lease enforcer keeps existing repairs supervised. The publisher verifies that
 the installed supervisor honors the lease before draining gateway calls.
+
+L77 (2026-10-03): a publisher killed by SIGTERM/SIGHUP/SIGINT (e.g. an outer `timeout`) used to leave its Halo start pause
+standing until expiry, which blocked Halo incident runs for an hour. Termination signals are now converted to an exception
+so every `finally` runs (Halo pause released by token, drain fences closed, temp state removed). Both leases carry the
+owner pid so a SIGKILLed publisher's leftovers are taken over by the next publish (audit-logged) instead of refused.
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -21,7 +27,9 @@ import os
 from pathlib import Path
 import re
 import secrets
+import signal
 import subprocess
+import sys
 import time
 import urllib.request
 
@@ -42,9 +50,107 @@ HALO_INCIDENTS = Path("/home/kevin/.local/share/estate-overseer/halo-incidents")
 HALO_START_PAUSE = Path("/home/kevin/.local/share/estate-overseer/HALO_INCIDENT_START_PAUSE.json")
 HALO_SUPERVISOR_LOCK = Path("/tmp/halo-incident-supervisor.lock")
 ESTATE_RUNTIME = Path("/home/kevin/.local/share/estate-overseer")
+# L77: the gateway keeps the drain lease id only in memory, so a publisher that dies without its `finally` strands the fence
+# until the TTL. The lease id is recorded here (with the owner pid) so the next publish can close an orphan at once.
+DRAIN_STATE = Path("/home/kevin/.local/share/vllm-qwen27b/gateway-publish-drain.json")
+AUDIT_LOG = Path("/home/kevin/.local/share/vllm-qwen27b/gateway-publish-audit.log")
+HALO_LEASE_OWNER = "gateway-safe-publish"
+_TERMINATION_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 
 
 _BY = (os.environ.get("PUBLISH_BY") or "gateway_safe_publish")[:60] + f" pid={os.getpid()}"
+
+
+class PublishTerminated(BaseException):
+    """A termination signal arrived. BaseException so `except Exception` rollback paths do not swallow it, while every
+    `finally` (lease release) still runs."""
+
+    def __init__(self, signum: int):
+        super().__init__(f"terminated by signal {signum}")
+        self.signum = signum
+
+
+@contextlib.contextmanager
+def _terminate_as_exception():
+    """SIGTERM/SIGHUP/SIGINT raise PublishTerminated in the main thread so try/finally can release what is held."""
+    def handler(signum, _frame):
+        raise PublishTerminated(signum)
+    previous = {}
+    try:
+        for sig in _TERMINATION_SIGNALS:
+            previous[sig] = signal.signal(sig, handler)
+    except ValueError:      # not the main thread: signals cannot be hooked here
+        pass
+    try:
+        yield
+    finally:
+        for sig, old in previous.items():
+            signal.signal(sig, old)
+
+
+@contextlib.contextmanager
+def _shielded():
+    """Cleanup must not be interrupted halfway by a second signal."""
+    previous = {}
+    try:
+        for sig in _TERMINATION_SIGNALS:
+            previous[sig] = signal.signal(sig, signal.SIG_IGN)
+    except ValueError:
+        pass
+    try:
+        yield
+    finally:
+        for sig, old in previous.items():
+            signal.signal(sig, old)
+
+
+def _audit(event: str, **fields) -> None:
+    """One line to stderr and (best effort) to the audit log. Never raises."""
+    line = json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "event": event, "by": _BY, **fields},
+                      sort_keys=True, default=str)
+    try:
+        print(line, file=sys.stderr, flush=True)
+    except Exception:
+        pass
+    try:
+        AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with AUDIT_LOG.open("a") as out:
+            out.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _proc_stat(pid: int) -> tuple[str, str] | None:
+    """(state, starttime) from /proc/<pid>/stat, or None when the process does not exist."""
+    if not Path("/proc/self/stat").exists():
+        raise OSError("/proc is not available; process liveness is unknowable")
+    try:
+        raw = Path(f"/proc/{int(pid)}/stat").read_text()
+    except FileNotFoundError:
+        return None
+    rest = raw.rsplit(")", 1)[1].split()
+    return rest[0], rest[19]
+
+
+def _own_stamp() -> dict:
+    stat = _proc_stat(os.getpid())
+    return {"pid": os.getpid(), "pid_start": stat[1] if stat else None}
+
+
+def _owner_dead(row: dict) -> bool:
+    """True only when the lease records a pid that is provably gone (missing, zombie, or the pid was reused).
+    A lease without a pid (older publisher) or with an unreadable /proc is never presumed dead."""
+    pid = row.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        stat = _proc_stat(pid)
+    except (OSError, ValueError, IndexError):
+        return False
+    if stat is None or stat[0] in {"Z", "X"}:
+        return True
+    recorded = row.get("pid_start")
+    return bool(recorded) and str(recorded) != stat[1]
 
 
 def _sha(data: bytes) -> str:
@@ -76,12 +182,17 @@ def _run(*args: str) -> None:
 
 def _atomic_write(path: Path, data: bytes, mode: int = 0o755) -> None:
     tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
-    with tmp.open("xb") as out:
-        out.write(data)
-        out.flush()
-        os.fsync(out.fileno())
-    tmp.chmod(mode)
-    os.replace(tmp, path)
+    tmp.unlink(missing_ok=True)         # a stale tmp from a killed process whose pid was reused
+    try:
+        with tmp.open("xb") as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        tmp.chmod(mode)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)     # never leave temp state behind, including when a signal lands mid-write
+        raise
     fd = os.open(path.parent, os.O_RDONLY)
     try:
         os.fsync(fd)
@@ -134,22 +245,33 @@ def _begin_halo_quiesce(halo_wait_s: float, drain_timeout_s: float) -> str:
     except (OSError, ValueError) as exc:
         raise RuntimeError("existing Halo start pause is unreadable") from exc
     if float(prior.get("expires_at_epoch") or 0) > time.time():
-        raise RuntimeError("another release owns the Halo start pause")
+        # L77: our own lease left behind by a dead publisher is taken over, not waited out (the 2026-10-03 incident
+        # blocked Halo for an hour). Only a lease this tool wrote, with a recorded pid that is provably gone.
+        if prior.get("owner") == HALO_LEASE_OWNER and _owner_dead(prior):
+            _audit("halo-start-pause-takeover", dead_pid=prior.get("pid"), prior_token=str(prior.get("token"))[:8],
+                   prior_expires_at_epoch=prior.get("expires_at_epoch"))
+        else:
+            raise RuntimeError("another release owns the Halo start pause")
     token = secrets.token_hex(16)
     now = time.time()
-    lease = {"owner": "gateway-safe-publish", "token": token,
+    lease = {"owner": HALO_LEASE_OWNER, "token": token, **_own_stamp(),
              "issued_at_epoch": now,
              "expires_at_epoch": now + min(3550, halo_wait_s + drain_timeout_s + 180)}
     _atomic_write(HALO_START_PAUSE, (json.dumps(lease, sort_keys=True) + "\n").encode(), 0o644)
     return token
 
 
-def _end_halo_quiesce(token: str) -> None:
+def _end_halo_quiesce(token: str | None) -> None:
+    """Release the pause only if it is still ours. token=None (a signal landed before the token reached the caller)
+    matches on this process's pid instead."""
     try:
         row = json.loads(HALO_START_PAUSE.read_text())
     except FileNotFoundError:
         return
-    if row.get("owner") != "gateway-safe-publish" or row.get("token") != token:
+    ours = (row.get("token") == token) if token is not None else (row.get("pid") == os.getpid())
+    if row.get("owner") != HALO_LEASE_OWNER or not ours:
+        if token is None:
+            return      # never held one
         raise RuntimeError("Halo start pause ownership changed during gateway publication")
     HALO_START_PAUSE.unlink()
     fd = os.open(HALO_START_PAUSE.parent, os.O_RDONLY)
@@ -199,23 +321,86 @@ def _wait_empty(token: str, timeout_s: float) -> None:
     raise TimeoutError("accepted calls did not drain within the deployment bound")
 
 
-def _fence_failed_release(token: str, timeout_s: float) -> None:
+def _record_drain(lease: str) -> None:
+    """Persist the lease id + owner pid so a publisher that dies without its `finally` can be cleaned up after."""
+    try:
+        _atomic_write(DRAIN_STATE, (json.dumps({"lease": lease, **_own_stamp(), "by": _BY, "ts": time.time()},
+                                               sort_keys=True) + "\n").encode(), 0o600)
+    except OSError as exc:
+        _audit("drain-record-failed", error=repr(exc))
+
+
+def _clear_drain_record(lease: str | None = None) -> None:
+    try:
+        row = json.loads(DRAIN_STATE.read_text())
+    except (OSError, ValueError):
+        return
+    if lease is None or row.get("lease") == lease:
+        DRAIN_STATE.unlink(missing_ok=True)
+
+
+def _release_drain(token: str, lease: str | None) -> None:
+    """Close a drain lease this process opened. Never raises: the lease also expires on its own."""
+    if not lease:
+        return
+    try:
+        if _http("/gateway/drain", token=token).get("draining"):
+            _http("/gateway/drain", "DELETE", {"lease": lease}, token)
+    except Exception as exc:
+        _audit("drain-release-failed", error=repr(exc))     # lease itself expires; no permanent admission stop
+    else:
+        _clear_drain_record(lease)
+
+
+def _reap_orphan_drain(token: str) -> bool:
+    """A drain fence is up. If it is the recorded fence of a publisher that is provably dead, close it and report True."""
+    try:
+        row = json.loads(DRAIN_STATE.read_text())
+    except (OSError, ValueError):
+        return False
+    if not row.get("lease") or not _owner_dead(row):
+        return False
+    try:
+        _http("/gateway/drain", "DELETE", {"lease": row["lease"]}, token)
+    except Exception as exc:       # 409 = the lease is not that fence any more (it expired or was replaced)
+        _audit("orphan-drain-release-refused", dead_pid=row.get("pid"), error=repr(exc))
+        return False
+    _audit("orphan-drain-released", dead_pid=row.get("pid"), prior_by=row.get("by"))
+    _clear_drain_record(row["lease"])
+    return True
+
+
+def _fence_failed_release(token: str, timeout_s: float) -> str:
     """A failed new process may already have accepted work; fence it before rollback.
 
     An unreadable process is ambiguous, including when systemd says it failed.
     Leave it in place for diagnosis instead of issuing another destructive restart.
+    Returns the fence lease so the caller releases it; if the wait itself fails the fence is released here.
     """
     current = _http("/gateway/drain", token=token)
     if current.get("draining"):
         raise RuntimeError("new gateway already has an unknown drain owner")
     opened = _http("/gateway/drain", "POST",
                    {"ttl_s": 1800, "reason": "governed gateway rollback", "by": _BY}, token)
-    if not opened.get("lease"):
+    lease = opened.get("lease")
+    if not lease:
         raise RuntimeError("new gateway did not grant a rollback drain lease")
-    _wait_empty(token, timeout_s)
+    _record_drain(lease)
+    try:
+        _wait_empty(token, timeout_s)
+    except BaseException:
+        _release_drain(token, lease)
+        raise
+    return lease
 
 
 def publish(timeout_s: float = 1500, halo_wait_s: float = 1800) -> dict:
+    """Publish with termination-safe leases: SIGTERM/SIGHUP/SIGINT become PublishTerminated and the finally releases."""
+    with _terminate_as_exception():
+        return _publish(timeout_s, halo_wait_s)
+
+
+def _publish(timeout_s: float, halo_wait_s: float) -> dict:
     if not 1 <= timeout_s <= 1700:
         raise ValueError("timeout_s must be 1..1700")
     if not 1 <= halo_wait_s <= 1800:
@@ -242,14 +427,17 @@ def publish(timeout_s: float = 1500, halo_wait_s: float = 1800) -> dict:
     if not (spend.get("enforce") and spend.get("durable") and float(spend.get("cap") or 0) == 25.0):
         raise RuntimeError("hard $25 spend authority is not healthy")
     drain_before = _http("/gateway/drain", token=token)
-    if drain_before.get("draining"):
+    if drain_before.get("draining") and not _reap_orphan_drain(token):
         raise RuntimeError("another publisher already holds the drain lease")
 
-    halo_pause = _begin_halo_quiesce(halo_wait_s, timeout_s)
+    halo_pause = None
     lease = None
+    rollback_lease = None
+    backup = None
     installed = False
     dash_state = {"changed": False}
     try:
+        halo_pause = _begin_halo_quiesce(halo_wait_s, timeout_s)
         _assert_halo_quiesce_live(halo_pause)
         _wait_halo_quiet(halo_wait_s)
         # Unit readiness is installed without stopping the current process.
@@ -263,6 +451,7 @@ def publish(timeout_s: float = 1500, halo_wait_s: float = 1800) -> dict:
         _atomic_write(backup, previous)
         opened = _http("/gateway/drain", "POST", {"ttl_s": 1800, "reason": "governed gateway publish", "by": _BY}, token)
         lease = opened["lease"]
+        _record_drain(lease)
         _wait_empty(token, timeout_s)
         # The minute scheduler and ten-second enforcer share this lock. Hold
         # it only across the final active-run check and quick restart, never
@@ -289,10 +478,21 @@ def publish(timeout_s: float = 1500, halo_wait_s: float = 1800) -> dict:
                 pass
             time.sleep(1)
         raise RuntimeError("new gateway failed health/spend/readback checks")
+    except PublishTerminated as term:
+        # Killed (outer timeout, operator, logout). Do not start a long fenced rollback inside a dying process: release
+        # every lease in the finally below and say loudly what state the gateway is in.
+        if installed:
+            _audit("terminated-after-install", signal=term.signum, backup=str(backup),
+                   note="new gateway file installed and restarted but NOT verified; roll back from the backup if it is unhealthy")
+        else:
+            with _shielded():
+                _restore_dashboard(dash_state)
+            _audit("terminated-before-install", signal=term.signum)
+        raise
     except Exception as publish_error:
         if installed:
             try:
-                _fence_failed_release(token, timeout_s)
+                rollback_lease = _fence_failed_release(token, timeout_s)
             except Exception as fence_error:
                 raise RuntimeError(
                     "gateway publish failed; automatic rollback refused because the new process "
@@ -311,13 +511,20 @@ def publish(timeout_s: float = 1500, halo_wait_s: float = 1800) -> dict:
             _restore_dashboard(dash_state)
         raise
     finally:
-        if lease:
+        with _shielded():
+            release_errors = []
+            for held in (lease, rollback_lease):
+                _release_drain(token, held)
+            if backup is not None and not installed:
+                with contextlib.suppress(OSError):
+                    backup.unlink(missing_ok=True)       # a publish that never swapped the file has no use for its backup
             try:
-                if _http("/gateway/drain", token=token).get("draining"):
-                    _http("/gateway/drain", "DELETE", {"lease": lease}, token)
-            except Exception:
-                pass  # lease itself expires; no permanent admission stop
-        _end_halo_quiesce(halo_pause)
+                _end_halo_quiesce(halo_pause)           # halo_pause None: a signal landed before the token returned; match by pid
+            except Exception as exc:
+                release_errors.append(exc)
+                _audit("halo-pause-release-failed", error=repr(exc))
+        if release_errors and sys.exc_info()[0] is None:
+            raise release_errors[0]
 
 
 def main() -> None:
@@ -336,7 +543,12 @@ def main() -> None:
     lock_path = Path("/tmp/vllm-gateway-publish.lock")
     with lock_path.open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        print(json.dumps(publish(args.timeout_s, args.halo_wait_s), sort_keys=True))
+        try:
+            print(json.dumps(publish(args.timeout_s, args.halo_wait_s), sort_keys=True))
+        except PublishTerminated as term:
+            # Leases are already released (publish()'s finally). Exit the conventional 128+signal.
+            print(json.dumps({"status": "terminated", "signal": term.signum, "leases_released": True}, sort_keys=True))
+            sys.exit(128 + term.signum)
 
 
 if __name__ == "__main__":

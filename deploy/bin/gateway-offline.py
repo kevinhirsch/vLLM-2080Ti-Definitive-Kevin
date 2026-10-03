@@ -14,6 +14,7 @@ Use this INSTEAD of a /gateway/drain lease; the drain fence stays for gateway co
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -26,12 +27,33 @@ TOKEN_FILE = os.path.expanduser("~/.local/share/vllm-qwen27b/admin.token")
 LEASE_FILE = os.environ.get("OFFLINE_LEASE_FILE", os.path.expanduser("~/.local/share/vllm-qwen27b/offline-lease.json"))
 
 
-def save_lease(lease, by, reason, ttl):
+def proc_start(pid):
+    """starttime field of /proc/<pid>/stat (None when the process is gone or /proc is unreadable)."""
+    try:
+        with open(f"/proc/{int(pid)}/stat") as fh:
+            return fh.read().rsplit(")", 1)[1].split()[19]
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def owner_dead(rec):
+    """L77: a `run` wrapper's record is provably orphaned when its pid is gone (or reused by another process).
+    `open` records are never presumed dead: the short-lived CLI that wrote them exits by design."""
+    if not rec or rec.get("mode") != "run" or not isinstance(rec.get("pid"), int):
+        return False
+    if not os.path.exists("/proc/self/stat"):
+        return False
+    now = proc_start(rec["pid"])
+    return now is None or (bool(rec.get("pid_start")) and rec["pid_start"] != now)
+
+
+def save_lease(lease, by, reason, ttl, mode="open"):
     os.makedirs(os.path.dirname(LEASE_FILE), exist_ok=True)
     tmp = LEASE_FILE + ".tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as fh:
-        json.dump({"lease": lease, "by": by, "reason": reason, "until": time.time() + ttl, "pid": os.getpid()}, fh)
+        json.dump({"lease": lease, "by": by, "reason": reason, "until": time.time() + ttl, "pid": os.getpid(),
+                   "pid_start": proc_start(os.getpid()), "mode": mode}, fh)
     os.replace(tmp, LEASE_FILE)
 
 
@@ -67,19 +89,56 @@ def http(path, method="GET", payload=None):
         return {"error": e.read().decode()[:300], "http": e.code}
 
 
-def open_window(reason, by, ttl, wait_s):
+def open_window(reason, by, ttl, wait_s, mode="open"):
     d = http("/gateway/offline", "POST", {"ttl_s": ttl, "reason": reason, "by": by})
     if not d.get("lease"):
         return d, None
-    t0 = time.time()
-    while time.time() - t0 < wait_s:                      # accepted local work finishes; nothing new is admitted
-        if (http("/gateway/offline").get("local_active") or 0) == 0:
-            break
-        time.sleep(2)
-    return http("/gateway/offline"), d["lease"]
+    # L77: persist at once (not after the wait) and close the window if this process is interrupted while waiting, so a
+    # TERM/INT during the local-work wait cannot strand it until the TTL.
+    try:
+        save_lease(d["lease"], by, reason, ttl, mode)
+        t0 = time.time()
+        while time.time() - t0 < wait_s:                  # accepted local work finishes; nothing new is admitted
+            if (http("/gateway/offline").get("local_active") or 0) == 0:
+                break
+            time.sleep(2)
+        return http("/gateway/offline"), d["lease"]
+    except BaseException:
+        try:
+            http("/gateway/offline", "DELETE", {"lease": d["lease"]})
+        finally:
+            drop_lease(d["lease"])
+        raise
+
+
+def _exit_on_signal(code):
+    def handler(*_):
+        sys.exit(code)
+    return handler
+
+
+def reap_orphan_run_window():
+    """A previous `run` wrapper that died without its finally (SIGKILL/OOM) left a recorded window: close it now."""
+    rec = load_lease()
+    if owner_dead(rec):
+        r = http("/gateway/offline", "DELETE", {"lease": rec.get("lease")})
+        if not r.get("error") or r.get("http") == 409:
+            drop_lease(rec.get("lease"))
+        print(json.dumps({"audit": "orphan-offline-window-released", "dead_pid": rec.get("pid"), "by": rec.get("by"),
+                          "reason": rec.get("reason"), "result": r}), file=sys.stderr)
 
 
 def main():
+    saved = {sg: signal.getsignal(sg) for sg in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
+    try:
+        return _main()
+    finally:
+        for sg, h in saved.items():     # handlers are per-process; give them back (matters for in-process callers/tests)
+            if h is not None:
+                signal.signal(sg, h)
+
+
+def _main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["status", "open", "close", "run"])
     ap.add_argument("--reason", default="planned local work")
@@ -110,19 +169,18 @@ def main():
         if not r.get("error") or r.get("http") == 409:          # closed, or already gone/expired/replaced: the record is stale
             drop_lease(lease)
         print(json.dumps(r)); return 0
-    st, lease = open_window(a.reason, a.by, a.ttl, a.wait_s)
+    for sg, code in ((signal.SIGTERM, 143), (signal.SIGHUP, 129), (signal.SIGINT, 130)):
+        signal.signal(sg, _exit_on_signal(code))               # a TERM'd wrapper must still close its window, even while opening
+    reap_orphan_run_window()
+    st, lease = open_window(a.reason, a.by, a.ttl, a.wait_s, "run" if a.cmd == "run" else "open")
     if not lease:
         print(json.dumps({"opened": False, **st}), file=sys.stderr); return 2
-    save_lease(lease, a.by, a.reason, a.ttl)
     if a.cmd == "open":
         print(json.dumps({"opened": True, "lease": lease, **st})); return 0
     cmd = list(a.rest)
     if not cmd:
         print(json.dumps({"error": "run needs a command after --"}), file=sys.stderr)
         http("/gateway/offline", "DELETE", {"lease": lease}); drop_lease(lease); return 2
-    import signal
-    for sg in (signal.SIGTERM, signal.SIGHUP):                    # a TERM'd wrapper must still close its window
-        signal.signal(sg, lambda *_: sys.exit(143))
     try:
         return subprocess.call(cmd)
     finally:

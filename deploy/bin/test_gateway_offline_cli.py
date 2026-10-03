@@ -91,6 +91,63 @@ class LeaseFileTests(unittest.TestCase):
         self.assertIn(("DELETE", {"lease": "L1"}), calls)     # closed despite TERM
         self.assertIsNone(self.m.load_lease())
 
+    def test_term_while_opening_the_window_closes_it(self):
+        """L77: the signal handlers are live before the window opens, and the lease is recorded at once."""
+        calls = []
+
+        def fake_http(path, method="GET", payload=None):
+            calls.append((method, payload))
+            if method == "POST":
+                return {"lease": "L2"}
+            if method == "GET":
+                os.kill(os.getpid(), signal.SIGTERM)       # TERM'd while waiting for accepted local work
+                time.sleep(1)
+            return {}
+
+        self.m.http = fake_http
+        sys.argv = ["gateway-offline.py", "open", "--by", "S3", "--wait-s", "30"]
+        with self.assertRaises(SystemExit) as cm:
+            self.m.main()
+        self.assertEqual(cm.exception.code, 143)
+        self.assertIn(("DELETE", {"lease": "L2"}), calls)
+        self.assertIsNone(self.m.load_lease())
+
+    def test_handlers_are_given_back_after_main(self):
+        before = signal.getsignal(signal.SIGTERM)
+        self.m.http = lambda *a, **k: {"offline": False}
+        sys.argv = ["gateway-offline.py", "status"]
+        self.m.main()
+        sys.argv = ["gateway-offline.py", "run", "--", "true"]
+        self.m.http = lambda path, method="GET", payload=None: {"lease": "L3"} if method == "POST" else {"local_active": 0}
+        self.m.main()
+        self.assertEqual(signal.getsignal(signal.SIGTERM), before)
+
+    def test_orphaned_run_window_of_a_dead_wrapper_is_closed_by_the_next_run(self):
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        self.m.save_lease("OLD", "S3", "bench", 600, mode="run")
+        rec = self.m.load_lease()
+        rec["pid"] = dead.pid
+        with open(self.lf, "w") as fh:
+            json.dump(rec, fh)
+        calls = []
+
+        def fake_http(path, method="GET", payload=None):
+            calls.append((method, payload))
+            return {"lease": "NEW", "local_active": 0} if method == "POST" else {"local_active": 0}
+
+        self.m.http = fake_http
+        sys.argv = ["gateway-offline.py", "run", "--", "true"]
+        self.m.main()
+        self.assertEqual(calls[0], ("DELETE", {"lease": "OLD"}))
+        self.assertIsNone(self.m.load_lease())
+
+    def test_open_records_and_a_live_run_record_are_never_presumed_dead(self):
+        self.m.save_lease("A", "S3", "bench", 60, mode="open")   # the CLI that wrote it exits by design
+        self.assertFalse(self.m.owner_dead(self.m.load_lease()))
+        self.m.save_lease("B", "S3", "bench", 60, mode="run")    # this very process is alive
+        self.assertFalse(self.m.owner_dead(self.m.load_lease()))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -18,8 +18,53 @@ Actions (every one writes an event to the estate event log, source "engine", so 
 The allow-list is DIAG below: a fixed map name -> env vars. Nothing else can be set through this tool. Every change is
 reversible (stage-diag --clear) and recorded. Flags only take effect at the next engine start.
 """
-import argparse, fcntl, json, os, re, subprocess, sys, time, urllib.request
+import argparse, contextlib, fcntl, json, os, re, signal, subprocess, sys, time, urllib.request
 from datetime import datetime
+
+_TERMINATION_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+
+
+class Terminated(BaseException):
+    """L77 (2026-10-03): a termination signal arrived. BaseException so no `except Exception` swallows it, while every
+    `finally` still runs and the gateway fence / offline window this process opened is released (it used to be stranded
+    until its TTL when the actuator was killed mid-drain)."""
+
+    def __init__(self, signum):
+        super().__init__(f"terminated by signal {signum}")
+        self.signum = signum
+
+
+@contextlib.contextmanager
+def terminate_as_exception():
+    def handler(signum, _frame):
+        raise Terminated(signum)
+    previous = {}
+    try:
+        for sg in _TERMINATION_SIGNALS:
+            previous[sg] = signal.signal(sg, handler)
+    except ValueError:      # not the main thread
+        pass
+    try:
+        yield
+    finally:
+        for sg, old in previous.items():
+            signal.signal(sg, old)
+
+
+@contextlib.contextmanager
+def shielded():
+    """Cleanup is not interrupted halfway by a second signal."""
+    previous = {}
+    try:
+        for sg in _TERMINATION_SIGNALS:
+            previous[sg] = signal.signal(sg, signal.SIG_IGN)
+    except ValueError:
+        pass
+    try:
+        yield
+    finally:
+        for sg, old in previous.items():
+            signal.signal(sg, old)
 
 HOME = os.path.expanduser("~")
 BASE = f"{HOME}/.local/share/vllm-qwen27b"
@@ -262,15 +307,20 @@ def drain_and_wait(deadline_s, reason, token, by=None):
         return facts, None
     t0 = time.time()
     active = facts["active_at_start"]
-    while time.time() - t0 < deadline_s:
-        try:
-            d = http(f"{GATEWAY}/gateway/drain", token=token)
-            active = int(d.get("active") or 0)
-            if active == 0:
-                break
-        except Exception:  # noqa: BLE001
-            pass
-        time.sleep(2)
+    try:
+        while time.time() - t0 < deadline_s:
+            try:
+                d = http(f"{GATEWAY}/gateway/drain", token=token)
+                active = int(d.get("active") or 0)
+                if active == 0:
+                    break
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(2)
+    except BaseException:  # noqa: BLE001  L77: the caller never saw this lease; a signal here must not strand the fence
+        with shielded():
+            release_lease(lease, token)
+        raise
     facts["waited_s"] = round(time.time() - t0)
     facts["active_at_end"] = active
     return facts, lease
@@ -379,7 +429,12 @@ def offline_and_wait(deadline_s, reason, token, by=None, hard_cap_s=None):
             return int(http(f"{GATEWAY}/gateway/offline", token=token).get("local_active") or 0)
         except Exception:  # noqa: BLE001
             return None
-    w = wait_drained(_active, deadline_s, hard_cap_s=hard_cap_s, get_progress=engine_progress)
+    try:
+        w = wait_drained(_active, deadline_s, hard_cap_s=hard_cap_s, get_progress=engine_progress)
+    except BaseException:  # noqa: BLE001  L77: the caller never saw this lease; release the window rather than strand it to TTL
+        with shielded():
+            release_lease(("offline", lease), token)
+        raise
     facts.update(waited_s=w["waited_s"], active_at_end=w["active_at_end"] if w["active_at_end"] is not None else facts["active_at_start"],
                  end_reason=w["end_reason"], extended_s=w["extended_s"], hard_cap_s=hard_cap_s)
     return facts, ("offline", lease)
@@ -487,47 +542,81 @@ def do_restart(a):
     emit("action", f"planned engine restart requested by {by}: {reason}",
          {"action": "restart-requested", "by": by, "reason": reason, "engine_healthy": healthy, "gateway_active": inflight_before,
           "diag_staged": staged_flags(), "faults_24h": faults_summary(24)["faults"]})
-    drain_facts, lease = ({"skipped": "engine unhealthy; nothing to drain"}, None)
-    if healthy and not a.no_drain:
-        write_job(state="draining")
-        t_drain = time.time()
-        hard_cap = float(max(a.drain_s, getattr(a, "drain_max_s", 0) or 0))
-        got = None if os.environ.get("ENGINE_ACTUATOR_FORCE_DRAIN") else offline_and_wait(a.drain_s, reason, token, by, hard_cap_s=hard_cap)
-        drain_facts, lease = got if got else drain_and_wait(a.drain_s, reason, token, by)
-        # FX2: the fence counts only gateway-accepted requests. Also wait on the engine's own in-flight count inside the SAME
-        # budget (what is left of it; at least one sample), so a direct :8001 caller is not cut mid-request. In an offline
-        # window (new work already goes remote) both waits may run past --drain-s while tokens still advance, to the hard cap.
-        offline = drain_facts.get("strategy") == "offline-window"
-        used = time.time() - t_drain
-        eng = wait_engine_idle(max(0.0, a.drain_s - used), hard_cap_s=(hard_cap - used) if offline and hard_cap > a.drain_s else None)
-        drain_facts["engine"] = eng
-        drain_facts["total_waited_s"] = round(time.time() - t_drain)
-        drain_facts["engine_active_at_end"] = None if eng.get("running_at_end") is None else eng["running_at_end"] + (eng["waiting_at_end"] or 0)
-    write_job(state="stopping", drain=drain_facts)
-    json.dump({"ts": now_iso(), "by": by, "reason": reason, "drain": drain_facts, "active_at_stop": drain_facts.get("active_at_end")},
-              open(PLANNED, "w"))
-    t_stop = time.time()
-    r = subprocess.run(["sudo", "-n", "systemctl", "stop", UNIT], capture_output=True, text=True, timeout=200)
-    stop_s = round(time.time() - t_stop, 1)
-    # EF2 measured 2026-10-02: releasing the fence here let live traffic hit the cold engine during warm-up
-    # (warm-up 504 s instead of ~160 s). Keep the fence until `start` returns (it returns after the warm-up hook).
-    write_job(state="starting-engine", stop_s=stop_s, stop_rc=r.returncode)
+    lease, stop_issued, started = None, False, False
     try:
-        r2 = subprocess.run(["sudo", "-n", "systemctl", "start", UNIT], capture_output=True, text=True, timeout=900)
+        with terminate_as_exception():
+            drain_facts, lease = ({"skipped": "engine unhealthy; nothing to drain"}, None)
+            if healthy and not a.no_drain:
+                write_job(state="draining")
+                t_drain = time.time()
+                hard_cap = float(max(a.drain_s, getattr(a, "drain_max_s", 0) or 0))
+                got = None if os.environ.get("ENGINE_ACTUATOR_FORCE_DRAIN") else offline_and_wait(a.drain_s, reason, token, by, hard_cap_s=hard_cap)
+                drain_facts, lease = got if got else drain_and_wait(a.drain_s, reason, token, by)
+                # FX2: the fence counts only gateway-accepted requests. Also wait on the engine's own in-flight count inside the SAME
+                # budget (what is left of it; at least one sample), so a direct :8001 caller is not cut mid-request. In an offline
+                # window (new work already goes remote) both waits may run past --drain-s while tokens still advance, to the hard cap.
+                offline = drain_facts.get("strategy") == "offline-window"
+                used = time.time() - t_drain
+                eng = wait_engine_idle(max(0.0, a.drain_s - used), hard_cap_s=(hard_cap - used) if offline and hard_cap > a.drain_s else None)
+                drain_facts["engine"] = eng
+                drain_facts["total_waited_s"] = round(time.time() - t_drain)
+                drain_facts["engine_active_at_end"] = None if eng.get("running_at_end") is None else eng["running_at_end"] + (eng["waiting_at_end"] or 0)
+            write_job(state="stopping", drain=drain_facts)
+            json.dump({"ts": now_iso(), "by": by, "reason": reason, "drain": drain_facts, "active_at_stop": drain_facts.get("active_at_end")},
+                      open(PLANNED, "w"))
+            t_stop = time.time()
+            stop_issued = True
+            r = subprocess.run(["sudo", "-n", "systemctl", "stop", UNIT], capture_output=True, text=True, timeout=200)
+            stop_s = round(time.time() - t_stop, 1)
+            # EF2 measured 2026-10-02: releasing the fence here let live traffic hit the cold engine during warm-up
+            # (warm-up 504 s instead of ~160 s). Keep the fence until `start` returns (it returns after the warm-up hook).
+            write_job(state="starting-engine", stop_s=stop_s, stop_rc=r.returncode)
+            try:
+                r2 = subprocess.run(["sudo", "-n", "systemctl", "start", UNIT], capture_output=True, text=True, timeout=900)
+                started = True
+            finally:
+                with shielded():
+                    release_lease(lease, token)
+                lease = None
+            ok = engine_healthy()
+            res = {"restart_rc": r2.returncode, "stop_s": stop_s, "healthy_after": ok, "drain": drain_facts,
+                   "diag_active": active_flags()}
+            write_job(state="done" if ok else "failed", finished=now_iso(), result=res)
+            emit("outcome", f"planned engine restart by {by} finished: healthy={ok}, stop took {stop_s}s, "
+                 f"{drain_facts.get('active_at_end')} gateway request(s) and {drain_facts.get('engine_active_at_end')} engine request(s) "
+                 f"still active when it stopped (gateway was {drain_facts.get('active_at_start')}); waited {drain_facts.get('total_waited_s')}s, "
+                 f"drain ended: {drain_facts.get('end_reason')}/{(drain_facts.get('engine') or {}).get('end_reason')}"
+                 f"{' (extended ' + str(drain_facts.get('extended_s')) + 's past --drain-s)' if drain_facts.get('extended_s') else ''}",
+                 {"action": "restart-finished", "by": by, "reason": reason, **res})
+            print(json.dumps(res))
+            return 0 if ok else 1
+    except BaseException as exc:  # noqa: BLE001  Terminated (signal) or any unexpected error: never strand the fence/window
+        sig = getattr(exc, "signum", None)
+        with shielded():
+            if stop_issued and not started:
+                # The engine may be down because of this restart: ask systemd to bring it back without blocking, so a killed
+                # actuator does not leave the estate with no engine (the watchdog is the backstop, not the plan).
+                try:
+                    subprocess.run(["sudo", "-n", "systemctl", "start", "--no-block", UNIT], capture_output=True, text=True, timeout=30)
+                except Exception:  # noqa: BLE001
+                    pass
+            release_lease(lease, token)
+            lease = None
+            try:
+                write_job(state="aborted", finished=now_iso(), result={"aborted": repr(exc)[:200], "signal": sig,
+                                                                       "engine_start_requested": bool(stop_issued and not started)})
+                emit("outcome", f"planned engine restart by {by} ABORTED ({'signal ' + str(sig) if sig else repr(exc)[:120]}); "
+                     f"gateway fence/window released" + ("; engine start requested" if stop_issued and not started else ""),
+                     {"action": "restart-aborted", "by": by, "reason": reason, "signal": sig, "stop_issued": stop_issued})
+            except Exception:  # noqa: BLE001
+                pass
+        if sig:
+            return 128 + sig
+        raise
     finally:
-        release_lease(lease, token)
-    ok = engine_healthy()
-    res = {"restart_rc": r2.returncode, "stop_s": stop_s, "healthy_after": ok, "drain": drain_facts,
-           "diag_active": active_flags()}
-    write_job(state="done" if ok else "failed", finished=now_iso(), result=res)
-    emit("outcome", f"planned engine restart by {by} finished: healthy={ok}, stop took {stop_s}s, "
-         f"{drain_facts.get('active_at_end')} gateway request(s) and {drain_facts.get('engine_active_at_end')} engine request(s) "
-         f"still active when it stopped (gateway was {drain_facts.get('active_at_start')}); waited {drain_facts.get('total_waited_s')}s, "
-         f"drain ended: {drain_facts.get('end_reason')}/{(drain_facts.get('engine') or {}).get('end_reason')}"
-         f"{' (extended ' + str(drain_facts.get('extended_s')) + 's past --drain-s)' if drain_facts.get('extended_s') else ''}",
-         {"action": "restart-finished", "by": by, "reason": reason, **res})
-    print(json.dumps(res))
-    return 0 if ok else 1
+        if lease is not None:
+            with shielded():
+                release_lease(lease, token)
 
 
 def spawn_detached(a):
