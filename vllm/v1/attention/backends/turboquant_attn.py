@@ -106,6 +106,8 @@ _FLASHINFER_VERSION = _flashinfer_version()
 # kernel can read them efficiently. This avoids O(cached_len) dequant work
 # per continuation, eliminating the O(N²/chunk_size) collapse at long context.
 _CONTINUATION_DECODE_THRESHOLD = 128
+# [FORK][LANE S3] tokens per in-place inverse-rotation matmul in _continuation_prefill (bounds its temporary).
+_TQ_CONT_ROT_CHUNK = int(os.getenv("VLLM_TQ_CONT_ROT_CHUNK", "16384"))
 _SPEC_CONTINUATION_DECODE_FASTPATH = (
     os.getenv("VLLM_TURBOQUANT_SPEC_CONTINUATION_DECODE_FASTPATH", "0") == "1"
 )
@@ -777,9 +779,14 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
         if not reserve_continuation_prefill:
             return
 
-        max_cached_len = max(0, model_config.max_model_len - 1)
-        alloc_len = round_up(max_cached_len, self.kv_cache_spec.block_size)
-        cache_buf_shape = (1, num_kv_heads, alloc_len, head_size)
+        # [FORK][LANE S3] the continuation path dequantizes straight into the
+        # (rows, Hk, D) K/V it hands to attention (no second full-context copy),
+        # so reserve exactly that once, at max_model_len, inside the profiled
+        # workspace instead of paying for context-sized temporaries at runtime.
+        alloc_len = round_up(
+            max(1, model_config.max_model_len - 1), self.kv_cache_spec.block_size
+        )
+        cache_buf_shape = (alloc_len, num_kv_heads, head_size)
         current_workspace_manager().get_simultaneous(
             (cache_buf_shape, torch.float16),
             (cache_buf_shape, torch.float16),
@@ -2017,22 +2024,24 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         mse_bytes = self._mse_bytes
         val_data_bytes = self._val_data_bytes
 
-        # Dequant cached K/V from TQ cache
-        # Allocate slightly over to align to block_size for the grid.
-        # Reuse cached buffers to avoid per-call allocation (~16MB at 8K).
+        # Dequant cached K/V from TQ cache.
+        # [FORK][LANE S3] The dequant kernel writes straight into the
+        # (rows, Hk, D) buffers that attention reads (strided output), the
+        # inverse key rotation is applied in place in bounded token chunks,
+        # and the buffers come from the WorkspaceManager (reserved at
+        # max_model_len and counted by memory profiling). The previous code
+        # also allocated k_flat, k_full and v_full per call, each
+        # cached_len*Hk*D*2 bytes (268 MB at 262K tokens, 537 MB at 524K) with
+        # ~0.3 GiB free, which OOM-killed the engine at long context.
         alloc_len = math.ceil(cached_len / block_size) * block_size
-        buf_shape = (1, Hk, alloc_len, D)
-        # Use WorkspaceManager for dequant buffers.
-        # Shared across all layers — saves 60× memory at long context.
-        # Required for CUDA Graph capture (per-layer growth incompatible with CG).
-        k_buf, v_buf = current_workspace_manager().get_simultaneous(
-            (buf_shape, torch.float16),
-            (buf_shape, torch.float16),
+        rows = max(alloc_len, math.ceil(seq_len / block_size) * block_size)
+        k_rows, v_rows = current_workspace_manager().get_simultaneous(
+            ((rows, Hk, D), torch.float16),
+            ((rows, Hk, D), torch.float16),
         )
-        # Skip .zero_() — kernel writes all positions up to cached_len,
-        # and we only read [:cached_len] afterwards.
-        k_cached = k_buf[:, :, :alloc_len, :]
-        v_cached = v_buf[:, :, :alloc_len, :]
+        # Dequant layout view (1, Hk, rows, D) over the (rows, Hk, D) buffer.
+        k_cached = k_rows.permute(1, 0, 2).unsqueeze(0)
+        v_cached = v_rows.permute(1, 0, 2).unsqueeze(0)
 
         grid = (alloc_len, 1 * Hk)
         if self._soa_store:
@@ -2117,22 +2126,30 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 num_warps=4,
             )
 
-        # Inverse-rotate MSE keys back to original space
+        # Inverse-rotate MSE keys back to original space, in place, in
+        # bounded chunks (temporary <= _TQ_CONT_ROT_CHUNK*Hk*D*2 bytes).
         if not self.tq_config.key_fp8:
-            # fp16 matmul for rotation (2× less bandwidth, uses fp16 tensor cores)
             Pi_half = layer._tq_Pi_half
-            k_flat = k_cached[0, :, :cached_len, :].reshape(-1, D)
-            k_flat = k_flat @ Pi_half
-            k_cached_trim = k_flat.reshape(Hk, cached_len, D).transpose(
-                0, 1
-            )  # (cached_len, Hk, D) — already fp16
-        else:
-            k_cached_trim = k_cached[0, :, :cached_len, :].transpose(
-                0, 1
-            )  # (cached_len, Hk, D)
+            for c0 in range(0, cached_len, _TQ_CONT_ROT_CHUNK):
+                c1 = min(c0 + _TQ_CONT_ROT_CHUNK, cached_len)
+                blk = k_rows[c0:c1]
+                blk.copy_((blk.reshape(-1, D) @ Pi_half).reshape(c1 - c0, Hk, D))
 
-        # Skip .contiguous() — the copy into k_full/v_full handles layout
-        v_cached_trim = v_cached[0, :, :cached_len, :].transpose(0, 1)
+        qdtype = query.dtype
+        if qdtype == torch.float16:
+            k_full = k_rows[:seq_len]
+            v_full = v_rows[:seq_len]
+            k_full[cached_len:] = key_chunk
+            v_full[cached_len:] = val_chunk
+            k_cached_trim = k_rows[:cached_len]
+            v_cached_trim = v_rows[:cached_len]
+        else:
+            k_full = k_rows[:seq_len].to(qdtype)
+            v_full = v_rows[:seq_len].to(qdtype)
+            k_full[cached_len:] = key_chunk
+            v_full[cached_len:] = val_chunk
+            k_cached_trim = k_full[:cached_len]
+            v_cached_trim = v_full[:cached_len]
 
         if flashinfer_prefix_combine_wrappers is not None:
             prefix_wrapper, current_wrapper = flashinfer_prefix_combine_wrappers
@@ -2178,16 +2195,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 q_len,
             )
             return merged_out
-
-        # Concatenate cached + current chunk K/V (match query dtype)
-        # Pre-allocate full K/V buffer, copy into slices (no cat alloc)
-        qdtype = query.dtype
-        k_full = torch.empty(seq_len, Hk, D, dtype=qdtype, device=device)
-        v_full = torch.empty(seq_len, Hk, D, dtype=qdtype, device=device)
-        k_full[:cached_len] = k_cached_trim.to(qdtype)
-        k_full[cached_len:] = key_chunk
-        v_full[:cached_len] = v_cached_trim.to(qdtype)
-        v_full[cached_len:] = val_chunk
 
         if flashinfer_wrapper is not None:
             return flashinfer_wrapper.run(query, k_full, v_full)
