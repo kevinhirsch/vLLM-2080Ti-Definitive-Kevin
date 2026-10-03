@@ -8,6 +8,7 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
+from vllm.model_executor.layers.quantization import u2_headquant
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group, tensor_model_parallel_all_gather
@@ -86,6 +87,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
+            quant_config=quant_config if u2_headquant.embed_enabled() else None,
         )
 
         # Workaround: mtp.fc is stored as BF16 in NVFP4 checkpoints but is

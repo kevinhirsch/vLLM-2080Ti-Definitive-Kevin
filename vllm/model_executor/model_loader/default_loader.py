@@ -14,6 +14,7 @@ from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 from vllm.config import ModelConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization import u2_headquant
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.ep_weight_filter import (
@@ -330,7 +331,13 @@ class DefaultModelLoader(BaseModelLoader):
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
         )
-        yield from self._get_weights_iterator(primary_weights)
+        primary_iter = self._get_weights_iterator(primary_weights)
+        if u2_headquant.enabled():
+            # Lane U2 (opt-in, default off): int4 lm_head / MTP block at load time.
+            primary_iter = u2_headquant.wrap_weights(
+                primary_iter, model_config.model, logger
+            )
+        yield from primary_iter
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source],

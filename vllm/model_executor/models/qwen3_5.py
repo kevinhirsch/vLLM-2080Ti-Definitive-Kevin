@@ -29,6 +29,7 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
+from vllm.model_executor.layers.quantization import u2_headquant
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -245,6 +246,9 @@ class Qwen3_5Model(Qwen3NextModel):
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
+            quant_config=(
+                vllm_config.quant_config if u2_headquant.embed_enabled() else None
+            ),  # Lane U2: opt-in int4 embedding, default off
         )
 
         def get_layer(prefix: str):

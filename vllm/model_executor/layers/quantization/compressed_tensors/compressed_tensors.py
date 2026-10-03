@@ -28,6 +28,7 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization import QuantizationMethods
+from vllm.model_executor.layers.quantization import u2_headquant
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -247,7 +248,9 @@ class CompressedTensorsConfig(QuantizationConfig):
                 grps_without_attn_quant[k] = v
             config["config_groups"] = grps_without_attn_quant
 
-        ignore: list[str] = cast(list[str], config.get("ignore", []))
+        ignore: list[str] = u2_headquant.ignore_filter(
+            cast(list[str], config.get("ignore", []))
+        )
         quant_format = cast(str, config.get("format"))
         target_scheme_map = cls._quantization_scheme_map_from_config(config=config)
 
@@ -968,6 +971,20 @@ class CompressedTensorsConfig(QuantizationConfig):
                 targets=self.target_scheme_map.keys(),
                 fused_mapping=self.packed_modules_mapping,
             )
+            if (
+                matched_target is None
+                and (
+                    (isinstance(layer, ParallelLMHead) and u2_headquant.head_enabled())
+                    or (
+                        isinstance(layer, VocabParallelEmbedding)
+                        and not isinstance(layer, ParallelLMHead)
+                        and u2_headquant.embed_enabled()
+                    )
+                )
+            ):
+                # Lane U2 (opt-in): ParallelLMHead is not a "Linear" by class name, so it
+                # never matches the checkpoint's Linear target; give it that scheme.
+                matched_target = "Linear" if "Linear" in self.target_scheme_map else None
             if matched_target is not None:
                 scheme_dict = self.target_scheme_map[matched_target]
                 if scheme_dict.get("format") is None:
