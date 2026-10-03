@@ -2110,6 +2110,37 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         block_size = kv_cache.shape[1]
         BLOCK_D = triton.next_power_of_2(D)
 
+        # [FORK][LANE K2] prefix attention straight on the TQ codes with INT8 tensor cores (no full dequant, no
+        # rotation pass, no fp16 FlashInfer over the prefix); the chunk's own causal part stays on FlashInfer.
+        if (
+            flashinfer_prefix_combine_wrappers is not None
+            and _imma_cuda.prefill_enabled()
+            and query.dtype == torch.float16
+            and not self._soa_store
+            and cached_len > 0
+            and _imma_cuda.eligible(
+                Hq=Hq, Hk=Hk, D=D, mse_bits=self.tq_config.key_mse_bits,
+                value_quant_bits=self.tq_config.effective_value_quant_bits, key_fp8=self.tq_config.key_fp8,
+                key_packed_size=self.tq_config.key_packed_size, q_per_seq=1, block_size=block_size,
+            )
+        ):
+            _, current_wrapper = flashinfer_prefix_combine_wrappers
+            prefix_out, prefix_lse = _imma_cuda.tq_imma_prefill_prefix_attention(
+                query, kv_cache, block_table[:1], cached_len, centroids, self.scale,
+                self.tq_config.norm_correction, layer._tq_PiT,
+            )
+            current_out = torch.empty_like(query)
+            current_lse = torch.empty((q_len, Hq), dtype=torch.float32, device=device)
+            current_out, current_lse = current_wrapper.run(
+                query, key_chunk, val_chunk, out=current_out, lse=current_lse, return_lse=True
+            )
+            logger.info_once("TurboQuant continuation prefix via IMMA (lane K2): cached_len=%s q_len=%s",
+                             cached_len, q_len)
+            # K2 LSE is natural-log, FlashInfer's is base 2: express both in base 2 and merge as such.
+            return _tq_merge_flashinfer_partials(
+                prefix_out, prefix_lse * (1.0 / _LN2), current_out, current_lse, lse_base2=True
+            )
+
         mse_bytes = self._mse_bytes
         val_data_bytes = self._val_data_bytes
 

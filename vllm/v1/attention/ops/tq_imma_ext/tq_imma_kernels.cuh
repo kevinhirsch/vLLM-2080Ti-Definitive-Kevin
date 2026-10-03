@@ -442,14 +442,14 @@ __device__ __forceinline__ void load_chunk2(Pref2& R, const uint8_t* __restrict_
     if (tk < nvalid) {
       const uint8_t* a = KV + tok_slot(A, tk, bs, scp);
       const uint32_t s = (uint32_t)((uintptr_t)a >> 1) & 1u;
-      const uint32_t* a0 = reinterpret_cast<const uint32_t*>((uintptr_t)a & ~(uintptr_t)3);
+      const unsigned int* a0 = reinterpret_cast<const unsigned int*>(a - 2 * s);  // record start rounded down to 4 B
       R.shb |= s << u;
-      R.w0[u] = a0[lane];
+      R.w0[u] = __ldg(a0 + lane);
       if (lane < 26) {
         if (lane == 25 && s == 0u)
-          R.w1[u] = *reinterpret_cast<const unsigned short*>(a0 + 57);  // never read past the record end
+          R.w1[u] = __ldg(reinterpret_cast<const unsigned short*>(a0 + 57));  // never read past the record end
         else
-          R.w1[u] = a0[32 + lane];
+          R.w1[u] = __ldg(a0 + 32 + lane);
       }
     }
   }
