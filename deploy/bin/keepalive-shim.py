@@ -144,6 +144,40 @@ def _load_cfg_schema():
 
 
 _cfgschema = _load_cfg_schema()
+
+
+# Lane SH (2026-10-03): ONE boolean reader. Before, 26 import-time readers and 19 dashboard casts used four different
+# spellings: `not in ("0","false","")` turned "off"/"no"/"False " ON, `in ("1","true","on")` turned "yes" OFF, and ""
+# meant ON for two keys but OFF for the rest. Vocabulary = the config schema's (fallback copy if it is absent);
+# an empty or unrecognised value means the code default (and is reported), never a silent guess.
+_FLAG_TRUE = frozenset(getattr(_cfgschema, "TRUE_TOKENS", None) or {"1", "true", "on", "yes", "y", "t"})
+_FLAG_FALSE = frozenset(getattr(_cfgschema, "FALSE_TOKENS", None) or {"0", "false", "off", "no", "n", "f"})
+
+
+def _flag_value(raw):
+    """True / False for a recognised spelling, None otherwise (None, "", junk)."""
+    if raw is None or isinstance(raw, bool):
+        return raw
+    s = str(raw).strip().lower()
+    return True if s in _FLAG_TRUE else (False if s in _FLAG_FALSE else None)
+
+
+def _env_flag(raw, default):
+    """Import-time boolean: wrap the literal read, `_env_flag(os.environ.get("SHIM_X", "1"), True)`."""
+    v = _flag_value(raw)
+    if v is None:
+        if raw is not None and str(raw).strip():
+            print("gateway-shim: not a boolean: %r -> code default %s" % (raw, bool(default)), file=sys.stderr)
+        return bool(default)
+    return v
+
+
+def _cfg_flag(v):
+    """Dashboard/API cast (apply_config): an unrecognised value is refused (logged, live value unchanged)."""
+    out = _flag_value(v)
+    if out is None:
+        raise ValueError("not a boolean: %r" % (v,))
+    return out
 PORT         = int(os.environ.get("SHIM_PORT", "8000"))
 LOCAL        = os.environ.get("SHIM_UPSTREAM", "http://127.0.0.1:8001").rstrip("/")
 # where live config edits (via the dashboard) are persisted so they survive a restart
@@ -158,7 +192,7 @@ REMOTE_MODEL = os.environ.get("SHIM_REMOTE_MODEL", "deepseek-v4-flash")
 LOCAL_CONTEXT_LIMIT = int(os.environ.get("SHIM_LOCAL_CONTEXT_LIMIT", "524288"))
 REMOTE_CONTEXT_LIMIT = int(os.environ.get("SHIM_REMOTE_CONTEXT_LIMIT", "128000"))
 CONTEXT_SAFETY_MARGIN = int(os.environ.get("SHIM_CONTEXT_SAFETY_MARGIN", "1024"))
-CONTEXT_COMPACTION_ENABLED = os.environ.get("SHIM_CONTEXT_COMPACTION", "1").lower() not in ("0", "false", "off")
+CONTEXT_COMPACTION_ENABLED = _env_flag(os.environ.get("SHIM_CONTEXT_COMPACTION", "1"), True)
 CONTEXT_COMPACTION_KEEP = int(os.environ.get("SHIM_CONTEXT_COMPACTION_KEEP", "12"))
 ALIASES_FILE = os.environ.get("SHIM_ALIASES_FILE", "/home/kevin/.local/share/vllm-qwen27b/gateway-aliases.json")
 BUDGET       = int(os.environ.get("SHIM_LOCAL_BUDGET", "2"))
@@ -173,7 +207,7 @@ SLOT_POLL    = float(os.environ.get("SHIM_SLOT_POLL_SECS", "0.05"))
 HEALTH_TTL   = 5
 CHARS_PER_TOK = 3.5
 # Exact tokenisation for routing decisions. See _tokenize_exact().
-EXACT_TOKENS      = os.environ.get("SHIM_EXACT_TOKENS", "1") not in ("0", "false", "")
+EXACT_TOKENS      = _env_flag(os.environ.get("SHIM_EXACT_TOKENS", "1"), True)
 MIN_CHARS_PER_TOK = float(os.environ.get("SHIM_MIN_CHARS_PER_TOK", "2.0"))
 TOKENIZE_TIMEOUT  = float(os.environ.get("SHIM_TOKENIZE_TIMEOUT", "5"))
 # Adaptive first-token deadline: base + est_prompt_tokens/prefill_rate. Big-context prefills
@@ -225,7 +259,7 @@ POOL_TOKENS = int(os.environ.get("SHIM_POOL_TOKENS", "754068"))
 # itself stable again: BIG_PROMPT_RESTORE_N consecutive LOCAL completions whose prompt size is
 # "big" relative to the (lowered) floor land cleanly. Master-switched off by default so there
 # is no behaviour change until Kevin opts in.
-CRASH_ADAPTIVE        = os.environ.get("SHIM_CRASH_ADAPTIVE", "0") not in ("0", "false", "")
+CRASH_ADAPTIVE        = _env_flag(os.environ.get("SHIM_CRASH_ADAPTIVE", "0"), False)
 BIG_PROMPT_RESTORE_N  = int(os.environ.get("SHIM_BIG_PROMPT_RESTORE_N", "5"))
 CRASH_ADAPTIVE_FLOOR  = 24000
 # A completion with ptok >= the CURRENT (possibly-floored) BIG_PROMPT never reaches local -- the
@@ -331,8 +365,8 @@ PREFIX_MODEL_MAX_NODES = int(os.environ.get("SHIM_PREFIX_MODEL_MAX_NODES", "6000
 #                          splitting them to remote under monster/prefill pressure.
 #  SHIM_PREFIX_CREDIT_UNIT=N  round the cost model's credit to N tokens instead of whole attention blocks
 #                          (set to the engine's --prefix-match-unit when it runs VLLM_GDN_TAIL_PUBLISH=copy).
-CHAIN_TELEMETRY = os.environ.get("SHIM_CHAIN_TELEMETRY", "0").lower() in ("1", "true", "on", "yes")
-WARM_PRIORITY = os.environ.get("SHIM_WARM_PRIORITY", "0").lower() in ("1", "true", "on", "yes")
+CHAIN_TELEMETRY = _env_flag(os.environ.get("SHIM_CHAIN_TELEMETRY", "0"), False)
+WARM_PRIORITY = _env_flag(os.environ.get("SHIM_WARM_PRIORITY", "0"), False)
 WARM_PRIORITY_MIN_CREDIT = int(os.environ.get("SHIM_WARM_PRIORITY_MIN_CREDIT", "4096"))
 WARM_PRIORITY_MAX_COMPUTED = int(os.environ.get("SHIM_WARM_PRIORITY_MAX_COMPUTED", "1700"))
 WARM_PRIORITY_VALUE = int(os.environ.get("SHIM_WARM_PRIORITY_VALUE", "-10"))
@@ -377,18 +411,18 @@ BG_WAIT     = float(os.environ.get("SHIM_BG_WAIT_SECS", "5"))
 # Legitimate SIZE-based remote routing (size/big-out/big-prompt/monster) is deliberately
 # untouched: those requests can't run local regardless of engine health, remote or not, and
 # interactive traffic's behavior is completely unchanged either way.
-BG_LOCAL_ONLY    = os.environ.get("SHIM_BG_LOCAL_ONLY", "1") not in ("0", "false", "")
+BG_LOCAL_ONLY    = _env_flag(os.environ.get("SHIM_BG_LOCAL_ONLY", "1"), True)
 BG_WAIT_LOCAL    = float(os.environ.get("SHIM_BG_WAIT_LOCAL_SECS", "120"))
 BG_REJECT_RETRY_SECS = int(os.environ.get("SHIM_BG_REJECT_RETRY_SECS", "300"))
 # Background turns don't need chain-of-thought: thinking mode makes a cron status report
 # generate 2-3K reasoning tokens and hold a local lane for minutes. Injecting
 # enable_thinking=false for LOCAL background requests cuts their lane-hold ~10x.
-BG_NO_THINK = os.environ.get("SHIM_BG_NO_THINK", "1") not in ("0", "false", "")
+BG_NO_THINK = _env_flag(os.environ.get("SHIM_BG_NO_THINK", "1"), True)
 # thinking-budget guard: below THINK_OFF_UNDER tokens disable thinking entirely, below
 # THINK_LOW_UNDER downgrade to reasoning_effort=low. Measured starvation point ~1315 tok.
-THINK_GUARD     = os.environ.get("SHIM_THINK_GUARD", "1") not in ("0", "false", "")
-EMPTY_RETRY     = os.environ.get("SHIM_EMPTY_RETRY", "1") not in ("0", "false", "")
-REP_GUARD       = os.environ.get("SHIM_REP_GUARD", "1") not in ("0", "false", "")
+THINK_GUARD     = _env_flag(os.environ.get("SHIM_THINK_GUARD", "1"), True)
+EMPTY_RETRY     = _env_flag(os.environ.get("SHIM_EMPTY_RETRY", "1"), True)
+REP_GUARD       = _env_flag(os.environ.get("SHIM_REP_GUARD", "1"), True)
 REP_MIN_PATTERN = int(os.environ.get("SHIM_REP_MIN_PATTERN", "8"))
 REP_MAX_PATTERN = int(os.environ.get("SHIM_REP_MAX_PATTERN", "64"))
 REP_MIN_COUNT   = int(os.environ.get("SHIM_REP_MIN_COUNT", "6"))
@@ -405,14 +439,14 @@ THINK_LOW_UNDER = int(os.environ.get("SHIM_THINK_LOW_UNDER", "1400"))
 # guidance, so this never touches them. Each param is applied only when the caller did NOT already
 # provide it -- an explicit caller value always wins. Disable with SHIM_NONTHINK_PROFILE=0; tune the
 # individual values via SHIM_NONTHINK_{PP,TOP_P,TEMP,TOP_K}.
-NONTHINK_PROFILE = os.environ.get("SHIM_NONTHINK_PROFILE", "1") not in ("0", "false", "")
+NONTHINK_PROFILE = _env_flag(os.environ.get("SHIM_NONTHINK_PROFILE", "1"), True)
 NONTHINK_PP      = float(os.environ.get("SHIM_NONTHINK_PP", "1.5"))
 NONTHINK_TOP_P   = float(os.environ.get("SHIM_NONTHINK_TOP_P", "0.80"))
 NONTHINK_TEMP    = float(os.environ.get("SHIM_NONTHINK_TEMP", "0.7"))
 NONTHINK_TOP_K   = int(os.environ.get("SHIM_NONTHINK_TOP_K", "20"))
 # MASTER SWITCH: 1 = FULL REMOTE (every completion -> DeepSeek; local engine untouched —
 # for maintenance/repro/debugging), 0 = normal local-first. Toggle live from the dashboard.
-FORCE_REMOTE = 1 if os.environ.get("SHIM_FORCE_REMOTE", "0").lower() in ("1", "true", "on") else 0
+FORCE_REMOTE = 1 if _env_flag(os.environ.get("SHIM_FORCE_REMOTE", "0"), False) else 0
 # A paid full-remote maintenance mode is a lease, not a permanent routing state.
 # An old persisted FORCE_REMOTE=1 without a lease is inert after an upgrade.
 FORCE_REMOTE_LEASE_S = 3600
@@ -430,7 +464,7 @@ def effective_force_remote():
 # Better than unsetting the remote credentials because it is reversible from the dashboard and
 # leaves the remote configured for the moment it is wanted again. It OUTRANKS FORCE_REMOTE: if
 # both are somehow set, local wins, because the mode that cannot spend money is the safe one.
-LOCAL_ONLY = 1 if os.environ.get("SHIM_LOCAL_ONLY", "0").lower() in ("1", "true", "on") else 0
+LOCAL_ONLY = 1 if _env_flag(os.environ.get("SHIM_LOCAL_ONLY", "0"), False) else 0
 # PEAK-AWARE overflow bias (2026-08-13, DeepSeek peak/off-peak pricing eff. Aug 16):
 # during remote-provider PEAK hours (UTC ranges like "1-4,6-10"), BACKGROUND requests
 # wait the full LOCAL_WAIT for a local lane instead of fast-overflowing at BG_WAIT —
@@ -481,10 +515,10 @@ _CFG = {
     "SHIM_LOCAL_CONTEXT_LIMIT": ("LOCAL_CONTEXT_LIMIT", int),
     "SHIM_REMOTE_CONTEXT_LIMIT": ("REMOTE_CONTEXT_LIMIT", int),
     "SHIM_CONTEXT_SAFETY_MARGIN": ("CONTEXT_SAFETY_MARGIN", int),
-    "SHIM_CONTEXT_COMPACTION": ("CONTEXT_COMPACTION_ENABLED", lambda v: str(v).lower() not in ("0", "false", "off")),
+    "SHIM_CONTEXT_COMPACTION": ("CONTEXT_COMPACTION_ENABLED", lambda v: _cfg_flag(v)),
     "SHIM_CONTEXT_COMPACTION_KEEP": ("CONTEXT_COMPACTION_KEEP", int),
-    "SHIM_FORCE_REMOTE":     ("FORCE_REMOTE", lambda v: 1 if str(v).lower() in ("1","true","on") else 0),
-    "SHIM_LOCAL_ONLY":       ("LOCAL_ONLY",   lambda v: 1 if str(v).lower() in ("1","true","on") else 0),
+    "SHIM_FORCE_REMOTE":     ("FORCE_REMOTE", lambda v: 1 if _cfg_flag(v) else 0),
+    "SHIM_LOCAL_ONLY":       ("LOCAL_ONLY",   lambda v: 1 if _cfg_flag(v) else 0),
     # local capacity
     "SHIM_LOCAL_BUDGET":     ("BUDGET",       int),
     "SHIM_LOCAL_WAIT_SECS":  ("LOCAL_WAIT",   float),
@@ -518,24 +552,24 @@ _CFG = {
     "SHIM_BG_XCLIENTS":      ("BG_XCLIENTS", lambda v: [m.lower() for m in _parse_seq(v, _CFG_SEP["SHIM_BG_XCLIENTS"])]),
     "SHIM_POOL_TOKENS":      ("POOL_TOKENS",      int),
     # live capacity model (lane GW, 2026-10-02) -- see the CAPACITY MODEL section
-    "SHIM_CAPACITY_LIVE":    ("CAPACITY_LIVE",    lambda v: str(v).lower() not in ("0", "false", "off", "")),
-    "SHIM_CONTEXT_LIVE":     ("CONTEXT_LIVE",     lambda v: str(v).lower() not in ("0", "false", "off", "")),
+    "SHIM_CAPACITY_LIVE":    ("CAPACITY_LIVE",    lambda v: _cfg_flag(v)),
+    "SHIM_CONTEXT_LIVE":     ("CONTEXT_LIVE",     lambda v: _cfg_flag(v)),
     "SHIM_MODELS_POLL_SECS": ("MODELS_POLL_S",    float),
     "SHIM_TOKEN_BUDGET_FRAC": ("TOKEN_BUDGET_FRAC", float),
     "SHIM_TOKEN_BUDGET_CEIL": ("TOKEN_BUDGET_CEIL", int),
     "SHIM_LOCAL_MODALITIES": ("LOCAL_MODALITIES", lambda v: ",".join(sorted({x.strip().lower() for x in str(v).split(",") if x.strip()})) or "text"),
-    "SHIM_REMOTE_VISION":    ("REMOTE_VISION", lambda v: 1 if str(v).lower() in ("1", "true", "on") else 0),
+    "SHIM_REMOTE_VISION":    ("REMOTE_VISION", lambda v: 1 if _cfg_flag(v) else 0),
     "SHIM_BG_WAIT_SECS":     ("BG_WAIT",          float),
     "SHIM_BG_MARKERS":       ("BG_MARKERS", lambda v: [m for m in str(v).split("|") if m]),
-    "SHIM_BG_LOCAL_ONLY":    ("BG_LOCAL_ONLY", lambda v: str(v).lower() not in ("0","false","")),
+    "SHIM_BG_LOCAL_ONLY":    ("BG_LOCAL_ONLY", lambda v: _cfg_flag(v)),
     "SHIM_BG_WAIT_LOCAL_SECS": ("BG_WAIT_LOCAL", float),
     "SHIM_BG_REJECT_RETRY_SECS": ("BG_REJECT_RETRY_SECS", int),
     "SHIM_PEAK_HOURS_UTC":   ("PEAK_HOURS",       str),
     # behaviour toggles
-    "SHIM_BG_NO_THINK":      ("BG_NO_THINK",  lambda v: str(v).lower() not in ("0","false","")),
-    "SHIM_THINK_GUARD":      ("THINK_GUARD",  lambda v: str(v).lower() not in ("0","false","")),
-    "SHIM_EMPTY_RETRY":      ("EMPTY_RETRY",  lambda v: str(v).lower() not in ("0","false","")),
-    "SHIM_REP_GUARD":        ("REP_GUARD",    lambda v: str(v).lower() not in ("0","false","")),
+    "SHIM_BG_NO_THINK":      ("BG_NO_THINK",  lambda v: _cfg_flag(v)),
+    "SHIM_THINK_GUARD":      ("THINK_GUARD",  lambda v: _cfg_flag(v)),
+    "SHIM_EMPTY_RETRY":      ("EMPTY_RETRY",  lambda v: _cfg_flag(v)),
+    "SHIM_REP_GUARD":        ("REP_GUARD",    lambda v: _cfg_flag(v)),
     "SHIM_REP_MIN_PATTERN":  ("REP_MIN_PATTERN", int),
     "SHIM_REP_MAX_PATTERN":  ("REP_MAX_PATTERN", int),
     "SHIM_REP_MIN_COUNT":    ("REP_MIN_COUNT", int),
@@ -545,16 +579,16 @@ _CFG = {
     "SHIM_THINK_OFF_UNDER":  ("THINK_OFF_UNDER", int),
     "SHIM_THINK_LOW_UNDER":  ("THINK_LOW_UNDER", int),
     "SHIM_NO_THINK_IPS":     ("NO_THINK_IPS", lambda v: set(_parse_seq(v, _CFG_SEP["SHIM_NO_THINK_IPS"]))),
-    "SHIM_LOG_REQUESTS":     ("LOG_REQUESTS", lambda v: str(v).lower() not in ("0","false","")),
+    "SHIM_LOG_REQUESTS":     ("LOG_REQUESTS", lambda v: _cfg_flag(v)),
     # non-thinking sampling profile (EXP-026)
-    "SHIM_NONTHINK_PROFILE": ("NONTHINK_PROFILE", lambda v: str(v).lower() not in ("0","false","")),
+    "SHIM_NONTHINK_PROFILE": ("NONTHINK_PROFILE", lambda v: _cfg_flag(v)),
     "SHIM_NONTHINK_PP":      ("NONTHINK_PP",    float),
     "SHIM_NONTHINK_TOP_P":   ("NONTHINK_TOP_P", float),
     "SHIM_NONTHINK_TEMP":    ("NONTHINK_TEMP",  float),
     "SHIM_NONTHINK_TOP_K":   ("NONTHINK_TOP_K", int),
     "SHIM_PREDICTED_OCCUPANCY_SECS": ("PREDICTED_OCCUPANCY_SECS", float),
     "SHIM_DECODE_TPS_FLOOR": ("DECODE_TPS_FLOOR", float),
-    "SHIM_PERF_BREAKER_ENABLED": ("PERF_BREAKER_ENABLED", lambda v: str(v).lower() not in ("0", "false", "")),
+    "SHIM_PERF_BREAKER_ENABLED": ("PERF_BREAKER_ENABLED", lambda v: _cfg_flag(v)),
     "SHIM_PERF_BREAKER_TTFT_P95_SECS": ("PERF_BREAKER_TTFT_P95_SECS", float),
     "SHIM_PERF_BREAKER_GPU_UTIL_PCT": ("PERF_BREAKER_GPU_UTIL_PCT", float),
     "SHIM_PERF_BREAKER_KV_PCT": ("PERF_BREAKER_KV_PCT", float),
@@ -562,8 +596,8 @@ _CFG = {
     "SHIM_PERF_BREAKER_HOLD_SECS": ("PERF_BREAKER_HOLD_SECS", float),
     "SHIM_STREAM_IDLE_TIMEOUT_SECS": ("STREAM_IDLE_TIMEOUT_SECS", float),
     # [GW2 / L100] Lane CR knobs, hot-reloadable so the warm-priority A/B can alternate arms without restarts
-    "SHIM_CHAIN_TELEMETRY": ("CHAIN_TELEMETRY", lambda v: str(v).lower() in ("1", "true", "on", "yes")),
-    "SHIM_WARM_PRIORITY": ("WARM_PRIORITY", lambda v: str(v).lower() in ("1", "true", "on", "yes")),
+    "SHIM_CHAIN_TELEMETRY": ("CHAIN_TELEMETRY", lambda v: _cfg_flag(v)),
+    "SHIM_WARM_PRIORITY": ("WARM_PRIORITY", lambda v: _cfg_flag(v)),
     "SHIM_WARM_PRIORITY_MIN_CREDIT": ("WARM_PRIORITY_MIN_CREDIT", int),
     "SHIM_WARM_PRIORITY_MAX_COMPUTED": ("WARM_PRIORITY_MAX_COMPUTED", int),
     "SHIM_REASONING_WATCHDOG": ("REASONING_WATCHDOG", lambda v: str(v).strip().lower()),
@@ -575,15 +609,15 @@ _CFG = {
     "SHIM_CREDIT_PROBE_TIMEOUT_S": ("CREDIT_PROBE_TIMEOUT_S", float),
     "SHIM_CREDIT_PROBE_MIN_TOKENS": ("CREDIT_PROBE_MIN_TOKENS", int),
     # LOCAL-FIRST (L1, 2026-09-25) -- see the block after STREAM_IDLE_TIMEOUT_SECS below.
-    "SHIM_LOCAL_FIRST":      ("LOCAL_FIRST", lambda v: str(v).lower() not in ("0", "false", "off", "")),
+    "SHIM_LOCAL_FIRST":      ("LOCAL_FIRST", lambda v: _cfg_flag(v)),
     "SHIM_LOCAL_FIRST_REASONS": ("LOCAL_FIRST_REASONS", lambda v: _parse_reason_set(v)),
     "SHIM_LOCAL_FIRST_QUEUE_WAIT_SECS": ("LOCAL_FIRST_QUEUE_WAIT_SECS", float),
     "SHIM_LOCAL_FIRST_WAIT_WINDOW_SECS": ("LOCAL_FIRST_WAIT_WINDOW_SECS", float),
     "SHIM_LOCAL_FIRST_FIRST_TOKEN_MAX": ("LOCAL_FIRST_FIRST_TOKEN_MAX", float),
     "SHIM_LOCAL_FIRST_INTERACTIVE_TTFT_SECS": ("LOCAL_FIRST_INTERACTIVE_TTFT_SECS", float),
     # LF (10-03): deadline-derived local-first + expected-output big-out rule (see the LF block below).
-    "SHIM_LOCAL_FIRST_DERIVE": ("LOCAL_FIRST_DERIVE", lambda v: str(v).lower() not in ("0", "false", "off", "")),
-    "SHIM_EXPECTED_OUTPUT":  ("EXPECTED_OUTPUT", lambda v: str(v).lower() not in ("0", "false", "off", "")),
+    "SHIM_LOCAL_FIRST_DERIVE": ("LOCAL_FIRST_DERIVE", lambda v: _cfg_flag(v)),
+    "SHIM_EXPECTED_OUTPUT":  ("EXPECTED_OUTPUT", lambda v: _cfg_flag(v)),
     "SHIM_EXPECTED_OUTPUT_QUANTILE": ("EXPECTED_OUTPUT_QUANTILE", float),
     "SHIM_EXPECTED_OUTPUT_MIN_SAMPLES": ("EXPECTED_OUTPUT_MIN_SAMPLES", int),
 }
@@ -602,11 +636,11 @@ TOKEN_BUDGET     = _parse_budget(os.environ.get("SHIM_TOKEN_BUDGET"))
 # CAPACITY MODEL (lane GW, 2026-10-02). The gateway's capacity numbers are FACTS OF THE RUNNING ENGINE, so they are read
 # from it (see the "CAPACITY MODEL" section: pool_info / token_budget_info / prefill_info) and the configured values
 # below are only fallbacks / optional overrides. SHIM_CAPACITY_LIVE=0 restores configured-only behaviour (kill switch).
-CAPACITY_LIVE = os.environ.get("SHIM_CAPACITY_LIVE", "1").lower() not in ("0", "false", "off", "")
+CAPACITY_LIVE = _env_flag(os.environ.get("SHIM_CAPACITY_LIVE", "1"), True)
 # The context window the gateway admits against (SHIM_LOCAL_CONTEXT_LIMIT, SHIM_MAX_LOCAL_TOKENS) is the engine's own
 # max_model_len, read from its /v1/models every MODELS_POLL_S (and at once after an engine restart); the configured values are
 # only the fallback until the engine has answered. SHIM_CONTEXT_LIVE=0 (or SHIM_CAPACITY_LIVE=0) = configured-only (kill switch).
-CONTEXT_LIVE = os.environ.get("SHIM_CONTEXT_LIVE", "1").lower() not in ("0", "false", "off", "")
+CONTEXT_LIVE = _env_flag(os.environ.get("SHIM_CONTEXT_LIVE", "1"), True)
 MODELS_POLL_S = float(os.environ.get("SHIM_MODELS_POLL_SECS", "30"))
 # The token budget as a fraction of the KV pool. CALIBRATION (the only hand-set capacity datum, with its provenance):
 # 500,000 reserved tokens was set 2026-08-12 from the breaking-point bench (4 x 170K = 680K held with 611 MB VRAM margin at
@@ -626,7 +660,7 @@ TOKEN_BUDGET_CEIL = int(os.environ.get("SHIM_TOKEN_BUDGET_CEIL", "680000"))
 # so the default is 0). A media request the local engine cannot take goes to the remote provider when it can take it and
 # the hard daily cap has room, otherwise it gets one clear 400 -- never the engine's bare error.
 LOCAL_MODALITIES = ",".join(sorted({x.strip().lower() for x in os.environ.get("SHIM_LOCAL_MODALITIES", "text").split(",") if x.strip()})) or "text"
-REMOTE_VISION = 1 if os.environ.get("SHIM_REMOTE_VISION", "0").lower() in ("1", "true", "on") else 0
+REMOTE_VISION = 1 if _env_flag(os.environ.get("SHIM_REMOTE_VISION", "0"), False) else 0
 _MEDIA_PART_TYPES = {"image_url": "image", "input_image": "image", "image": "image", "video_url": "video", "input_video": "video",
                      "video": "video", "input_audio": "audio", "audio_url": "audio", "audio": "audio"}
 DEFAULT_MAX_OUT  = int(os.environ.get("SHIM_DEFAULT_MAX_OUT", "8192"))
@@ -646,7 +680,7 @@ TINY_EXTRA_LANES  = int(os.environ.get("SHIM_TINY_EXTRA_LANES", "2"))
 # MICRO_LEARN lets the gateway LEARN that a (client, prompt-head) signature is short-output and admit it to the tiny
 # lane. Unlike static-tiny, a learned-tiny request that finds the tiny lanes full WAITS locally (never overflows to
 # paid remote). Kill switch: SHIM_MICRO_LEARN=0.
-MICRO_LEARN       = os.environ.get("SHIM_MICRO_LEARN", "1") not in ("0", "false", "")
+MICRO_LEARN       = _env_flag(os.environ.get("SHIM_MICRO_LEARN", "1"), True)
 MICRO_SIG_CHARS   = int(os.environ.get("SHIM_MICRO_SIG_CHARS", "32"))      # normalized prompt-head chars in a signature
 MICRO_MIN_SAMPLES = int(os.environ.get("SHIM_MICRO_MIN_SAMPLES", "6"))     # completions seen before a signature qualifies
 MICRO_HISTORY     = int(os.environ.get("SHIM_MICRO_HISTORY", "16"))        # most recent completions kept per signature
@@ -658,7 +692,7 @@ MICRO_MAX_SIGS    = 2000
 # 391 of 1558 probes in that week were billed to the paid remote. When the engine has produced real tokens within
 # PROBE_FRESH_S, the gateway answers the probe itself; every PROBE_REAL_EVERY-th probe still goes through for real
 # so end-to-end generation stays proven. Only local-capable aliases (never estate-remote). Kill: SHIM_PROBE_SYNTH=0.
-PROBE_SYNTH       = os.environ.get("SHIM_PROBE_SYNTH", "1") not in ("0", "false", "")
+PROBE_SYNTH       = _env_flag(os.environ.get("SHIM_PROBE_SYNTH", "1"), True)
 PROBE_FRESH_S     = float(os.environ.get("SHIM_PROBE_FRESH_S", "120"))
 PROBE_REAL_EVERY  = int(os.environ.get("SHIM_PROBE_REAL_EVERY", "12"))
 # --- concurrency-aware first-token deadline (2026-08-13) ---
@@ -672,18 +706,18 @@ FT_CONCURRENCY_SCALE = int(os.environ.get("SHIM_FT_CONCURRENCY_SCALE", "1"))
 # Log source (ip/UA), model, size and a short prompt preview for each completion, to attribute
 # traffic (which client fires the tiny bursts / the slow big prefills). Set SHIM_LOG_REQUESTS=0
 # to disable (e.g. for prompt privacy).
-LOG_REQUESTS      = os.environ.get("SHIM_LOG_REQUESTS", "1") not in ("0", "false", "")
+LOG_REQUESTS      = _env_flag(os.environ.get("SHIM_LOG_REQUESTS", "1"), True)
 LOG_PREVIEW_CHARS = int(os.environ.get("SHIM_LOG_PREVIEW_CHARS", "70"))
 # vLLM-only params that a remote OpenAI endpoint would reject — stripped on overflow.
 REMOTE_STRIP = ("chat_template_kwargs", "mamba_cache_mode", "guided_decoding_backend")
 # Force non-thinking on the DeepSeek failover (see remap_for_remote). Disable with SHIM_REMOTE_NO_THINK=0.
-REMOTE_NO_THINK = os.environ.get("SHIM_REMOTE_NO_THINK", "1") not in ("0", "false", "")
+REMOTE_NO_THINK = _env_flag(os.environ.get("SHIM_REMOTE_NO_THINK", "1"), True)
 
 # Congestion controls.  These guards run inside the gateway before local admission.  Callers
 # never select a provider; they may only express an optional route intent.
 PREDICTED_OCCUPANCY_SECS = float(os.environ.get("SHIM_PREDICTED_OCCUPANCY_SECS", "180"))
 DECODE_TPS_FLOOR = float(os.environ.get("SHIM_DECODE_TPS_FLOOR", "20"))
-PERF_BREAKER_ENABLED = os.environ.get("SHIM_PERF_BREAKER_ENABLED", "1") not in ("0", "false", "")
+PERF_BREAKER_ENABLED = _env_flag(os.environ.get("SHIM_PERF_BREAKER_ENABLED", "1"), True)
 PERF_BREAKER_TTFT_P95_SECS = float(os.environ.get("SHIM_PERF_BREAKER_TTFT_P95_SECS", "20"))
 PERF_BREAKER_GPU_UTIL_PCT = float(os.environ.get("SHIM_PERF_BREAKER_GPU_UTIL_PCT", "95"))
 PERF_BREAKER_KV_PCT = float(os.environ.get("SHIM_PERF_BREAKER_KV_PCT", "85"))
@@ -756,7 +790,7 @@ def _parse_reason_set(v):
     return frozenset(x.strip(_REPR_JUNK) for x in parts if x.strip(_REPR_JUNK))
 
 
-LOCAL_FIRST = os.environ.get("SHIM_LOCAL_FIRST", "1").lower() not in ("0", "false", "off", "")
+LOCAL_FIRST = _env_flag(os.environ.get("SHIM_LOCAL_FIRST", "1"), True)
 LOCAL_FIRST_REASONS = _parse_reason_set(os.environ.get(
     "SHIM_LOCAL_FIRST_REASONS", "big-prompt,perf,predicted,big-out,monster"))
 LOCAL_FIRST_QUEUE_WAIT_SECS = float(os.environ.get("SHIM_LOCAL_FIRST_QUEUE_WAIT_SECS", "5"))
@@ -787,10 +821,10 @@ LOCAL_FIRST_INTERACTIVE_TTFT_SECS = float(os.environ.get("SHIM_LOCAL_FIRST_INTER
 # LOCAL_FIRST_FIRST_TOKEN_MAX, the first-token wait the local relay will actually grant. The flat
 # QUEUE_WAIT_SECS / HEAVY_* / MONSTER_PREFILL_SECS values remain the configured FALLBACK (derive off, or no measured
 # prefill rate yet). ROLLBACK: SHIM_LOCAL_FIRST_DERIVE=0 and SHIM_EXPECTED_OUTPUT=0 restore the previous rules.
-LOCAL_FIRST_DERIVE = os.environ.get("SHIM_LOCAL_FIRST_DERIVE", "1").lower() not in ("0", "false", "off", "")
+LOCAL_FIRST_DERIVE = _env_flag(os.environ.get("SHIM_LOCAL_FIRST_DERIVE", "1"), True)
 # big-out is decided on the output a caller ACTUALLY produces (this quantile of its recent completions) once there
 # are enough samples; the requested max_tokens stays the hard upper bound and the fallback.
-EXPECTED_OUTPUT = os.environ.get("SHIM_EXPECTED_OUTPUT", "1").lower() not in ("0", "false", "off", "")
+EXPECTED_OUTPUT = _env_flag(os.environ.get("SHIM_EXPECTED_OUTPUT", "1"), True)
 EXPECTED_OUTPUT_QUANTILE = float(os.environ.get("SHIM_EXPECTED_OUTPUT_QUANTILE", "0.95"))
 EXPECTED_OUTPUT_MIN_SAMPLES = int(os.environ.get("SHIM_EXPECTED_OUTPUT_MIN_SAMPLES", "20"))
 EXPECTED_OUTPUT_HISTORY = int(os.environ.get("SHIM_EXPECTED_OUTPUT_HISTORY", "200"))
@@ -2903,7 +2937,7 @@ def _claim_spend_authority(path=SPEND_FILE):
 SPEND_CLIENTS_FILE = os.environ.get("SHIM_SPEND_CLIENTS_FILE",
                                     "/home/kevin/.local/share/vllm-qwen27b/spend-clients.json")
 SPEND_CAP_USD = float(os.environ.get("SHIM_SPEND_CAP_USD", "25.0"))
-SPEND_ENFORCE = os.environ.get("SHIM_SPEND_ENFORCE", "1").lower() not in ("0", "false", "off", "")
+SPEND_ENFORCE = _env_flag(os.environ.get("SHIM_SPEND_ENFORCE", "1"), True)
 SPEND_TZ = os.environ.get("SHIM_SPEND_TZ", "America/Phoenix")   # the estate host's day (SpendGuard's)
 SPEND_RESERVATION_TTL_MAX = int(os.environ.get("SHIM_SPEND_RESERVATION_TTL_MAX", str(4 * 3600)))
 SPEND_REQUEST_HOLD_TTL = int(os.environ.get("SHIM_SPEND_REQUEST_HOLD_TTL", "1800"))
@@ -2918,7 +2952,7 @@ SPEND_KEEP_SECS = 2 * 86400          # finalized/expired reservations kept for i
 _SPEND_RID = re.compile(r"^[0-9a-f]{32}$")
 _CFG.update({
     "SHIM_SPEND_CAP_USD": ("SPEND_CAP_USD", float),
-    "SHIM_SPEND_ENFORCE": ("SPEND_ENFORCE", lambda v: str(v).lower() not in ("0", "false", "off", "")),
+    "SHIM_SPEND_ENFORCE": ("SPEND_ENFORCE", lambda v: _cfg_flag(v)),
 })
 try:
     with open(os.path.abspath(__file__), "rb") as _fh:
@@ -5747,7 +5781,7 @@ def flow_note_route(decision, reason, request):
 # Lane DB2: the routing ring is in memory, so every restart emptied the "24 h" window (live: 6,439 of the 17,568 requests
 # the on-disk log held). At startup the last 24 h are rebuilt from the request log. A restored row cannot know whether
 # local had headroom at the time, so its headroom flag is None (never counted as a defect) and it is reported as `restored`.
-FLOW_RESTORE = os.environ.get("SHIM_FLOW_RESTORE", "1").lower() not in ("0", "false", "off")
+FLOW_RESTORE = _env_flag(os.environ.get("SHIM_FLOW_RESTORE", "1"), True)
 _FLOW_RESTORED = {"from": None, "n": 0}
 
 

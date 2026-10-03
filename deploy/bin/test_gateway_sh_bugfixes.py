@@ -218,3 +218,52 @@ class TelemetryLogCountsAreTruthful(_Fresh):
                 pass
         G.asyncio.run(run())
         self.assertEqual(self.m._JSONL_STATE["dropped_err"], 3)
+
+
+class OneBooleanVocabulary(unittest.TestCase):
+    """Class: inconsistent bool parsing (four spellings across 26 readers + 20 dashboard casts)."""
+
+    FLAGS = {  # global -> (env key, code default)
+        "BG_LOCAL_ONLY": ("SHIM_BG_LOCAL_ONLY", True), "THINK_GUARD": ("SHIM_THINK_GUARD", True),
+        "EMPTY_RETRY": ("SHIM_EMPTY_RETRY", True), "LOG_REQUESTS": ("SHIM_LOG_REQUESTS", True),
+        "LOCAL_FIRST": ("SHIM_LOCAL_FIRST", True), "CONTEXT_COMPACTION_ENABLED": ("SHIM_CONTEXT_COMPACTION", True),
+        "FLOW_RESTORE": ("SHIM_FLOW_RESTORE", True), "CHAIN_TELEMETRY": ("SHIM_CHAIN_TELEMETRY", False),
+        "FORCE_REMOTE": ("SHIM_FORCE_REMOTE", False), "LOCAL_ONLY": ("SHIM_LOCAL_ONLY", False),
+        "REMOTE_VISION": ("SHIM_REMOTE_VISION", False), "CRASH_ADAPTIVE": ("SHIM_CRASH_ADAPTIVE", False),
+    }
+
+    def _import_with(self, value, schema=True):
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="gw-sh-flag-") as td:
+            return G._fresh_shim(td, 0, extra_env={k: value for k, _ in self.FLAGS.values()})
+
+    def test_every_spelling_means_the_same_everywhere(self):
+        for value, want in (("off", False), ("no", False), ("False", False), (" FALSE ", False), ("0", False),
+                            ("on", True), ("yes", True), ("True", True), ("1", True)):
+            m = self._import_with(value)
+            for g, (k, _d) in self.FLAGS.items():
+                with self.subTest(value=value, flag=g):
+                    self.assertEqual(bool(getattr(m, g)), want)
+
+    def test_empty_or_junk_means_the_code_default(self):
+        for value in ("", "maybe", "2"):
+            m = self._import_with(value)
+            for g, (k, d) in self.FLAGS.items():
+                with self.subTest(value=value, flag=g):
+                    self.assertEqual(bool(getattr(m, g)), d)
+
+    def test_dashboard_cast_matches_and_refuses_junk(self):
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="gw-sh-flag-") as td:
+            m = G._fresh_shim(td, 0)
+            m._persist_config = lambda: None
+            self.assertEqual(m.apply_config({"bg_local_only": "off"}), ["bg_local_only"])
+            self.assertIs(m.BG_LOCAL_ONLY, False)                 # was True: "off" not in ("0","false","")
+            self.assertEqual(m.apply_config({"chain_telemetry": "yes"}), ["chain_telemetry"])
+            self.assertIs(m.CHAIN_TELEMETRY, True)
+            self.assertEqual(m.apply_config({"local_only": True}), ["local_only"])
+            self.assertEqual(m.LOCAL_ONLY, 1)
+            self.assertEqual(m.apply_config({"local_only": 0}), ["local_only"])
+            self.assertEqual(m.LOCAL_ONLY, 0)
+            self.assertEqual(m.apply_config({"bg_local_only": "maybe"}), [])   # refused, value unchanged
+            self.assertIs(m.BG_LOCAL_ONLY, False)
