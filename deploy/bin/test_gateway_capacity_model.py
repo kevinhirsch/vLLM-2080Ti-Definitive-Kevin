@@ -40,13 +40,14 @@ def fam(info=LIVE_INFO, start=1791008353.28):
 class Base(unittest.TestCase):
     def setUp(self):
         self._p = []
-        for name, val in dict(CAPACITY_LIVE=True, TOKEN_BUDGET=None, POOL_TOKENS=637560, PREFILL_TPS=1100.0,
+        for name, val in dict(CAPACITY_LIVE=True, CONTEXT_LIVE=True, LOCAL_CONTEXT_LIMIT=524288, MAX_LOCAL_TOKENS=524288, TOKEN_BUDGET=None, POOL_TOKENS=637560, PREFILL_TPS=1100.0,
                               PREFIX_ALIGN_TOKENS=3568, TOKEN_BUDGET_CEIL=680000).items():
             p = patch.object(shim, name, val)
             p.start()
             self._p.append(p)
         self._st = patch.dict(shim._CAPLIVE, {"pool": None, "pool_at": 0.0, "pool_src": None, "block": None, "gen_start": None,
-                                              "gen_src": None, "scrapes": 0, "measure": None})
+                                              "gen_src": None, "scrapes": 0, "measure": None,
+                                              "ctx": None, "ctx_at": 0.0, "ctx_poll_at": 0.0, "ctx_err": None, "ctx_models": None})
         self._st.start()
         shim._CAPLIVE["events"].clear()
         self._eng = patch.dict(shim._ENGINE_METRICS, {"ok": True})
@@ -281,6 +282,147 @@ class GenerationAndFacts(Base):
         shim.capacity_note_scrape({"vllm:cache_config_info": [({"kv_cache_size_tokens": "x"}, 1.0)]}, 1.0)
         shim.capacity_note_scrape({}, 2.0)
         self.assertEqual(shim.pool_info()["source"], "configured")
+
+
+def models(*lens, extra=None):
+    data = [{"id": "m%d" % i, "object": "model", "max_model_len": n} for i, n in enumerate(lens)]
+    return {"object": "list", "data": data + (extra or [])}
+
+
+class ContextWindowFromEngine(Base):
+    """Lane FX: SHIM_LOCAL_CONTEXT_LIMIT / SHIM_MAX_LOCAL_TOKENS follow the engine's live /v1/models max_model_len."""
+    def test_never_answered_uses_configured(self):
+        self.assertEqual(shim.local_context_limit(), 524288)
+        i = shim.context_window_info(shim.LOCAL_CONTEXT_LIMIT)
+        self.assertEqual((i["source"], i["tokens"]), ("configured", 524288))
+        self.assertEqual(i["detail"], "engine has not answered yet")
+
+    def test_live_value_replaces_both_knobs(self):
+        shim.capacity_note_models(models(262144, 262144), time.time())
+        self.assertEqual((shim.local_context_limit(), shim.max_local_tokens()), (262144, 262144))
+        i = shim.context_window_info(shim.MAX_LOCAL_TOKENS)
+        self.assertEqual((i["source"], i["configured"], i["live"], i["configured_stale"]), ("live", 524288, 262144, True))
+
+    def test_live_matching_config_is_not_stale(self):
+        shim.capacity_note_models(models(524288), time.time())
+        self.assertFalse(shim.context_window_info(shim.LOCAL_CONTEXT_LIMIT)["configured_stale"])
+        self.assertEqual([w for w in shim.capacity_model_facts()["warnings"] if "max_model_len" in w], [])
+
+    def test_smallest_served_window_wins_and_garbage_entries_are_skipped(self):
+        shim.capacity_note_models(models(524288, 131072, "x", 0, None, 12, extra=[{"id": "no-len"}]), time.time())
+        self.assertEqual(shim.local_context_limit(), 131072)
+
+    def test_garbage_payloads_keep_the_last_value_and_report(self):
+        shim.capacity_note_models(models(300000), time.time())
+        for bad in (None, [], {"data": []}, {"data": [{"id": "a", "max_model_len": "n/a"}]}, "x"):
+            shim.capacity_note_models(bad, time.time())
+        self.assertEqual(shim.local_context_limit(), 300000)
+        shim.capacity_note_models({"data": []}, time.time())
+        self.assertIn("usable max_model_len", shim._CAPLIVE["ctx_err"])
+
+    def test_unreachable_after_seen_keeps_last_known_live(self):
+        shim.capacity_note_models(models(300000), time.time() - 1000)       # answered long ago, silent since
+        i = shim.context_window_info(shim.LOCAL_CONTEXT_LIMIT)
+        self.assertEqual((i["source"], i["tokens"]), ("live-last-known", 300000))
+
+    def test_kill_switches_restore_configured(self):
+        shim.capacity_note_models(models(300000), time.time())
+        for name in ("CONTEXT_LIVE", "CAPACITY_LIVE"):
+            with patch.object(shim, name, False):
+                self.assertEqual((shim.local_context_limit(), shim.max_local_tokens()), (524288, 524288))
+                self.assertEqual(shim.context_window_info(shim.LOCAL_CONTEXT_LIMIT)["source"], "configured")
+
+    def test_a_disabled_guard_is_never_replaced(self):
+        shim.capacity_note_models(models(300000), time.time())
+        with patch.object(shim, "MAX_LOCAL_TOKENS", 0):
+            self.assertEqual(shim.max_local_tokens(), 0)
+
+    def test_restart_with_another_window_is_followed_and_forces_a_reread(self):
+        shim.capacity_note_models(models(524288), time.time())
+        shim._CAPLIVE["ctx_poll_at"] = 1000.0
+        shim._capacity_engine_changed(1100.0, "engine restarted")
+        self.assertEqual(shim._CAPLIVE["ctx_poll_at"], 0.0)
+        shim.capacity_note_models(models(200000), 1101.0)
+        self.assertEqual(shim.local_context_limit(), 200000)
+        self.assertTrue(any("context window 524288 -> 200000" in e["event"] for e in shim._CAPLIVE["events"]))
+
+    def test_admission_math_follows_the_live_window(self):
+        body = json.dumps({"messages": [{"role": "user", "content": "x" * 4000}], "max_tokens": 1000}).encode()
+        self.assertFalse(shim.over_local_cap(body))
+        shim.capacity_note_models(models(2048), time.time())         # shrunken engine window: the same request no longer fits
+        self.assertTrue(shim.over_local_cap(body))
+        with patch.object(shim, "LOCAL_MAX_OUT", 0):             # no output clamp: the reservation fills the live window
+            self.assertEqual(shim.local_reservation_estimate(500, 0), 2048)
+
+    def test_facts_carry_the_context_window(self):
+        shim.capacity_note_models(models(262144), time.time())
+        f = shim.flow_capacity_facts()["capacity_model"]["context_window"]
+        json.dumps(f)
+        self.assertEqual(f["local_context_limit"]["effective"], 262144)
+        self.assertEqual(f["max_local_tokens"]["source"], "live")
+        self.assertEqual(f["kill_switch"], "SHIM_CONTEXT_LIVE=0")
+        self.assertTrue(any("SHIM_LOCAL_CONTEXT_LIMIT=524288 differs" in w for w in shim.capacity_model_facts()["warnings"]))
+
+    def test_config_parser_knows_the_new_knobs(self):
+        self.assertIn("SHIM_CONTEXT_LIVE", shim._CFG)
+        self.assertIn("SHIM_MODELS_POLL_SECS", shim._CFG)
+        self.assertIs(shim._CFG["SHIM_CONTEXT_LIVE"][1]("0"), False)
+
+
+class ModelsPoll(unittest.IsolatedAsyncioTestCase):
+    """The poller itself, against a real local HTTP server standing in for the engine."""
+    async def asyncSetUp(self):
+        from aiohttp import web
+        self.payload, self.status, self.hits = models(262144), 200, 0
+
+        async def h(request):
+            self.hits += 1
+            return web.json_response(self.payload, status=self.status)
+        app = web.Application()
+        app.router.add_get("/v1/models", h)
+        self.runner = web.AppRunner(app)
+        await self.runner.setup()
+        site = web.TCPSite(self.runner, "127.0.0.1", 0)
+        await site.start()
+        port = self.runner.addresses[0][1]
+        self._p = [patch.object(shim, "_MODELS_URL", "http://127.0.0.1:%d/v1/models" % port),
+                   patch.object(shim, "CAPACITY_LIVE", True), patch.object(shim, "CONTEXT_LIVE", True),
+                   patch.object(shim, "MODELS_POLL_S", 30.0),
+                   patch.dict(shim._CAPLIVE, {"ctx": None, "ctx_at": 0.0, "ctx_poll_at": 0.0, "ctx_err": None, "ctx_models": None})]
+        for p in self._p:
+            p.start()
+
+    async def asyncTearDown(self):
+        for p in self._p:
+            p.stop()
+        await self.runner.cleanup()
+
+    async def test_polls_reads_and_is_rate_limited(self):
+        await shim._poll_engine_models(1000.0)
+        self.assertEqual((shim._CAPLIVE["ctx"], self.hits), (262144, 1))
+        self.payload = models(100000)
+        await shim._poll_engine_models(1010.0)            # inside MODELS_POLL_S: no request
+        self.assertEqual((shim._CAPLIVE["ctx"], self.hits), (262144, 1))
+        await shim._poll_engine_models(1031.0)
+        self.assertEqual((shim._CAPLIVE["ctx"], self.hits), (100000, 2))
+
+    async def test_http_error_keeps_last_value_and_reports(self):
+        await shim._poll_engine_models(1000.0)
+        self.status = 503
+        await shim._poll_engine_models(1100.0)
+        self.assertEqual(shim._CAPLIVE["ctx"], 262144)
+        self.assertIn("503", shim._CAPLIVE["ctx_err"])
+
+    async def test_kill_switch_never_calls_the_engine(self):
+        with patch.object(shim, "CONTEXT_LIVE", False):
+            await shim._poll_engine_models(1000.0)
+        self.assertEqual((self.hits, shim._CAPLIVE["ctx"]), (0, None))
+
+    async def test_engine_down_does_not_raise(self):
+        with patch.object(shim, "_MODELS_URL", "http://127.0.0.1:1/v1/models"):
+            await shim._poll_engine_models(1000.0)
+        self.assertIsNone(shim._CAPLIVE["ctx"])
+        self.assertTrue(shim._CAPLIVE["ctx_err"])
 
 
 if __name__ == "__main__":

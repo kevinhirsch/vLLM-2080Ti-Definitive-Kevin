@@ -473,6 +473,8 @@ _CFG = {
     "SHIM_POOL_TOKENS":      ("POOL_TOKENS",      int),
     # live capacity model (lane GW, 2026-10-02) -- see the CAPACITY MODEL section
     "SHIM_CAPACITY_LIVE":    ("CAPACITY_LIVE",    lambda v: str(v).lower() not in ("0", "false", "off", "")),
+    "SHIM_CONTEXT_LIVE":     ("CONTEXT_LIVE",     lambda v: str(v).lower() not in ("0", "false", "off", "")),
+    "SHIM_MODELS_POLL_SECS": ("MODELS_POLL_S",    float),
     "SHIM_TOKEN_BUDGET_FRAC": ("TOKEN_BUDGET_FRAC", float),
     "SHIM_TOKEN_BUDGET_CEIL": ("TOKEN_BUDGET_CEIL", int),
     "SHIM_LOCAL_MODALITIES": ("LOCAL_MODALITIES", lambda v: ",".join(sorted({x.strip().lower() for x in str(v).split(",") if x.strip()})) or "text"),
@@ -537,6 +539,11 @@ TOKEN_BUDGET     = _parse_budget(os.environ.get("SHIM_TOKEN_BUDGET"))
 # from it (see the "CAPACITY MODEL" section: pool_info / token_budget_info / prefill_info) and the configured values
 # below are only fallbacks / optional overrides. SHIM_CAPACITY_LIVE=0 restores configured-only behaviour (kill switch).
 CAPACITY_LIVE = os.environ.get("SHIM_CAPACITY_LIVE", "1").lower() not in ("0", "false", "off", "")
+# The context window the gateway admits against (SHIM_LOCAL_CONTEXT_LIMIT, SHIM_MAX_LOCAL_TOKENS) is the engine's own
+# max_model_len, read from its /v1/models every MODELS_POLL_S (and at once after an engine restart); the configured values are
+# only the fallback until the engine has answered. SHIM_CONTEXT_LIVE=0 (or SHIM_CAPACITY_LIVE=0) = configured-only (kill switch).
+CONTEXT_LIVE = os.environ.get("SHIM_CONTEXT_LIVE", "1").lower() not in ("0", "false", "off", "")
+MODELS_POLL_S = float(os.environ.get("SHIM_MODELS_POLL_SECS", "30"))
 # The token budget as a fraction of the KV pool. CALIBRATION (the only hand-set capacity datum, with its provenance):
 # 500,000 reserved tokens was set 2026-08-12 from the breaking-point bench (4 x 170K = 680K held with 611 MB VRAM margin at
 # util 0.82) and has run in production ever since, on the 637,560-token pool and (since the 2026-09-05 R4 promotion) the
@@ -1010,6 +1017,7 @@ REMOTE_COST_OUT_PER_MTOK_PEAK = float(os.environ.get("SHIM_REMOTE_COST_OUT_PER_M
 # /v1 -- same normalisation the existing FOREIGN_LOAD_GUARD probe in local_healthy() uses below,
 # duplicated here rather than factored out to avoid touching that function for a one-liner.
 _METRICS_URL = (LOCAL.rsplit("/v1", 1)[0] if LOCAL.endswith("/v1") else LOCAL) + "/metrics"
+_MODELS_URL = (LOCAL.rsplit("/v1", 1)[0] if LOCAL.endswith("/v1") else LOCAL) + "/v1/models"
 
 _CFG.update({
     "SHIM_TELEM_SAMPLE_SECS":             ("TELEM_SAMPLE_SECS", float),
@@ -1151,7 +1159,7 @@ def local_reservation_estimate(ptok, maxtok):
     if LOCAL_MAX_OUT > 0 and (out <= 0 or out > LOCAL_MAX_OUT):
         out = LOCAL_MAX_OUT
     elif out <= 0:
-        out = max(0, MAX_LOCAL_TOKENS - ptok)
+        out = max(0, max_local_tokens() - ptok)
     return max(0, int(ptok)) + int(out)
 
 
@@ -1452,6 +1460,7 @@ async def _scrape_engine_metrics():
     dt = (now - prev_at) if prev_fam is not None else 0
     _ENGINE_METRICS.update(ok=True, at=now, err=None, text=text, families=fam)
     capacity_note_scrape(fam, now)     # live KV pool / block size / engine generation (lane GW)
+    await _poll_engine_models(now)     # live max_model_len -> context window (lane FX)
     kv = _fv(fam, "vllm:kv_cache_usage_perc")
     dq = _counter_rate(fam, prev_fam, "vllm:prefix_cache_queries_total", dt)
     dh = _counter_rate(fam, prev_fam, "vllm:prefix_cache_hits_total", dt)
@@ -3536,7 +3545,8 @@ def flow_prefill_pure_tps(now=None, window=300.0):
 #                  CURRENT engine generation only (after a settle period, planned offline windows excluded)
 #   attention block vllm:cache_config_info{block_size}  (the prefix-cache credit is rounded to whole blocks)
 _CAPLIVE = {"pool": None, "pool_at": 0.0, "pool_src": None, "block": None, "gen_start": None, "gen_src": None,
-            "scrapes": 0, "events": collections.deque(maxlen=20), "measure": None}
+            "scrapes": 0, "events": collections.deque(maxlen=20), "measure": None,
+            "ctx": None, "ctx_at": 0.0, "ctx_poll_at": 0.0, "ctx_err": None, "ctx_models": None}
 PREFILL_MEASURE_WINDOW_S = float(os.environ.get("SHIM_PREFILL_MEASURE_WINDOW_S", "1800"))
 PREFILL_MEASURE_BUCKET_S = float(os.environ.get("SHIM_PREFILL_MEASURE_BUCKET_S", "60"))
 PREFILL_MEASURE_MIN_BUCKETS = int(os.environ.get("SHIM_PREFILL_MEASURE_MIN_BUCKETS", "5"))
@@ -3557,6 +3567,7 @@ def _capacity_engine_changed(now, why):
     on the previous one stops counting."""
     _CAPLIVE["events"].appendleft({"at": round(now, 1), "event": why})
     _CAPLIVE["measure"] = None
+    _CAPLIVE["ctx_poll_at"] = 0.0          # a new engine may serve a different max_model_len: re-read /v1/models at once
     if _CAPLIVE["gen_src"] != "process_start_time_seconds":
         _CAPLIVE["gen_start"], _CAPLIVE["gen_src"] = now, "health transition"
 
@@ -3619,6 +3630,83 @@ def pool_info(now=None):
         out.update(tokens=cfg, source="configured", detail=("SHIM_CAPACITY_LIVE=0" if not CAPACITY_LIVE else "engine has not answered yet"),
                    age_s=None, engine_reachable=bool(_ENGINE_METRICS.get("ok")), configured_stale=None)
     return out
+
+
+_CTX_MIN_SANE = 1024                   # a max_model_len below this is a garbage reading, not a window
+
+
+def capacity_note_models(payload, now=None):
+    """Called with the engine's parsed /v1/models: the context window is the SMALLEST max_model_len any served model
+    reports (aliases of one engine agree; if they ever differ the smaller one is the one a request can rely on)."""
+    try:
+        now = time.time() if now is None else now
+        lens = []
+        for m in (payload.get("data") or []) if isinstance(payload, dict) else []:
+            try:
+                v = int(m.get("max_model_len"))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if v >= _CTX_MIN_SANE:
+                lens.append(v)
+        if not lens:
+            _CAPLIVE["ctx_err"] = "no model in /v1/models reported a usable max_model_len"
+            return
+        win = min(lens)
+        if _CAPLIVE["ctx"] != win:
+            _CAPLIVE["events"].appendleft({"at": round(now, 1), "event": "context window %s -> %s tokens" % (_CAPLIVE["ctx"], win)})
+            log.info("capacity: live engine max_model_len %s -> %s tokens; configured SHIM_LOCAL_CONTEXT_LIMIT=%s SHIM_MAX_LOCAL_TOKENS=%s",
+                     _CAPLIVE["ctx"], win, LOCAL_CONTEXT_LIMIT, MAX_LOCAL_TOKENS)
+        _CAPLIVE["ctx"], _CAPLIVE["ctx_at"], _CAPLIVE["ctx_err"], _CAPLIVE["ctx_models"] = win, now, None, len(lens)
+    except Exception as e:      # noqa: BLE001 -- the capacity model must never break the scrape
+        log.warning("capacity_note_models: %s", e)
+
+
+async def _poll_engine_models(now=None):
+    """GET <engine>/v1/models at most every MODELS_POLL_S (the window changes only when the engine is restarted with another
+    --max-model-len, which also resets the poll timer). Bounded; any failure keeps the last-known value and is reported."""
+    now = time.time() if now is None else now
+    if not (CAPACITY_LIVE and CONTEXT_LIVE) or now - _CAPLIVE["ctx_poll_at"] < max(1.0, MODELS_POLL_S):
+        return
+    _CAPLIVE["ctx_poll_at"] = now
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=TELEM_SCRAPE_TIMEOUT)) as s:
+            async with s.get(_MODELS_URL) as r:
+                if r.status != 200:
+                    raise RuntimeError("http %s" % r.status)
+                payload = await r.json(content_type=None)
+    except Exception as e:      # noqa: BLE001
+        _CAPLIVE["ctx_err"] = str(e)[:200] or type(e).__name__
+        return
+    capacity_note_models(payload, now)
+
+
+def context_window_info(configured, now=None):
+    """The context window to admit against for one configured knob (SHIM_LOCAL_CONTEXT_LIMIT or SHIM_MAX_LOCAL_TOKENS), with
+    where it came from: live (the engine's max_model_len), live-last-known (it answered earlier, unreachable now), or
+    configured (never answered, or the kill switch). A configured value <= 0 means 'guard disabled' and is never replaced."""
+    now = time.time() if now is None else now
+    cfg, live = int(configured), _CAPLIVE["ctx"]
+    out = {"configured": cfg, "live": live}
+    if CAPACITY_LIVE and CONTEXT_LIVE and live and cfg > 0:
+        age = max(0.0, now - _CAPLIVE["ctx_at"])
+        fresh = age <= max(90.0, 3 * MODELS_POLL_S)          # the engine itself answered /v1/models recently
+        out.update(tokens=live, source="live" if fresh else "live-last-known", age_s=round(age, 1),
+                   configured_stale=(cfg != live), engine_reachable=fresh)
+    else:
+        why = ("SHIM_CAPACITY_LIVE=0" if not CAPACITY_LIVE else "SHIM_CONTEXT_LIVE=0" if not CONTEXT_LIVE
+               else "guard disabled (configured <= 0)" if cfg <= 0 else "engine has not answered yet")
+        out.update(tokens=cfg, source="configured", detail=why, age_s=None, configured_stale=None)
+    return out
+
+
+def local_context_limit():
+    """Effective SHIM_LOCAL_CONTEXT_LIMIT: the engine's live max_model_len, else the configured value."""
+    return context_window_info(LOCAL_CONTEXT_LIMIT)["tokens"]
+
+
+def max_local_tokens():
+    """Effective SHIM_MAX_LOCAL_TOKENS (the per-request size cap): the engine's live max_model_len, else the configured value."""
+    return context_window_info(MAX_LOCAL_TOKENS)["tokens"]
 
 
 def token_budget_info(now=None):
@@ -3744,7 +3832,14 @@ def capacity_model_facts(now=None):
     now = time.time() if now is None else now
     pool, tb, pf = pool_info(now), token_budget_info(now), prefill_info(now)
     align = prefix_align_tokens()
+    cl, ml = context_window_info(LOCAL_CONTEXT_LIMIT, now), context_window_info(MAX_LOCAL_TOKENS, now)
     warns = []
+    for env, w in (("SHIM_LOCAL_CONTEXT_LIMIT", cl), ("SHIM_MAX_LOCAL_TOKENS", ml)):
+        if w.get("configured_stale"):
+            warns.append("%s=%d differs from the engine's max_model_len %d; the live value is used, the configured one is only a fallback" % (
+                env, w["configured"], w["live"]))
+    if CAPACITY_LIVE and CONTEXT_LIVE and _CAPLIVE["ctx"] is None and _CAPLIVE["ctx_err"]:
+        warns.append("context window is the configured value: %s" % _CAPLIVE["ctx_err"])
     if pool.get("configured_stale"):
         warns.append("SHIM_POOL_TOKENS=%d is stale (the engine reports %d); the configured value is only a fallback" % (
             pool["configured_tokens"], pool["live_tokens"]))
@@ -3772,6 +3867,11 @@ def capacity_model_facts(now=None):
                           "measured_range": pf["measurement"].get("range_tok_s"),
                           "valid_minutes": pf["measurement"]["valid_minutes"], "min_minutes": pf["measurement"]["min_minutes"],
                           "status": pf["measurement"]["status"], "window_start": pf["measurement"].get("window_start")},
+        "context_window": {
+            "local_context_limit": {k: v for k, v in {**cl, "effective": cl["tokens"], "env": "SHIM_LOCAL_CONTEXT_LIMIT"}.items() if k != "tokens"},
+            "max_local_tokens": {k: v for k, v in {**ml, "effective": ml["tokens"], "env": "SHIM_MAX_LOCAL_TOKENS"}.items() if k != "tokens"},
+            "kill_switch": "SHIM_CONTEXT_LIVE=0", "read_from": "engine /v1/models max_model_len (min over served models)",
+            "poll_s": MODELS_POLL_S, "last_error": _CAPLIVE["ctx_err"], "models_reporting": _CAPLIVE["ctx_models"]},
         "prefix_align_tokens": {"effective": align, "source": "live" if (CAPACITY_LIVE and _CAPLIVE["block"]) else "configured",
                                 "configured": int(PREFIX_ALIGN_TOKENS), "read_from": "vllm:cache_config_info block_size"},
         "engine_generation": {"start": gen, "source": _CAPLIVE["gen_src"],
@@ -4762,7 +4862,7 @@ def _est_tokens(body):
 
 
 def _min_decision_threshold():
-    vals = [v for v in (TINY_TOKENS, BIG_TOKENS, BIG_PROMPT, MAX_LOCAL_TOKENS) if v and v > 0]
+    vals = [v for v in (TINY_TOKENS, BIG_TOKENS, BIG_PROMPT, max_local_tokens()) if v and v > 0]
     return min(vals) if vals else 1500
 
 
@@ -5211,7 +5311,7 @@ def over_local_cap(body):
         mt = DEFAULT_MAX_OUT
     # Never advertise more capacity than the engine actually exposes.  Older deployments had a
     # 700K shim cap beside a 524K vLLM -- the provider capability limit is authoritative here.
-    return (_est_tokens(body) + mt + max(0, CONTEXT_SAFETY_MARGIN)) > min(MAX_LOCAL_TOKENS, LOCAL_CONTEXT_LIMIT)
+    return (_est_tokens(body) + mt + max(0, CONTEXT_SAFETY_MARGIN)) > min(max_local_tokens(), local_context_limit())
 
 
 def strip_thinking(body):
@@ -5476,9 +5576,10 @@ def local_memory_reservation(body):
     prompt = _est_tokens(body)
     output = data.get("max_completion_tokens", data.get("max_tokens"))
     if output is None or output == 0:
-        if MAX_LOCAL_TOKENS <= 0:
+        mlt = max_local_tokens()
+        if mlt <= 0:
             raise ValueError("local output requires a finite token limit")
-        return max(prompt, MAX_LOCAL_TOKENS) * count, count
+        return max(prompt, mlt) * count, count
     if isinstance(output, bool) or not isinstance(output, int) or output < 0:
         raise ValueError("local output token limit must be a positive integer")
     return (prompt + output) * count, count
@@ -6545,7 +6646,7 @@ async def _route_completions(request, _no_overflow=False):
     # stale agent session once rebuilt a ~1.9M-token health probe on every retry.
     # The caller must rotate/compact its session; retrying this body is not work.
     provider_ceiling = max(
-        int(LOCAL_CONTEXT_LIMIT), int(REMOTE_CONTEXT_LIMIT),
+        int(local_context_limit()), int(REMOTE_CONTEXT_LIMIT),
         *(int(a.get("context_limit") or 0) for a in _ALIASES.values()
           if isinstance(a, dict) and a.get("enabled")),
     )
@@ -6751,7 +6852,7 @@ async def _route_completions(request, _no_overflow=False):
 
     # size cap: too-big-for-this-box requests OOM local even at budget=1 -> send straight to remote
     if overflow_ok and not local_pin and not alias_local_only and over_local_cap(body):
-        log.info("route %s est prompt+max > %d -> remote(size)", path, MAX_LOCAL_TOKENS)
+        log.info("route %s est prompt+max > %d -> remote(size)", path, max_local_tokens())
         record_event("remote", "size", request, units, 0, **ev)
         return await _overflow_forward()
 
@@ -6862,7 +6963,7 @@ async def _route_completions(request, _no_overflow=False):
     try:
         local_body = _prepare_local_body(request, body, background)
         local_context_body, local_ctx = _prepare_provider_context(
-            local_body, LOCAL_CONTEXT_LIMIT, LOCAL_MAX_OUT)
+            local_body, local_context_limit(), LOCAL_MAX_OUT)
         if local_context_body is None:
             if alias_local_only or LOCAL_ONLY:
                 return _context_error(local_ctx, "local")
@@ -6872,11 +6973,11 @@ async def _route_completions(request, _no_overflow=False):
             return _context_error(local_ctx, "local")
         if local_ctx.get("compacted"):
             local_body = _prepare_local_body(request, local_context_body, background)
-            _active_set(request, context_provider="local", context_limit=LOCAL_CONTEXT_LIMIT,
+            _active_set(request, context_provider="local", context_limit=local_context_limit(),
                         context_prompt_tokens=local_ctx.get("prompt_tokens"),
                         context_compacted=True, context_omitted=int(local_ctx.get("omitted", 0) or 0))
         else:
-            _active_set(request, context_provider="local", context_limit=LOCAL_CONTEXT_LIMIT,
+            _active_set(request, context_provider="local", context_limit=local_context_limit(),
                         context_prompt_tokens=local_ctx.get("prompt_tokens"), context_compacted=False)
         reservation, sequences = local_memory_reservation(local_body)
     except (ValueError, TypeError, AttributeError) as exc:
