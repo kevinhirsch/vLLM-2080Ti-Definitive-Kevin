@@ -6,7 +6,7 @@ os.environ.setdefault("TRITON_INTERPRET", "1")
 import numpy as np
 import torch
 
-from vllm.third_party.flash_linear_attention.ops.sr_convert import sr_fp32_to_fp16
+from vllm.third_party.flash_linear_attention.ops.sr_convert import sr_fp32_to_fp16, sr_hash
 from vllm.triton_utils import tl, triton
 
 
@@ -15,7 +15,7 @@ def _k(x_ptr, out_ptr, seed, N, BLOCK: tl.constexpr):
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     m = offs < N
     x = tl.load(x_ptr + offs, mask=m, other=0.0)
-    r = tl.randint(seed, offs)
+    r = sr_hash(seed, offs)
     tl.store(out_ptr + offs, sr_fp32_to_fp16(x, r), mask=m)
 
 

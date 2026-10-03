@@ -14,6 +14,7 @@ from vllm.third_party.flash_linear_attention.ops.sr_convert import (
     get_sr_seed,
     sr_enabled,
     sr_fp32_to_fp16,
+    sr_hash,
 )
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -365,7 +366,7 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
     if USE_SR:
         sr_base = (state_idx * 40503 + i_hv.to(tl.int64) * 1640531527 + sr_salt).to(tl.int32)
-        sr_rand = tl.randint(tl.load(sr_seed), (o_v[:, None] * K + o_k[None, :] + sr_base).to(tl.int32))
+        sr_rand = sr_hash(tl.load(sr_seed), o_v[:, None] * K + o_k[None, :] + sr_base)
         tl.store(p_ht, sr_fp32_to_fp16(b_h, sr_rand), mask=mask_h)
     else:
         tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)

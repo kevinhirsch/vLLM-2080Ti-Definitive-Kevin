@@ -13,6 +13,7 @@ from vllm.third_party.flash_linear_attention.ops.sr_convert import (
     get_sr_seed,
     sr_enabled,
     sr_fp32_to_fp16,
+    sr_hash,
 )
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -196,7 +197,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                         + sr_salt
                     ).to(tl.int32)
                     sr_off = o_v[:, None] * K + o_k[None, :] + sr_base
-                    sr_rand = tl.randint(tl.load(sr_seed), sr_off.to(tl.int32))
+                    sr_rand = sr_hash(tl.load(sr_seed), sr_off)
                     tl.store(p_ht, sr_fp32_to_fp16(b_h, sr_rand), mask=mask_h)
                 else:
                     tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
@@ -208,7 +209,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                     (bos + i_t) * 40503 + i_hv.to(tl.int64) * 1640531527 + i_t.to(tl.int64) * 1103515245 + sr_salt
                 ).to(tl.int32)
                 sr_off = o_v[:, None] * K + o_k[None, :] + sr_base
-                sr_rand = tl.randint(tl.load(sr_seed), sr_off.to(tl.int32))
+                sr_rand = sr_hash(tl.load(sr_seed), sr_off)
                 tl.store(p_ht, sr_fp32_to_fp16(b_h, sr_rand), mask=mask_h)
             else:
                 tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)

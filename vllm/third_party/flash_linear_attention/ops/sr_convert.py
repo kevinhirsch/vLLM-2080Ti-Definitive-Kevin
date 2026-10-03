@@ -58,3 +58,16 @@ def sr_fp32_to_fp16(x, rand):
     y = tl.where(neg, -y, y)
     y = tl.where(mag >= 0x7F800000, x, y)  # inf / nan unchanged
     return y.to(tl.float16)
+
+
+@triton.jit
+def sr_hash(seed, offset):
+    """Cheap 32-bit mixing hash (lowbias32, Chris Wellons) of (seed, element offset) -> uint32 random bits.  ~8 integer ops per element versus ~50
+    for the 10-round Philox in tl.randint (which also wastes 3 of its 4 outputs); plenty for SR dithering (needs uniform low 13/24 bits)."""
+    x = (offset.to(tl.uint32) + seed.to(tl.uint32) * tl.cast(2654435761, tl.uint32))
+    x = x ^ (x >> 16)
+    x = x * tl.cast(2146121005, tl.uint32)
+    x = x ^ (x >> 15)
+    x = x * tl.cast(2221713035, tl.uint32)
+    x = x ^ (x >> 16)
+    return x
