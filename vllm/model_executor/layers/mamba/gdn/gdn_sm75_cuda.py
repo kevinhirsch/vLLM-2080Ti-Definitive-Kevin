@@ -17,6 +17,8 @@ import torch
 
 _EXT = None
 _ENABLED = os.getenv("VLLM_K5_GDN_FUSED", "0") == "1"
+# 2 = reduction-light layout (8 lanes/row, single-pass algebra), 1 = upstream-style layout (32 lanes/row)
+_VARIANT = int(os.getenv("VLLM_K5_GDN_VARIANT", "2"))
 
 
 def enabled() -> bool:
@@ -76,6 +78,8 @@ def gdn_mtp(
     eps: float,
     null_block_id: int,
     sigmoid_gate: bool,
+    variant: int | None = None,
 ) -> None:
     _load().gdn_mtp(mixed_qkv, a, b, A_log, dt_bias, state_indices, cu_seqlens, num_accepted, state, z,
-                    norm_weight, out, float(scale), float(eps), int(null_block_id), bool(sigmoid_gate))
+                    norm_weight, out, float(scale), float(eps), int(null_block_id), bool(sigmoid_gate),
+                    int(_VARIANT if variant is None else variant))
