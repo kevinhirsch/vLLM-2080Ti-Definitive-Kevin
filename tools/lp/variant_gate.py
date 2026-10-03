@@ -142,6 +142,12 @@ def v_fp8w(n, x, info):
 
 VARIANTS = {k[2:]: v for k, v in globals().items() if k.startswith("v_")}
 
+# Plugins (K7 2026-10-03): VG_PLUGINS=/path/a.py,/path/b.py -> each file's register(VARIANTS) adds its variants.
+for _pf in filter(None, os.environ.get("VG_PLUGINS", "").split(",")):
+    import importlib.util as _ilu
+    _sp = _ilu.spec_from_file_location(os.path.splitext(os.path.basename(_pf))[0], _pf)
+    _pm = _ilu.module_from_spec(_sp); _sp.loader.exec_module(_pm); _pm.register(VARIANTS)
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -149,11 +155,14 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--variants", default="fp16,w4a8")
     ap.add_argument("--layers", type=int, default=R.N_LAYERS)
+    ap.add_argument("--windows", type=int, default=0, help="first N windows of ref.pt only (0 = all 12)")
     a = ap.parse_args()
     VARS = a.variants.split(",")
     for v in VARS: assert v in VARIANTS, f"unknown variant {v}; have {list(VARIANTS)}"
     T0 = time.time(); log = lambda *s: print(f"[{time.time()-T0:6.0f}s]", *s, flush=True)
-    ref = torch.load(a.ref); ids, H0 = ref["ids"], ref["H"]; B, T = ids.shape; D = R.D
+    ref = torch.load(a.ref); ids, H0 = ref["ids"], ref["H"]
+    if a.windows: ids, H0 = ids[:a.windows], H0[:a.windows]
+    B, T = ids.shape; D = R.D
     QI, CUR = {}, {"v": None}
 
     def load(i):

@@ -5,6 +5,8 @@ input, and quantizes it in each 8-bit format, reporting SQNR (dB) and the GEMM-o
   int8_tok    : per-token symmetric int8 (what W4A8 Marlin does; IMMA int8 on sm_75)
   e4m3_tok    : per-token scaled FP8 E4M3 (what Ada/Hopper FP8 GEMMs do with dynamic per-token scales)
   e5m2_tok    : per-token scaled FP8 E5M2
+  int8_g128   : per-(row,128-group) float scale (the proposed s8 Marlin epilogue; aligns with the weight group)
+  int8_g32    : per-(row,32) float scale
   mx_int8_b32 : block-scaled int8, one power-of-two scale per 32 contiguous K elements (MX-style; on sm_75 = IMMA per k-block +
                 integer shift-rescale of the int32 partial: the kernel cost of a per-group activation scale)
   mx_e4m3_b32 : MXFP8 E4M3 (OCP MX spec: E8M0 scale per 32)
@@ -45,7 +47,12 @@ def q_mx(x, kind, blk=32):
     return q.view_as(x)
 
 
-FMTS = {"int8_tok": q_int8_tok, "e4m3_tok": lambda x: q_fp8_tok(x, E4), "e5m2_tok": lambda x: q_fp8_tok(x, E5),
+def q_int8_g(x, g=128):
+    xg = x.view(x.shape[0], -1, g); sc = xg.abs().amax(-1, keepdim=True).clamp(min=1e-12) / 127
+    return (torch.clamp(torch.round(xg / sc), -127, 127) * sc).view_as(x)
+
+
+FMTS = {"int8_tok": q_int8_tok, "int8_g128": q_int8_g, "int8_g32": lambda x: q_int8_g(x, 32), "e4m3_tok": lambda x: q_fp8_tok(x, E4), "e5m2_tok": lambda x: q_fp8_tok(x, E5),
         "mx_int8_b32": lambda x: q_mx(x, "int8"), "mx_e4m3_b32": lambda x: q_mx(x, "e4m3")}
 QW = {}
 stats = {}
