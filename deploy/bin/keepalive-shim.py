@@ -8759,6 +8759,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
         _scan_tail[0] = b""
         _shape.tail = b""
         s2 = aiohttp.ClientSession()
+        up2 = None
         try:
             up2 = await _open(s2, base, path, strip_thinking(body), key, True)
             if up2.status >= 400:
@@ -8784,7 +8785,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
                 pass
             return False
         finally:
-            await s2.close()
+            await _drop_upstream(s2, up2)
 
     # TELEMETRY: exact output-token count when the client asked for stream_options.include_usage
     # and the usage trailer didn't already arrive within the gate phase above (long streams) --

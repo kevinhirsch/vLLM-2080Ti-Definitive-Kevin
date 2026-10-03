@@ -23,6 +23,11 @@ import test_gateway_cache_model as C
 shim = C.shim
 
 
+def shim_source():
+    from pathlib import Path
+    return Path(__file__).with_name("keepalive-shim.py").read_text()
+
+
 class StalledUpstream(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.leaks = []
@@ -122,6 +127,17 @@ class StalledUpstream(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.05)
         self.assertGreaterEqual(len(writes), 3)
         self.assertEqual(self.leaks, [])
+
+    def test_no_relay_exit_closes_a_session_without_its_response(self):
+        """Class ratchet: inside _relay every session close that can follow an opened upstream response goes through
+        _drop_upstream (the reasoning-retry session s2 had the same leak)."""
+        src = shim_source()
+        relay = src[src.index("async def _relay("):src.index("_RW_STATS = ")]
+        self.assertNotIn("await s2.close()", relay)
+        after_open = relay[relay.index("if up.status >= 500:"):]
+        bare = [l.strip() for l in after_open.splitlines() if l.strip() == "await session.close()"]
+        # the one bare close left follows up.read() of a streaming 4xx body (read() releases the connection)
+        self.assertLessEqual(len(bare), 1, bare)
 
     async def test_drop_upstream_helper_closes_response_before_session(self):
         order = []
