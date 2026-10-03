@@ -831,11 +831,14 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
             # accumulator the kernel merges pieces into. Everything else goes to the KV cache pool.
             cache_buf_shape = (k1_rows, num_kv_heads, head_size)
             nb = scheduler_config.max_num_batched_tokens
+            pshape_o, pshape_l = _k1fa.part_buffer_shapes(nb, num_heads)
             current_workspace_manager().get_simultaneous(
                 (cache_buf_shape, torch.float16),
                 (cache_buf_shape, torch.float16),
                 ((nb, num_heads, head_size), torch.float32),
                 ((nb, num_heads), torch.float32),
+                (pshape_o, torch.float32),
+                (pshape_l, torch.float32),
             )
             logger.info_once(
                 "TurboQuant continuation workspace (K1 segmented): %d rows instead of %d",
@@ -1701,6 +1704,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     cu_seqlens_q=attn_metadata.query_start_loc,
                     cu_seqlens_k=attn_metadata.query_start_loc,
                     max_seqlen_q=attn_metadata.max_query_len,
+                    nsplit=1,
                 )
             return attn_metadata.flashinfer_first_chunk_wrapper.run(query, key, value)
 
@@ -1785,7 +1789,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 )
                 if self._k1fa_ok(q_seq, k_seq):
                     out = _k1fa.fa75_prefill(
-                        q_seq, k_seq, v_seq, scale=self.scale, causal=True
+                        q_seq, k_seq, v_seq, scale=self.scale, causal=True, nsplit=1
                     )
                 elif first_chunk_wrapper is not None:
                     out = first_chunk_wrapper.run(q_seq, k_seq, v_seq)
@@ -2229,12 +2233,16 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         s_last = (cached_len // seg) * seg
         n_c = cached_len - s_last
         rows = seg + math.ceil(q_len / block_size) * block_size
-        k_rows, v_rows, acc_o, acc_lse = current_workspace_manager().get_simultaneous(
+        pshape_o, pshape_l = _k1fa.part_buffer_shapes(q_len, Hq)
+        k_rows, v_rows, acc_o, acc_lse, part_o, part_lse = current_workspace_manager().get_simultaneous(
             ((rows, Hk, D), torch.float16),
             ((rows, Hk, D), torch.float16),
             ((q_len, Hq, D), torch.float32),
             ((q_len, Hq), torch.float32),
+            (pshape_o, torch.float32),
+            (pshape_l, torch.float32),
         )
+        parts = dict(part_o=part_o, part_lse=part_lse)  # split-KV parts live in the profiled workspace
         out = torch.empty_like(query)
         for i, s0 in enumerate(range(0, s_last, seg)):
             self._tq_dequant_cached_rows(
@@ -2242,7 +2250,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             )
             _k1fa.fa75_prefill(
                 query, k_rows[:seg], v_rows[:seg], scale=self.scale, causal=False, out=out,
-                acc_o=acc_o, acc_lse=acc_lse, acc_mode=1 if i == 0 else 2,
+                acc_o=acc_o, acc_lse=acc_lse, acc_mode=1 if i == 0 else 2, **parts,
             )
         if n_c:
             self._tq_dequant_cached_rows(
@@ -2253,7 +2261,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         v_rows[n_c : n_c + q_len] = val_chunk
         return _k1fa.fa75_prefill(
             query, k_rows[: n_c + q_len], v_rows[: n_c + q_len], scale=self.scale, causal=True, out=out,
-            acc_o=acc_o, acc_lse=acc_lse, acc_mode=3 if s_last else 0,
+            acc_o=acc_o, acc_lse=acc_lse, acc_mode=3 if s_last else 0, **parts,
         )
 
     def _continuation_prefill(
@@ -2326,7 +2334,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             # One exact causal call over [dequantised cache | current chunk] (bottom-right aligned): no
             # prefix/current split and no LSE merge needed.
             return _k1fa.fa75_prefill(
-                query, k_full, v_full, scale=self.scale, causal=True
+                query, k_full, v_full, scale=self.scale, causal=True, nsplit=1
             )
 
         if flashinfer_prefix_combine_wrappers is not None:

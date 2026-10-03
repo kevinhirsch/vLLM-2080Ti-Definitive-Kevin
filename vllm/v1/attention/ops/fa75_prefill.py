@@ -101,6 +101,38 @@ def eligible(q: torch.Tensor, k: torch.Tensor) -> bool:
     )
 
 
+_MAX_SPLITS = int(os.getenv("VLLM_TQ_FA75_MAX_SPLITS", "4"))
+_MIN_SPLIT_KEYS = int(os.getenv("VLLM_TQ_FA75_MIN_SPLIT_KEYS", "4096"))
+_SLOTS: dict[int, int] = {}
+
+
+def choose_splits(Tq: int, Tkv: int, Hq: int, device: torch.device) -> int:
+    """KV splits that best fill whole waves of CTAs (2 resident per SM). Only for continuation-shaped calls where
+    every query tile does about the same work (Tkv - Tq >= Tq); first chunks keep heaviest-first ordering."""
+    if _MAX_SPLITS <= 1 or Tkv - Tq < Tq:
+        return 1
+    dev = device.index or 0
+    slots = _SLOTS.get(dev)
+    if slots is None:
+        slots = _SLOTS[dev] = 2 * torch.cuda.get_device_properties(dev).multi_processor_count
+    base = -(-Tq // 64) * Hq
+    best, best_eff = 1, 0.0
+    for S in range(1, _MAX_SPLITS + 1):
+        if S > 1 and Tkv // S < _MIN_SPLIT_KEYS:
+            break
+        n = base * S
+        eff = n / (-(-n // slots) * slots)
+        if eff > best_eff + 0.02:  # a split must buy > 2% of wave efficiency (combine pass + partial traffic)
+            best, best_eff = S, eff
+    return best
+
+
+def part_buffer_shapes(max_tokens: int, Hq: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Workspace shapes for the split-KV parts of one call of up to max_tokens query rows."""
+    S = max(1, _MAX_SPLITS)
+    return (S, max_tokens, Hq, 256), (S, max_tokens, Hq)
+
+
 _CU_CACHE: dict[tuple[int, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
 
 
@@ -136,6 +168,9 @@ def fa75_prefill(
     acc_o: torch.Tensor | None = None,
     acc_lse: torch.Tensor | None = None,
     acc_mode: int = 0,
+    nsplit: int | None = None,
+    part_o: torch.Tensor | None = None,
+    part_lse: torch.Tensor | None = None,
 ):
     """Attention of q over k/v. Single request unless cu_seqlens_* (int32, on device) are given.
 
@@ -145,6 +180,10 @@ def fa75_prefill(
     Segmented context (exact): acc_mode 1 = first piece writes acc_o (fp32 [Tq, Hq, 256]) and acc_lse (fp32 [Tq, Hq]);
     2 = middle piece merges into them; 3 = last piece merges and writes ``out`` (fp16). Pieces may come in any order;
     only the last one may be causal.
+
+    Split-KV (wave balance, single request): nsplit None = automatic (``choose_splits``), 1 = off. With nsplit > 1
+    the CTAs write fp32 parts to part_o [S, Tq, Hq, 256] / part_lse [S, Tq, Hq] (allocated here when not given) and a
+    combine kernel merges them exactly.
     """
     ext = _load()
     if out is None:
@@ -155,6 +194,18 @@ def fa75_prefill(
         cu_seqlens_q, cu_seqlens_k = _single_cu(q.shape[0], k.shape[0], q.device)
         max_seqlen_q = q.shape[0]
     assert cu_seqlens_k is not None and max_seqlen_q is not None
+    S = 1
+    if nsplit is None:
+        S = choose_splits(q.shape[0], k.shape[0], q.shape[1], q.device) if cu_seqlens_q.numel() == 2 else 1
+    else:
+        S = max(1, int(nsplit))
+    split_len = 0
+    if S > 1:
+        split_len = -(-(-(-k.shape[0] // S)) // 16) * 16
+        if part_o is None:
+            part_o = torch.empty((S, q.shape[0], q.shape[1], 256), dtype=torch.float32, device=q.device)
+        if part_lse is None:
+            part_lse = torch.empty((S, q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device)
     ext.fwd(
         q,
         k,
@@ -171,6 +222,10 @@ def fa75_prefill(
         acc_o,
         acc_lse,
         int(acc_mode),
+        int(S),
+        int(split_len),
+        part_o if S > 1 else None,
+        part_lse if S > 1 else None,
     )
     if return_lse:
         return out, lse

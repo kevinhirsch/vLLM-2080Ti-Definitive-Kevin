@@ -69,6 +69,13 @@ struct AccArgs {
   float* lse;
   int64_t o_row, o_head, lse_row, lse_head;
   int mode;
+  // split-KV (wave balance): nsplit > 1 -> each CTA covers keys [s * split_len, (s + 1) * split_len) of its request
+  // and writes normalised O (fp32) + LSE to part_o [S, Tq_total, Hq, 256] / part_lse [S, Tq_total, Hq]; a combine
+  // kernel then merges the S parts (and applies the acc mode)
+  int nsplit, split_len;
+  float* part_o;
+  float* part_lse;
+  int64_t part_rows;  // Tq_total
 };
 
 // PV16: P V accumulates each BN-key slice in fp16 then adds into fp32 O (fa75's scheme), else straight fp32.
@@ -100,7 +107,8 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
   const int q_beg = cu_q[b], Tq = cu_q[b + 1] - q_beg;
   const int k_beg = cu_k[b], Tkv = cu_k[b + 1] - k_beg;
   const int n_mtiles = (Tq + BM - 1) / BM;
-  const int m_tile = n_mtiles - 1 - (int)blockIdx.x;  // heaviest (last) query tiles first
+  const int split = (int)blockIdx.x % acc.nsplit;
+  const int m_tile = n_mtiles - 1 - (int)blockIdx.x / acc.nsplit;  // heaviest (last) query tiles first
   if (m_tile < 0) return;
 
   const int t_id = threadIdx.x;
@@ -161,7 +169,9 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
   const int row0 = m0 + 16 * warp + gq;  // this thread's rows: row0, row0 + 8
   int kv_end = CAUSAL ? min(Tkv, m0 + BM - 1 + offs + 1) : Tkv;
   kv_end = max(kv_end, 0);
-  const int n_tiles = (kv_end + BN - 1) / BN;
+  const int kv_lo = acc.nsplit > 1 ? split * acc.split_len : 0;  // split_len is a multiple of BN
+  if (acc.nsplit > 1) kv_end = min(kv_end, kv_lo + acc.split_len);
+  const int n_tiles = kv_end > kv_lo ? (kv_end - kv_lo + BN - 1) / BN : 0;
   // this warp's last visible key (causal): tiles beyond it contribute nothing to the warp
   const int warp_kv_end = CAUSAL ? min(Tkv, m0 + 16 * warp + 15 + offs + 1) : Tkv;
 
@@ -186,14 +196,14 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
 
   uint4 stage[LD_PER_T];
   if (n_tiles > 0) {
-    load_tile(k_, k_row, 0, stage);
+    load_tile(k_, k_row, kv_lo, stage);
     store_tile(0, stage);
   }
   __syncthreads();
 
   constexpr int NT8 = BN / 8;  // n8 score tiles per warp per key tile
   for (int kt = 0; kt < n_tiles; ++kt) {
-    const int n0 = kt * BN;
+    const int n0 = kv_lo + kt * BN;
     if (!(ABL & 1)) load_tile(v_, v_row, n0, stage);  // V(kt) in flight during Q K^T
 
     const bool warp_active = n0 < warp_kv_end;  // warp-uniform
@@ -391,7 +401,7 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
     float wa = 0.0f, wn = inv, lse_tot = lse_new;  // final value = acc_o * wa + oacc * wn
     float* ao = nullptr;
     float* al = nullptr;
-    if (acc.mode != 0 && row < Tq) {
+    if (acc.nsplit == 1 && acc.mode != 0 && row < Tq) {
       ao = acc.o + (int64_t)(q_beg + row) * acc.o_row + (int64_t)hq * acc.o_head;
       al = acc.lse + (int64_t)(q_beg + row) * acc.lse_row + (int64_t)hq * acc.lse_head;
       if (acc.mode >= 2) {
@@ -407,6 +417,17 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
       }
     }
     __syncwarp();  // every lane of the quad has read acc_lse before lane cq == 0 rewrites it
+    if (acc.nsplit > 1) {
+      if (row < Tq) {
+        const int64_t pr = (int64_t)split * acc.part_rows + q_beg + row;
+        float* po = acc.part_o + (pr * Hq + hq) * HD;
+#pragma unroll
+        for (int dn = 0; dn < HD / 8; ++dn)
+          *reinterpret_cast<float2*>(po + 8 * dn + 2 * cq) = make_float2(oacc[dn][2 * hh] * inv, oacc[dn][2 * hh + 1] * inv);
+        if (cq == 0) acc.part_lse[pr * Hq + hq] = lse_new;
+      }
+      continue;
+    }
     if (row < Tq) {
       if (acc.mode == 1 || acc.mode == 2) {
 #pragma unroll
@@ -434,6 +455,61 @@ __global__ void __launch_bounds__(NTHREADS, 2) k1fa_kernel(
 #endif
 }
 
+// Merge the S split-KV parts of every (row, head) exactly by LSE, then apply the segment-accumulation mode.
+// grid (Tq_total, Hq), 64 threads x 4 dims.
+__global__ void __launch_bounds__(64) k1fa_combine_kernel(const float* __restrict__ part_o, const float* __restrict__ part_lse,
+                                                        int S, int64_t rows, int Hq, half* __restrict__ o, int64_t o_row,
+                                                        int64_t o_head, float* __restrict__ lse, int64_t lse_row,
+                                                        int64_t lse_head, AccArgs acc) {
+  const int r = blockIdx.x, h = blockIdx.y, d = threadIdx.x * 4;
+  float mx = -INFINITY;
+  for (int s = 0; s < S; ++s) mx = fmaxf(mx, part_lse[((int64_t)s * rows + r) * Hq + h]);
+  float den = 0.0f;
+  float4 a = make_float4(0.f, 0.f, 0.f, 0.f);
+  if (mx != -INFINITY) {
+    for (int s = 0; s < S; ++s) {
+      const int64_t pr = ((int64_t)s * rows + r) * Hq + h;
+      const float w = __expf(part_lse[pr] - mx);
+      if (w == 0.0f) continue;
+      const float4 x = *reinterpret_cast<const float4*>(part_o + pr * HD + d);
+      a.x += w * x.x; a.y += w * x.y; a.z += w * x.z; a.w += w * x.w;
+      den += w;
+    }
+  }
+  const float inv = den > 0.0f ? 1.0f / den : 0.0f;
+  float lse_new = den > 0.0f ? mx + __logf(den) : -INFINITY;
+  float wa = 0.0f, wn = inv;
+  float* ao = nullptr;
+  float* al = nullptr;
+  if (acc.mode != 0) {
+    ao = acc.o + (int64_t)r * acc.o_row + (int64_t)h * acc.o_head + d;
+    al = acc.lse + (int64_t)r * acc.lse_row + (int64_t)h * acc.lse_head;
+    if (acc.mode >= 2) {
+      const float la = *al, m2 = fmaxf(la, lse_new);
+      if (m2 == -INFINITY) { wa = 0.0f; wn = 0.0f; }
+      else {
+        const float ea = __expf(la - m2), en = __expf(lse_new - m2), dd = ea + en;
+        wa = ea / dd; wn = inv * en / dd; lse_new = m2 + __logf(dd);
+      }
+    }
+  }
+  __syncthreads();  // all threads read acc_lse before thread 0 rewrites it
+  float4 v = make_float4(a.x * wn, a.y * wn, a.z * wn, a.w * wn);
+  if (acc.mode >= 2) {
+    const float4 p = *reinterpret_cast<const float4*>(ao);
+    v.x += p.x * wa; v.y += p.y * wa; v.z += p.z * wa; v.w += p.w * wa;
+  }
+  if (acc.mode == 1 || acc.mode == 2) {
+    *reinterpret_cast<float4*>(ao) = v;
+    if (threadIdx.x == 0) *al = lse_new;
+  } else {
+    half* op = o + (int64_t)r * o_row + (int64_t)h * o_head + d;
+    *reinterpret_cast<uint32_t*>(op) = pack_h2(v.x, v.y);
+    *reinterpret_cast<uint32_t*>(op + 2) = pack_h2(v.z, v.w);
+    if (lse != nullptr && threadIdx.x == 0) lse[(int64_t)r * lse_row + (int64_t)h * lse_head] = lse_new;
+  }
+}
+
 template <int BN, bool CAUSAL, bool PV16, bool LAZY, bool QK4, int ABL = 0, int QKC = 0>
 static void launch(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, at::Tensor& o,
                    float* lse_ptr, int64_t lse_row, int64_t lse_head, const AccArgs& acc,
@@ -448,7 +524,7 @@ static void launch(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v
   }
   const int B = cu_q.size(0) - 1;
   const int Hq = q.size(1), Hkv = k.size(1);
-  dim3 grid((max_q + BM - 1) / BM, Hq, B);
+  dim3 grid(((max_q + BM - 1) / BM) * acc.nsplit, Hq, B);
   kern<<<grid, NTHREADS, SMEM, at::cuda::getCurrentCUDAStream()>>>(
       (const half*)q.data_ptr(), q.stride(0), q.stride(1),
       (const half*)k.data_ptr(), k.stride(0), k.stride(1),
@@ -463,7 +539,8 @@ static void launch(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v
 // 64*k = timing ablations; bn = 16
 void k1fa_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, c10::optional<at::Tensor> lse,
               at::Tensor cu_q, at::Tensor cu_k, int64_t max_q, double scale, bool causal, int64_t bn,
-              int64_t variant, c10::optional<at::Tensor> acc_o, c10::optional<at::Tensor> acc_lse, int64_t acc_mode) {
+              int64_t variant, c10::optional<at::Tensor> acc_o, c10::optional<at::Tensor> acc_lse, int64_t acc_mode,
+              int64_t nsplit, int64_t split_len, c10::optional<at::Tensor> part_o, c10::optional<at::Tensor> part_lse) {
   const at::cuda::OptionalCUDAGuard guard(q.device());
   TORCH_CHECK(q.dtype() == at::kHalf && k.dtype() == at::kHalf && v.dtype() == at::kHalf && o.dtype() == at::kHalf,
               "fp16 q/k/v/o");
@@ -486,7 +563,7 @@ void k1fa_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, c10::optio
     lse_row = lse->stride(0);
     lse_head = lse->stride(1);
   }
-  AccArgs acc{nullptr, nullptr, 0, 0, 0, 0, (int)acc_mode};
+  AccArgs acc{nullptr, nullptr, 0, 0, 0, 0, (int)acc_mode, 1, 0, nullptr, nullptr, 0};
   if (acc_mode != 0) {
     TORCH_CHECK(acc_mode >= 1 && acc_mode <= 3 && acc_o.has_value() && acc_lse.has_value(), "acc_mode needs acc_o/acc_lse");
     TORCH_CHECK(acc_o->dtype() == at::kFloat && acc_o->dim() == 3 && acc_o->size(0) == q.size(0) &&
@@ -495,14 +572,25 @@ void k1fa_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, c10::optio
     TORCH_CHECK(acc_lse->dtype() == at::kFloat && acc_lse->dim() == 2 && acc_lse->size(0) == q.size(0) &&
                     acc_lse->size(1) == q.size(1), "acc_lse fp32 [Tq, Hq]");
     acc = AccArgs{acc_o->data_ptr<float>(), acc_lse->data_ptr<float>(), acc_o->stride(0), acc_o->stride(1),
-                  acc_lse->stride(0), acc_lse->stride(1), (int)acc_mode};
+                  acc_lse->stride(0), acc_lse->stride(1), (int)acc_mode, 1, 0, nullptr, nullptr, 0};
+  }
+  if (nsplit > 1) {
+    TORCH_CHECK(split_len > 0 && split_len % 16 == 0 && part_o.has_value() && part_lse.has_value(), "split-KV needs part buffers");
+    TORCH_CHECK(part_o->dtype() == at::kFloat && part_o->is_contiguous() && part_o->numel() >= nsplit * q.size(0) * q.size(1) * HD &&
+                    part_lse->dtype() == at::kFloat && part_lse->is_contiguous() && part_lse->numel() >= nsplit * q.size(0) * q.size(1),
+                "part_o fp32 >= [S, Tq, Hq, 256], part_lse fp32 >= [S, Tq, Hq], contiguous");
+    acc.nsplit = (int)nsplit;
+    acc.split_len = (int)split_len;
+    acc.part_o = part_o->data_ptr<float>();
+    acc.part_lse = part_lse->data_ptr<float>();
+    acc.part_rows = q.size(0);
   }
   if (max_q <= 0) return;
   const float sl2 = (float)(scale * 1.4426950408889634);
 #define K1_DISPATCH(C, P, L, Q) \
   launch<16, C, P, L, Q>(q, k, v, o, lse_ptr, lse_row, lse_head, acc, cu_q, cu_k, (int)max_q, sl2)
   TORCH_CHECK(bn == 16, "bn must be 16");
-  TORCH_CHECK(variant >= 0 && variant <= 7, "variant 0..7, 8/9 (QK16), or 64*k (ablations)");
+  [&]() {
   const int vv = (int)variant & 7;
 #define K1_V(C)                                                  \
   switch (vv) {                                                  \
@@ -539,7 +627,15 @@ void k1fa_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, c10::optio
     }
     return;
   }
+  TORCH_CHECK(variant >= 0 && variant <= 7, "variant 0..7, 8/9 (QK16), or 64*k (ablations)");
   if (causal) { K1_V(true) } else { K1_V(false) }
+  }();
+  if (acc.nsplit > 1) {
+    k1fa_combine_kernel<<<dim3((unsigned)q.size(0), (unsigned)q.size(1)), 64, 0, at::cuda::getCurrentCUDAStream()>>>(
+        acc.part_o, acc.part_lse, acc.nsplit, acc.part_rows, (int)q.size(1), (half*)o.data_ptr(), o.stride(0), o.stride(1),
+        lse_ptr, lse_row, lse_head, acc);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
 #undef K1_V
 #undef K1_DISPATCH
 }
