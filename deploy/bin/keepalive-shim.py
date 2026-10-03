@@ -808,6 +808,7 @@ def routing_mode():
 STATS_FILE = os.environ.get("SHIM_STATS_FILE", "/home/kevin/.local/share/vllm-qwen27b/gateway-stats.json")
 
 # ---------------- live metrics (for the /gateway/dashboard status page) ----------------
+_PROCESS_STARTED = time.time()   # THIS process (the persisted _stats["started"] below survives restarts)
 _stats = {"started": time.time(), "total": 0, "local": 0, "remote": 0,
           "waited_total": 0.0, "waited_n": 0, "peak_inflight": 0, "peak_waiting": 0,
           "overflowed_after_wait": 0, "held": 0, "rejected_bg": 0}
@@ -7768,6 +7769,9 @@ async def gateway_stats(request):
     total = _stats["total"] or 1
     return web.json_response({
         "uptime": int(time.time() - _stats["started"]),
+        # "uptime" above is the age of the PERSISTED counters (they survive restarts), not of this process;
+        # the dashboard needs both to label its lifetime counters honestly.
+        "process_uptime": int(time.time() - _PROCESS_STARTED), "stats_since": _stats["started"],
         "local_healthy": up,
         "budget": effective_budget(), "configured_budget": BUDGET,
         "inflight": _inflight, "peak_inflight": _stats["peak_inflight"],
@@ -7821,6 +7825,17 @@ async def gateway_stats(request):
 # See LANE/DESIGN.md (f). Both are read-only, additive routes with no interaction with the
 # routing/failover path -- worst case (engine down, as observed live all session) they report
 # a degraded field, never a 5xx of their own. ----
+def _telem_tail(series, raw):
+    """?fast=N / ?slow=N: only the newest N samples (0 = none). Absent or malformed = everything (back-compat)."""
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return list(series)
+    if n < 0:
+        return list(series)
+    return list(series)[-n:] if n else []
+
+
 async def gateway_telemetry(request):
     latest = _TELEM_FAST[-1] if _TELEM_FAST else None
     pct = {}
@@ -7847,7 +7862,8 @@ async def gateway_telemetry(request):
     return web.json_response({
         "at": time.time(),
         "latest": latest,
-        "series": {"fast": list(_TELEM_FAST), "slow": list(_TELEM_SLOW)},
+        "series": {"fast": _telem_tail(_TELEM_FAST, request.query.get("fast")),
+                   "slow": _telem_tail(_TELEM_SLOW, request.query.get("slow"))},
         "per_client": per_client,
         "errors": list(_ERROR_FEED)[:60],
         "mis_estimates": list(_MISESTIMATE_FEED)[:60],
@@ -8997,8 +9013,34 @@ async def gateway_window_log(request):
     return web.Response(text=text, content_type="text/plain")
 
 
+# The dashboard page lives in its own file (deploy/bin/gateway_dashboard.html, installed next to this script by
+# gateway_safe_publish.py). It is read per request and cached by mtime, so a page-only change needs no restart.
+# DASHBOARD_HTML below is the legacy inline copy, served only if the file is missing or unreadable.
+DASHBOARD_FILE = os.environ.get("SHIM_DASHBOARD_FILE") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "gateway_dashboard.html")
+_DASH_CACHE = {"mtime": None, "path": None, "text": None}
+
+
+def dashboard_html():
+    """(html, source): source is 'file' or 'inline-fallback'."""
+    path = DASHBOARD_FILE
+    try:
+        mtime = os.stat(path).st_mtime_ns
+        if _DASH_CACHE["path"] != path or _DASH_CACHE["mtime"] != mtime:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+            if "<html" not in text[:2000].lower():
+                raise ValueError("not an html document")
+            _DASH_CACHE.update(path=path, mtime=mtime, text=text)
+        return _DASH_CACHE["text"], "file"
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        if _DASH_CACHE["text"] is None or _DASH_CACHE["path"] != path:
+            log.warning("dashboard file %s unusable (%s); serving the inline fallback", path, exc)
+        return DASHBOARD_HTML, "inline-fallback"
+
+
 async def gateway_dashboard(request):
-    return web.Response(text=DASHBOARD_HTML, content_type="text/html")
+    html, source = dashboard_html()
+    return web.Response(text=html, content_type="text/html", headers={"Cache-Control": "no-store", "X-Dashboard-Source": source})
 
 DASHBOARD_HTML = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><title>vLLM Gateway</title>
