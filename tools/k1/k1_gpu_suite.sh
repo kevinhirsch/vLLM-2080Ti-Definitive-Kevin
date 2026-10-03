@@ -8,10 +8,15 @@ cd "$(dirname "$0")"
 O=/home/kevin/projects/lanes/k1/suite_$(date +%H%M); mkdir -p "$O"
 export CUDA_VISIBLE_DEVICES=$G K1_CAP_MB=${K1_CAP_MB:-420} K1_FI_WS_MB=64 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   CUDA_HOME=/usr/local/cuda-13 PATH=/home/kevin/Desktop/wt-integrate/.venv/bin:/usr/local/cuda-13/bin:$PATH \
-  PYTHONPATH=/home/kevin/Desktop/wt-k1
-run() { local n=$1; shift; echo "== $n $(date +%T)"; timeout 1500 "$@" > "$O/$n.log" 2>&1; echo "rc=$? $(grep -E 'GATE|passed|failed|Hk=|ms ' "$O/$n.log" | grep -v Warn | tail -14)"; }
+  PYTHONPATH=/home/kevin/Desktop/wt-k1:/home/kevin/projects/lanes/windows
+# every GPU process runs under the enforced cap runner (own systemd unit, allocator cap, watcher kill at cap+margin)
+CAP=${K1_CAP_MB:-420}
+run() { local n=$1; shift; echo "== $n $(date +%T)"
+  ~/projects/lanes/windows/gpuok.sh --run --lane k1 --job "$n" --gpu "$G" --cap $((CAP + 250)) --margin 150 --timeout 1500 \
+    --out "$O/$n.log" -- env CUDA_VISIBLE_DEVICES=$G K1_CAP_MB=$CAP K1_FI_WS_MB=64 PYTHONPATH=$PYTHONPATH PATH=$PATH CUDA_HOME=$CUDA_HOME "$@"
+  echo "rc=$? $(grep -E 'GATE|passed|failed|Hk=|ms ' "$O/$n.log" | grep -v Warn | tail -14)"; }
 run gate python test_fa75_prefill.py
-run pytest_cont python -m pytest -q -p no:cacheprovider /home/kevin/Desktop/wt-k1/tests/v1/attention/test_tq_k1_continuation.py /home/kevin/Desktop/wt-k1/tests/v1/attention/test_tq_prefix_combine_lse.py
+run pytest_cont python -m pytest -q -p no:cacheprovider --confcutdir=/home/kevin/Desktop/wt-k1/tools/k1 -c /dev/null --rootdir=/home/kevin/Desktop/wt-k1/tools/k1 -p live_guard /home/kevin/Desktop/wt-k1/tests/v1/attention/test_tq_k1_continuation.py /home/kevin/Desktop/wt-k1/tests/v1/attention/test_tq_prefix_combine_lse.py
 run gqa_proxy python ablate.py --gqa-proxy
 run ablate_3632x32k python ablate.py 3632 32768
 run ablate_512x64k python ablate.py 512 65536
