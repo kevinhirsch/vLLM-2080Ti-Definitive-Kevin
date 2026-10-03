@@ -291,7 +291,7 @@ def status():
         pass
     try:   # LV: the liveness authority's published state + holds (what engine_status shows Halo)
         live = json.load(open(LSTATE))
-        live = {k: live.get(k) for k in ("state", "since", "reason", "as_of", "gate", "last_action", "declared")}
+        live = {k: live.get(k) for k in ("state", "since", "reason", "as_of", "gate", "last_action", "declared", "implicit_holds")}
     except Exception:  # noqa: BLE001
         live = None
     return {"as_of": now_iso(), "unit": unit_view(), "engine_healthy": engine_healthy(), "gateway": gateway_view(),
@@ -444,17 +444,25 @@ def offline_and_wait(deadline_s, reason, token, by=None, hard_cap_s=None):
     flowing during the restart. Returns (facts, lease) or None when the gateway has no such endpoint (older gateway,
     or the window cannot be taken): the caller then falls back to the drain fence."""
     facts = {"fence": False, "strategy": "offline-window", "waited_s": 0, "active_at_start": None, "active_at_end": None}
+    lease = None
     try:
         cur = http(f"{GATEWAY}/gateway/offline", token=token)
-        if "offline" not in cur or cur.get("offline"):
+        if "offline" not in cur:
             return None
-        opened = http(f"{GATEWAY}/gateway/offline", "POST", {"ttl_s": min(3600, int(deadline_s) + 1200),
-                      "reason": f"engine planned restart: {reason}"[:120], "by": by or "engine-actuator"}, token)
-        lease = opened.get("lease")
-        if not lease:
-            return None
-        facts["fence"] = True
-        facts["active_at_start"] = opened.get("local_active")
+        if cur.get("offline"):
+            # LV 2026-10-03: a window is ALREADY open (typically the caller's own `gateway-offline.py run` around a window that
+            # restarts through here). New work already goes remote, so ride it: never fall back to the drain fence, which
+            # refuses ALL admission and is for gateway code swaps only. We hold no lease of it, so we release nothing.
+            facts.update(strategy="existing-offline-window", fence=True, window_by=cur.get("by"), window_reason=cur.get("reason"),
+                         window_remaining_s=cur.get("remaining_s"), active_at_start=cur.get("local_active"))
+        else:
+            opened = http(f"{GATEWAY}/gateway/offline", "POST", {"ttl_s": min(3600, int(deadline_s) + 1200),
+                          "reason": f"engine planned restart: {reason}"[:120], "by": by or "engine-actuator"}, token)
+            lease = opened.get("lease")
+            if not lease:
+                return None
+            facts["fence"] = True
+            facts["active_at_start"] = opened.get("local_active")
     except Exception:  # noqa: BLE001
         return None
     # FX2/L63: inside an offline window NEW work already goes remote, so the local count can only fall; a longer wait costs
@@ -467,12 +475,13 @@ def offline_and_wait(deadline_s, reason, token, by=None, hard_cap_s=None):
     try:
         w = wait_drained(_active, deadline_s, hard_cap_s=hard_cap_s, get_progress=engine_progress)
     except BaseException:  # noqa: BLE001  L77: the caller never saw this lease; release the window rather than strand it to TTL
-        with shielded():
-            release_lease(("offline", lease), token)
+        if lease:
+            with shielded():
+                release_lease(("offline", lease), token)
         raise
     facts.update(waited_s=w["waited_s"], active_at_end=w["active_at_end"] if w["active_at_end"] is not None else facts["active_at_start"],
                  end_reason=w["end_reason"], extended_s=w["extended_s"], hard_cap_s=hard_cap_s)
-    return facts, ("offline", lease)
+    return facts, (("offline", lease) if lease else None)
 
 
 def engine_inflight(engine=None, timeout=3):
@@ -597,11 +606,11 @@ def do_restart(a):
                 t_drain = time.time()
                 hard_cap = float(max(a.drain_s, getattr(a, "drain_max_s", 0) or 0))
                 got = None if os.environ.get("ENGINE_ACTUATOR_FORCE_DRAIN") else offline_and_wait(a.drain_s, reason, token, by, hard_cap_s=hard_cap)
-                drain_facts, lease = got if got else drain_and_wait(a.drain_s, reason, token, by)
+                drain_facts, lease = got if got is not None else drain_and_wait(a.drain_s, reason, token, by)
                 # FX2: the fence counts only gateway-accepted requests. Also wait on the engine's own in-flight count inside the SAME
                 # budget (what is left of it; at least one sample), so a direct :8001 caller is not cut mid-request. In an offline
                 # window (new work already goes remote) both waits may run past --drain-s while tokens still advance, to the hard cap.
-                offline = drain_facts.get("strategy") == "offline-window"
+                offline = drain_facts.get("strategy") in ("offline-window", "existing-offline-window")
                 used = time.time() - t_drain
                 eng = wait_engine_idle(max(0.0, a.drain_s - used), hard_cap_s=(hard_cap - used) if offline and hard_cap > a.drain_s else None)
                 drain_facts["engine"] = eng
@@ -765,6 +774,7 @@ FQ_RUNNING_MAX_S = 10800
 #: legacy windows that neither hold nor stop the timer (lane window.sh / *_window.sh / *_driver.sh, the frontier runner's own guard
 #: pattern): treated as an implicit engine hold for at most HOLD_MAX_TTL_S of their runtime, until every window takes a real hold
 WINDOW_PROC_RE = re.compile(r"^(?:\S*/)?bash\s+\S*(?:_window|_driver|/window)\.sh(?:\s|$)")
+HOLD_ENV = "ENGINE_HOLD_LEASE"                    # `hold run` exports its lease to the child; `restart` reads it as --hold
 HOLD_KINDS = ("engine", "quiesce")                # engine: the holder owns the engine. quiesce: a release (gateway publish) is in flight
 
 def _env_i(name, default):
@@ -935,7 +945,10 @@ def hold_run(kind, by, reason, ttl_s, cmd, ensure_up=True):
     child = None
     try:
         with terminate_as_exception():
-            child = subprocess.Popen(cmd)
+            # the child (a window script) inherits the lease: its own `engine-actuator.py restart` calls pick it up from
+            # ENGINE_HOLD_LEASE without knowing about holds, so wrapping a legacy window in `hold run` never breaks it
+            env = dict(os.environ, **{HOLD_ENV: got["lease"], HOLD_ENV + "_KIND": kind})
+            child = subprocess.Popen(cmd, env=env)
             rc = child.wait()
     except Terminated as t:
         rc = 128 + t.signum
@@ -1102,6 +1115,31 @@ def observe(now=None):
             "fault_times": _recent_fault_times(now), "gate": gate(now)}
 
 
+def implicit_holds(f):
+    """Holds nobody took explicitly but that DO own the engine, in the order classify() honours them. ONE rule for all of them
+    (documented in deploy/docs/engine-liveness-authority.md section 4):
+      * they defer every AUTOMATIC action (tick start/recover, watchdog probes and its recover requests), exactly like an
+        explicit engine hold;
+      * they never refuse a PLANNED restart: their owner is the one calling `restart` (a `gateway-offline.py run` window or a
+        legacy window script restarting its own engine), and a planned restart inside an open offline window rides that window
+        instead of opening a fence. Only an explicit hold, which names its holder, can refuse a planned restart.
+    Each is bounded: the gateway's own lease TTL, FQ_RUNNING_MAX_S, HOLD_MAX_TTL_S of process runtime."""
+    out = []
+    off = f.get("offline") or {}
+    if off.get("offline"):
+        out.append({"kind": "engine", "implicit": "gateway-offline-window", "by": off.get("by"), "reason": off.get("reason"),
+                    "remaining_s": off.get("remaining_s"), "state": "OFFLINE_WINDOW"})
+    if f.get("frontier_window_age_s") is not None:
+        out.append({"kind": "engine", "implicit": "frontier-queue-running", "by": "frontier-queue",
+                    "reason": f"legacy frontier-queue window running ({round(f['frontier_window_age_s'])}s; runner trusts it {FQ_RUNNING_MAX_S}s)",
+                    "remaining_s": round(FQ_RUNNING_MAX_S - f["frontier_window_age_s"]), "state": "HELD"})
+    for w in f.get("window_procs") or []:
+        out.append({"kind": "engine", "implicit": "window-process", "by": f"pid {w[0]}",
+                    "reason": f"legacy window process running without a hold (pid {w[0]}, {w[1]}s, bounded {HOLD_MAX_TTL_S}s): {w[2]}",
+                    "remaining_s": HOLD_MAX_TTL_S - w[1], "state": "HELD"})
+    return out
+
+
 def classify(f, prev):
     """Pure: facts + previous published state -> (state, reason, facts-to-carry). Ordered: who owns the engine first, then health."""
     now, u = f["now"], f.get("unit") or {}
@@ -1119,14 +1157,12 @@ def classify(f, prev):
     if eh:
         h = eh[0]
         return "HELD", f"engine held by {h.get('by')} until {datetime.fromtimestamp(h['until']).strftime('%H:%M:%S')}: {h.get('reason')}", carry
-    off = f.get("offline") or {}
-    if off.get("offline"):
-        return "OFFLINE_WINDOW", f"gateway planned-offline window by {off.get('by')} ({off.get('remaining_s')}s left): {off.get('reason')}", carry
-    if f.get("frontier_window_age_s") is not None:
-        return "HELD", f"legacy frontier-queue window running ({round(f['frontier_window_age_s'])}s; runner trusts it {FQ_RUNNING_MAX_S}s)", carry
-    if f.get("window_procs"):
-        w = f["window_procs"][0]
-        return "HELD", f"legacy window process running without a hold (pid {w[0]}, {w[1]}s, bounded {HOLD_MAX_TTL_S}s): {w[2]}", carry
+    imp = implicit_holds(f)
+    if imp:
+        h = imp[0]
+        if h["implicit"] == "gateway-offline-window":
+            return "OFFLINE_WINDOW", f"gateway planned-offline window by {h['by']} ({h['remaining_s']}s left): {h['reason']}", carry
+        return h["state"], h["reason"], carry
     pend = [a for a in _actions_cached(f) if a.get("outcome") == "pending" and now - float(a.get("t") or 0) < VERIFY_S]
     if f["healthy"]:
         if f.get("watchdog_failures"):
@@ -1226,6 +1262,7 @@ def _publish_state(state, reason, carry, f, extra=None):
            "declared": STATES[state], "probe": state not in NO_PROBE_STATES, **carry,
            "unit": {k: (f.get("unit") or {}).get(k) for k in ("ActiveState", "SubState", "MainPID", "NRestarts", "ExecMainStartTimestamp")},
            "healthy": f["healthy"], "holds": [{k: h.get(k) for k in ("kind", "by", "reason", "until", "mode")} for h in f.get("holds") or []],
+           "implicit_holds": implicit_holds(f),
            "gate": f.get("gate"), "faults_window": f.get("faults_window"), "last_action": (_actions_cached(f) or [None])[-1]}
     if extra:
         out.update(extra)
@@ -1376,7 +1413,8 @@ def main():
     p.add_argument("--no-drain", action="store_true"); p.add_argument("--foreground", action="store_true")
     p.add_argument("--force", action="store_true", help="restart even when the requested diag flags are already active")
     p.add_argument("--health-wait-s", type=int, default=HEALTH_WAIT_S, help="after start, wait this long for /health before calling the restart failed")
-    p.add_argument("--hold", default=None, help="LV: the lease of the engine hold this caller owns (a window restarting its own engine)")
+    p.add_argument("--hold", default=os.environ.get(HOLD_ENV) or None,
+                   help=f"LV: the lease of the engine hold this caller owns (a window restarting its own engine); default ${HOLD_ENV}")
     p = sp.add_parser("announce-start"); p.add_argument("--wait-healthy", action="store_true", help=argparse.SUPPRESS)
     sp.add_parser("restart-status")
     # LV: the liveness authority
@@ -1448,7 +1486,10 @@ def main():
                 print(json.dumps({"refused": "nothing to run (hold run ... -- CMD ARGS)"})); return 2
             return hold_run(a.kind, a.by, a.reason, a.ttl, argv, ensure_up=not a.no_ensure_up)
         else:
-            r = {"holds": active_holds(), "max_ttl_s": HOLD_MAX_TTL_S}
+            f = observe()
+            r = {"holds": active_holds(), "implicit_holds": implicit_holds(f), "max_ttl_s": HOLD_MAX_TTL_S,
+                 "rule": "explicit holds defer automatic actions AND refuse others' planned restarts; implicit holds defer "
+                         "automatic actions only (their owner is the restart caller)"}
         print(json.dumps(r, default=str))
         return 3 if r.get("refused") else 0
     return 0

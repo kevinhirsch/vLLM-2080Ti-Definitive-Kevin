@@ -395,6 +395,88 @@ class PlannedRestartHonoursHolds(Base):
         self.assertEqual(rc, 0)
 
 
+class LeaseInheritance(Base):
+    """Coordinator 2026-10-03: lane window scripts call `restart` with no --hold; wrapped in `hold run` they must keep working."""
+
+    def test_hold_run_exports_the_lease_to_its_child(self):
+        out = os.path.join(self.tmp.name, "env.json")
+        rc = ea.hold_run("engine", "W", "window wrapped in hold run", 600,
+                         [sys.executable, "-c", "import json,os,sys; json.dump({k: os.environ.get(k) for k in "
+                          "('ENGINE_HOLD_LEASE','ENGINE_HOLD_LEASE_KIND')}, open(sys.argv[1],'w'))", out], ensure_up=False)
+        self.assertEqual(rc, 0)
+        env = json.load(open(out))
+        self.assertTrue(env["ENGINE_HOLD_LEASE"])
+        self.assertEqual(env["ENGINE_HOLD_LEASE_KIND"], "engine")
+        self.assertEqual(ea.active_holds(), [])          # released after the child exits
+
+    def test_restart_reads_the_lease_from_the_environment(self):
+        seen = {}
+        with patch.dict(os.environ, {ea.HOLD_ENV: "LEASE-FROM-ENV"}), \
+                patch.object(sys, "argv", ["engine-actuator.py", "restart", "--reason", "arm restore inside a window"]), \
+                patch.object(ea, "spawn_detached", lambda a: seen.setdefault("hold", a.hold) and {"scheduled": True}), \
+                patch("builtins.print", lambda *a, **k: None):
+            ea.main()
+        self.assertEqual(seen["hold"], "LEASE-FROM-ENV")
+        with patch.dict(os.environ, {ea.HOLD_ENV: "LEASE-FROM-ENV"}), \
+                patch.object(sys, "argv", ["engine-actuator.py", "restart", "--reason", "arm restore inside a window", "--hold", "EXPLICIT"]), \
+                patch.object(ea, "spawn_detached", lambda a: seen.__setitem__("hold2", a.hold) or {"scheduled": True}), \
+                patch("builtins.print", lambda *a, **k: None):
+            ea.main()
+        self.assertEqual(seen["hold2"], "EXPLICIT")
+
+    def test_child_restart_with_inherited_lease_is_admitted(self):
+        h = ea.hold_acquire("engine", "W", "window wrapped in hold run", 600)
+        args = PlannedRestartHonoursHolds.args(self, hold=h["lease"])
+        with patch("builtins.print", lambda s: None), patch.object(ea, "status", lambda: {"gateway": {}}), \
+                patch.object(ea, "active_flags", lambda: []), patch.object(ea, "staged_flags", lambda: []), \
+                patch.object(ea.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, "", "")):
+            self.assertEqual(ea.do_restart(args), 0)
+
+
+class ImplicitHoldsOneRule(Base):
+    """Implicit holds (gateway offline window, frontier RUNNING, legacy window process) defer AUTOMATIC actions and never
+    refuse a PLANNED restart; explicit holds do both."""
+
+    def test_offline_window_defers_automatic_but_admits_planned(self):
+        self.offline = {"offline": True, "by": "K3", "reason": "microbench", "remaining_s": 900}
+        out = ea.tick()
+        self.assertEqual(out["state"], "OFFLINE_WINDOW")
+        self.assertEqual(out["implicit_holds"][0]["implicit"], "gateway-offline-window")
+        self.assertFalse(ea.recover("wedge", "watchdog", "x")["acted"])
+        self.assertEqual(ea.active_holds(), [])          # active_holds() = explicit only, by definition
+        args = PlannedRestartHonoursHolds.args(self)
+        with patch("builtins.print", lambda s: None), patch.object(ea, "status", lambda: {"gateway": {}}), \
+                patch.object(ea, "active_flags", lambda: []), patch.object(ea, "staged_flags", lambda: []), \
+                patch.object(ea.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, "", "")):
+            self.assertEqual(ea.do_restart(args), 0)
+
+    def test_order_matches_classify(self):
+        self.offline = {"offline": True, "by": "K3", "reason": "r", "remaining_s": 10}
+        self.windows = [(1, 5, "bash x/window.sh")]
+        f = ea.observe()
+        imp = ea.implicit_holds(f)
+        self.assertEqual([h["implicit"] for h in imp], ["gateway-offline-window", "window-process"])
+        self.assertEqual(ea.classify(f, {})[0], "OFFLINE_WINDOW")
+
+
+class RestartRidesAnOpenOfflineWindow(unittest.TestCase):
+    """A planned restart inside someone's open offline window used to fall back to the drain FENCE (refuses all admission)."""
+
+    def test_rides_existing_window(self):
+        calls = []
+
+        def http(url, method="GET", payload=None, token=None, timeout=5):
+            calls.append((url.replace(ea.GATEWAY, ""), method))
+            return {"offline": True, "by": "K3", "reason": "bench", "remaining_s": 900, "local_active": 0}
+        with patch.object(ea, "http", http), patch.object(ea, "engine_progress", lambda *a, **k: None):
+            facts, lease = ea.offline_and_wait(5, "arm", "tok", "W", hard_cap_s=5)
+        self.assertEqual(facts["strategy"], "existing-offline-window")
+        self.assertEqual(facts["window_by"], "K3")
+        self.assertIsNone(lease)
+        self.assertEqual({m for _p, m in calls}, {"GET"})        # no POST (new window), no DELETE (not ours), no drain
+        self.assertTrue(all(p == "/gateway/offline" for p, _m in calls))
+
+
 class Cli(Base):
     def test_status_shows_liveness_and_holds(self):
         ea.tick()
