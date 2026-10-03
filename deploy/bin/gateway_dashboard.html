@@ -650,6 +650,7 @@ const REASONS={
   'monster':{plain:'A huge prefill was already monopolising the engine, so new arrivals were sent remote until it drained.',field:'monster_inflight',fix:'Raise the threshold, or expect this while a big job runs.',explicit:false},
   'tiny-fast':{plain:'A tiny request found even the reserved tiny-request headroom full.',field:'tiny_extra_lanes',fix:'Add tiny extra lanes.',explicit:false},
   'tokens':{plain:'A lane was free, but admitting this request would exceed the total in-flight token budget.',field:'token_budget',fix:'Raise the token budget (or leave it on auto to follow the live KV pool).',explicit:false},
+  'qol':{plain:'An interactive request was predicted to wait too long for its first local token (queue + backlog + its own prefill, over the QoL target) and the remote answers that size measurably faster (SHIM_QOL_OVERFLOW=on).',field:'qol_ttft_s',fix:'Raise the QoL target or minimum gain, or set qol_overflow to shadow/off.',explicit:false},
   'prefill':{plain:'The engine already had as much uncached prompt queued as the admission window allows.',field:'prefill_admit_secs',fix:'Raise the admission window, or wait for the backlog to drain.',explicit:false},
   'bg-yield':{plain:'Lanes were free but reserved for interactive work, and this request was background.',field:'fg_reserved',fix:'Lower the reserved-lane count.',explicit:false},
   'cap':{plain:'All lanes were busy and the request waited past its queue timeout.',field:'local_budget',fix:'Raise the lane budget or the queue-wait timeout.',explicit:false},
