@@ -20,6 +20,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+
+def _gateway_source():
+    """The gateway's full source: keepalive-shim.py with its include parts expanded (lane SH, gateway_parts.py)."""
+    import importlib.util as _ilu
+    _s = _ilu.spec_from_file_location("gateway_parts_for_tests", str(__import__("pathlib").Path(__file__).with_name("gateway_parts.py")))
+    _m = _ilu.module_from_spec(_s)
+    _s.loader.exec_module(_m)
+    return _m.expanded_source(str(__import__("pathlib").Path(__file__).with_name("keepalive-shim.py")))
+
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "gateway_dashboard.html"
 
@@ -307,7 +316,7 @@ class DashLibMapping(unittest.TestCase):
         self.assertAlmostEqual(r["rows"][0]["pct"], 200 / 3.0)
 
     def test_every_reason_the_gateway_emits_is_documented(self):
-        src = (HERE / "keepalive-shim.py").read_text()
+        src = _gateway_source()
         emitted = set(re.findall(r'record_event\(\s*"(?:remote|rejected|rejected-bg)"\s*,\s*"([a-z-]+)"', src))
         documented = set(self.js("Object.keys(L.REASONS)"))
         self.assertEqual(sorted(emitted - documented), [], "reasons emitted by the gateway but missing from the dashboard")
@@ -551,7 +560,7 @@ class SafePublishShipsTheDashboard(unittest.TestCase):
     def test_the_shim_finds_the_page_beside_itself_by_default(self):
         self.assertEqual(self.pub.DASH_RUNTIME.name, "gateway_dashboard.html")
         self.assertEqual(self.pub.DASH_RUNTIME.parent, self.pub.RUNTIME.parent)
-        src = (HERE / "keepalive-shim.py").read_text()
+        src = _gateway_source()
         self.assertIn('os.path.join(os.path.dirname(os.path.abspath(__file__)), "gateway_dashboard.html")', src)
 
 

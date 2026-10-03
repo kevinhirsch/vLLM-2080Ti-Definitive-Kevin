@@ -14,8 +14,9 @@ beginning with "# gateway-part:"; everything after them is the original code, by
 
     python3 gateway_parts.py expand [SHIM]            print the monolith (includes replaced by part bodies)
     python3 gateway_parts.py check  [SHIM] --against REV
-                                                      exit 0 iff expand(SHIM) == expand(SHIM at git REV): the proof
-                                                      that a split commit is a pure move
+                                                      exit 0 iff expand(SHIM) == expand(SHIM at git REV), with the
+                                                      GATEWAY_PARTS registry tuple normalised: the proof that a split
+                                                      commit is a pure move
     python3 gateway_parts.py split  SHIM FIRST LAST NAME "TITLE"
                                                       move lines FIRST..LAST (1-based, inclusive) into gateway_part_NAME.py
 
@@ -66,6 +67,15 @@ def expanded_source(shim_path=SHIM):
     return expand_text(text, read_part)
 
 
+_REGISTRY_RE = re.compile(r'^GATEWAY_PARTS = \(\n(?:    "[^"\n]+",\n)*\)\n', re.M)
+
+
+def without_registry(text):
+    """The source with its GATEWAY_PARTS tuple emptied: a split commit adds exactly one include line (expanded away)
+    and one tuple entry (normalised here), nothing else."""
+    return _REGISTRY_RE.sub("GATEWAY_PARTS = (\n)\n", text)
+
+
 def expanded_at(rev, repo=None, rel="deploy/bin"):
     repo = repo or os.path.dirname(os.path.dirname(HERE))
 
@@ -102,7 +112,7 @@ def main(argv):
         rest = argv[2:]
         rev = rest[rest.index("--against") + 1]
         shim = rest[0] if rest and rest[0] != "--against" else SHIM
-        same = expanded_source(shim) == expanded_at(rev)
+        same = without_registry(expanded_source(shim)) == without_registry(expanded_at(rev))
         print("pure move: expanded source is byte-identical to %s" % rev if same else "DIFFERS from %s" % rev)
         return 0 if same else 1
     if len(argv) == 7 and argv[1] == "split":

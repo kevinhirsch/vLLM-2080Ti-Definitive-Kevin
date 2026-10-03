@@ -677,9 +677,29 @@ def effective(module_globals=None, environ=None, env_file=None, schema=SCHEMA, o
 
 
 # ------------------------------------------------------------------ code scan (used by the test and `scan`)
+def gateway_parts(path):
+    """Lane SH: the include parts a shim lists in its literal GATEWAY_PARTS tuple (read by AST, nothing executed)."""
+    tree = ast.parse(open(path).read())
+    for n in tree.body:
+        if (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "GATEWAY_PARTS" for t in n.targets)
+                and isinstance(n.value, (ast.Tuple, ast.List))):
+            return [e.value for e in n.value.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+    return []
+
+
 def scan_code(path):
     """{key: [(lineno, default_literal_or_marker), ...]} for every literal-named env read in a Python file:
-    os.environ.get("K", d), os.getenv("K", d), os.environ["K"], "K" in os.environ."""
+    os.environ.get("K", d), os.getenv("K", d), os.environ["K"], "K" in os.environ. Lane SH: a shim's include parts
+    (its GATEWAY_PARTS tuple) execute in its namespace, so their reads are the shim's reads -- returned as the union."""
+    hits = _scan_one(path)
+    base = os.path.dirname(os.path.abspath(path))
+    for part in gateway_parts(path):
+        for k, reads in _scan_one(os.path.join(base, part)).items():
+            hits.setdefault(k, []).extend(reads)
+    return hits
+
+
+def _scan_one(path):
     src = open(path).read()
     tree = ast.parse(src)
     hits = {}

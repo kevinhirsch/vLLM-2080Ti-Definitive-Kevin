@@ -85,11 +85,21 @@ print("RATCHET " + json.dumps({"hits": hits, "ran": result.testsRun,
 # any WRITE to these paths by a test or tool is a hit too (reads are allowed).
 _LIVE = "/home/kevin/.local/share/vllm-qwen27b/"
 LIVE_GATEWAY_FILES = [_LIVE + n for n in ("keepalive-shim.py", "gateway_dashboard.html", "gateway_config_schema.py",
-                                          "shim.env", "gateway-aliases.json", "admin.token")]
+                                          "shim.env", "gateway-aliases.json", "admin.token",
+                                          "gateway_part_")]          # lane SH: every include part (prefix match)
+
+
+def _gateway_source():
+    """The gateway's full source: keepalive-shim.py with its include parts expanded (lane SH, gateway_parts.py)."""
+    import importlib.util as _ilu
+    _s = _ilu.spec_from_file_location("gateway_parts_for_tests", str(__import__("pathlib").Path(__file__).with_name("gateway_parts.py")))
+    _m = _ilu.module_from_spec(_s)
+    _s.loader.exec_module(_m)
+    return _m.expanded_source(str(__import__("pathlib").Path(__file__).with_name("keepalive-shim.py")))
 
 
 def production_paths():
-    src = SHIM.read_text()
+    src = _gateway_source()
     paths = []
     for var in ("SHIM_SPEND_FILE", "SHIM_SPEND_CLIENTS_FILE"):
         m = re.search(var + r'",\s*\n?\s*"([^"]+)"', src)

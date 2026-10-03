@@ -236,8 +236,24 @@ GATEWAY_MODULES = (
 )
 
 
+# The shim's include parts (gateway_parts.py) are required modules too; they are discovered from the shim source being
+# published, so the manifest can never drift from the includes the new gateway will execute.
+_PART_INCLUDE_RE = re.compile(r'^_include_gateway_part\("(gateway_part_[a-z0-9_]+\.py)"\)[ \t]*$', re.M)
+
+
+def _part_names() -> list[str]:
+    try:
+        return _PART_INCLUDE_RE.findall(SOURCE.read_text(encoding="utf-8"))
+    except OSError:
+        return []
+
+
 def _module_names() -> list[str]:
-    return [name for name, _ in GATEWAY_MODULES]
+    return [name for name, _ in GATEWAY_MODULES] + _part_names()
+
+
+def _module_entries() -> list:
+    return list(GATEWAY_MODULES) + [(name, name) for name in _part_names()]
 
 
 def _module_sources() -> dict:
@@ -291,7 +307,7 @@ def _restore_gateway_files(state: dict) -> None:
 
 def _install_modules() -> dict:
     out = {"modules": {}}
-    for name, key in GATEWAY_MODULES:
+    for name, key in _module_entries():
         src, dst = SOURCE.with_name(name), RUNTIME.with_name(name)
         if not src.is_file():
             out[key] = "absent"

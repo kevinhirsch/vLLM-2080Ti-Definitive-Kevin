@@ -25,6 +25,15 @@ _HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 import gateway_config_schema as S  # noqa: E402
 
+
+def _gateway_source():
+    """The gateway's full source: keepalive-shim.py with its include parts expanded (lane SH, gateway_parts.py)."""
+    import importlib.util as _ilu
+    _s = _ilu.spec_from_file_location("gateway_parts_for_tests", str(__import__("pathlib").Path(__file__).with_name("gateway_parts.py")))
+    _m = _ilu.module_from_spec(_s)
+    _s.loader.exec_module(_m)
+    return _m.expanded_source(str(__import__("pathlib").Path(__file__).with_name("keepalive-shim.py")))
+
 _SHIM = _HERE / "keepalive-shim.py"
 _SPEC = importlib.util.spec_from_file_location("keepalive_shim_cfg", _SHIM)
 shim = importlib.util.module_from_spec(_SPEC)
@@ -302,7 +311,7 @@ class EffectiveView(unittest.TestCase):
         body = json.loads(resp.body)
         self.assertEqual(body["schema_version"], S.SCHEMA_VERSION)
         self.assertIn("summary", body)
-        src = _SHIM.read_text()
+        src = _gateway_source()
         self.assertIn('add_get("/gateway/config/effective", gateway_config_effective)', src)
 
 

@@ -9,6 +9,15 @@ import pathlib
 import unittest
 from unittest.mock import patch
 
+
+def _gateway_source():
+    """The gateway's full source: keepalive-shim.py with its include parts expanded (lane SH, gateway_parts.py)."""
+    import importlib.util as _ilu
+    _s = _ilu.spec_from_file_location("gateway_parts_for_tests", str(__import__("pathlib").Path(__file__).with_name("gateway_parts.py")))
+    _m = _ilu.module_from_spec(_s)
+    _s.loader.exec_module(_m)
+    return _m.expanded_source(str(__import__("pathlib").Path(__file__).with_name("keepalive-shim.py")))
+
 _HERE = pathlib.Path(__file__).resolve().parent
 _SPEC = importlib.util.spec_from_file_location("keepalive_shim_ra", _HERE / "keepalive-shim.py")
 shim = importlib.util.module_from_spec(_SPEC)
@@ -119,7 +128,7 @@ class RepeatToolNote(unittest.TestCase):
             self.assertEqual(shim.repeated_tool_call_note(body), (body, 0))
 
     def test_wired_into_the_one_local_prep_chain(self):
-        src = (_HERE / "keepalive-shim.py").read_text()
+        src = _gateway_source()
         self.assertEqual(src.count("repeated_tool_call_note(prepared)"), 1)
 
     def test_prep_chain_applies_note_and_records_it(self):

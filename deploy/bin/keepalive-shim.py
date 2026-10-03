@@ -156,10 +156,18 @@ def _load_gateway_module(fname, modname, required=True):
         return None
 
 
+# Every include part, in include order (gateway_parts.py). A literal tuple on purpose: gateway_config_schema.scan_code
+# reads it by AST to scan the parts' SHIM_* reads too, and a part not listed here is refused at include time.
+GATEWAY_PARTS = (
+)
+
+
 def _include_gateway_part(fname):
     """Lane SH: execute a gateway_part_*.py file INSIDE this module's own namespace, at the point of the call -- a
     pure file split of this shim (see gateway_parts.py). Required: a missing or broken part stops the gateway at
     startup (gateway_safe_publish ships every part and verifies its sha256 via GET /gateway/modules)."""
+    if fname not in GATEWAY_PARTS:
+        raise RuntimeError("gateway part %s is not listed in GATEWAY_PARTS" % fname)
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), fname)
     rec = _GATEWAY_MODULES_LOADED[fname] = {"sha256": None, "loaded": False, "required": True, "error": None,
                                             "kind": "part"}

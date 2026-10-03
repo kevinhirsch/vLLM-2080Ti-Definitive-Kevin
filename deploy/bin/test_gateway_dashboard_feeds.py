@@ -21,6 +21,15 @@ from unittest.mock import AsyncMock, patch
 
 import test_gateway_local_first as lf
 
+
+def _gateway_source():
+    """The gateway's full source: keepalive-shim.py with its include parts expanded (lane SH, gateway_parts.py)."""
+    import importlib.util as _ilu
+    _s = _ilu.spec_from_file_location("gateway_parts_for_tests", str(__import__("pathlib").Path(__file__).with_name("gateway_parts.py")))
+    _m = _ilu.module_from_spec(_s)
+    _s.loader.exec_module(_m)
+    return _m.expanded_source(str(__import__("pathlib").Path(__file__).with_name("keepalive-shim.py")))
+
 shim = lf.shim
 HERE = pathlib.Path(__file__).resolve().parent
 REAL_ACTIVE_SET = shim._active_set                       # captured before any fixture patches it
@@ -209,7 +218,7 @@ class OverflowReasons(unittest.TestCase):
 
     @staticmethod
     def emitted():
-        src = (HERE / "keepalive-shim.py").read_text()
+        src = _gateway_source()
         route = src[src.index("async def _route_completions("):]
         route = route[:route.index("\n# ---------------- passthrough")]
         literal = set(re.findall(r'record_event\(\s*"(?:remote|rejected|rejected-bg)"\s*,\s*"([a-z-]+)"', route))
