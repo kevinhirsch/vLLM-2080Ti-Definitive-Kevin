@@ -799,6 +799,27 @@ logging.basicConfig(level=logging.INFO, stream=sys.stdout,
                     format="%(asctime)s [gateway] %(levelname)s %(message)s")
 log = logging.getLogger("gateway-shim")
 
+# ---- lane SH (2026-10-03): swallowed exceptions are counted, never invisible ----
+# ~100 `except Exception: pass` blocks keep bookkeeping from breaking a request, which is right, but a handler that
+# fires on EVERY request (an unwritable ledger, an unreadable outcome alarm that silently keeps the stalled brake on,
+# a learning table that always raises) looked exactly like health. State/IO sites now call _swallowed(site, exc):
+# per-site count + last error, a warning on the 1st, 2nd, 4th, 8th... occurrence, exported at
+# /gateway/internal-errors and as gateway_swallowed_errors_total{site} on /metrics. Parse-tolerance sites
+# (untrusted request bodies, optional files, regex scrapes) stay silent on purpose.
+_SWALLOWED = {}                 # site -> [count, last_epoch, last_repr]; keys are fixed source sites (bounded)
+
+
+def _swallowed(site, exc):
+    rec = _SWALLOWED.get(site)
+    if rec is None:
+        rec = _SWALLOWED[site] = [0, 0.0, ""]
+    rec[0] += 1
+    rec[1] = time.time()
+    rec[2] = repr(exc)[:240]
+    n = rec[0]
+    if n & (n - 1) == 0:          # 1, 2, 4, 8, ...: loud at first, never a log flood
+        log.warning("swallowed exception #%d at %s: %s", n, site, rec[2])
+
 # Optional admin gate for mutating gateway endpoints (POST /gateway/config, POST
 # /gateway/models/local). Default OFF: loaded once at import. SHIM_ADMIN_TOKEN env
 # overrides; otherwise read from SHIM_ADMIN_TOKEN_FILE (0600 file, one line, whitespace
@@ -894,8 +915,8 @@ def _remote_dead_save():
         with open(tmp, "w") as fh:
             json.dump({"until": _remote_dead_until, "count": _remote_dead_count}, fh)
         os.replace(tmp, _REMOTE_DEAD_FILE)
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("_remote_dead_save", _e)
 
 
 _REMOTE_DEAD_PERSIST = False       # armed by _on_startup only: importing the module (tests) must never read or write live state
@@ -915,8 +936,8 @@ def _note_remote_status(base, status):
         elif status == 200 and str(base).rstrip("/") != str(LOCAL).rstrip("/") and _remote_dead_until:
             _remote_dead_until = 0.0
             _remote_dead_save()
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("_note_remote_status", _e)
 
 
 def remote_ok():
@@ -981,8 +1002,8 @@ def _drain_ledger_write(row):
         os.makedirs(os.path.dirname(_DRAIN_LEDGER), exist_ok=True)
         with open(_DRAIN_LEDGER, "a") as fh:
             fh.write(json.dumps(row, sort_keys=True) + "\n")
-    except Exception:       # never let bookkeeping affect admission
-        pass
+    except Exception as _e:       # never let bookkeeping affect admission
+        _swallowed("_drain_ledger_write", _e)
 
 
 def _drain_close_record(how, now=None):
@@ -1019,8 +1040,8 @@ def _drain_startup_recover():
                                  "duration_s": round(time.time() - float(last.get("t") or time.time()), 1), "reason": last.get("reason"),
                                  "by": last.get("by"), "ttl_s": last.get("ttl_s"), "active_at_open": last.get("active"),
                                  "refused": None, "note": "refused count unknown: the process that held the fence is gone"})
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("_drain_startup_recover", _e)
 
 
 def _draining(now=None):
@@ -1196,7 +1217,10 @@ _CFG.update({
 
 _JSONL_PENDING = []   # plain list; appended to only from the event loop (see _telemetry_log_enqueue)
 _JSONL_STATE = {"date": None, "path": None, "bytes": 0, "capped": False,
-                "written": 0, "dropped_cap": 0, "dropped_queue": 0, "last_err": None}
+                "written": 0, "dropped_cap": 0, "dropped_queue": 0, "last_err": None,
+                # lane SH: rows lost AFTER leaving the queue used to vanish uncounted (and a failed write still
+                # counted as written): unserialisable row / failed write / flusher error.
+                "dropped_bad": 0, "dropped_io": 0, "dropped_err": 0}
 _HISTORY_SUMMARY_CACHE = {"key": None, "at": 0.0, "data": None}
 
 # ---- rings: bounded by construction (deque maxlen), see DESIGN.md (e) ----
@@ -1209,6 +1233,20 @@ _PER_CLIENT = collections.defaultdict(lambda: {
     "requests": 0, "local": 0, "remote": 0, "tokens_out": 0, "tokens_out_exact": 0,
     "tokens_out_lb": 0, "wait_sum": 0.0, "wait_n": 0, "ttft_sum": 0.0, "ttft_n": 0,
     "errors": 0, "cost_est_usd": 0.0, "classes": collections.Counter()})
+# lane SH: keyed by the caller-supplied X-Client/X-Title (or IP), so a client that varies its header grew this table
+# -- and the per-client /metrics label set -- without bound. Past CLIENT_KEYS_MAX distinct names, new names share
+# one "(other)" row; existing rows keep counting.
+CLIENT_KEYS_MAX = 512
+CLIENT_OVERFLOW_KEY = "(other)"
+
+
+def _client_key(table, name):
+    """`name` if `table` already has it or still has room, else the shared overflow key."""
+    if name in table or len(table) < CLIENT_KEYS_MAX:
+        return name
+    return CLIENT_OVERFLOW_KEY
+
+
 _ERROR_FEED = collections.deque(maxlen=200)
 # gw-admission-computed-token-cost safety AC: a request whose actual computed tokens exceed
 # what predict_computed_tokens() would have charged it by > 2x, regardless of whether
@@ -1465,8 +1503,8 @@ def note_output_tokens(client, outtok, t=None):
         h.append((time.time() if t is None else t, int(outtok)))
         if len(_OUT_HIST) > 500:                       # bounded: drop the longest-idle client
             _OUT_HIST.pop(min(_OUT_HIST, key=lambda k: _OUT_HIST[k][-1][0] if _OUT_HIST[k] else 0), None)
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("note_output_tokens", _e)
 
 
 def expected_output_tokens(client, maxtok):
@@ -1552,8 +1590,8 @@ def micro_observe(client, text, outtok):
             _MICRO_HIST.move_to_end(sig)
         h.append(int(outtok))
         _MICRO_STATS["observed"] += 1
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("micro_observe", _e)
 
 
 def micro_predict(client, text, ptok):
@@ -1996,8 +2034,8 @@ def lat_note_request(now, route, ttft, duration, waited, outtok, flow_class=None
                 if v < 120:
                     itl = round(v, 5)
         _REQ_LAT.append((now, route, round(float(ttft), 4), itl, flow_class))
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("lat_note_request", _e)
 
 
 def _quantile(vals, q):
@@ -3594,7 +3632,8 @@ def _spend_allows_overflow(ptok, maxtok):
     locally (queueing for a lane) instead of refusing it."""
     try:
         return _spend().can_hold(_spend_hold_estimate(ptok, maxtok))
-    except Exception:
+    except Exception as _e:
+        _swallowed("_spend_allows_overflow", _e)
         return False
 
 
@@ -3618,7 +3657,8 @@ def _automatic_remote_budget_allows(ptok, maxtok):
         spend = _spend().snapshot()
         exposure = sum(float(spend.get(k) or 0) for k in ("spent", "held", "reserved"))
         return exposure + _spend_hold_estimate(ptok, maxtok) <= STALLED_AUTO_OVERFLOW_CAP_USD
-    except Exception:
+    except Exception as _e:
+        _swallowed("_automatic_remote_budget_allows", _e)
         return False
 
 
@@ -3818,8 +3858,8 @@ def _note_payload_outcome(request, payload, stream):
                     kw["cached_actual"] = cached
                     kw["ptok_exact_local"] = int(u["prompt_tokens"])
         _active_set(request, **kw)
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("_note_payload_outcome", _e)
 
 
 _EST_ERR = collections.deque(maxlen=2000)    # [GW2] (client, est_tokens, exact, est_computed, computed_actual)
@@ -3938,7 +3978,7 @@ def _telemetry_note_request(info, resp=None):
         status = getattr(resp, "status", None)
         if status is None:
             status = info.get("http_status")
-        c = _PER_CLIENT[name]
+        c = _PER_CLIENT[_client_key(_PER_CLIENT, name)]
         c["requests"] += 1
         c["classes"][info.get("flow_class") or "?"] += 1          # Lane DB2: the real work class, per client
         if route in ("local", "remote"):
@@ -4144,15 +4184,17 @@ def _flush_jsonl_blocking(lines, cur_date, cur_path, cur_bytes, cur_capped):
             cur_capped = True
     if cur_capped:
         return {"date": cur_date, "path": cur_path, "bytes": cur_bytes, "capped": True,
-                "written": 0, "dropped_cap": len(lines), "rotated": rotated}
+                "written": 0, "dropped_cap": len(lines), "rotated": rotated, "dropped_bad": 0, "dropped_io": 0}
     max_bytes = int(TELEMETRY_JSONL_MAX_MB * 1024 * 1024)
-    written = dropped_cap = 0
+    written = dropped_cap = dropped_bad = dropped_io = 0
+    start_bytes = cur_bytes
     buf = []
     for rec in lines:
         try:
             s = json.dumps(rec, separators=(",", ":")) + "\n"
         except Exception:
-            continue   # one broken record must not lose the rest of the batch
+            dropped_bad += 1   # one broken record must not lose the rest of the batch (lane SH: but it is counted)
+            continue
         n = len(s.encode("utf-8"))
         if cur_bytes + n > max_bytes:
             cur_capped = True
@@ -4168,8 +4210,11 @@ def _flush_jsonl_blocking(lines, cur_date, cur_path, cur_bytes, cur_capped):
             os.chmod(cur_path, 0o600)   # previews can contain prompt text -- same as flightrec
         except OSError as e:
             log.warning("jsonl flush: write %s failed: %s", cur_path, e)
+            # lane SH: nothing was written -- do not report the batch as written or advance the day's size
+            dropped_io, written, cur_bytes = written, 0, start_bytes
     return {"date": cur_date, "path": cur_path, "bytes": cur_bytes, "capped": cur_capped,
-            "written": written, "dropped_cap": dropped_cap, "rotated": rotated}
+            "written": written, "dropped_cap": dropped_cap, "rotated": rotated,
+            "dropped_bad": dropped_bad, "dropped_io": dropped_io}
 
 
 def _telemetry_retention_sweep():
@@ -4219,14 +4264,17 @@ async def _jsonl_flusher():
             _JSONL_STATE["capped"] = result["capped"]
             _JSONL_STATE["written"] += result["written"]
             _JSONL_STATE["dropped_cap"] += result["dropped_cap"]
-            _JSONL_STATE["last_err"] = None
+            _JSONL_STATE["dropped_bad"] += result.get("dropped_bad", 0)
+            _JSONL_STATE["dropped_io"] += result.get("dropped_io", 0)
+            _JSONL_STATE["last_err"] = None if not result.get("dropped_io") else "write failed"
             if result.get("rotated"):
                 await loop.run_in_executor(None, _telemetry_retention_sweep)
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            log.warning("jsonl flusher: %s", e)
+            log.warning("jsonl flusher: %s (%d rows lost)", e, len(lines))
             _JSONL_STATE["last_err"] = str(e)
+            _JSONL_STATE["dropped_err"] += len(lines)      # lane SH: the batch left the queue; count its loss
 
 
 def _read_lines_reverse(path, max_bytes):
@@ -5246,8 +5294,8 @@ def flow_meter_update(fam, prev_fam, dt, running, waiting, hit_rate, gen_tok_s):
         ct0, pt0 = hsum(prev_fam, "vllm:request_prefill_kv_computed_tokens"), hsum(prev_fam, "vllm:request_prefill_time_seconds")
         if None not in (ct, pt, ct0, pt0) and pt >= pt0 and ct >= ct0 and (pt > pt0 or ct > ct0):
             _FLOW_PURE.append((time.time(), ct - ct0, pt - pt0))
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("flow_meter_update", _e)
 
 
 # ---- the mode, as a fact ----
@@ -5514,8 +5562,8 @@ def flow_note_cache(info):
         row[0] += 1
         row[1] += int(cached)
         row[2] += int(ptok)
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("flow_note_cache", _e)
 
 
 @_flow_failopen(None)
@@ -5692,8 +5740,8 @@ def flow_note_route(decision, reason, request):
         headroom = bool(_health.get("ok") and not _local_offline() and _inflight < effective_budget()
                         and flow_backlog_s() <= LIGHT_PREFILL_SECS)
         _FLOW_ROUTES.append((time.time(), decision, reason, info.get("flow_class"), headroom))
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("flow_note_route", _e)
 
 
 # Lane DB2: the routing ring is in memory, so every restart emptied the "24 h" window (live: 6,439 of the 17,568 requests
@@ -5764,8 +5812,8 @@ def flow_remote_use(now=None):
     try:
         snap = _spend().snapshot()
         spend = {k: snap.get(k) for k in ("spent", "held", "reserved", "cap", "remaining") if k in snap}
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("flow_remote_use", _e)
     return {"principle": "local-first: remote is a valve for abnormal spikes and planned local-offline windows, not the "
                          "normal path. gateway_chosen_remote counts routes the gateway chose (not forced/aliased/"
                          "local-down/offline); remote_while_local_had_headroom is the defect signal: remote used although "
@@ -6742,8 +6790,8 @@ def _pm_feedback(info):
             _PM_STATS["underpredict"] += 1
         else:
             _PM_STATS["accurate"] += 1
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("_pm_feedback", _e)
 
 
 def _pm_summary():
@@ -6986,8 +7034,8 @@ def _prepare_local_body(request, body, background):
                 try:
                     if request.get("cr_warm_priority"):
                         local_alias_body["priority"] = WARM_PRIORITY_VALUE     # [LANE CR] warm continuation
-                except Exception:
-                    pass
+                except Exception as _e:
+                    _swallowed("_prepare_local_body", _e)
             if halo_control:
                 # vLLM priority scheduling preempts bulk FCFS work for the one
                 # control decision that keeps the estate supervised. A bounded
@@ -6996,8 +7044,8 @@ def _prepare_local_body(request, body, background):
                 local_alias_body["max_tokens"] = min(
                     int(local_alias_body.get("max_tokens") or 1024), 1024)
             body = json.dumps(local_alias_body).encode()
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("_prepare_local_body", _e)
     prepared = repetition_guard(nonthinking_sampling_profile(thinking_budget_guard(bound_local_output(body))))
     if halo_control or _no_think_policy(request, background):
         prepared = strip_thinking(prepared)
@@ -7781,8 +7829,8 @@ def _timeout_note(request, layer, deadline_s, base, body, **extra):
         os.makedirs(os.path.dirname(_TIMEOUT_LEDGER), exist_ok=True)
         with open(_TIMEOUT_LEDGER, "a") as fh:
             fh.write(json.dumps(row, sort_keys=True) + "\n")
-    except Exception:       # bookkeeping must never touch the request path
-        pass
+    except Exception as _e:       # bookkeeping must never touch the request path
+        _swallowed("_timeout_note", _e)
 
 
 class _ClientGone(Exception):
@@ -8879,7 +8927,7 @@ async def _route_completions(request, _no_overflow=False):
             _local_first_remote[f"{reason}:{why}"] += 1
             try:                                   # LF: cold-cache loop signal (remote turns never warm the local prefix)
                 if _pm["credit"] < 0.1 * max(1, ptok) and why.startswith("saturated"):
-                    _local_first_cold_remote[client] += 1
+                    _local_first_cold_remote[_client_key(_local_first_cold_remote, client)] += 1
             except Exception:
                 pass
         return keep
@@ -9718,6 +9766,19 @@ def _prom_line(name, value, labels=None):
     return f"{name} {value}"
 
 
+async def gateway_internal_errors(request):
+    """Lane SH: every suppressed exception (per source site: count, last time, last error) and every router crash
+    since start. Read-only; empty objects mean nothing has been swallowed."""
+    now = time.time()
+    return web.json_response({
+        "swallowed": {site: {"n": r[0], "last_t": round(r[1], 1), "last_age_s": round(now - r[1], 1), "last": r[2]}
+                      for site, r in sorted(_SWALLOWED.items())},
+        "router_crashes": dict(_ROUTER_CRASHES),
+        "telemetry_log": {k: _JSONL_STATE.get(k) for k in ("written", "dropped_queue", "dropped_cap", "dropped_bad",
+                                                            "dropped_io", "dropped_err", "last_err")},
+    })
+
+
 async def gateway_metrics(request):
     """One scrape target for both layers: this gateway's own counters/gauges, hand-formatted
     (deliberately not the prometheus_client library -- see the TELEMETRY module docstring far
@@ -9820,6 +9881,17 @@ async def gateway_metrics(request):
         L.append("# TYPE gateway_client_cost_est_usd_total counter")
         for name, c in _PER_CLIENT.items():
             L.append(_prom_line("gateway_client_cost_est_usd_total", round(c["cost_est_usd"], 6), {"client": name}))
+
+    if _SWALLOWED:                                    # lane SH: hidden failures are scrapeable
+        L.append("# HELP gateway_swallowed_errors_total Exceptions caught and suppressed at a state/IO site.")
+        L.append("# TYPE gateway_swallowed_errors_total counter")
+        for site, rec in sorted(_SWALLOWED.items()):
+            L.append(_prom_line("gateway_swallowed_errors_total", rec[0], {"site": site}))
+    if _ROUTER_CRASHES:
+        L.append("# HELP gateway_router_crashes_total Unhandled router exceptions answered with a JSON 500.")
+        L.append("# TYPE gateway_router_crashes_total counter")
+        for typ, n in sorted(_ROUTER_CRASHES.items()):
+            L.append(_prom_line("gateway_router_crashes_total", n, {"type": typ}))
 
     if _ENGINE_METRICS["ok"]:
         L.append(f"# engine metrics passthrough: last good scrape {round(time.time() - _ENGINE_METRICS['at'], 1)}s ago")
@@ -12245,6 +12317,7 @@ def make_app():
     app.router.add_post("/gateway/models/local", gateway_models_local)
     app.router.add_get("/gateway/config", gateway_config)
     app.router.add_get("/gateway/config/effective", gateway_config_effective)   # lane CFG: typed effective config
+    app.router.add_get("/gateway/internal-errors", gateway_internal_errors)    # lane SH: swallowed exceptions
     app.router.add_get("/gateway/spend", gateway_spend)                        # R2 spend authority
     app.router.add_post("/gateway/spend/reserve", gateway_spend_reserve)
     app.router.add_post("/gateway/spend/finalize", gateway_spend_finalize)
