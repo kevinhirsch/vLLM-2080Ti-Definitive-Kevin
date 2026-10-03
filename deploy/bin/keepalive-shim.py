@@ -417,6 +417,14 @@ def is_peak():
 NO_THINK_IPS = set(_parse_seq(os.environ.get("SHIM_NO_THINK_IPS", ""), _CFG_SEP["SHIM_NO_THINK_IPS"]))
 
 
+def _parse_budget(v):
+    """SHIM_TOKEN_BUDGET: a positive integer is an EXPLICIT override, 0 disables the cap, and ''/auto/None means
+    "derive it from the live engine" (see token_budget_info)."""
+    if v is None or str(v).strip().lower() in ("", "auto", "none", "live"):
+        return None
+    return int(float(v))
+
+
 # ---------------- live config (editable from the dashboard, no restart) ----------------
 # env-var name -> (global name, caster). Only these are runtime-tunable.
 _CFG = {
@@ -434,7 +442,7 @@ _CFG = {
     # local capacity
     "SHIM_LOCAL_BUDGET":     ("BUDGET",       int),
     "SHIM_LOCAL_WAIT_SECS":  ("LOCAL_WAIT",   float),
-    "SHIM_TOKEN_BUDGET":     ("TOKEN_BUDGET", int),
+    "SHIM_TOKEN_BUDGET":     ("TOKEN_BUDGET", _parse_budget),
     "SHIM_OOM_BACKOFF_SECS": ("OOM_BACKOFF",  int),
     # routing guards
     "SHIM_BIG_TOKENS":       ("BIG_TOKENS",       int),
@@ -463,6 +471,10 @@ _CFG = {
     "SHIM_LIGHT_PREFILL_SECS": ("LIGHT_PREFILL_SECS", float),
     "SHIM_BG_XCLIENTS":      ("BG_XCLIENTS", lambda v: [m.lower() for m in _parse_seq(v, _CFG_SEP["SHIM_BG_XCLIENTS"])]),
     "SHIM_POOL_TOKENS":      ("POOL_TOKENS",      int),
+    # live capacity model (lane GW, 2026-10-02) -- see the CAPACITY MODEL section
+    "SHIM_CAPACITY_LIVE":    ("CAPACITY_LIVE",    lambda v: str(v).lower() not in ("0", "false", "off", "")),
+    "SHIM_TOKEN_BUDGET_FRAC": ("TOKEN_BUDGET_FRAC", float),
+    "SHIM_TOKEN_BUDGET_CEIL": ("TOKEN_BUDGET_CEIL", int),
     "SHIM_BG_WAIT_SECS":     ("BG_WAIT",          float),
     "SHIM_BG_MARKERS":       ("BG_MARKERS", lambda v: [m for m in str(v).split("|") if m]),
     "SHIM_BG_LOCAL_ONLY":    ("BG_LOCAL_ONLY", lambda v: str(v).lower() not in ("0","false","")),
@@ -516,7 +528,24 @@ MAX_LOCAL_TOKENS = int(os.environ.get("SHIM_MAX_LOCAL_TOKENS", "80000"))
 # Historical prompt-only calibration (activation ∝
 # concurrent context). Benchmark (2026-08-12, util 0.82) held 4x170K=680K with 611MB margin;
 # 500K default leaves comfortable headroom while allowing generous concurrency. 0 = disabled.
-TOKEN_BUDGET     = int(os.environ.get("SHIM_TOKEN_BUDGET", "500000"))
+# 2026-10-02 (lane GW): the token budget is a DECLARED FRACTION OF THE LIVE KV POOL, not a number frozen against an old
+# engine. TOKEN_BUDGET stays as an optional explicit override (int) or None = auto.
+TOKEN_BUDGET     = _parse_budget(os.environ.get("SHIM_TOKEN_BUDGET"))
+# CAPACITY MODEL (lane GW, 2026-10-02). The gateway's capacity numbers are FACTS OF THE RUNNING ENGINE, so they are read
+# from it (see the "CAPACITY MODEL" section: pool_info / token_budget_info / prefill_info) and the configured values
+# below are only fallbacks / optional overrides. SHIM_CAPACITY_LIVE=0 restores configured-only behaviour (kill switch).
+CAPACITY_LIVE = os.environ.get("SHIM_CAPACITY_LIVE", "1").lower() not in ("0", "false", "off", "")
+# The token budget as a fraction of the KV pool. CALIBRATION (the only hand-set capacity datum, with its provenance):
+# 500,000 reserved tokens was set 2026-08-12 from the breaking-point bench (4 x 170K = 680K held with 611 MB VRAM margin at
+# util 0.82) and has run in production ever since, on the 637,560-token pool and (since the 2026-09-05 R4 promotion) the
+# 754,068-token pool. The LARGEST pool it was proven against sets the fraction (500,000 / 754,068 = 0.663): a bigger pool
+# earns a bigger budget only in proportion, never more than that.
+TOKEN_BUDGET_CALIBRATION = (500000, 754068)       # (reserved tokens proven safe, KV pool they were proven against)
+TOKEN_BUDGET_FRAC = float(os.environ.get("SHIM_TOKEN_BUDGET_FRAC") or 0) or (TOKEN_BUDGET_CALIBRATION[0] / TOKEN_BUDGET_CALIBRATION[1])
+# Absolute ceiling = the largest in-flight context the bench actually HELD (680K). The KV pool is not the only memory that
+# grows with concurrent context (activations do), so a larger pool alone must not raise the budget past what was exercised;
+# raise this only after a new breaking-point bench. 0 = no ceiling.
+TOKEN_BUDGET_CEIL = int(os.environ.get("SHIM_TOKEN_BUDGET_CEIL", "680000"))
 DEFAULT_MAX_OUT  = int(os.environ.get("SHIM_DEFAULT_MAX_OUT", "8192"))
 # --- TINY fast-lane (2026-08-13) ---
 # Micro-calls (title-gen, classification, keepalive probes: est. prompt+max_out <= TINY_TOKENS)
@@ -1144,18 +1173,19 @@ def local_first_decision(reason, *, background, units, reservation, est_computed
         # That is not a capacity question local-first can answer with free lanes: stay remote.
         return False, "prefill-backlog"
     sat = local_saturation(background, units, reservation, now)
-    if USE_COMPUTED_COST and PREFILL_TPS > 0 and HEAVY_PREFILL_SECS > 0:
+    _ptps = prefill_tps()
+    if USE_COMPUTED_COST and _ptps > 0 and HEAVY_PREFILL_SECS > 0:
         # A HEAVY cold prefill (many seconds of the engine's chunk steps) runs locally only when it
         # will not queue behind another one; otherwise the engine serializes them and everything
         # younger waits on both. The bound is in seconds at the measured prefill rate.
-        if (max(0, est_computed or 0) / PREFILL_TPS >= HEAVY_PREFILL_SECS
+        if (max(0, est_computed or 0) / _ptps >= HEAVY_PREFILL_SECS
                 and _prefill_backlog_secs() > HEAVY_ADMIT_BACKLOG_SECS):
             sat = list(sat) + ["prefill-backlog"]
     if sat:
         return False, "saturated:" + "+".join(sat)
     if LOCAL_FIRST_INTERACTIVE_TTFT_SECS > 0 and not background:
         conc = max(1, _inflight + 1) if FT_CONCURRENCY_SCALE else 1
-        predicted_ttft = (max(0, est_computed or 0) / max(1.0, PREFILL_TPS)) * conc
+        predicted_ttft = (max(0, est_computed or 0) / max(1.0, _ptps)) * conc
         if predicted_ttft > LOCAL_FIRST_INTERACTIVE_TTFT_SECS:
             return False, "interactive-ttft"
     return True, "capacity"
@@ -1186,7 +1216,7 @@ def predicted_occupancy_seconds(ptok, maxtok, concurrency=1):
     """
     if not maxtok or PREDICTED_OCCUPANCY_SECS <= 0:
         return None
-    prefill = (max(0, ptok) / max(1.0, PREFILL_TPS)) * max(1, concurrency)
+    prefill = (max(0, ptok) / max(1.0, prefill_tps())) * max(1, concurrency)
     decode = max(0, maxtok) / _latest_decode_tps()
     return round(prefill + decode, 3)
 
@@ -1409,6 +1439,7 @@ async def _scrape_engine_metrics():
     now = time.time()
     dt = (now - prev_at) if prev_fam is not None else 0
     _ENGINE_METRICS.update(ok=True, at=now, err=None, text=text, families=fam)
+    capacity_note_scrape(fam, now)     # live KV pool / block size / engine generation (lane GW)
     kv = _fv(fam, "vllm:kv_cache_usage_perc")
     dq = _counter_rate(fam, prev_fam, "vllm:prefix_cache_queries_total", dt)
     dh = _counter_rate(fam, prev_fam, "vllm:prefix_cache_hits_total", dt)
@@ -3344,7 +3375,7 @@ _FLOW_STATS = collections.Counter()
 _FLOW_DEMAND = collections.deque(maxlen=20000)       # (t, class, ptok, est_computed_tokens)
 _FLOW_WAITS = collections.deque(maxlen=4000)         # (t, class, waited_s) per ticket that left the queue
 _FLOW_METER = collections.deque(maxlen=900)          # (t, compute_tok_s, decode_tok_s, running, waiting, hit_rate)
-_FLOW_PURE = collections.deque(maxlen=600)           # (t, computed tokens, prefill seconds) deltas between scrapes
+_FLOW_PURE = collections.deque(maxlen=3000)          # (t, computed tokens, prefill seconds) deltas between scrapes
 _FLOW_SERVICE = collections.deque(maxlen=400)        # (t, class, duration_s) local completions
 _FLOW_CACHE = {"adjacent": [0, 0, 0], "other": [0, 0, 0]}   # [requests, cached_tokens, prompt_tokens]
 _FLOW_MODE_STATE = {"mode": None, "since": None, "basis": None, "events": collections.deque(maxlen=200)}
@@ -3466,7 +3497,7 @@ def flow_prefill_tps():
     vals = sorted(r[1] for r in list(_FLOW_METER)[-120:] if r[1] and r[1] > 0 and (r[4] or 0) > 0)
     if len(vals) >= 5:
         return max(50.0, vals[len(vals) // 2])
-    return PREFILL_TPS
+    return prefill_tps()
 
 
 def flow_prefill_pure_tps(now=None, window=300.0):
@@ -3478,6 +3509,265 @@ def flow_prefill_pure_tps(now=None, window=300.0):
     if secs < 10.0 or toks < 1000:
         return None
     return toks / secs
+
+
+# ================= CAPACITY MODEL: derived from the LIVE engine (lane GW, 2026-10-02) =================
+# Why: shim.env carried hand-set capacity numbers (SHIM_POOL_TOKENS=637560, SHIM_TOKEN_BUDGET=500000, SHIM_PREFILL_TPS=1100)
+# calibrated against an engine that no longer exists; the engine now has a 922,358-token KV pool and prefills at ~1,270
+# tok/s, and the gateway kept admitting as if neither had changed. Rule: code supplies facts and mechanics. Every number
+# here is read from the running engine's own /metrics (scraped every TELEM_SAMPLE_SECS by the telemetry sampler); the
+# configured value is only the fallback used when the engine has never answered (or SHIM_CAPACITY_LIVE=0).
+#
+#   KV pool        vllm:cache_config_info{kv_cache_size_tokens}  (== the boot log's "GPU KV cache size: N tokens")
+#   token budget   TOKEN_BUDGET_FRAC x live pool, capped at TOKEN_BUDGET_CEIL; SHIM_TOKEN_BUDGET (int) is an explicit override
+#   prefill rate   p75 of per-minute pure per-request rates (computed tokens / prefill seconds, queue EXCLUDED) over the
+#                  CURRENT engine generation only (after a settle period, planned offline windows excluded)
+#   attention block vllm:cache_config_info{block_size}  (the prefix-cache credit is rounded to whole blocks)
+_CAPLIVE = {"pool": None, "pool_at": 0.0, "pool_src": None, "block": None, "gen_start": None, "gen_src": None,
+            "scrapes": 0, "events": collections.deque(maxlen=20), "measure": None}
+PREFILL_MEASURE_WINDOW_S = float(os.environ.get("SHIM_PREFILL_MEASURE_WINDOW_S", "1800"))
+PREFILL_MEASURE_BUCKET_S = float(os.environ.get("SHIM_PREFILL_MEASURE_BUCKET_S", "60"))
+PREFILL_MEASURE_MIN_BUCKETS = int(os.environ.get("SHIM_PREFILL_MEASURE_MIN_BUCKETS", "5"))
+PREFILL_MEASURE_QUANTILE = float(os.environ.get("SHIM_PREFILL_MEASURE_QUANTILE", "0.75"))
+# Same settle/pad as tools/agent_config_standard.py (lane AC2): samples start this long after the engine generation began
+# (CUDA graphs, cold prefix cache) and this long after a planned offline window closed (a benchmark shared the engine).
+PREFILL_MEASURE_SETTLE_S = float(os.environ.get("SHIM_PREFILL_MEASURE_SETTLE_S", "180"))
+PREFILL_MEASURE_OFFLINE_PAD_S = float(os.environ.get("SHIM_PREFILL_MEASURE_OFFLINE_PAD_S", "180"))
+_PREFILL_BUCKET_MIN_SECS = 2.0         # a minute with less prefill than this says nothing about the rate
+_PREFILL_BUCKET_MIN_TOKENS = 1000
+_PREFILL_MEASURE_TTL_S = 5.0
+_OFFLINE_SPANS = collections.deque(maxlen=64)       # (t0, t1) planned local-offline windows that closed (see _flow_event)
+_POOL_STALE_FRAC = 0.05
+
+
+def _capacity_engine_changed(now, why):
+    """The engine process behind :8001 is a new generation (restart / came back after being down): everything measured
+    on the previous one stops counting."""
+    _CAPLIVE["events"].appendleft({"at": round(now, 1), "event": why})
+    _CAPLIVE["measure"] = None
+    if _CAPLIVE["gen_src"] != "process_start_time_seconds":
+        _CAPLIVE["gen_start"], _CAPLIVE["gen_src"] = now, "health transition"
+
+
+def capacity_note_scrape(fam, now=None):
+    """Called by the engine scrape with the parsed /metrics families: refresh the live KV pool, the attention block size and
+    the engine generation. Cheap (one info line); runs on every sample, so a restart or a changed serve config is seen
+    within one sample interval."""
+    try:
+        now = time.time() if now is None else now
+        _CAPLIVE["scrapes"] += 1
+        info = (fam.get("vllm:cache_config_info") or [({}, 1.0)])[0][0]
+        pool, src = None, None
+        try:
+            pool = int(float(info.get("kv_cache_size_tokens")))
+            src = "kv_cache_size_tokens"
+        except (TypeError, ValueError):
+            try:
+                pool = int(info["num_gpu_blocks"]) * int(info["block_size"])
+                src = "num_gpu_blocks x block_size (upper bound on hybrid models)"
+            except (KeyError, TypeError, ValueError):
+                pass
+        if pool and pool > 0:
+            if _CAPLIVE["pool"] != pool:
+                _CAPLIVE["events"].appendleft({"at": round(now, 1), "event": "kv pool %s -> %s tokens" % (_CAPLIVE["pool"], pool)})
+                log.info("capacity: live engine KV pool %s -> %s tokens (%s); configured SHIM_POOL_TOKENS=%s",
+                         _CAPLIVE["pool"], pool, src, POOL_TOKENS)
+                _CAPLIVE["measure"] = None
+            _CAPLIVE["pool"], _CAPLIVE["pool_at"], _CAPLIVE["pool_src"] = pool, now, src
+        try:
+            blk = int(info.get("block_size"))
+            _CAPLIVE["block"] = blk if blk > 0 else _CAPLIVE["block"]
+        except (TypeError, ValueError):
+            pass
+        start = _fv(fam, "process_start_time_seconds")
+        if start and start > 0:
+            if _CAPLIVE["gen_src"] == "process_start_time_seconds" and abs(start - (_CAPLIVE["gen_start"] or 0)) > 2.0:
+                _capacity_engine_changed(now, "engine restarted (process start %s -> %s)" % (
+                    time.strftime("%H:%M:%S", time.localtime(_CAPLIVE["gen_start"])), time.strftime("%H:%M:%S", time.localtime(start))))
+            _CAPLIVE["gen_start"], _CAPLIVE["gen_src"] = float(start), "process_start_time_seconds"
+        elif _CAPLIVE["gen_start"] is None:
+            _CAPLIVE["gen_start"], _CAPLIVE["gen_src"] = now, "first scrape"
+    except Exception as e:      # noqa: BLE001 -- the capacity model must never break the scrape
+        log.warning("capacity_note_scrape: %s", e)
+
+
+def pool_info(now=None):
+    """The KV pool the admission math should use, with where it came from: live (this engine answered within the last
+    scrapes), live-last-known (it answered earlier and is unreachable now: still a better guess than a hand-set number),
+    or configured (SHIM_POOL_TOKENS: the engine has never answered, or SHIM_CAPACITY_LIVE=0)."""
+    now = time.time() if now is None else now
+    cfg, live = int(POOL_TOKENS), _CAPLIVE["pool"]
+    out = {"configured_tokens": cfg, "live_tokens": live}
+    if CAPACITY_LIVE and live:
+        reachable = bool(_ENGINE_METRICS.get("ok"))
+        out.update(tokens=live, source="live" if reachable else "live-last-known", detail=_CAPLIVE["pool_src"],
+                   age_s=round(max(0.0, now - _CAPLIVE["pool_at"]), 1), engine_reachable=reachable,
+                   configured_stale=abs(live - cfg) > _POOL_STALE_FRAC * live)
+    else:
+        out.update(tokens=cfg, source="configured", detail=("SHIM_CAPACITY_LIVE=0" if not CAPACITY_LIVE else "engine has not answered yet"),
+                   age_s=None, engine_reachable=bool(_ENGINE_METRICS.get("ok")), configured_stale=None)
+    return out
+
+
+def token_budget_info(now=None):
+    """Effective cap on in-flight RESERVED tokens (prompt + bounded output across local lanes): the explicit SHIM_TOKEN_BUDGET
+    override if one is set (0 = disabled), else TOKEN_BUDGET_FRAC x the live pool, never above TOKEN_BUDGET_CEIL."""
+    pool = pool_info(now)
+    derived = int(pool["tokens"] * TOKEN_BUDGET_FRAC)
+    capped = bool(TOKEN_BUDGET_CEIL > 0 and derived > TOKEN_BUDGET_CEIL)
+    if capped:
+        derived = int(TOKEN_BUDGET_CEIL)
+    out = {"derived_tokens": derived, "fraction": round(TOKEN_BUDGET_FRAC, 4), "ceiling": TOKEN_BUDGET_CEIL or None,
+           "ceiling_applied": capped, "pool_tokens": pool["tokens"], "pool_source": pool["source"],
+           "calibration": "%d reserved tokens proven against a %d-token pool" % TOKEN_BUDGET_CALIBRATION}
+    if TOKEN_BUDGET is not None:
+        out.update(tokens=int(TOKEN_BUDGET), source="override",
+                   detail="explicit SHIM_TOKEN_BUDGET=%d (set it to 'auto' to follow the engine)" % int(TOKEN_BUDGET),
+                   override_vs_derived_pct=(round(100.0 * (int(TOKEN_BUDGET) - derived) / derived, 1) if derived and TOKEN_BUDGET else None))
+    else:
+        out.update(tokens=derived, source=("live-derived" if pool["source"].startswith("live") else "configured-pool-derived"),
+                   detail="%.1f%% of the %s KV pool%s" % (100 * TOKEN_BUDGET_FRAC, pool["source"], ", capped at the benchmarked ceiling" if capped else ""))
+    return out
+
+
+def token_budget():
+    return token_budget_info()["tokens"]
+
+
+def _quantile(vals, q):
+    vals = sorted(vals)
+    if not vals:
+        return None
+    x = max(0.0, min(1.0, q)) * (len(vals) - 1)
+    lo = int(x)
+    hi = min(len(vals) - 1, lo + 1)
+    return vals[lo] + (vals[hi] - vals[lo]) * (x - lo)
+
+
+def _offline_pad_spans(now):
+    spans = list(_OFFLINE_SPANS)
+    if _OFFLINE.get("t0"):
+        spans.append((_OFFLINE["t0"], max(now, _OFFLINE.get("until") or now)))
+    return [(a, b + PREFILL_MEASURE_OFFLINE_PAD_S) for a, b in spans]
+
+
+def measured_prefill_pure(now=None, force=False):
+    """The pure per-request prefill rate (computed tokens / prefill seconds, queue and admission wait excluded) that the
+    CURRENT engine generation delivered: the PREFILL_MEASURE_QUANTILE (p75) of per-minute rates over the last
+    PREFILL_MEASURE_WINDOW_S, counting only minutes that carried real prefill. A transient dip (decode contention, a thermal
+    throttle blip, a foreign probe) therefore cannot collapse the budgets, and a rate measured on a previous engine, during
+    the post-restart settle, or inside a planned offline window never counts. Report dict; tok_s is None when the evidence is
+    not there (status says why) and callers fall back to the configured value."""
+    explicit_now = now is not None
+    cached = _CAPLIVE.get("measure")
+    t_now = time.time()
+    if not explicit_now and not force and cached and t_now - cached["at"] < _PREFILL_MEASURE_TTL_S:
+        return cached["rep"]
+    now = t_now if now is None else now
+    gen = _CAPLIVE["gen_start"]
+    rep = {"tok_s": None, "status": "no-engine-generation", "valid_minutes": 0, "min_minutes": PREFILL_MEASURE_MIN_BUCKETS,
+           "quantile": PREFILL_MEASURE_QUANTILE, "generation_start": gen, "generation_source": _CAPLIVE["gen_src"],
+           "window_start": None, "samples_in_window": 0, "excluded_offline": 0, "excluded_pre_generation": 0}
+    if gen:
+        lo = max(now - PREFILL_MEASURE_WINDOW_S, gen + PREFILL_MEASURE_SETTLE_S)
+        rep["window_start"] = lo
+        pads = _offline_pad_spans(now)
+        buckets = {}
+        for t, toks, secs in list(_FLOW_PURE):
+            if t > now:
+                continue
+            if t < gen + PREFILL_MEASURE_SETTLE_S and t >= now - PREFILL_MEASURE_WINDOW_S:
+                rep["excluded_pre_generation"] += 1
+            if t < lo:
+                continue
+            if any(a <= t <= b for a, b in pads):
+                rep["excluded_offline"] += 1
+                continue
+            b = buckets.setdefault(int(t // PREFILL_MEASURE_BUCKET_S), [0.0, 0.0])
+            b[0] += toks
+            b[1] += secs
+            rep["samples_in_window"] += 1
+        rates = [tk / sc for tk, sc in buckets.values() if sc >= _PREFILL_BUCKET_MIN_SECS and tk >= _PREFILL_BUCKET_MIN_TOKENS]
+        rep["valid_minutes"] = len(rates)
+        if now < gen + PREFILL_MEASURE_SETTLE_S:
+            rep["status"] = "settling"
+        elif len(rates) < PREFILL_MEASURE_MIN_BUCKETS:
+            rep["status"] = "insufficient"
+        else:
+            rep["status"] = "ok"
+            rep["tok_s"] = round(_quantile(rates, PREFILL_MEASURE_QUANTILE), 1)
+            rep["range_tok_s"] = [round(min(rates), 1), round(max(rates), 1)]
+    if not explicit_now:
+        _CAPLIVE["measure"] = {"at": t_now, "rep": rep}
+    return rep
+
+
+def prefill_info(now=None):
+    """Effective prefill rate for admission seconds, first-token deadlines, heavy-prefill routing and predicted TTFT."""
+    rep = measured_prefill_pure(now)
+    cfg = float(PREFILL_TPS)
+    if CAPACITY_LIVE and rep["tok_s"]:
+        return {"tok_s": rep["tok_s"], "source": "measured", "configured_tok_s": cfg, "measurement": rep,
+                "detail": "p%d of per-minute pure per-request prefill rate over %d minutes of this engine generation (queue excluded)" % (
+                    round(rep["quantile"] * 100), rep["valid_minutes"])}
+    why = "SHIM_CAPACITY_LIVE=0" if not CAPACITY_LIVE else "%s (%d of %d minutes with prefill)" % (
+        rep["status"], rep["valid_minutes"], rep["min_minutes"])
+    return {"tok_s": cfg, "source": "configured", "configured_tok_s": cfg, "measurement": rep,
+            "detail": "configured SHIM_PREFILL_TPS: %s" % why}
+
+
+def prefill_tps():
+    return prefill_info()["tok_s"]
+
+
+def prefix_align_tokens():
+    """Whole attention blocks are what the engine's prefix cache serves: the live block size, else the configured one."""
+    if CAPACITY_LIVE and _CAPLIVE["block"]:
+        return int(_CAPLIVE["block"])
+    return int(PREFIX_ALIGN_TOKENS)
+
+
+def capacity_model_facts(now=None):
+    """Everything the dashboard and /gateway/capacity say about the gateway's capacity model, each number with its source."""
+    now = time.time() if now is None else now
+    pool, tb, pf = pool_info(now), token_budget_info(now), prefill_info(now)
+    align = prefix_align_tokens()
+    warns = []
+    if pool.get("configured_stale"):
+        warns.append("SHIM_POOL_TOKENS=%d is stale (the engine reports %d); the configured value is only a fallback" % (
+            pool["configured_tokens"], pool["live_tokens"]))
+    if tb["source"] == "override" and tb.get("override_vs_derived_pct") is not None and abs(tb["override_vs_derived_pct"]) > 10:
+        warns.append("SHIM_TOKEN_BUDGET=%d pins the budget %+.0f%% away from the live-derived %d; set SHIM_TOKEN_BUDGET=auto to follow the engine" % (
+            tb["tokens"], tb["override_vs_derived_pct"], tb["derived_tokens"]))
+    if pf["source"] == "configured" and CAPACITY_LIVE:
+        m = pf["measurement"]
+        if m.get("tok_s") is None and m["status"] != "ok":
+            warns.append("prefill rate is the configured SHIM_PREFILL_TPS=%g: %s" % (pf["configured_tok_s"], m["status"]))
+    gen = _CAPLIVE["gen_start"]
+    return {
+        "enabled": bool(CAPACITY_LIVE), "kill_switch": "SHIM_CAPACITY_LIVE=0",
+        "principle": "capacity numbers come from the running engine; configured values are fallbacks or explicit overrides",
+        "kv_pool_tokens": {"effective": pool["tokens"], "source": pool["source"], "live": pool["live_tokens"],
+                           "configured": pool["configured_tokens"], "configured_stale": pool.get("configured_stale"),
+                           "read_from": "vllm:cache_config_info kv_cache_size_tokens", "age_s": pool.get("age_s"),
+                           "engine_reachable": pool.get("engine_reachable")},
+        "token_budget": {"effective": tb["tokens"], "source": tb["source"], "detail": tb["detail"],
+                         "derived_from_live": tb["derived_tokens"], "fraction_of_pool": tb["fraction"], "ceiling": tb["ceiling"],
+                         "ceiling_applied": tb["ceiling_applied"], "override": (int(TOKEN_BUDGET) if TOKEN_BUDGET is not None else None),
+                         "calibration": tb["calibration"], "halo_control_reserve": _halo_control_token_reserve()},
+        "prefill_tok_s": {"effective": pf["tok_s"], "source": pf["source"], "detail": pf["detail"],
+                          "configured": pf["configured_tok_s"], "measured_p75": pf["measurement"].get("tok_s"),
+                          "measured_range": pf["measurement"].get("range_tok_s"),
+                          "valid_minutes": pf["measurement"]["valid_minutes"], "min_minutes": pf["measurement"]["min_minutes"],
+                          "status": pf["measurement"]["status"], "window_start": pf["measurement"].get("window_start")},
+        "prefix_align_tokens": {"effective": align, "source": "live" if (CAPACITY_LIVE and _CAPLIVE["block"]) else "configured",
+                                "configured": int(PREFIX_ALIGN_TOKENS), "read_from": "vllm:cache_config_info block_size"},
+        "engine_generation": {"start": gen, "source": _CAPLIVE["gen_src"],
+                              "age_s": round(now - gen, 1) if gen else None,
+                              "settled": bool(gen and now >= gen + PREFILL_MEASURE_SETTLE_S),
+                              "recent_changes": list(_CAPLIVE["events"])[:8]},
+        "warnings": warns,
+    }
 
 
 def flow_decode_tps():
@@ -3509,7 +3799,7 @@ def flow_meter_update(fam, prev_fam, dt, running, waiting, hit_rate, gen_tok_s):
             return _fv(f, name + "_sum")
         ct, pt = hsum(fam, "vllm:request_prefill_kv_computed_tokens"), hsum(fam, "vllm:request_prefill_time_seconds")
         ct0, pt0 = hsum(prev_fam, "vllm:request_prefill_kv_computed_tokens"), hsum(prev_fam, "vllm:request_prefill_time_seconds")
-        if None not in (ct, pt, ct0, pt0) and pt >= pt0 and ct >= ct0:
+        if None not in (ct, pt, ct0, pt0) and pt >= pt0 and ct >= ct0 and (pt > pt0 or ct > ct0):
             _FLOW_PURE.append((time.time(), ct - ct0, pt - pt0))
     except Exception:
         pass
@@ -3869,6 +4159,11 @@ def _local_offline(now=None):
 
 
 def _flow_event(row):
+    if row.get("event") == "offline-close":
+        try:
+            _OFFLINE_SPANS.append((float(row.get("t0")), float(row.get("t"))))     # capacity model: not a sample window
+        except (TypeError, ValueError):
+            pass
     try:
         os.makedirs(os.path.dirname(_FLOW_EVENTS_FILE), exist_ok=True)
         with open(_FLOW_EVENTS_FILE, "a") as fh:
@@ -4028,12 +4323,14 @@ def flow_capacity_facts(now=None, cls=None, ptok=None):
             "prefill_pure_tok_s": None if flow_prefill_pure_tps(now) is None else round(flow_prefill_pure_tps(now), 1),
             "prefill_pure_basis": ("computed tokens / prefill seconds per request over the last 5 min (queue and admission wait "
                                    "EXCLUDED; derive per-request budgets from this)" if flow_prefill_pure_tps(now) is not None
-                                   else "too little prefill in the last 5 min to say; use the configured SHIM_PREFILL_TPS"),
+                                   else "too little prefill in the last 5 min to say; admission uses prefill_effective_tok_s (see capacity_model.prefill_tok_s)"),
+            "prefill_effective_tok_s": round(prefill_tps(), 1),
+            "prefill_effective_basis": prefill_info()["detail"],
             "prefill_uncached_tok_s": round(tps, 1),
             "prefill_basis_note": "prefill_uncached_tok_s is the engine's AGGREGATE uncached-prompt throughput while it had a queue (it falls when "
                                   "decode or a benchmark shares the engine); it sizes the engine backlog, not per-request budgets",
             "prefill_basis": "measured" if len([r for r in list(_FLOW_METER)[-120:] if r[1] and (r[4] or 0) > 0]) >= 5
-                             else "configured SHIM_PREFILL_TPS (too few busy samples yet)",
+                             else "configured fallback (too few busy samples yet; the effective rate is prefill_effective_tok_s)",
             "decode_tok_s_aggregate": None if dtps is None else round(dtps, 1),
             "decode_tok_s_per_stream": None if (dtps is None or not last or not (last[3] or 0)) else round(dtps / max(1.0, last[3]), 1),
             "engine_running": last[3] if last else None, "engine_waiting": last[4] if last else None,
@@ -4044,6 +4341,7 @@ def flow_capacity_facts(now=None, cls=None, ptok=None):
             "meaning": ">1 means uncached prefill is arriving faster than the engine can compute it; queues grow without bound "
                        "unless demand is shed, delayed or sent remote",
             "inflight": _inflight, "lane_budget": effective_budget()},
+        "capacity_model": capacity_model_facts(now),
         "demand": demand, "queue": queue,
         "affinity": {"adjacent_grants": _FLOW_STATS.get("affinity_adjacent", 0),
                      "reorders": _FLOW_STATS.get("affinity_reorders", 0),
@@ -4091,6 +4389,8 @@ def current_config(masked=True):
     for env, (gname, _) in _CFG.items():
         field = env.lower().replace("shim_", "")
         v = g[gname]
+        if v is None:
+            v = "auto"      # SHIM_TOKEN_BUDGET unset = follow the live engine
         if isinstance(v, (set, frozenset, list, tuple)):
             # Same separator table the env-file writer uses. This value is rendered straight
             # into the dashboard form, which POSTs it back into apply_config -- so if the two
@@ -4327,7 +4627,7 @@ def _persist_config():
     # are read back with a comma split, so every save handed the reader one unsplittable
     # token and the policy silently stopped matching anything.
     vals = {env: (_fmt_seq(g[gname], _CFG_SEP.get(env, _CFG_SEP_DEFAULT))
-                  if isinstance(g[gname], (list, tuple, set, frozenset)) else str(g[gname]))
+                  if isinstance(g[gname], (list, tuple, set, frozenset)) else ("auto" if g[gname] is None else str(g[gname])))
             for env, (gname, _) in _CFG.items()}
     vals["SHIM_FORCE_REMOTE_UNTIL_EPOCH"] = str(FORCE_REMOTE_UNTIL_EPOCH)
     try:
@@ -4642,7 +4942,7 @@ def _pm_predict(body, est_tokens, now=None):
         # estimate: pad it by the fixed margin plus 3%, shave it by how well past predictions held
         # up against the engine's own cached_tokens, then round DOWN to whole attention blocks.
         matched = chain[best][1] / total * est
-        a = max(1, PREFIX_ALIGN_TOKENS)
+        a = max(1, prefix_align_tokens())
         credit = (int(max(0.0, (matched - PREFIX_HIT_MARGIN_TOKENS - 0.03 * matched) * _pm_trust())) // a) * a
     return {"computed": max(1, est - credit), "credit": credit, "best": best,
             "age": age, "chain": chain, "total": total, "est": est}
@@ -4656,7 +4956,7 @@ def _pm_trust():
         if credit > 0:
             c += credit
             d += min(cached, credit)
-    if c < 4 * max(1, PREFIX_ALIGN_TOKENS):
+    if c < 4 * max(1, prefix_align_tokens()):
         return 1.0
     return max(0.3, min(1.0, d / c))
 
@@ -4722,7 +5022,7 @@ def _pm_feedback(info):
         if credit is None or cached is None or info.get("route") != "local":
             return
         _PM_PAIRS.append((int(credit), int(cached), int(ptok_exact or 0)))
-        a = max(1, PREFIX_ALIGN_TOKENS)
+        a = max(1, prefix_align_tokens())
         if credit - cached > 2 * a:
             _PM_STATS["overpredict"] += 1
             chain, best, total = pm.get("chain") or [], pm.get("best", -1), pm.get("total") or 0
@@ -4743,7 +5043,7 @@ def _pm_feedback(info):
 def _pm_summary():
     pairs = list(_PM_PAIRS)
     n = len(pairs)
-    out = {"nodes": len(_PM_NODES), "ttl_secs": PREFIX_MODEL_TTL_SECS, "align": PREFIX_ALIGN_TOKENS,
+    out = {"nodes": len(_PM_NODES), "ttl_secs": PREFIX_MODEL_TTL_SECS, "align": prefix_align_tokens(),
            "trust": round(_pm_trust(), 3), "graded": n, **{k: v for k, v in _PM_STATS.items()}}
     if n:
         err = sorted(abs(c - a) for c, a, _ in pairs)
@@ -4764,14 +5064,14 @@ def _prefix_cache_observe(client, body, prompt_tokens):
 
 def _prefill_backlog_secs():
     """Seconds of uncached prefill already admitted to the local engine, at the measured rate."""
-    return _inflight_computed / max(1.0, PREFILL_TPS)
+    return _inflight_computed / max(1.0, prefill_tps())
 
 
 def prefill_window_ok(est_computed, halo_control=False):
     """May a request with this predicted uncached prefill join the engine's prefill queue now?"""
-    if not USE_COMPUTED_COST or halo_control or PREFILL_ADMIT_SECS <= 0 or PREFILL_TPS <= 0:
+    if not USE_COMPUTED_COST or halo_control or PREFILL_ADMIT_SECS <= 0 or prefill_tps() <= 0:
         return True
-    own = max(0, est_computed or 0) / PREFILL_TPS
+    own = max(0, est_computed or 0) / prefill_tps()
     backlog = _prefill_backlog_secs()
     # An (almost) empty queue admits anything -- a request bigger than the whole window would
     # otherwise never run; the heavy-request backlog rule and the monster guard bound the rest.
@@ -4837,8 +5137,8 @@ def first_token_timeout(body, concurrency=1, local=False):
         # retries from scratch. Measured 2026-10-02 10:39-12:03: ~50% of requests ended
         # 'held/local-failed' 503 after ~60 s this way while DeepSeek was empty by Kevin's choice.
         # Give local the long cap instead; a truly wedged engine is the engine watchdog's job.
-        return max(cap, LOCAL_FIRST_FIRST_TOKEN_MAX, FIRST_TOKEN_BASE + (est / PREFILL_TPS) * factor)
-    return min(cap, FIRST_TOKEN_BASE + (est / PREFILL_TPS) * factor)
+        return max(cap, LOCAL_FIRST_FIRST_TOKEN_MAX, FIRST_TOKEN_BASE + (est / prefill_tps()) * factor)
+    return min(cap, FIRST_TOKEN_BASE + (est / prefill_tps()) * factor)
 
 
 def is_background(body, request):
@@ -5173,16 +5473,18 @@ def local_memory_reservation(body):
 
 
 def _halo_control_token_reserve():
-    return min(65536, TOKEN_BUDGET // 8) if TOKEN_BUDGET >= 100000 else 0
+    tb = token_budget()
+    return min(65536, tb // 8) if tb >= 100000 else 0
 
 
 def _memory_available(reservation, *, halo_control=False):
-    if TOKEN_BUDGET <= 0:
+    tb = token_budget()
+    if tb <= 0:
         return True
     # Keep one bounded Halo control prompt's KV reservation available even
     # when ordinary work fills the local engine. The reserve is a fraction of
     # the validated token pool and does not narrow small test/backoff pools.
-    limit = TOKEN_BUDGET if halo_control else TOKEN_BUDGET - _halo_control_token_reserve()
+    limit = tb if halo_control else tb - _halo_control_token_reserve()
     return _inflight_reserved_tokens + reservation <= limit
 
 
@@ -5353,7 +5655,7 @@ async def local_healthy():
                                 # KV the engine holds beyond what this gateway admitted (prompt tokens);
                                 # a foreign monster prefill shows up here as tens of thousands of tokens,
                                 # a foreign tiny probe as ~0.
-                                foreign_tokens = max(0, int(kv_pct * POOL_TOKENS) - _inflight_tokens)
+                                foreign_tokens = max(0, int(kv_pct * pool_info()["tokens"]) - _inflight_tokens)
                             foreign_heavy = bool(foreign > 0 and BIG_TOKENS > 0 and foreign_tokens >= BIG_TOKENS)
                 except Exception:
                     foreign = 0
@@ -5363,6 +5665,7 @@ async def local_healthy():
         ok = False
     if ok and not _health.get("ok", False) and _health.get("at", 0.0) > 0:
         _pm_reset("engine back after being down")      # its prefix cache did not survive the outage
+        _capacity_engine_changed(now, "engine back after being down")
     _health.update(ok=ok, at=now, foreign=foreign, foreign_tokens=foreign_tokens, foreign_heavy=foreign_heavy)
     return ok
 
@@ -6536,7 +6839,8 @@ async def _route_completions(request, _no_overflow=False):
         reservation, sequences = local_memory_reservation(local_body)
     except (ValueError, TypeError, AttributeError) as exc:
         return web.json_response({"error": str(exc)}, status=400)
-    if TOKEN_BUDGET > 0 and reservation > TOKEN_BUDGET:
+    _tb = token_budget()
+    if _tb > 0 and reservation > _tb:
         # Waiting cannot make a request larger than the entire pool admissible.
         if overflow_ok and not local_pin and not alias_local_only and not LOCAL_ONLY:
             record_event("remote", "tokens", request, units, 0, **ev)
@@ -6772,7 +7076,7 @@ async def _route_completions(request, _no_overflow=False):
             reason = "cap"
         where = f"remote({reason})" if overflow_ok and not alias_local_only else "local-only(wait-exhausted)"
         log.info("route %s units=%d inflight=%d/%d tok=%d/%d waited=%.1fs -> %s",
-                 path, units, _inflight, effective_budget(), _inflight_tokens, TOKEN_BUDGET, waited, where)
+                 path, units, _inflight, effective_budget(), _inflight_tokens, token_budget(), waited, where)
         if queued and not alias_local_only:
             _stats["overflowed_after_wait"] += 1
         if alias_local_only:
@@ -6962,7 +7266,8 @@ async def gateway_stats(request):
         "waiting_by_class": dict(_waiting_by_class),
         "flow_mode": FLOW_MODE, "flow_waiting_by_work_class": {c: sum(1 for w in _FLOW["waiters"] if w.cls == c) for c in FLOW_CLASSES},
         "overflowed_after_wait": _stats["overflowed_after_wait"],
-        "inflight_tokens": _inflight_tokens, "token_budget": TOKEN_BUDGET,
+        "inflight_tokens": _inflight_tokens, "token_budget": token_budget(),
+        "capacity_model": capacity_model_facts(),
         "inflight_computed": _inflight_computed,
         "remote_dead_for_s": max(0, int(_remote_dead_until - time.time())),
         "remote_402_count": _remote_dead_count,
