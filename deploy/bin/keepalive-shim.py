@@ -4370,13 +4370,13 @@ def _telemetry_note_request(info, resp=None):
         if (CREDIT_ANCHOR != "off" or CREDIT_PROBE != "off") and route in ("local", "held") and info.get("ptok_exact_local"):
             try:
                 _anchor_note((_PM_INFLIGHT.get(info.get("pm_ref")) or {}).get("chain") or [], info["ptok_exact_local"], now)
-            except Exception:
-                pass
+            except Exception as _e:
+                _swallowed("telemetry:anchor_note", _e)
         if CHAIN_TELEMETRY or WARM_PRIORITY:
             try:
                 _chain_route_note((_PM_INFLIGHT.get(info.get("pm_ref")) or {}).get("chain") or [], route, now)
-            except Exception:
-                pass
+            except Exception as _e:
+                _swallowed("telemetry:chain_route_note", _e)
         _pm_feedback(info)        # LS lane: grade + self-correct the cache-aware cost model
         _shape_stats_note(route, status, info)
         _est_err_note(route, name, info)
@@ -9362,8 +9362,8 @@ async def _route_completions(request, _no_overflow=False):
     # (it used to be set only on the local admission path: 407 of 410 remote requests showed class "?").
     try:
         _active_set(request, flow_class=flow_class_of(request, body, background, halo_control))
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("route:flow_class", _e)
     # gw-admission-computed-token-cost: predicted UNCONDITIONALLY (not gated on
     # USE_COMPUTED_COST, which only decides whether admission COST uses this number) so the
     # card's own accuracy gate has real predicted-vs-actual data to grade from the moment this
@@ -9379,8 +9379,8 @@ async def _route_completions(request, _no_overflow=False):
     if CREDIT_ANCHOR != "off" or CREDIT_PROBE != "off":
         try:
             await _credit_sources(request, _pm, _pm_body, ptok)     # [GW2 / L105] engine-reported credit
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallowed("route:credit_sources", _e)
     est_computed = _pm["computed"]
     units = estimate_units(body, client=client, computed=est_computed)
     # The chain holds raw digests (not JSON-serialisable), so it lives in a side table keyed by the
@@ -9393,8 +9393,8 @@ async def _route_completions(request, _no_overflow=False):
             _cr_route, _cr_age, _ = _chain_route_lookup(_pm["chain"])
             _active_set(request, chain_prev_route=_cr_route,
                         chain_prev_age_s=None if _cr_age is None else round(_cr_age, 1), pm_match_tok=_pm.get("matched"))
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallowed("route:chain_route_lookup", _e)
     _cr_warm = warm_continuation(_pm)
     if _cr_warm:
         request["cr_warm_priority"] = True
@@ -9504,8 +9504,8 @@ async def _route_completions(request, _no_overflow=False):
             try:                                   # LF: cold-cache loop signal (remote turns never warm the local prefix)
                 if _pm["credit"] < 0.1 * max(1, ptok) and why.startswith("saturated"):
                     _local_first_cold_remote[_client_key(_local_first_cold_remote, client)] += 1
-            except Exception:
-                pass
+            except Exception as _e:
+                _swallowed("route:lf_cold_remote", _e)
         return keep
 
     if LOG_REQUESTS:

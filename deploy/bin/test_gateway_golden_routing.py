@@ -281,6 +281,9 @@ def _run_scenario(sc, n, tmp):
     outcome["polls"] = clock.sleeps
     if flightrec:
         outcome["flightrec"] = flightrec
+    swallowed = {k: v[0] for k, v in getattr(m, "_SWALLOWED", {}).items()}
+    if swallowed:
+        outcome["swallowed"] = swallowed           # lane SH: a scenario that trips a counted suppressed exception
     return outcome
 
 

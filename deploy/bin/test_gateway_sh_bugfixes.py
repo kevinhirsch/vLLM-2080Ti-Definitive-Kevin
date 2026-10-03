@@ -315,3 +315,17 @@ class InputTokensAreMeasuredWhereCountedEstimatedElsewhere(_Fresh):
         m._telemetry_note_request({"name": "b", "route": "rejected", "t0": t0, "ptok": 30})
         c = m._PER_CLIENT["b"]
         self.assertEqual((c["tokens_in_exact"], c["tokens_in_est"]), (145, 30))
+
+
+def _raising_flow_class(m):
+    def boom(*a, **k):
+        raise ValueError("bad class map")
+    return boom
+_raising_flow_class._needs_module = True
+
+
+class RouterSuppressedErrorsAreCounted(unittest.TestCase):
+    def test_flow_class_failure_is_counted_and_the_request_still_served(self):
+        out = G.run_scenario(dict(patch=dict(flow_class_of=_raising_flow_class)), 0)
+        self.assertEqual(out["response"]["status"], 500)          # flow_class_of is also called unguarded later
+        self.assertEqual(out["swallowed"].get("route:flow_class"), 1)
