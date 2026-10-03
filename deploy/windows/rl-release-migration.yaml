@@ -1,0 +1,103 @@
+# RL (L104) migration: production stops booting the mutable dev tree wt-integrate and boots the immutable release
+# `current` (~/.local/share/vllm-releases/current) instead. ONE planned window, run by WQ through the window framework.
+#   1. deploy the release-aware serve scripts (+ the attributing fault collector and unitrun.py beside it). With no
+#      `current` pointer they boot wt-integrate exactly as before (proved by the BASE arm below).
+#   2. BASE arm: fresh boot of the legacy tree (window-start override) -> quick.py, greedy probe, evalkit tool_call.
+#   3. RELEASE arm: fresh boot of the release built from wt-integrate's HEAD (same sha; built BEFORE the window opens)
+#      -> `release.py verify --running` (engine runs from the release, the boot rebuilt nothing) -> same probes.
+#   4. identity gate (release_ab_probe.py compare): KV pool equal, greedy outputs byte-identical, decode not slower,
+#      evalkit not worse, wt-integrate HEAD unchanged during the window.
+#   5. ONLY if every step passed: promote = flip `current` to the release + keep the deployed files; the framework's
+#      restore boot then lands production on the release and checks it (root, .so, KV pool, health).
+#   Any failure: no promotion; the restore puts the old serve scripts back verbatim and reboots the legacy tree.
+#   Rollback later (any time): python3 deploy/bin/release.py rollback --reason "..."  (pointer removed + drained restart)
+#   validate:  python3 deploy/bin/windowctl.py validate deploy/windows/rl-release-migration.yaml
+#   run (WQ):  python3 deploy/bin/windowctl.py submit deploy/windows/rl-release-migration.yaml --wait
+lane: rl
+window: rl-release-migration
+reason: "RL L104: switch production from the wt-integrate tree to the immutable release pointer (A/B identity gated)"
+by: RL
+max_s: 3600            # 3 boots x ~5 min + 2 x (quick ~2 min, probe ~1 min, evalkit tool_call ~4 min)
+ttl_s: 1800
+wait_s: 120
+spend_pause_usd: 20
+gpu_gate_wait_s: 300
+kv_pool_tolerance: 0.005
+conflicts: [trial_guard.sh]
+on_new_xid: abort
+vars:
+  BIN: /home/kevin/Desktop/vLLM-2080Ti-Definitive/deploy/bin
+  SD: /home/kevin/.local/share/vllm-qwen27b
+  TREE: /home/kevin/Desktop/wt-integrate
+  B: /home/kevin/Desktop/wt-integrate/tools/s2-bench
+  EVALKIT: /home/kevin/Desktop/qwen38-evalkit
+snapshot_files:
+  - /home/kevin/.local/share/vllm-qwen27b/serve-hauhaucs-v02.sh
+  - /home/kevin/.local/share/vllm-qwen27b/serve-profile-v02.sh
+  - /home/kevin/.local/share/vllm-qwen27b/engine-fault-collector.py
+  - /home/kevin/.local/share/vllm-qwen27b/unitrun.py
+promote:
+  release: {tree_head: /home/kevin/Desktop/wt-integrate}
+  files:
+    - /home/kevin/.local/share/vllm-qwen27b/serve-hauhaucs-v02.sh
+    - /home/kevin/.local/share/vllm-qwen27b/serve-profile-v02.sh
+    - /home/kevin/.local/share/vllm-qwen27b/engine-fault-collector.py
+    - /home/kevin/.local/share/vllm-qwen27b/unitrun.py
+steps:
+  - name: preconditions
+    timeout_s: 120
+    run: |
+      set -eu
+      R={{RELEASE_rel_boot}}
+      python3 {{BIN}}/release.py verify "$(basename $R)" >/dev/null
+      test "$(git -C {{TREE}} rev-parse HEAD)" = "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["sha"])' $R/RELEASE.json)"
+      test -z "$(git -C {{TREE}} status --porcelain --untracked-files=no)"
+      grep -q 'V02_RELEASES' {{BIN}}/serve-hauhaucs-v02.sh
+      echo "release $R matches {{TREE}} HEAD, tree clean"
+  - name: deploy-serve
+    timeout_s: 60
+    run: |
+      set -eu
+      install -m 755 {{BIN}}/serve-hauhaucs-v02.sh {{SD}}/serve-hauhaucs-v02.sh
+      install -m 755 {{BIN}}/serve-profile-v02.sh {{SD}}/serve-profile-v02.sh
+      install -m 755 {{BIN}}/engine-fault-collector.py {{SD}}/engine-fault-collector.py
+      install -m 644 {{BIN}}/unitrun.py {{SD}}/unitrun.py
+      bash -n {{SD}}/serve-hauhaucs-v02.sh && echo deployed
+
+  - name: base-boot
+    boot: {default: true, label: base, timeout_s: 1200}
+  - name: base-root
+    timeout_s: 60
+    run: "test \"$(readlink -f /proc/$(systemctl show -p MainPID --value vllm-qwen27b)/cwd)\" = {{TREE}} && echo base runs {{TREE}}"
+  - name: base-probe
+    timeout_s: 1800
+    run: |
+      set -u
+      python3 {{B}}/quick.py 2>&1 | tail -1 | tee {{RESULTS}}/quick_base.json
+      python3 {{BIN}}/release_ab_probe.py probe --out {{RESULTS}}/probe_base.json --reps 2
+      cd {{EVALKIT}} && timeout 900 python3 run_eval.py --tag rl-mig-base --categories tool_call > {{RESULTS}}/evalkit_base.out 2>&1; tail -3 {{RESULTS}}/evalkit_base.out
+    outputs: ["{{RESULTS}}/quick_base.json", "{{RESULTS}}/probe_base.json"]
+
+  - name: rel-boot
+    boot:
+      release: {tree_head: /home/kevin/Desktop/wt-integrate}
+      label: release
+      timeout_s: 1200
+  - name: rel-verify-running
+    timeout_s: 120
+    run: "python3 {{BIN}}/release.py verify \"$(basename {{RELEASE_rel_boot}})\" --running | tee {{RESULTS}}/verify_running.json | python3 -c 'import json,sys;v=json.load(sys.stdin);sys.exit(0 if v[\"ok\"] and v[\"engine_runs_this_release\"] else 1)'"
+  - name: rel-probe
+    timeout_s: 1800
+    run: |
+      set -u
+      python3 {{B}}/quick.py 2>&1 | tail -1 | tee {{RESULTS}}/quick_release.json
+      python3 {{BIN}}/release_ab_probe.py probe --out {{RESULTS}}/probe_release.json --reps 2
+      cd {{EVALKIT}} && timeout 900 python3 run_eval.py --tag rl-mig-release --categories tool_call > {{RESULTS}}/evalkit_release.out 2>&1; tail -3 {{RESULTS}}/evalkit_release.out
+    outputs: ["{{RESULTS}}/quick_release.json", "{{RESULTS}}/probe_release.json"]
+
+  - name: tree-unchanged
+    timeout_s: 60
+    run: "test \"$(git -C {{TREE}} rev-parse HEAD)\" = \"$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))[\"sha\"])' {{RELEASE_rel_boot}}/RELEASE.json)\""
+  - name: identity-gate
+    timeout_s: 60
+    run: "python3 {{BIN}}/release_ab_probe.py compare --results {{RESULTS}} --base base --cand release"

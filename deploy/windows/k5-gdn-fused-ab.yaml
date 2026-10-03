@@ -1,0 +1,110 @@
+# K5 (L80) decode-megakernel step 1: sm_75 fused GDN post-conv MTP decode, A/B on the live config.
+# Port of /home/kevin/Desktop/wt-k5/tools/k5/k5_win.sh (k5-megakernel @ bc258cf019) to the window framework
+# (deploy/bin/windowctl.py, lane RL 2026-10-03). Everything the old script hand-rolled is now the framework's:
+# override save/verbatim restore, gateway offline window, Xid baseline, foreign-GPU gate before every boot,
+# KV pool per boot, spend pause, dead-man restore, units per command. The K5 arm boots an immutable RELEASE built from
+# bc258cf019 (not the wt-k5 tree): its own .deps/tq_gqa_build + FlashQLA .so are prebuilt at the release path.
+#   validate:  python3 deploy/bin/windowctl.py validate deploy/windows/k5-gdn-fused-ab.yaml
+#   run (WQ):  python3 deploy/bin/windowctl.py submit deploy/windows/k5-gdn-fused-ab.yaml --wait
+lane: k5
+window: k5-gdn-fused-ab
+reason: "K5 L80 GDN fused MTP decode A/B (kernel tests + base/k5 arms)"
+by: K5
+results: /home/kevin/projects/lanes/k5/win
+max_s: 4200            # 2 kernel tests ~10 min, 3 boots ~5 min each, quick+profiles x2, evalkit ~10 min
+ttl_s: 1800            # renewed every 60 s
+wait_s: 90
+spend_pause_usd: 20
+gpu_gate_wait_s: 300
+conflicts: [trial_guard.sh]
+on_new_xid: abort
+vars:
+  L: /home/kevin/projects/lanes/k5
+  K5: /home/kevin/Desktop/wt-k5
+  I: /home/kevin/Desktop/wt-integrate
+  EVALKIT: /home/kevin/Desktop/qwen38-evalkit
+steps:
+  - name: clean
+    run: "rm -f {{L}}/test_gdn_mtp.json {{L}}/test_tq_batched.json; mkdir -p {{RESULTS}}/prof_base {{RESULTS}}/prof_k5 {{L}}/ext"
+    timeout_s: 60
+
+  # 1. kernel correctness + microbench on GPU1 with the engine STOPPED. K5's OWN build dirs (never the prod .deps).
+  - name: stop-engine
+    engine: stop
+  - name: gdn-test
+    run: ". {{L}}/envbuild.sh; cd {{K5}} && nvidia-smi --query-gpu=index,memory.used --format=csv,noheader && CUDA_VISIBLE_DEVICES=1 VLLM_K5_GDN_BUILD_DIR={{L}}/ext PYTHONPATH={{K5}} python tools/k5/test_gdn_mtp.py"
+    timeout_s: 600
+    on_fail: continue
+    capture:
+      KPASS: {json: "{{L}}/test_gdn_mtp.json", key: pass, default: "False"}
+      VAR:
+        cmd: "python3 -c \"import json;b=json.load(open('{{L}}/test_gdn_mtp.json'))['bench'];f=[r for r in b if r['state']=='float16'];print(1 if sum(r['k5v1_us'] for r in f)<sum(r['k5v2_us'] for r in f) else 2)\""
+        default: "2"
+  - name: tq-test
+    run: ". {{L}}/envbuild.sh; cd {{K5}} && CUDA_VISIBLE_DEVICES=1 VLLM_TQ_GQA_CUDA=1 VLLM_TQ_GQA_BUILD_DIR={{K5}}/.deps/tq_gqa_build PYTHONPATH={{K5}} python tools/k5/test_tq_batched.py"
+    timeout_s: 600
+    on_fail: continue
+    capture:
+      TQ_ON:
+        cmd: "python3 -c \"import json;print(1 if json.load(open('{{L}}/test_tq_batched.json'))['pass'] is True else 0)\""
+        default: "0"
+
+  # 2. BASE arm = the override found at window start (+ torch profiler) on the production root
+  - name: base-boot
+    boot:
+      default: true
+      label: base
+      extra_args_append: '--profiler-config {"profiler":"torch","torch_profiler_dir":"{{RESULTS}}/prof_base","torch_profiler_with_stack":false}'
+      timeout_s: 1200
+  - name: base-measure
+    timeout_s: 1800
+    run: |
+      set -u; pd={{RESULTS}}/prof_base
+      python3 {{I}}/tools/s2-bench/quick.py 2>&1 | tail -1 | tee {{RESULTS}}/quick_base.json
+      for s in 1 4 12; do
+        mkdir -p $pd/s$s
+        python3 {{K5}}/tools/k5/k5_prof.py $s 96 2>&1 | tail -3; sleep 10
+        mv $pd/*.pt.trace.json.gz $pd/profiler_out_* $pd/s$s/ 2>/dev/null
+        for f in $pd/s$s/rank0*.pt.trace.json.gz; do python3 {{K5}}/tools/k5/k5_steps.py $f | tee -a {{RESULTS}}/steps_base.jsonl; done
+      done
+    outputs: ["{{RESULTS}}/quick_base.json"]
+    on_fail: continue
+
+  # 3. K5 arm (only if the GDN kernel test passed): release built from K5's commit + the K5 flags
+  - name: k5-boot
+    when: "{{KPASS}} == True"
+    boot:
+      release: {sha: bc258cf019, label: k5}
+      label: k5
+      env:
+        VLLM_K5_GDN_FUSED: "1"
+        VLLM_K5_GDN_VARIANT: "{{VAR}}"
+        VLLM_K5_TQ_BATCHED: "{{TQ_ON}}"
+        VLLM_K5_GDN_BUILD_DIR: "{{L}}/ext"
+      extra_args_append: '--profiler-config {"profiler":"torch","torch_profiler_dir":"{{RESULTS}}/prof_k5","torch_profiler_with_stack":false}'
+      timeout_s: 1200
+  - name: k5-measure
+    when: "{{KPASS}} == True"
+    timeout_s: 1800
+    run: |
+      set -u; pd={{RESULTS}}/prof_k5
+      journalctl -u vllm-qwen27b --since '-15 min' --no-pager | grep -iE "k5|gdn_mtp" | tail -3
+      python3 {{I}}/tools/s2-bench/quick.py 2>&1 | tail -1 | tee {{RESULTS}}/quick_k5.json
+      for s in 1 4 12; do
+        mkdir -p $pd/s$s
+        python3 {{K5}}/tools/k5/k5_prof.py $s 96 2>&1 | tail -3; sleep 10
+        mv $pd/*.pt.trace.json.gz $pd/profiler_out_* $pd/s$s/ 2>/dev/null
+        for f in $pd/s$s/rank0*.pt.trace.json.gz; do python3 {{K5}}/tools/k5/k5_steps.py $f | tee -a {{RESULTS}}/steps_k5.jsonl; done
+      done
+    outputs: ["{{RESULTS}}/quick_k5.json"]
+    on_fail: continue
+  - name: k5-evalkit
+    when: "{{KPASS}} == True"
+    timeout_s: 1500
+    run: "cd {{EVALKIT}} && python3 run_eval.py --tag k5-gdnfused --categories tool_call,code_exec,long_ctx 2>&1 | tee {{RESULTS}}/evalkit_k5.out | grep -E 'passed=False|/60'"
+    on_fail: continue
+  - name: k5-errors
+    when: "{{KPASS}} == True"
+    timeout_s: 120
+    run: "n=$(journalctl -u vllm-qwen27b --since '-40 min' --no-pager | grep -cE 'Traceback|CUDA error|illegal memory' || true); echo \"k5 errors in journal: $n\" | tee {{RESULTS}}/k5_errors.txt"
+# 4. restore: the framework (override verbatim + restart + health + expected KV pool + timers + .so + lease), always.
