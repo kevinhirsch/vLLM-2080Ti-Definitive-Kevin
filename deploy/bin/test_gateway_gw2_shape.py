@@ -134,6 +134,32 @@ class ToolArgs(unittest.TestCase):
         json.dumps(shim._shape_stats_summary())
 
 
+class EstimateError(unittest.TestCase):
+    """CR2: the request log's local `ptok` is the gateway's ESTIMATE; ptok_exact was None on every local row."""
+
+    def note(self, **info):
+        rows = []
+        base = {"name": "pi", "route": "local", "t0": 1.0, "ptok": 20000, "est_tokens": 20000, "est_computed": 6000}
+        with patch.object(shim, "_telemetry_log_enqueue", rows.append), patch.object(shim, "_pm_feedback", lambda i: None):
+            shim._telemetry_note_request(dict(base, **info))
+        return rows[0]
+
+    def test_local_row_carries_engine_usage(self):
+        with patch.object(shim, "_EST_ERR", shim.collections.deque(maxlen=2000)):
+            r = self.note(ptok_exact_local=22000, cached_actual=15000, computed_actual=7000)
+            self.assertEqual((r["ptok_exact"], r["ptok_exact_src"], r["ptok_est_err"], r["cached_actual"]),
+                             (22000, "engine", -2000, 15000))
+            r = self.note()                                   # aborted stream: no usage -> honest None
+            self.assertEqual((r["ptok_exact"], r["ptok_exact_src"], r["ptok_est_err"]), (None, None, None))
+            r = self.note(route="remote", ptok_exact=21000, ptok_exact_local=None)
+            self.assertEqual((r["ptok_exact"], r["ptok_exact_src"], r["ptok_est_err"]), (21000, "provider", None))
+            summ = shim._est_err_summary()
+        self.assertEqual(summ["window"], 1)
+        self.assertEqual((summ["prompt_tokens"]["bias_mean"], summ["computed_tokens"]["p50"]), (-2000, -1000))
+        self.assertIn("pi", summ["by_client"])
+        json.dumps(summ)
+
+
 class ThinkBudgetExplicit(unittest.TestCase):
     def body(self, **kw):
         return json.dumps(dict({"messages": [], "max_tokens": 16384}, **kw)).encode()

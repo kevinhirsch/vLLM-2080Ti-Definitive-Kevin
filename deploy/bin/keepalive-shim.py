@@ -3772,6 +3772,48 @@ def _note_payload_outcome(request, payload, stream):
         pass
 
 
+_EST_ERR = collections.deque(maxlen=2000)    # [GW2] (client, est_tokens, exact, est_computed, computed_actual)
+
+
+def _est_err_note(route, name, info):
+    """Grade the gateway's prompt-size estimate against the engine's own usage on a finished local request."""
+    try:
+        exact = info.get("ptok_exact_local")
+        if route not in ("local", "held") or exact is None:
+            return
+        est = info.get("est_tokens") or info.get("ptok")
+        if not est:
+            return
+        _EST_ERR.append((name, int(est), int(exact), info.get("est_computed"), info.get("computed_actual")))
+    except Exception:
+        pass
+
+
+def _err_dist(pairs):
+    """Signed error (estimate - actual) distribution for [(estimate, actual)]."""
+    if not pairs:
+        return None
+    errs = sorted(e - a for e, a in pairs)
+    n = len(errs)
+    q = lambda f: errs[min(n - 1, int(n * f))]
+    return {"n": n, "bias_mean": round(sum(errs) / n, 1), "abs_mean": round(sum(abs(x) for x in errs) / n, 1),
+            "p05": q(0.05), "p50": q(0.5), "p95": q(0.95), "min": errs[0], "max": errs[-1],
+            "ratio_mean": round(sum(e / max(1, a) for e, a in pairs) / n, 4)}
+
+
+def _est_err_summary():
+    rows = list(_EST_ERR)
+    by_client = collections.defaultdict(list)
+    for c, e, a, _, _ in rows:
+        by_client[c].append((e, a))
+    top = sorted(by_client.items(), key=lambda kv: -len(kv[1]))[:8]
+    return {"window": len(rows), "basis": "estimate - engine usage, last %d local requests" % _EST_ERR.maxlen,
+            "prompt_tokens": _err_dist([(e, a) for _, e, a, _, _ in rows]),
+            "computed_tokens": _err_dist([(int(ec), int(ca)) for _, _, _, ec, ca in rows
+                                          if ec is not None and ca is not None]),
+            "by_client": {c: _err_dist(p) for c, p in top}}
+
+
 _SHAPE_STATS = collections.defaultdict(collections.Counter)   # [GW2 / L94] route -> response-shape counters
 
 
@@ -3890,6 +3932,7 @@ def _telemetry_note_request(info, resp=None):
                 pass
         _pm_feedback(info)        # LS lane: grade + self-correct the cache-aware cost model
         _shape_stats_note(route, status, info)
+        _est_err_note(route, name, info)
         # (e) append-only JSONL request log -- see DESIGN.md (e) / REPORT.md. Never write on the
         # request path: this only appends a small dict to a bounded in-memory list;
         # _jsonl_flusher() (sibling to _stats_saver()) does the actual blocking file I/O off the
@@ -3932,7 +3975,15 @@ def _telemetry_note_request(info, resp=None):
             "reasoning_watchdog": info.get("reasoning_watchdog"),
             "reasoning_watchdog_at_tok": info.get("reasoning_watchdog_at_tok"),
             "reasoning_watchdog_ok": info.get("reasoning_watchdog_ok"),
-            "ptok_exact": info.get("ptok_exact"),
+            # [GW2] remote: the provider's usage; local: the ENGINE's usage.prompt_tokens (row `ptok` is the
+            # gateway's ESTIMATE -- CR2 found it off by -5200..+2334 tokens, which read as a phantom engine bug).
+            "ptok_exact": (info.get("ptok_exact") if info.get("ptok_exact") is not None
+                           else (info.get("ptok_exact_local") if route in ("local", "held") else None)),
+            "ptok_exact_src": ("provider" if info.get("ptok_exact") is not None else
+                               ("engine" if route in ("local", "held") and info.get("ptok_exact_local") is not None
+                                else None)),
+            "ptok_est_err": ((info.get("est_tokens") or info.get("ptok") or 0) - info["ptok_exact_local"]
+                             if route in ("local", "held") and info.get("ptok_exact_local") is not None else None),
             "predicted_occupancy_s": info.get("predicted_occupancy_s"),
             "context_provider": info.get("context_provider"),
             "context_limit": info.get("context_limit"),
@@ -9220,6 +9271,7 @@ async def gateway_stats(request):
         "prefill_backlog_secs": round(_prefill_backlog_secs(), 1),
         "cache_model": _pm_summary(),
         "response_shape": _shape_stats_summary(),      # [GW2 / L94+L95]
+        "estimate_error": _est_err_summary(),          # [GW2] gateway prompt/computed estimate vs engine usage
         "inflight_reserved_tokens": _inflight_reserved_tokens,
         "halo_control_lane_limit": admission_lane_limit(
             False, effective_budget(), FG_RESERVED, halo_control=True,
