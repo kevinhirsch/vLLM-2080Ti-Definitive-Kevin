@@ -11,6 +11,7 @@ computes rows [m, n).
 Env-gated, default OFF:
   VLLM_K3_AR_OVERLAP=1            enable
   VLLM_K3_AR_OVERLAP_CHUNKS=2     row chunks per layer (>=2)
+  VLLM_K3_AR_OVERLAP_PRIO=-1      CUDA stream priority of the all-reduce side stream
   VLLM_K3_AR_OVERLAP_MIN_TOKENS=1024
                                   below this (all decode / CUDA-graph sizes)
                                   the plain GEMM + all-reduce path is used
@@ -54,7 +55,10 @@ def _comm_stream(device: torch.device) -> torch.cuda.Stream:
     if s is None:
         # highest priority so the (few-SM) all-reduce kernel is scheduled ahead
         # of queued GEMM thread blocks.
-        s = torch.cuda.Stream(device=idx, priority=-1)
+        s = torch.cuda.Stream(
+            device=idx,
+            priority=int(os.environ.get("VLLM_K3_AR_OVERLAP_PRIO", "-1")),
+        )
         _COMM_STREAMS[idx] = s
     return s
 
@@ -127,3 +131,13 @@ direct_register_custom_op(
     op_func=k3_row_linear_ar_impl,
     fake_impl=k3_row_linear_ar_fake,
 )
+
+
+# CONCURRENCY NOTE (K6 interaction): the custom all-reduce keeps one set of
+# cross-GPU signal/barrier counters per communicator, and NCCL requires every
+# rank to launch collectives on a communicator in the same order. So at most
+# ONE all-reduce may be in flight per TP communicator at a time. This module
+# serializes its own chunks on one side stream, but a decode stream running a
+# TP all-reduce concurrently (K6 prefill/decode multiplexing) would race with
+# it. K6 must either give decode its own communicator/signal buffers or
+# serialize collectives behind a shared lock/stream.
