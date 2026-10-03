@@ -164,3 +164,16 @@ def gptq_sym(W: torch.Tensor, H: torch.Tensor, bits: int = 4, group: int = 0, bl
         W[:, i2:] -= E1 @ Hinv[i1:i2, i2:]
     inv = torch.argsort(perm)
     return Q[:, inv].to(torch.int8), scale
+
+
+def pack_s4(q: torch.Tensor) -> torch.Tensor:
+    """codes [R,K] in [-8,7] -> int8 [R,K/2], low nibble = even column (cutlass int4b_t / k7 kernels)."""
+    q = q.to(torch.int16)
+    return ((q[:, 0::2] & 15) | ((q[:, 1::2] & 15) << 4)).to(torch.uint8).view(torch.int8)
+
+
+def unpack_s4(p: torch.Tensor) -> torch.Tensor:
+    u = p.view(torch.uint8).to(torch.int16)
+    lo, hi = u & 15, (u >> 4) & 15
+    lo = torch.where(lo > 7, lo - 16, lo); hi = torch.where(hi > 7, hi - 16, hi)
+    return torch.stack([lo, hi], -1).reshape(p.shape[0], -1).to(torch.int8)

@@ -21,6 +21,9 @@ ap.add_argument("--json", default="/home/kevin/projects/lanes/k7/w4a4_bench.json
 a = ap.parse_args()
 gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
 free = int(subprocess.check_output(["nvidia-smi", "-i", gpu, "--query-gpu=memory.free", "--format=csv,noheader,nounits"]).decode())
+_g = subprocess.run([os.path.expanduser("~/projects/lanes/windows/gpuok.sh"), gpu, str(a.min_free_mib)], capture_output=True, text=True)
+if _g.returncode != 0:
+    sys.exit("gpuok refused: " + _g.stdout.strip())
 if free < a.min_free_mib:
     sys.exit(f"refusing: GPU{gpu} {free} MiB free < {a.min_free_mib}")
 import torch
@@ -71,6 +74,7 @@ def timeit(fn):
 rows = []
 Ms = [int(m) for m in a.Ms.split(",")]
 for name in a.shapes.split(","):
+    k7ext.gpu_gate(a.min_free_mib)  # re-check between shapes
     mk, nl, mult = SHAPES[name]
     t, N, K = mk()
     t = {k: v.contiguous() for k, v in t.items()}; t["weight_scale"] = t["weight_scale"].half()

@@ -11,6 +11,7 @@ if free < int(os.environ.get("K7_MIN_FREE", 380)):
 import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import k7ext
+k7ext.gpu_gate(int(os.environ.get("K7_MIN_FREE", 380)))
 from rotquant import hadamard
 
 E = k7ext.ext()

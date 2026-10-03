@@ -2,6 +2,7 @@
 import os, sys, statistics, torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import k7ext
+k7ext.gpu_gate(800)
 E = k7ext.ext()
 def tm(fn):
     s, e = torch.cuda.Event(True), torch.cuda.Event(True); s.record(); fn(); e.record(); e.synchronize(); return s.elapsed_time(e)

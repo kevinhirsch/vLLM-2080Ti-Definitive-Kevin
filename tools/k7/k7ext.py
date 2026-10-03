@@ -36,3 +36,17 @@ def unpack_s4(p: torch.Tensor) -> torch.Tensor:
     lo, hi = u & 15, (u >> 4) & 15
     lo = torch.where(lo > 7, lo - 16, lo); hi = torch.where(hi > 7, hi - 16, hi)
     return torch.stack([lo, hi], -1).reshape(p.shape[0], -1)
+
+
+def gpu_gate(need_mib=800, exit_on_fail=True):
+    """Shared estate GPU gate (lane RL): refuses during windows/boots/planned-offline/unhealthy engine/low free VRAM."""
+    import subprocess, sys
+    gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0] or "0"
+    r = subprocess.run([os.path.expanduser("~/projects/lanes/windows/gpuok.sh"), gpu, str(need_mib)], capture_output=True, text=True)
+    if r.returncode != 0:
+        msg = f"gpuok refused GPU{gpu}: {r.stdout.strip()} {r.stderr.strip()}"
+        if exit_on_fail:
+            sys.exit(msg)
+        print(msg, flush=True)
+        return False
+    return True

@@ -14,6 +14,9 @@ ap.add_argument("--json", default="/home/kevin/projects/lanes/k7/head_decode_ben
 a = ap.parse_args()
 gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
 free = int(subprocess.check_output(["nvidia-smi", "-i", gpu, "--query-gpu=memory.free", "--format=csv,noheader,nounits"]).decode())
+_g = subprocess.run([os.path.expanduser("~/projects/lanes/windows/gpuok.sh"), gpu, str(a.min_free_mib)], capture_output=True, text=True)
+if _g.returncode != 0:
+    sys.exit("gpuok refused: " + _g.stdout.strip())
 if free < a.min_free_mib:
     sys.exit(f"refusing: GPU{gpu} {free} MiB free")
 import torch
