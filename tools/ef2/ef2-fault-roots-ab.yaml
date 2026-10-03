@@ -48,7 +48,7 @@ steps:
       wait $K8; echo "k8 rc=$?"
   # on_new_xid is `continue` (the memcheck legs may meet a real FI 0.6.8 OOB): attribute any new Xid of the step by PCI
   # bus (01:00 = GPU0 = EF2 rider, 04:00 = GPU1 = K8) and pid, so a K8 Xid is never read as L134 evidence (or vice versa).
-  - name: rider-xid-attribution
+  - name: rider-xid-attribution   # on_fail default = abort -> framework restore, arms never boot
     timeout_s: 60
     run: |
       journalctl -k --no-pager -o short-iso --since "$(cat {{RESULTS}}/t_rider.txt)" | grep "NVRM: Xid" > {{RESULTS}}/xid_rider_step.txt || true
@@ -56,10 +56,16 @@ steps:
       import re, sys
       own = {"0000:01:00": "GPU0 EF2 l134 rider", "0000:04:00": "GPU1 K8 SR check"}
       lines = open(sys.argv[1]).read().splitlines()
+      foreign = 0
       for l in lines:
           m = re.search(r"Xid \(PCI:(\w{4}:\w{2}:\w{2})[^)]*\): (\d+), pid=(\d+)", l)
-          print(own.get(m.group(1), "unknown GPU") if m else "unparsed", "| xid", m.group(2) if m else "?", "pid", m.group(3) if m else "?", "|", l[-160:])
-      print(f"new Xid lines in the rider/K8 step: {len(lines)}")
+          who = own.get(m.group(1), "unknown GPU") if m else "unparsed"
+          foreign += who != "GPU0 EF2 l134 rider"
+          print(who, "| xid", m.group(2) if m else "?", "pid", m.group(3) if m else "?", "|", l[-160:])
+      print(f"new Xid lines in the rider/K8 step: {len(lines)} (not from the EF2 rider on GPU0: {foreign})")
+      # WQ policy 2026-10-03: a GPU1 (K8) / unattributable Xid stops the window BEFORE the A/B arms boot (straight to
+      # restore) so a fresh MMU fault never muddies the arms. A GPU0 line is the L134 finding: logged, A/B continues.
+      sys.exit(3 if foreign else 0)
       PY
 
   # 2. BASE arm
