@@ -79,8 +79,8 @@ def main():
             print(json.dumps(dict(Tq=Tq, Tkv=Tkv, skipped="memory budget")), flush=True)
             continue
         g = torch.Generator(device=dev).manual_seed(1)
-        q = (torch.randn(Tq, Hq, 256, device=dev, generator=g) * 2).half()
-        k = torch.randn(Tkv, Hk, 256, device=dev, generator=g).half()
+        q = torch.randn(Tq, Hq, 256, device=dev, generator=g, dtype=torch.half).mul_(2)
+        k = torch.randn(Tkv, Hk, 256, device=dev, generator=g, dtype=torch.half)
         v = k  # alias: timing is value independent
         out = torch.empty_like(q)
         flops = causal_flops(Tq, Tkv, Hq)
