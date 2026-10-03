@@ -78,7 +78,10 @@ class MarlinLinearKernel(MPLinearKernel):
         is_a_8bit = c.act_type is not None and c.act_type.itemsize == 1
 
         if is_a_8bit:
-            assert c.weight_type == scalar_types.uint4b8, (
+            # Lane LP: the s8 x u4 (zero-point, AWQ-style) kernels are compiled
+            # (generate_kernels.py "AWQ-INT4 with INT8 activation", sm75 too):
+            # int4 - zp lands exactly in int8 [-15, 15] via sub_zp_and_dequant.
+            assert c.weight_type in (scalar_types.uint4b8, scalar_types.uint4), (
                 "W8A8 is not supported by marlin kernel."
             )
 

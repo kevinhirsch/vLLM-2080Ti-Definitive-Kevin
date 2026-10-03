@@ -650,10 +650,29 @@ def get__quant_fp8_method() -> QuantFP8:
     return _quant_fp8_method
 
 
+def _lp_int8_prefix_allowed(prefix: str | None) -> bool:
+    """Lane LP: scope W4A8-INT8 to selected layers.  VLLM_LP_INT8_SKIP (regex, default
+    lm_head|mtp|embed|visual) keeps the int4 heads/drafter (U2b) and embeddings on fp16
+    activations; VLLM_LP_INT8_ONLY (regex, optional) restricts to matching prefixes,
+    e.g. 'mlp\\.gate_up_proj|linear_attn|self_attn' to leave down_proj on W4A16."""
+    import os
+    import re
+
+    if not prefix:
+        return True
+    skip = os.environ.get("VLLM_LP_INT8_SKIP", r"lm_head|mtp|embed|visual")
+    if skip and re.search(skip, prefix):
+        return False
+    only = os.environ.get("VLLM_LP_INT8_ONLY", "")
+    return not only or re.search(only, prefix) is not None
+
+
 def get_marlin_input_dtype(prefix: str | None = None):
     if envs.VLLM_MARLIN_INPUT_DTYPE is None:
         return
     elif envs.VLLM_MARLIN_INPUT_DTYPE.lower() == "int8":
+        if not _lp_int8_prefix_allowed(prefix):
+            return
         return torch.int8
     elif envs.VLLM_MARLIN_INPUT_DTYPE.lower() == "fp8":
         if not current_platform.is_device_capability(
@@ -712,7 +731,7 @@ def apply_gptq_marlin_linear(
 
     a_scales = None
     if input_dtype == torch.int8:
-        assert wtype == scalar_types.uint4b8, (
+        assert wtype in (scalar_types.uint4b8, scalar_types.uint4), (
             "W8A8-INT8 is not supported by marlin kernel."
         )
         reshaped_x, a_scales = marlin_quant_input(reshaped_x, input_dtype)
