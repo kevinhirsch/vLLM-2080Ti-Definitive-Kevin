@@ -29,6 +29,7 @@ FAKE_SYSTEMCTL = textwrap.dedent("""\
     # fake systemctl: state of the timer in $FAKE/timer.state, every call logged to $FAKE/systemctl.log
     echo "$*" >> "$FAKE/systemctl.log"
     case "$1" in
+      show) cat "$FAKE/wants" 2>/dev/null ;;
       is-active) cat "$FAKE/timer.state"; [ "$(cat "$FAKE/timer.state")" = active ] ;;
       stop) echo inactive > "$FAKE/timer.state" ;;
       start) echo active > "$FAKE/timer.state" ;;
@@ -93,8 +94,18 @@ class WithHold(Base):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.log("ran").strip(), "lease=lease1 args=one two")
         self.assertIn("hold run --kind engine --by T --reason a test window --ttl 600 -- bash", self.log("actuator.log"))
-        self.assertEqual(self.log("systemctl.log"), "")           # no stop, no start, nothing
+        self.assertNotRegex(self.log("systemctl.log"), r"(?m)^(stop|start) ")      # no stop, no start (only the read-only 'show')
         self.assertEqual(self.timer(), "active")
+
+    def test_a_stale_installed_watchdog_unit_still_gets_the_timer_paused_inside_the_hold(self):
+        # the installed unit has Wants=vllm-qwen27b.service: the timer would restart the stopped engine under the hold
+        (self.d / "wants").write_text("vllm-qwen27b.service\n")
+        s = self.script('echo "during=$(cat "$FAKE/timer.state") lease=${ENGINE_HOLD_LEASE:-none}" > "$FAKE/ran"')
+        r = subprocess.run([str(s)], env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.log("ran").strip(), "during=inactive lease=lease1")
+        self.assertEqual(self.timer(), "active")                    # restored exactly
+        self.assertIn("hold run --kind engine", self.log("actuator.log"))
 
     def test_exit_code_passes_through(self):
         s = self.script("exit 7")

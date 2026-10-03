@@ -16,6 +16,10 @@
 # restart is accepted, the hold is void the moment the wrapper dies, and the engine is brought back at exit). The second pass
 # sees ENGINE_HOLD_LEASE and returns. If another hold is already held the script never runs (hold run exits 75).
 #
+# The hold alone is not enough while the INSTALLED vllm-qwen27b-watchdog.service still has Wants=vllm-qwen27b.service: the timer
+# then starts the stopped engine every minute, whatever the hold says (K3's 08:11 window). Until deploy/systemd's unit (LV a03af0e133)
+# is installed (root), the guard also pauses the timer inside the hold, with the same exact-state restore.
+#
 # Fallback (the deployed actuator has no `hold` subcommand yet): the script runs as a child of a wrapper that pauses the
 # timer, and restores its EXACT prior state (started only if it was active) on every exit path, including signals.
 #
@@ -23,6 +27,10 @@
 WG_ACTUATOR=${WINDOW_GUARD_ACTUATOR:-$HOME/.local/share/vllm-qwen27b/engine-actuator.py}
 WG_TIMER=${WINDOW_GUARD_TIMER:-vllm-qwen27b-watchdog.timer}
 WG_FILE=$(readlink -f "${BASH_SOURCE[0]}")
+
+_wg_unit_wants_engine() {
+  systemctl show -p Wants --value "${WINDOW_GUARD_WATCHDOG_SERVICE:-vllm-qwen27b-watchdog.service}" 2>/dev/null | grep -qw 'vllm-qwen27b.service'
+}
 
 _wg_has_hold() {
   [ -f "$WG_ACTUATOR" ] && /usr/bin/python3 "$WG_ACTUATOR" hold status >/dev/null 2>&1
@@ -60,6 +68,11 @@ window_guard_enter() {
   local script=${BASH_SOURCE[1]:-$0}
   script=$(readlink -f "$script")
   if _wg_has_hold; then
+    if _wg_unit_wants_engine; then       # stale installed unit: the timer would restart the engine under the hold
+      WINDOW_GUARD_FALLBACK_PASS=1 export WINDOW_GUARD_FALLBACK_PASS
+      exec /usr/bin/python3 "$WG_ACTUATOR" hold run --kind engine --by "$by" --reason "$reason" --ttl "$ttl" -- \
+        bash "$WG_FILE" --fallback-run bash "$script" "$@"
+    fi
     exec /usr/bin/python3 "$WG_ACTUATOR" hold run --kind engine --by "$by" --reason "$reason" --ttl "$ttl" -- bash "$script" "$@"
   fi
   WINDOW_GUARD_FALLBACK_PASS=1 export WINDOW_GUARD_FALLBACK_PASS
