@@ -5,8 +5,9 @@
 
 Serves the dashboard file at /gateway/dashboard (re-read on every request, so edit-and-reload works) and proxies every
 other request to the upstream gateway, so the page is same-origin and needs no CORS. GET only: this tool refuses POST so a
-preview can never change gateway settings. --mock-capacity-model injects a capacity_model block (shape published by the
-live-capacity-model commit) into /gateway/capacity and /gateway/stats, for previewing a gateway that predates it.
+preview can never change gateway settings. --mock-capacity-model injects the capacity_model block (live-capacity-model commit) into /gateway/capacity and
+/gateway/stats, and the reconciliation/pricing blocks (dynamic-pricing commit) into /gateway/spend, for previewing a
+gateway that predates them. Mock values are marked (mock).
 """
 import argparse
 import http.server
@@ -67,6 +68,14 @@ def main():
                 return self._send(e.code, e.read(), e.headers.get("Content-Type", "text/plain"))
             except Exception as e:  # noqa: BLE001
                 return self._send(502, str(e).encode(), "text/plain")
+            if args.mock_capacity_model and path == "/gateway/spend":
+                d = json.loads(body)
+                d.setdefault("reconciliation", {"generated_at": 0, "window": "2026-10-02", "provider_usd": 8.1501, "ledger_usd": 8.1526,
+                                                 "drift_usd": 0.0025, "ledger_over_provider": 1.0003, "failed_calls_charged_usd": 0.0,
+                                                 "hours_drifted": 0, "verdict": "ledger matches the provider bill (mock)", "age_s": 3600})
+                d.setdefault("pricing", {"source": "file", "fetched": "2026-10-02", "age_days": 0, "period_now": "off_peak", "stale": False,
+                                         "holidays_through": "2026-12-31", "models": ["deepseek-flash"], "source_url": "https://api-docs.deepseek.com/quick_start/pricing", "error": None})
+                body = json.dumps(d).encode()
             if args.mock_capacity_model and path in ("/gateway/capacity", "/gateway/stats"):
                 d = json.loads(body)
                 if "capacity_model" not in d:

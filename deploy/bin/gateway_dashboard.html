@@ -159,6 +159,7 @@ td.wrapc{white-space:normal;min-width:160px}
 th.sortable{cursor:pointer;user-select:none} th.sortable:hover{color:var(--ink)}
 .empty{color:var(--ink2);padding:10px 4px;font-size:13px}
 .pill{display:inline-block;max-width:100%;padding:0 7px;border-radius:999px;font-size:11.5px;font-weight:650;border:1px solid var(--axis);background:var(--raised);color:var(--ink2)}
+td .pill{white-space:nowrap}
 .pill.local{border-color:var(--s3);background:transparent;color:var(--ink)} .pill.remote{border-color:var(--s2);background:transparent;color:var(--ink)}
 .pill.held{border-color:var(--s1);color:var(--ink)} .pill.reject{border-color:var(--bad);color:var(--bad-ink)}
 .pill.ok{color:var(--good-ink);border-color:var(--good)} .pill.warn{color:var(--warn-ink);border-color:var(--warn)} .pill.bad{color:var(--bad-ink);border-color:var(--bad)}
@@ -598,12 +599,24 @@ function spendView(cap,spend){
     enforce:get(spend,['enforce']),durable:get(spend,['durable']),in_flight:get(spend,['in_flight']),
     gap:get(spend,['attribution_gap_usd']),orphans:get(spend,['orphans_charged'])};
 }
-const BASIS_TEXT={'actual':'Provider reported real usage','usage':'Provider reported real usage','held-fallback':'No usage reported: charged the upper-bound hold','orphan-held':'Orphaned hold, charged in full','estimated':'Estimated from token counts','unsent':'Never sent (released)'};
+const BASIS_TEXT={'actual':'Provider reported real usage (hit, miss and output priced separately)','usage':'Provider reported only total prompt tokens: priced as cache misses, an upper bound','held-fallback':'No usage reported: charged the whole upfront hold (older settlement rule)','orphan-held':'Orphaned hold, charged in full','estimate':'No usage reported: bounded estimate from the recent cache-hit share','estimated':'Estimated from token counts','unsent':'Never sent (released, charged nothing)'};
+const NOT_METERED=new Set(['held-fallback','orphan-held','estimate','estimated']);
+function reconView(spend){
+  const r=get(spend,['reconciliation']);if(!r)return null;
+  const ratio=isNum(r.ledger_over_provider)?r.ledger_over_provider:(isNum(r.ledger_usd)&&isNum(r.provider_usd)&&r.provider_usd>0?r.ledger_usd/r.provider_usd:null);
+  const drift=isNum(r.drift_usd)?r.drift_usd:(isNum(r.ledger_usd)&&isNum(r.provider_usd)?r.ledger_usd-r.provider_usd:null);
+  const level=ratio==null?'unk':Math.abs(ratio-1)>0.25?'bad':Math.abs(ratio-1)>0.05?'warn':'ok';
+  return {providerUsd:r.provider_usd,ledgerUsd:r.ledger_usd,drift,ratio,level,window:r.window,failedCharged:r.failed_calls_charged_usd,hoursDrifted:r.hours_drifted,verdict:r.verdict,ageS:r.age_s};
+}
+function pricingView(spend){
+  const p=get(spend,['pricing']);if(!p)return null;
+  return {error:p.error||null,source:p.source,fetched:p.fetched,ageDays:p.age_days,period:p.period_now,stale:!!p.stale,staleReason:p.stale_reason,holidaysThrough:p.holidays_through,models:p.models||[],url:p.source_url};
+}
 function spendBreakdown(spend){
   const groups=get(spend,['attribution','groups'])||[];
   const by=(k)=>{const m={};for(const g of groups){const key=g[k]==null?'?':String(g[k]);const r=m[key]||(m[key]={key,usd:0,calls:0});r.usd+=+g.usd||0;r.calls+=+g.calls||0;}return Object.values(m).sort((a,b)=>b.usd-a.usd);};
   const basis=by('basis'),total=groups.reduce((a,g)=>a+(+g.usd||0),0);
-  const fallback=basis.filter(b=>b.key!=='actual'&&b.key!=='usage').reduce((a,b)=>a+b.usd,0);
+  const fallback=basis.filter(b=>NOT_METERED.has(b.key)).reduce((a,b)=>a+b.usd,0);
   return {groups:groups.slice().sort((a,b)=>b.usd-a.usd),total,byClient:by('client'),byReason:by('reason'),byBasis:basis,
     nonActualUsd:fallback,nonActualShare:total>0?fallback/total:null,accounted:get(spend,['attribution','accounted_usd'])};
 }
@@ -822,7 +835,7 @@ function lineChart(spec){
 }
 
 return {CLASSES,DASH,isNum,esc,fmtInt,fmtNum,fmtTok,fmtPct,fmtFrac,fmtUsd,fmtDur,fmtAgo,fmtMiB,get,mean,median,tail,windowMean,windowMedian,windowHitRate,bucketMean,pointsOf,
-  effectiveMode,spendView,spendBreakdown,BASIS_TEXT,EXPLICIT,REASONS,reasonInfo,remoteWindows,reasonRows,stillRemoteRows,parseClassMap,classOfClient,activeByClass,workClassRows,
+  effectiveMode,spendView,spendBreakdown,reconView,pricingView,BASIS_TEXT,EXPLICIT,REASONS,reasonInfo,remoteWindows,reasonRows,stillRemoteRows,parseClassMap,classOfClient,activeByClass,workClassRows,
   capacityView,healthIssues,verdict,gpuLevel,niceMax,lineChart};
 })();
 /*LIB-END*/
@@ -1298,8 +1311,14 @@ reg('spend',['spend','capacity','config'],()=>{
   const c2='<div class="card"><h3>How the charges were computed '+LIVE()+'<span class="sub">metered usage vs fallbacks</span></h3>'+
     (b.byBasis.length?bar(b.byBasis.map((x,i)=>({pct:100*x.usd/(b.total||1),c:x.key==='actual'||x.key==='usage'?'c3':x.key==='held-fallback'?'c4':'neutral',label:x.key})))+
     '<div class="tw"><table><thead><tr><th>Basis</th><th>What it means</th><th class="num">Calls</th><th class="num">Dollars</th><th class="num">Share</th></tr></thead><tbody>'+b.byBasis.map(x=>'<tr><td><span class="pill">'+esc(x.key)+'</span></td><td class="wrapc dim sm">'+esc(L.BASIS_TEXT[x.key]||'')+'</td><td class="num">'+L.fmtInt(x.calls)+'</td><td class="num">'+L.fmtUsd(x.usd)+'</td><td class="num">'+L.fmtPct(100*x.usd/(b.total||1),0)+'</td></tr>').join('')+'</tbody></table></div>'+
-    (isNum(nonShare)&&nonShare>0.1?'<div class="note warn" style="margin-top:8px">'+st('warn','Heads up')+'<span>'+L.fmtPct(100*nonShare,0)+' of today’s charges ('+L.fmtUsd(b.nonActualUsd)+') were not metered from provider usage. They are charged at an upper bound, so the real cost is probably lower than the ledger shows.</span></div>':''):empty('No attribution rows yet today.'))+'</div>';
-  $('#spend_cards').innerHTML=c1+c2;
+    (isNum(nonShare)&&nonShare>0.1&&b.total>=1?'<div class="note warn" style="margin-top:8px">'+st('warn','Heads up')+'<span>'+L.fmtPct(100*nonShare,0)+' of today’s charges ('+L.fmtUsd(b.nonActualUsd)+') were not metered from provider-reported usage (an upfront hold or an estimate was charged instead), so the ledger can differ from the provider\u2019s bill.</span></div>':''):empty('No attribution rows yet today.'))+'</div>';
+  const rc=L.reconView(S.spend);
+  const c3=rc?'<div class="card"><h3>Ledger vs the provider\u2019s own bill '+MEAS(rc.window||'last report','Written by spend_reconcile.py'+(isNum(rc.ageS)?', run '+L.fmtDur(rc.ageS)+' ago':''))+'<span class="sub">is the cap counting the right money?</span></h3>'+
+      '<div class="bigv">'+(rc.ratio==null?DASH:L.fmtNum(rc.ratio,2)+'\u00d7')+' <small class="dim">ledger \u00f7 provider</small></div>'+
+      kv([['Provider billed',L.fmtUsd(rc.providerUsd)],['Ledger charged',L.fmtUsd(rc.ledgerUsd)],['Difference',(rc.drift>0?'+':'')+L.fmtUsd(rc.drift)+' '+(rc.level==='ok'?st('ok','within 5%'):rc.level==='warn'?st('warn','drifting'):rc.level==='bad'?st('bad','off by more than 25%'):'')],
+          ['Failed calls charged',L.fmtUsd(rc.failedCharged)+' <span class="mut">(should be $0.00)</span>'],['Hours that drifted',L.fmtInt(rc.hoursDrifted)],['Verdict',esc(rc.verdict||DASH)],['Report age',isNum(rc.ageS)?L.fmtDur(rc.ageS)+(rc.ageS>86400?' '+st('warn','over a day old'):''):DASH]])+'</div>'
+    :'<div class="card"><h3>Ledger vs the provider\u2019s own bill</h3>'+empty('No reconciliation report yet. It appears once spend_reconcile.py --fact-out has run and this gateway version publishes it.')+'</div>';
+  $('#spend_cards').innerHTML=c1+c2+c3;
   const tbl=(title,rows,keyName)=>'<div><h4 class="sm" style="margin:6px 0">'+title+'</h4><div class="tw"><table><thead><tr><th>'+keyName+'</th><th class="num">Calls</th><th class="num">Dollars</th><th class="num">Share</th></tr></thead><tbody>'+rows.slice(0,12).map(x=>'<tr><td class="wrapc">'+esc(x.key)+'</td><td class="num">'+L.fmtInt(x.calls)+'</td><td class="num">'+L.fmtUsd(x.usd)+'</td><td class="num">'+L.fmtPct(100*x.usd/(b.total||1),0)+'</td></tr>').join('')+'</tbody></table></div>'+(rows.length>12?'<div class="xs mut">+ '+(rows.length-12)+' more</div>':'')+'</div>';
   $('#spend_table').innerHTML=b.groups.length?'<div class="grid g-3">'+tbl('By client',b.byClient,'Client')+tbl('By reason it went remote',b.byReason,'Reason')+'<div><h4 class="sm" style="margin:6px 0">Largest single groups</h4><div class="tw"><table><thead><tr><th>Client / reason</th><th>Basis</th><th class="num">Calls</th><th class="num">Dollars</th></tr></thead><tbody>'+b.groups.slice(0,12).map(g=>'<tr><td class="wrapc">'+esc(g.client)+' <span class="mut">/ '+esc(g.reason)+'</span></td><td><span class="pill">'+esc(g.basis)+'</span></td><td class="num">'+L.fmtInt(g.calls)+'</td><td class="num">'+L.fmtUsd(g.usd)+'</td></tr>').join('')+'</tbody></table></div></div></div>'+
     '<div class="cap">'+LIVE()+' accounted today: '+L.fmtUsd(b.accounted)+' across '+b.groups.length+' client/reason/basis groups.</div>':empty('No spend recorded today.');
@@ -1309,6 +1328,9 @@ reg('spend',['spend','capacity','config'],()=>{
     ['Output',P('remote_price_output_per_mtok')+' (peak '+P('remote_price_output_per_mtok_peak')+')'],
     ['Legacy estimate prices',P('remote_cost_in_per_mtok')+' in / '+P('remote_cost_out_per_mtok')+' out — used only for the per-client dollar estimates elsewhere on this page, not for the cap']])+
     '<div class="cap">'+CONF()+' Peak prices apply during the provider’s peak hours.</div>';
+  const pv=L.pricingView(S.spend);
+  if(pv)$('#spend_prices').innerHTML+='<h4 class="sm" style="margin:12px 0 4px">Dated pricing table the ledger uses '+(pv.error?st('bad','error: '+esc(pv.error)):pv.stale?st('warn','stale'+(pv.staleReason?': '+esc(pv.staleReason):'')):st('ok','current'))+'</h4>'+
+    kv([['Price period right now',esc(pv.period==='peak'?'peak':'off-peak')+' '+LIVE('Weekday windows in UTC; Chinese public holidays are off-peak')],['Table fetched',esc(pv.fetched||DASH)+(isNum(pv.ageDays)?' ('+pv.ageDays+' days ago)':'')],['Holiday calendar covers through',esc(pv.holidaysThrough||DASH)],['Models priced',esc(pv.models.join(', ')||DASH)],['Source',esc(pv.url||DASH)+' ('+esc(pv.source||'?')+')']]);
 });
 
 /* ====================== WORK CLASSES ====================== */

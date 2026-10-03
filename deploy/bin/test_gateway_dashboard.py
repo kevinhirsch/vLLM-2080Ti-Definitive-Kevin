@@ -255,6 +255,28 @@ class DashLibMapping(unittest.TestCase):
         self.assertEqual(b["byClient"][0], {"key": "a", "usd": 9.0, "calls": 110})
         self.assertEqual(b["byBasis"][0]["key"], "held-fallback")
 
+    def test_metered_and_unmetered_bases_are_told_apart(self):
+        spend = {"attribution": {"groups": [
+            {"client": "a", "reason": "r", "basis": "actual", "usd": 1.0, "calls": 1},
+            {"client": "a", "reason": "r", "basis": "usage", "usd": 1.0, "calls": 1},
+            {"client": "a", "reason": "r", "basis": "estimate", "usd": 2.0, "calls": 1}]}}
+        b = self.js("L.spendBreakdown(spend)", spend=spend)
+        self.assertEqual(b["nonActualUsd"], 2.0)            # provider-reported usage (even prompt-only) counts as metered
+
+    def test_reconciliation_and_pricing_blocks_are_optional_and_mapped(self):
+        self.assertIsNone(self.js("L.reconView({})"))
+        self.assertIsNone(self.js("L.pricingView({})"))
+        r = self.js("L.reconView(s)", s={"reconciliation": {"provider_usd": 8.15, "ledger_usd": 20.98, "failed_calls_charged_usd": 5.0,
+                                                           "hours_drifted": 9, "verdict": "ledger over-counts", "age_s": 60, "window": "2026-10-02"}})
+        self.assertAlmostEqual(r["ratio"], 20.98 / 8.15)
+        self.assertAlmostEqual(r["drift"], 12.83)
+        self.assertEqual(r["level"], "bad")
+        ok = self.js("L.reconView(s)", s={"reconciliation": {"provider_usd": 8.15, "ledger_usd": 8.16, "ledger_over_provider": 1.001}})
+        self.assertEqual(ok["level"], "ok")
+        p = self.js("L.pricingView(s)", s={"pricing": {"source": "file", "fetched": "2026-10-02", "age_days": 1, "period_now": "off_peak",
+                                                      "stale": True, "stale_reason": "holiday calendar ended", "models": ["deepseek-flash"]}})
+        self.assertEqual((p["period"], p["stale"], p["models"]), ("off_peak", True, ["deepseek-flash"]))
+
     # ---- routing windows and reasons ----
     CAP = {"remote_use": {"windows": {
         "15m": {"requests": 100, "remote": 80, "remote_share": 0.8, "by_reason": {"big-out": 30, "local-offline": 40},

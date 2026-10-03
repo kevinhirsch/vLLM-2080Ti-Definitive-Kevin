@@ -123,6 +123,8 @@ section 3. Every number on it carries a source tag: LIVE, MEASURED (with its win
 | Latency by class (admission wait, queue+prefill, decode) | `history/summary.latency_by_class` | Throughput |
 | 24 h latency and outcome totals | `history/summary` | Throughput, Routing |
 | Cumulative latency since engine start | `telemetry.percentiles` | Throughput |
+| Ledger vs provider bill, failed calls charged, hours drifted | `spend.reconciliation` (Lane SL) | Spend |
+| Dated price table: current period, age, stale flag | `spend.pricing` (Lane SL) | Spend |
 | Process uptime | `stats.process_uptime` (new) | Health |
 | Every configuration value | `/gateway/config` | Telemetry detail (read-only) |
 | Model modalities (text-only) | `/v1/models` | Health |
@@ -131,7 +133,7 @@ section 3. Every number on it carries a source tag: LIVE, MEASURED (with its win
 ## 4. Findings the page cannot fix (for the gateway owners)
 
 1. `capacity.remote_use.windows.*.by_class` is almost all `"?"` (407 of 410 remote requests in 15 min): the work class is only recorded on the local admission path, so the per-class split of *remote* use is unknowable from the gateway. The Work classes section therefore infers class from the client name and says so.
-2. 57-58% of today's recorded spend is on a non-metered basis (`held-fallback`, upper-bound hold, 319 calls averaging $0.039 vs $0.0009 for metered calls). The ledger probably overstates real cost; Lane SL's actual-usage settlement should move this.
+2. On 2026-10-02, 57-58% of the recorded spend was on a non-metered basis (`held-fallback`, an upper-bound hold: 319 calls averaging $0.039 vs $0.0009 for metered calls), and the ledger said $20.98 against a provider bill of $8.15. Lane SL's commit `2e89542375` (settle from actual usage at dated prices) fixes the cause. The page shows it either way: the "How the charges were computed" card flags any non-metered share over 10% of a day's spend of $1 or more, and the "Ledger vs the provider's own bill" card shows `spend.reconciliation` once the gateway publishes it.
 3. `/gateway/lanes` is 407 KB per call (1,184 agent-lane rows, 200 research rows), polled every 5 s by the new page, 81 KB/s per tab. It needs a server-side limit or filter.
 4. The windowed TTFT / inter-token quantiles are empty 80% of the time because they are per-2-s-window. A 60 s window would make "recent" numbers reliable.
 5. Before this change the page transferred about 1.4 MB/s per open tab; with the trim it is about 0.19 MB/s (7x less), measured by serialising the same payload (150-sample recent tail 202 KB / 4 s, 450+139 long tail 697 KB / 30 s). Until the gateway is republished it ignores the trim and the page falls back to polling the full payload every 10 s.
