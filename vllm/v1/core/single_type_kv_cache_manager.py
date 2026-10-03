@@ -54,6 +54,23 @@ def eager_tail_publish_enabled() -> bool:
     return os.environ.get("VLLM_GDN_TAIL_PUBLISH", "").strip().lower() == "copy"
 
 
+# Copy mode never ends a prompt with a final chunk this short: a 1 + num_spec
+# token prefill chunk is shape-identical to a uniform spec-decode batch and can
+# replay the spec-decode FULL cudagraph with the wrong GDN metadata
+# (vllm-project/vllm#53051). Backing the tail off one unit costs <= one unit.
+COPY_MODE_TAIL_MIN_REMAINDER = 8
+
+
+def copy_mode_tail_boundary(num_prompt_tokens: int, boundary: int, unit: int) -> int:
+    """[FORK][LANE CR] The prompt-tail boundary copy mode publishes at."""
+    if (
+        boundary > 0
+        and 0 < num_prompt_tokens - boundary <= COPY_MODE_TAIL_MIN_REMAINDER
+    ):
+        return max(boundary - unit, 0)
+    return boundary
+
+
 class SingleTypeKVCacheManager(ABC):
     """
     An abstract base class for a manager that handle the kv cache management
@@ -2140,6 +2157,10 @@ class MambaManager(SingleTypeKVCacheManager):
             # so register the tail one unit lower.
             latest_prompt_hash_boundary = max(
                 latest_prompt_hash_boundary - hash_block_size, 0
+            )
+        if self.eager_tail_publish:
+            latest_prompt_hash_boundary = copy_mode_tail_boundary(
+                request.num_prompt_tokens, latest_prompt_hash_boundary, hash_block_size
             )
         # The junction is the other position a sibling resumes at: where one was
         # observed to stop, and where the scheduler already ends a chunk. Bounded
