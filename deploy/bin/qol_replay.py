@@ -34,7 +34,8 @@ HERE = Path(__file__).resolve().parent
 TELEMETRY = Path(os.environ.get("SHIM_TELEMETRY_DIR", "/home/kevin/.local/share/vllm-qwen27b/telemetry"))
 GOVERNED_REMOTE = {"perf", "big-prompt", "monster", "predicted", "cap", "tokens", "prefill"}
 LOCAL_OK = lambda reason: reason in ("-", "", None) or str(reason).startswith(("lf-", "tiny"))
-FIELDS = ("t", "duration", "route", "reason", "bg", "stream", "ttft", "waited", "est_computed", "ptok", "ptok_exact",
+FIELDS = ("qol_mode", "qol_would", "qol_why", "qol_at", "qol_legacy", "qol_pred_local_s", "qol_pred_remote_s", "qol_waited_s",
+          "t", "duration", "route", "reason", "bg", "stream", "ttft", "waited", "est_computed", "ptok", "ptok_exact",
           "pm_credit_anchored", "alias", "xclient", "flow_class", "charged_usd", "cost_est", "status")
 
 
@@ -229,15 +230,38 @@ def summarize(res, ttft_target=15.0):
                                                          / max(1, len(res)), 3)))
 
 
+def shadow_report(rows, cutoff, ttft_target=15.0):
+    """Score the LIVE predictor from the qol_* fields the gateway logged in shadow/on mode (no reconstruction)."""
+    live = [r for r in rows if r.get("qol_mode") in ("shadow", "on") and not r["bg"] and r["t"] >= cutoff]
+    loc = [r for r in live if r["route"] == "local" and r["ttft"] is not None and r.get("qol_pred_local_s") is not None
+           and r.get("qol_at") in ("admission",)]
+    err = [(r["qol_pred_local_s"] + (r.get("qol_waited_s") or 0)) - ((r["waited"] or 0) + r["ttft"]) for r in loc]
+    aerr = sorted(abs(e) for e in err)
+    rem = [r for r in live if r["route"] == "remote" and r["ttft"] is not None and r.get("qol_pred_remote_s") is not None]
+    rerr = sorted(abs(r["qol_pred_remote_s"] - r["ttft"]) for r in rem)
+    would = collections.Counter((r["route"], r.get("qol_would")) for r in live)
+    return dict(rows=len(live), local_scored=len(loc),
+                local_median_signed_err_s=round(statistics.median(err), 2) if err else None,
+                local_p50_abs_err_s=pct(aerr, 0.5), local_p90_abs_err_s=pct(aerr, 0.9),
+                local_within_5s=round(sum(1 for e in aerr if e <= 5) / len(aerr), 3) if aerr else None,
+                remote_scored=len(rem), remote_p50_abs_err_s=pct(rerr, 0.5), remote_p90_abs_err_s=pct(rerr, 0.9),
+                actual_vs_would={"%s->%s" % k: v for k, v in would.most_common()},
+                on_gate="p90 |local err| < 10 s: %s" % ((pct(aerr, 0.9) or 1e9) < 10))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--days", type=float, default=7)
     ap.add_argument("--ttft", type=float, default=15.0)
     ap.add_argument("--gain", type=float, default=5.0)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--shadow", action="store_true", help="score the live predictor from logged qol_* fields")
     a = ap.parse_args(argv)
-    shim = _shim()
     rows, cutoff = load(a.days)
+    if a.shadow:
+        print(json.dumps(shadow_report(rows, cutoff, a.ttft), indent=1, default=str))
+        return 0
+    shim = _shim()
     res = replay(rows, cutoff, shim, ttft_target=a.ttft, min_gain=a.gain)
     s = summarize(res, a.ttft)
     s["window"] = dict(days=a.days, from_=time.strftime("%Y-%m-%d %H:%M", time.localtime(cutoff)), rows_loaded=len(rows),
