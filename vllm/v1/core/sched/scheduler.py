@@ -504,11 +504,12 @@ class Scheduler(SchedulerInterface):
         # tokens never counted as short and queued behind the cold prefill it
         # could have overtaken in one step. When on, the yield decision probes
         # the local prefix cache (read-only hash lookups, bounded by the same
-        # 16-request scan) and counts num_tokens - hit. Default off:
+        # 16-request scan) and counts num_tokens - hit. The prefill-batch
+        # barrier sizes waiting peers the same way (_waiting_prefill_remaining)
+        # so a warm peer cannot set a whole-prompt frontier. Default off:
         # VLLM_SCHED_SHORT_FIRST_PREFIX_AWARE=1 enables it.
         self.short_first_prefix_aware: bool = (
-            self.short_first_enabled
-            and self.cache_config.enable_prefix_caching
+            self.cache_config.enable_prefix_caching
             and os.environ.get("VLLM_SCHED_SHORT_FIRST_PREFIX_AWARE", "0") == "1"
         )
         self.num_short_first_prefix_yields: int = 0
@@ -533,6 +534,24 @@ class Scheduler(SchedulerInterface):
         """Prompt tokens still to prefill (0 for a decode-phase row)."""
         prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
         return max(prefill_end - request.num_computed_tokens, 0)
+
+    def _waiting_prefill_remaining(self, request: Request) -> int:
+        """Prompt tokens a WAITING request still has to prefill.
+
+        Without VLLM_SCHED_SHORT_FIRST_PREFIX_AWARE this is the prompt minus
+        num_computed_tokens, which stays 0 until admission, so a warm
+        continuation is sized by its whole prompt. With the flag it is sized by
+        what it would actually compute (prompt minus the read-only local
+        prefix-cache probe) -- see __init__ ([FORK][LANE CR2])."""
+        remaining = max(request.num_prompt_tokens - request.num_computed_tokens, 0)
+        if (
+            remaining
+            and request.num_computed_tokens == 0
+            and getattr(self, "short_first_prefix_aware", False)
+        ):
+            hit = self.kv_cache_manager.probe_prefix_cache_hit(request)
+            remaining = max(request.num_prompt_tokens - hit, 0)
+        return remaining
 
     def _prefill_share_cooldown(self, now: float) -> bool:
         """[FORK][LANE EF2] Update the chunk-time estimate from the previous
@@ -568,6 +587,11 @@ class Scheduler(SchedulerInterface):
         if (
             not self.short_first_enabled
             or self._short_first_streak >= self.short_first_max_run
+            # [FORK][LANE CR2] The prefill-batch barrier owns prefill ordering:
+            # it holds a waiting peer below the cohort frontier, so a yield
+            # would pause the running prefill AND skip the short request,
+            # an empty step (measured on the real scheduler).
+            or getattr(self, "prefill_batch_barrier", False)
         ):
             return False
         block = self.cache_config.block_size
@@ -910,8 +934,13 @@ class Scheduler(SchedulerInterface):
                     itertools.islice(waiting_candidates, available_slots)
                 )
 
+            # [FORK][LANE CR2] waiting peers are sized by their uncached
+            # remainder when prefix-aware sizing is on: a warm continuation
+            # must not set (or be measured against) a whole-prompt frontier.
             remaining_prompts = [
-                request.num_prompt_tokens - request.num_computed_tokens
+                self._waiting_prefill_remaining(request)
+                if request.status != RequestStatus.RUNNING
+                else request.num_prompt_tokens - request.num_computed_tokens
                 for request in prefill_candidates
             ]
             if remaining_prompts and barrier_has_running_prefill:
@@ -1298,8 +1327,10 @@ class Scheduler(SchedulerInterface):
                 request = request_queue.peek_request()
                 request_id = request.request_id
 
-                request_prefill_remaining = max(
-                    request.num_prompt_tokens - request.num_computed_tokens, 0
+                request_prefill_remaining = (
+                    self._waiting_prefill_remaining(request)
+                    if prefill_frontier is not None
+                    else max(request.num_prompt_tokens - request.num_computed_tokens, 0)
                 )
                 if (
                     prefill_frontier is not None
