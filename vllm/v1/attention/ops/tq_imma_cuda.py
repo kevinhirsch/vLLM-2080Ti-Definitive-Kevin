@@ -149,3 +149,49 @@ def tq_imma_decode_attention(
     _load().decode(q_rot, kv_cache, block_table, rl, q8, qs, mid, out, lse, S, q_per_seq, ns, scale, cscale,
                    1 if norm_correction else 0, lo, hi, 1 if qsplit_enabled() else 0)
     return out, lse
+
+
+def prefill_splits(Lq: int, Hq: int, Hk: int, C: int) -> int:
+    """KV splits for the prefix kernel: enough CTAs for ~2 waves of 68 SMs (1 CTA/SM)."""
+    env = os.getenv("VLLM_TQ_IMMA_PREFILL_SPLITS")
+    if env:
+        return int(env)
+    ctas = (Lq * (Hq // Hk) + 63) // 64 * Hk
+    ns = max(1, (2 * 68 + ctas - 1) // ctas)
+    return max(1, min(ns, (C + 1023) // 1024, 32))
+
+
+def prefill_enabled() -> bool:
+    return os.getenv("VLLM_TQ_IMMA_PREFILL", "0") == "1"
+
+
+def tq_imma_prefill_prefix_attention(
+    query: torch.Tensor,  # [Lq, Hq, D] fp16, un-rotated (the continuation chunk's queries)
+    kv_cache: torch.Tensor,
+    block_table_row: torch.Tensor,  # [1, max_blocks] or [max_blocks] int32
+    cached_len: int,
+    centroids: torch.Tensor,
+    scale: float,
+    norm_correction: bool,
+    PiT: torch.Tensor,
+    num_splits: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Attention of every chunk query over the C cached tokens (non-causal: all precede the chunk).
+    Returns (out fp16 [Lq, Hq, D], lse fp32 [Lq, Hq], natural log) for merging with the chunk's own attention."""
+    Lq, Hq, D = query.shape
+    Hk = kv_cache.shape[2]
+    dev = query.device
+    ns = num_splits or prefill_splits(Lq, Hq, Hk, cached_len)
+    q_rot = (query.float() @ PiT).contiguous()
+    q8 = torch.empty(Lq, Hq, 2 * D, dtype=torch.int8, device=dev)
+    qs = torch.empty(Lq, Hq, dtype=torch.float32, device=dev)
+    out = torch.empty(Lq, Hq, D, dtype=torch.float16, device=dev)
+    lse = torch.empty(Lq, Hq, dtype=torch.float32, device=dev)
+    mid = torch.empty(Lq, Hq, ns, D + 8, dtype=torch.float32, device=dev) if ns > 1 else lse
+    lo, hi, cscale, _ = _lut_for(centroids, norm_correction)
+    bt = block_table_row.reshape(-1)
+    if bt.dtype != torch.int32 or bt.stride(0) != 1:
+        bt = bt.to(torch.int32).contiguous()
+    _load().prefill_prefix(q_rot, kv_cache, bt, int(cached_len), q8, qs, out, lse, mid, ns, scale, cscale,
+                           1 if norm_correction else 0, lo, hi, 1 if qsplit_enabled() else 0)
+    return out, lse
