@@ -85,7 +85,7 @@ select,input[type=text],input[type=number],input[type=password]{background:var(-
 .seg button[aria-pressed="true"]{background:var(--info-bg);color:var(--info-ink)}
 
 /* ---------- source tags: shape + text, never colour alone ---------- */
-.tag{display:inline-block;font-size:10px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;padding:0 6px;border-radius:4px;line-height:16px;vertical-align:1px;white-space:nowrap;margin-left:4px;color:var(--ink2);background:var(--surface)}
+.tag{display:inline-block;font-size:10px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;padding:0 6px;border-radius:4px;line-height:16px;vertical-align:1px;white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis;margin-left:4px;color:var(--ink2);background:var(--surface)}
 .tag.live{border:1px solid var(--s3);color:var(--ink)} .tag.live::before{content:"\25CF\00a0";color:var(--s3)}
 .tag.measured{border:1px solid var(--s1);color:var(--ink)} .tag.measured::before{content:"\25F7\00a0";color:var(--s1)}
 .tag.configured{border:1px dashed var(--s4);color:var(--ink)} .tag.configured::before{content:"\2699\00a0";color:var(--warn-ink)}
@@ -292,7 +292,7 @@ dl.gl dt{display:inline;font-weight:650} dl.gl dd{display:inline;margin:0 0 0 4p
  <h2 id="h-thr">Throughput &amp; latency</h2>
  <p class="lede">How fast the engine reads prompts and writes answers, and how long people wait. Decode and prompt speeds are separate charts on purpose: they differ by about 100&times;.</p>
  <div class="grid g-tiles" id="thr_tiles"></div>
- <div class="card" style="margin-top:12px"><h3>Response time <span class="sub">three views of the same thing, over different windows</span></h3><div class="tw" id="lat_table"></div></div>
+ <div class="card" style="margin-top:12px"><h3>Response time <span class="sub">four views of the same thing, over different windows</span></h3><div class="tw" id="lat_table"></div></div>
  <div class="rangebar" style="margin-top:14px"><span>Chart range:</span>
   <div class="seg" id="range_seg"><button type="button" data-r="fast" aria-pressed="true">Last 15 min</button><button type="button" data-r="slow" aria-pressed="false">Last 2 hours</button></div>
   <span class="xs" id="range_note"></span></div>
@@ -321,6 +321,10 @@ dl.gl dt{display:inline;font-weight:650} dl.gl dd{display:inline;margin:0 0 0 4p
     <span class="xs" id="reason_note"></span></div>
   <div class="tw" id="rt_reasons"></div>
  </div>
+ <div class="card" style="margin-top:12px">
+  <h3>Each reason&rsquo;s share, side by side <span class="sub">of all requests sent to the paid provider in each window</span></h3>
+  <div class="tw" id="rt_reason_shares"></div>
+ </div>
  <div class="grid g-2" style="margin-top:12px">
   <div class="card" id="rt_localfirst"></div>
   <div class="card" id="rt_modes"></div>
@@ -343,7 +347,8 @@ dl.gl dt{display:inline;font-weight:650} dl.gl dd{display:inline;margin:0 0 0 4p
   <div class="card" id="cls_pressure"></div>
   <div class="card" id="cls_flow"></div>
  </div>
- <details class="dd"><summary>Who is in each class <span class="sub">client &rarr; class, inferred from the class map</span></summary><div class="in" id="cls_clients"></div></details>
+ <div class="card" style="margin-top:12px"><h3>Who the paid requests came from <span class="sub">by the work class the gateway recorded on every route</span></h3><div class="tw" id="cls_remote"></div></div>
+ <details class="dd"><summary>Who is in each class <span class="sub">clients and the classes the gateway recorded for them</span></summary><div class="in" id="cls_clients"></div></details>
 </section>
 
 <section class="sec" id="cache" aria-labelledby="h-cache">
@@ -363,11 +368,12 @@ dl.gl dt{display:inline;font-weight:650} dl.gl dd{display:inline;margin:0 0 0 4p
    <span class="pager"><button class="btn" id="n_prev" disabled>&lsaquo;</button><span id="n_page" class="num">1/1</span><button class="btn" id="n_next" disabled>&rsaquo;</button></span></div>
   <div class="tw"><table id="n_table"><thead><tr><th></th><th>Kind</th><th class="sortable" data-sort="who">Who / what</th><th>Status</th><th class="sortable num" data-sort="age">Age</th><th></th></tr></thead><tbody id="n_rows"><tr><td colspan="6" class="empty">Loading&hellip;</td></tr></tbody></table></div>
   <div id="n_err" class="sm" style="color:var(--bad-ink)"></div>
+  <div id="n_lanes_note" class="xs mut"></div>
   <div style="margin-top:6px"><button class="btn" id="n_csv" type="button">Export CSV</button></div>
  </div></details>
  <details class="dd"><summary>Recent requests <span class="sub" id="ev_sub">gateway memory, newest first</span></summary><div class="in">
   <div class="tools"><span id="req_summary"></span><span class="pager"><button class="btn" id="ev_prev" disabled>&lsaquo;</button><span id="ev_page" class="num">1/1</span><button class="btn" id="ev_next" disabled>&rsaquo;</button></span></div>
-  <div class="tw"><table><thead><tr><th>When</th><th>Endpoint</th><th>Client</th><th>Went to</th><th>Reason</th><th class="num">Prompt&rarr;max out (tok)</th><th class="num">Waited</th></tr></thead><tbody id="ev"><tr><td colspan="7" class="empty">Loading&hellip;</td></tr></tbody></table></div>
+  <div class="tw"><table><thead><tr><th>When</th><th>Endpoint</th><th>Client</th><th>Went to</th><th>Reason</th><th>Class</th><th class="num">Prompt&rarr;max out (tok)</th><th class="num">Waited</th></tr></thead><tbody id="ev"><tr><td colspan="8" class="empty">Loading&hellip;</td></tr></tbody></table></div>
  </div></details>
  <details class="dd"><summary>Request history <span class="sub">on-disk log &middot; survives restarts &middot; searched on the server</span></summary><div class="in">
   <div class="tools"><input type="text" id="h_client" placeholder="filter by client&hellip;" aria-label="Filter by client"><input type="text" id="h_route" placeholder="filter by route or reason (local, remote, tiny&hellip;)" aria-label="Filter by route or reason">
@@ -675,10 +681,10 @@ function remoteWindows(cap,stats){
 function reasonRows(win,cap,stats,cfg){
   let by,total,note='';
   if(win==='life'){by=get(stats,['remote_reasons'])||{};total=get(stats,['remote']);}
-  else{const w=get(cap,['remote_use','windows',win])||{};by=w.by_reason||{};total=w.remote;note='The gateway itemises its top 8 reasons per window.';}
+  else{const w=get(cap,['remote_use','windows',win])||{};by=w.by_reason||{};total=w.remote;note=isNum(w.covered_s)?(w.covered_s<({'15m':900,'1h':3600,'24h':86400}[win]||0)-1?'This window only reaches back to when the gateway process started.':''):'This gateway itemises only its top 8 reasons per window.';}
   const rows=Object.entries(by).sort((a,b)=>b[1]-a[1]).map(([k,n])=>Object.assign(reasonInfo(k,cfg,cap,stats),{n,pct:isNum(total)&&total>0?100*n/total:null}));
   const listed=rows.reduce((a,r)=>a+r.n,0);
-  if(isNum(total)&&total>listed)rows.push({key:'(other)',plain:'Reasons beyond the top 8 the gateway itemises for this window.',n:total-listed,pct:100*(total-listed)/total,explicit:null,setting:null,fix:'',field:null});
+  if(isNum(total)&&total>listed)rows.push({key:'(other)',plain:'Reasons the gateway did not itemise for this window.',n:total-listed,pct:100*(total-listed)/total,explicit:null,setting:null,fix:'',field:null});
   return {rows,total,note};
 }
 function stillRemoteRows(stats){
@@ -722,6 +728,59 @@ function workClassRows(cap,stats,lanes){
       rpm5:d.req_per_min_5m,rpm60:d.req_per_min_60m,tokpm5:d.prompt_tok_per_min_5m,pre5:d.uncached_prefill_s_per_min_5m,pre60:d.uncached_prefill_s_per_min_60m,
       running:act[c].running,queuedNow:act[c].queued};
   });
+}
+
+/* ---------- remote use by real work class and by reason, over several windows (Lane DB2) ---------- */
+const RC_WINDOWS=[['15m','15 min'],['1h','1 hour'],['24h','24 hours']];
+function remoteByClass(cap,hist){
+  const w=get(cap,['remote_use','windows'])||{},pcl=get(hist,['per_class']);
+  const cols=[];
+  for(const [k,label] of RC_WINDOWS){
+    const x=w[k];if(!x||!x.by_class)continue;
+    if(k==='24h'&&pcl)continue;                          // the on-disk log covers a true 24 h: prefer it
+    cols.push({key:k,label,total:x.remote,by:x.by_class,covered:x.covered_s,secs:{'15m':900,'1h':3600,'24h':86400}[k],source:'routing ledger (gateway memory)'});
+  }
+  if(pcl){
+    const by={};let tot=0;for(const c of Object.keys(pcl)){const n=(pcl[c]||{}).remote||0;if(n){by[c]=n;tot+=n;}}
+    cols.push({key:'24h',label:'24 hours',total:tot,by,covered:null,secs:86400,source:'on-disk request log'});
+  }
+  const names=[...CLASSES,'?'];
+  const rows=names.map(c=>({cls:c,cells:cols.map(col=>{const n=(col.by||{})[c]||0;return {n,pct:col.total>0?100*n/col.total:null};})}));
+  const other=Object.keys(cols.reduce((a,col)=>Object.assign(a,col.by||{}),{})).filter(c=>!names.includes(c));
+  other.forEach(c=>rows.push({cls:c,cells:cols.map(col=>{const n=(col.by||{})[c]||0;return {n,pct:col.total>0?100*n/col.total:null};})}));
+  const untagged=cols.map(col=>col.total>0?100*((col.by||{})['?']||0)/col.total:null);
+  return {cols,rows,untagged};
+}
+function reasonShares(cap,stats,hist){
+  const w=get(cap,['remote_use','windows'])||{},log=get(hist,['remote_by_reason']);
+  const cols=[];
+  const w15=w['15m'];
+  if(w15)cols.push({key:'15m',label:'15 min',by:w15.by_reason||{},total:w15.remote,covered:w15.covered_s,secs:900,source:'routing ledger (gateway memory)'});
+  if(log){const tot=Object.values(log).reduce((a,b)=>a+b,0);cols.push({key:'24h',label:'24 hours',by:log,total:tot,covered:null,secs:86400,source:'on-disk request log'});}
+  else if(w['24h'])cols.push({key:'24h',label:'24 hours',by:w['24h'].by_reason||{},total:w['24h'].remote,covered:w['24h'].covered_s,secs:86400,source:'routing ledger (gateway memory)'});
+  if(stats&&stats.remote_reasons)cols.push({key:'life',label:'All time',by:stats.remote_reasons,total:stats.remote,covered:null,secs:null,source:'persistent counters'});
+  const keys={};cols.forEach(c=>Object.keys(c.by).forEach(k=>keys[k]=(keys[k]||0)+c.by[k]/Math.max(1,c.total||1)));
+  const rows=Object.keys(keys).sort((a,b)=>keys[b]-keys[a]).map(k=>({key:k,documented:!!REASONS[k],explicit:(REASONS[k]||{}).explicit,
+    cells:cols.map(c=>{const n=c.by[k]||0;return {n,pct:c.total>0?100*n/c.total:null};})}));
+  const other=cols.map(c=>{const listed=Object.values(c.by).reduce((a,b)=>a+b,0);return isNum(c.total)&&c.total>listed?{n:c.total-listed,pct:100*(c.total-listed)/c.total}:{n:0,pct:0};});
+  if(other.some(o=>o.n>0))rows.push({key:'(other)',documented:true,explicit:null,cells:other});
+  const partial=cols.filter(c=>String(c.source).indexOf('routing ledger')===0&&isNum(c.secs)&&((!isNum(c.covered)&&c.secs>900)||(isNum(c.covered)&&c.covered<c.secs-1)));   // the in-memory ledger only reaches back to the process start
+  return {cols,rows,partial,undocumented:rows.filter(r=>!r.documented).map(r=>r.key)};
+}
+
+/* ---------- agent lanes: classify a STATUS heartbeat. keepalive-shim.py lane_state() mirrors this; a test compares them ---------- */
+function laneStage(status,ageS){
+  const stt=status||'',m=stt.match(/^(RUNNING|DONE|BLOCKED)\s*\|\s*([^|]*)\|\s*(.*)$/),head=stt.slice(0,90);
+  const stg=m?m[1]:(/\bSTALE\b/.test(head)?'STALE':/\bBLOCKED\b/.test(head)?'BLOCKED':/\bDONE\b|\bAPPLIED\b/.test(head)?'DONE':(stt?'RUNNING':'UNKNOWN'));
+  const stale=stg==='STALE'||(stg==='RUNNING'&&(ageS||0)>900);
+  const state=stg==='DONE'?'done':stg==='BLOCKED'?'blocked':stale?'stale':stg==='RUNNING'?'run':'empty';
+  return {stage:stg,state,text:m?m[3].trim():null};
+}
+/* The gateway's own windowed latency (Lane DB2): null when this gateway predates it or no request finished in the window. */
+function gatewayLatency(telem,win,route){
+  const x=get(telem,['windowed_latency','windows',win||'60s',route||'local']);
+  if(!x)return null;
+  return {n:x.n||0,ttft50:x.ttft_p50,ttft95:x.ttft_p95,itlN:x.itl_n||0,itl50:x.itl_p50,itl95:x.itl_p95,window:win||'60s'};
 }
 
 /* ---------- capacity ---------- */
@@ -835,7 +894,7 @@ function lineChart(spec){
 }
 
 return {CLASSES,DASH,isNum,esc,fmtInt,fmtNum,fmtTok,fmtPct,fmtFrac,fmtUsd,fmtDur,fmtAgo,fmtMiB,get,mean,median,tail,windowMean,windowMedian,windowHitRate,bucketMean,pointsOf,
-  effectiveMode,spendView,spendBreakdown,reconView,pricingView,BASIS_TEXT,EXPLICIT,REASONS,reasonInfo,remoteWindows,reasonRows,stillRemoteRows,parseClassMap,classOfClient,activeByClass,workClassRows,
+  effectiveMode,spendView,spendBreakdown,reconView,pricingView,BASIS_TEXT,EXPLICIT,REASONS,reasonInfo,remoteWindows,reasonRows,stillRemoteRows,parseClassMap,classOfClient,activeByClass,workClassRows,remoteByClass,reasonShares,laneStage,gatewayLatency,
   capacityView,healthIssues,verdict,gpuLevel,niceMax,lineChart};
 })();
 /*LIB-END*/
@@ -879,6 +938,7 @@ function clientDisplay(name,ip,ua){
 }
 
 /* ====================== state, feeds, polling ====================== */
+const LANES_LIGHT='/gateway/lanes?active=1&limit=200',LANES_FULL='/gateway/lanes';   // light: not-done lanes active in the last day, freshest 200; full: all ~1,200 lanes and 200 research rows (~400 KB)
 const S={stats:null,cap:null,telem:null,series:null,lanes:null,windows:null,cfg:null,models:null,spend:null,hist:null,local:null,history:null};
 const VER={};   // feed -> version counter, bumped on every successful arrival
 const FEEDS=[
@@ -887,7 +947,7 @@ const FEEDS=[
   {name:'telemetry',  url:'/gateway/telemetry?fast=150&slow=0',          every:4000,  key:'telem'},
   {name:'series',     url:'/gateway/telemetry?fast=450&slow=139',        every:30000, key:'series'},
   {name:'spend',      url:'/gateway/spend',                              every:5000,  key:'spend'},
-  {name:'lanes',      url:'/gateway/lanes',                              every:5000,  key:'lanes'},
+  {name:'lanes',      url:LANES_LIGHT,                                  every:5000,  key:'lanes'},
   {name:'windows',    url:'/gateway/windows',                            every:15000, key:'windows'},
   {name:'config',     url:'/gateway/config',                             every:15000, key:'cfg'},
   {name:'models',     url:'/v1/models',                                  every:30000, key:'models'},
@@ -947,6 +1007,7 @@ function derived(){
     tpot5:L.windowMedian(r,now,300,['engine','tpot_p50']),tpot95_5:L.windowMedian(r,now,300,['engine','tpot_p95']),
     e2e5:L.windowMedian(r,now,300,['engine','e2e_p50']),e2e95_5:L.windowMedian(r,now,300,['engine','e2e_p95']),
     spec5:L.windowMean(r,now,300,['engine','spec_accept_rate']),
+    gl60:L.gatewayLatency(S.telem,'60s','local'),gl300:L.gatewayLatency(S.telem,'300s','local'),
     pct:get(S.telem,['percentiles'])||{}};
 }
 
@@ -996,9 +1057,10 @@ reg('summary',['stats','capacity','telemetry','spend','config','series'],()=>{
   const hit=d.hit5;
   t.push(tile({label:'Prefix-cache hit rate',tag:MEAS('last 5 min','Weighted mean of the engine’s 2 s hit rates, weight = prompt tokens in that window. Approximate.'),value:hit==null?DASH:L.fmtFrac(hit,0),
     sub:hit==null?'no prompt traffic in the last 5 min':'share of prompt tokens served from cache',help:'Higher is better: cached tokens are not recomputed.'}));
-  const tt=isNum(d.ttft5)?d.ttft5:d.pct&&get(d.pct,['ttft','cumulative_p50']);
-  t.push(tile({label:'Time to first token',tag:isNum(d.ttft5)?MEAS('last 5 min, median of 2 s windows'):MEAS('since engine start','No request finished in the last 5 min; showing the cumulative median'),value:L.fmtNum(tt,1),unit:'s typical',
-    sub:'slowest 1 in 20: '+L.fmtNum(isNum(d.ttft95_5)?d.ttft95_5:get(d.pct,['ttft','cumulative_p95']),1)+' s',help:'How long until the answer starts appearing (p50 typical, p95 slow case).'}));
+  const g60=d.gl60&&d.gl60.n>0&&isNum(d.gl60.ttft50)?d.gl60:null;
+  const tt=g60?g60.ttft50:isNum(d.ttft5)?d.ttft5:d.pct&&get(d.pct,['ttft','cumulative_p50']);
+  t.push(tile({label:'Time to first token',tag:g60?MEAS('last 60 s','Measured by the gateway on every streaming request that finished in the last 60 s ('+g60.n+' request'+(g60.n===1?'':'s')+')'):isNum(d.ttft5)?MEAS('last 5 min, median of 2 s windows'):MEAS('since engine start','No request finished in the last 5 min; showing the cumulative median'),value:L.fmtNum(tt,1),unit:'s typical',
+    sub:'slowest 1 in 20: '+L.fmtNum(g60?g60.ttft95:isNum(d.ttft95_5)?d.ttft95_5:get(d.pct,['ttft','cumulative_p95']),1)+' s'+(g60?'':d.gl60?' · no request finished in the last 60 s':''),help:'How long until the answer starts appearing (p50 typical, p95 slow case).'}));
   const sub1=isNum(sv.available)?L.fmtUsd(sv.available)+' left today · '+L.fmtPct(sv.pct,0)+' of cap':'';
   t.push(tile({label:'Spend today',tag:LIVE('Gateway spend ledger (/gateway/spend), the enforcing authority'),value:L.fmtUsd(sv.spent)+' <small>of '+L.fmtUsd(sv.cap)+'</small>',level:sv.level==='unk'?'':sv.level,
     status:sv.level==='unk'?'':st(sv.level==='bad'?'bad':sv.level==='warn'?'warn':'ok',sv.level==='bad'?'At the cap':sv.level==='warn'?'Close to the cap':'Within cap'),
@@ -1125,11 +1187,12 @@ reg('throughput',['capacity','telemetry','stats','log24h'],()=>{
   $('#thr_tiles').innerHTML=tiles.join('');
   const pc=d.pct,h=S.hist||{};
   const pair=(a,b,u)=>(isNum(a)||isNum(b))?L.fmtNum(a,u)+' / '+L.fmtNum(b,u)+' s':DASH;
-  $('#lat_table').innerHTML='<table><thead><tr><th>What</th><th class="num">Recent '+MEAS('last 5 min','Median of the engine’s 2 s windows that saw a finished request')+'</th><th class="num">Since engine start '+MEAS('since engine start','Cumulative histogram quantile')+'</th><th class="num">Last 24 h '+MEAS('24 h','From the on-disk request log')+'</th></tr></thead><tbody>'+
-    '<tr><td>Time to first token<div class="xs mut">p50 / p95</div></td><td class="num">'+pair(d.ttft5,d.ttft95_5,2)+'</td><td class="num">'+pair(get(pc,['ttft','cumulative_p50']),get(pc,['ttft','cumulative_p95']),2)+'</td><td class="num">'+pair(h.ttft_p50,h.ttft_p95,2)+'</td></tr>'+
-    '<tr><td>Gap between tokens<div class="xs mut">p50 / p95</div></td><td class="num">'+pair(d.tpot5,d.tpot95_5,3)+'</td><td class="num">'+pair(get(pc,['tpot','cumulative_p50']),get(pc,['tpot','cumulative_p95']),3)+'</td><td class="num">'+DASH+'</td></tr>'+
-    '<tr><td>Whole request<div class="xs mut">p50 / p95</div></td><td class="num">'+pair(d.e2e5,d.e2e95_5,1)+'</td><td class="num">'+pair(get(pc,['e2e','cumulative_p50']),get(pc,['e2e','cumulative_p95']),1)+'</td><td class="num">'+pair(h.duration_p50,h.duration_p95,1)+'</td></tr></tbody></table>'+
-    '<div class="cap">The three columns disagree on purpose: they cover different windows and measure at different points (engine vs gateway). The engine reports no windowed value when no request finished in that window, so “recent” can be empty.</div>';
+  const g60=d.gl60,g300=d.gl300,gcell=(g,a,b,n,u)=>g?((isNum(g[a])||isNum(g[b]))?pair(g[a],g[b],u)+'<div class="xs mut">'+L.fmtInt(g[n])+' request'+(g[n]===1?'':'s')+'</div>':'<span class="mut">none finished</span>'):DASH;
+  $('#lat_table').innerHTML='<table><thead><tr><th>What</th><th class="num">Last 60 s '+MEAS('last 60 s','The gateway times every streaming request it relays and takes the quantile over those that finished in the window. Always present when traffic flows; the engine’s own windowed value is empty most of the time.')+'</th><th class="num">Recent '+MEAS('last 5 min','Median of the engine’s 2 s windows that saw a finished request')+'</th><th class="num">Since engine start '+MEAS('since engine start','Cumulative histogram quantile')+'</th><th class="num">Last 24 h '+MEAS('24 h','From the on-disk request log')+'</th></tr></thead><tbody>'+
+    '<tr><td>Time to first token<div class="xs mut">p50 / p95</div></td><td class="num">'+gcell(g60,'ttft50','ttft95','n',2)+'</td><td class="num">'+pair(d.ttft5,d.ttft95_5,2)+'</td><td class="num">'+pair(get(pc,['ttft','cumulative_p50']),get(pc,['ttft','cumulative_p95']),2)+'</td><td class="num">'+pair(h.ttft_p50,h.ttft_p95,2)+'</td></tr>'+
+    '<tr><td>Gap between tokens<div class="xs mut">p50 / p95</div></td><td class="num">'+gcell(g60,'itl50','itl95','itlN',3)+'</td><td class="num">'+pair(d.tpot5,d.tpot95_5,3)+'</td><td class="num">'+pair(get(pc,['tpot','cumulative_p50']),get(pc,['tpot','cumulative_p95']),3)+'</td><td class="num">'+DASH+'</td></tr>'+
+    '<tr><td>Whole request<div class="xs mut">p50 / p95</div></td><td class="num">'+DASH+'</td><td class="num">'+pair(d.e2e5,d.e2e95_5,1)+'</td><td class="num">'+pair(get(pc,['e2e','cumulative_p50']),get(pc,['e2e','cumulative_p95']),1)+'</td><td class="num">'+pair(h.duration_p50,h.duration_p95,1)+'</td></tr></tbody></table>'+
+    '<div class="cap">The columns disagree on purpose: they cover different windows and measure at different points. “Last 60 s” is computed by the gateway from the requests it relayed (time to first byte; gap = decode time ÷ tokens, exact counts only)'+(g300&&g300.n?'; the last 5 min has '+L.fmtInt(g300.n)+' such requests':'')+'. “Recent” is the engine’s own 2 s window, which is empty when no request finished in it.'+(g60?'':' <b>This gateway does not publish the 60 s view yet.</b>')+'</div>';
   const lc=get(h,['latency_by_class'])||{};
   const names={admission_wait:'Waiting at the gateway for a lane',queue_plus_prefill:'Queue + prompt reading',decode_time:'Writing the answer'};
   $('#lat_class').innerHTML=Object.keys(lc).length?'<div class="tw"><table><thead><tr><th>Class</th><th>Stage</th><th class="num">Typical (p50)</th><th class="num">Slow (p90)</th><th class="num">Requests</th></tr></thead><tbody>'+
@@ -1140,8 +1203,8 @@ reg('thr_charts',['series'],()=>{
   $('#thr_charts').innerHTML=
     chartCard('c_dec','Answer speed (decode)','tokens written per second, all streams',[ser('decode',1,['engine','gen_tok_s'])],{unit:'tok/s',yFmt:v=>L.fmtNum(v,0)})+
     chartCard('c_pre','Prompt tokens accepted','tokens/s, including cache hits',[ser('prompt',2,['engine','prompt_tok_s'])],{unit:'tok/s',yFmt:L.fmtTok,valFmt:v=>L.fmtNum(v,0)})+
-    chartCard('c_ttft','Time to first token','seconds · gaps = no request finished in that window',[ser('typical (p50)',1,['engine','ttft_p50']),ser('slow (p95)',2,['engine','ttft_p95'])],{yFmt:v=>L.fmtNum(v,0)+' s',valFmt:v=>L.fmtNum(v,2)+' s'})+
-    chartCard('c_tpot','Gap between tokens','seconds',[ser('typical (p50)',1,['engine','tpot_p50']),ser('slow (p95)',2,['engine','tpot_p95'])],{yFmt:v=>L.fmtNum(v,1)+' s',valFmt:v=>L.fmtNum(v,3)+' s'})+
+    chartCard('c_ttft','Time to first token','seconds · each point is a 60 s window measured by the gateway · gaps = no request finished',[ser('typical (p50), 60 s window',1,['gateway','ttft60_p50']),ser('slow (p95), 60 s window',2,['gateway','ttft60_p95'])],{yFmt:v=>L.fmtNum(v,0)+' s',valFmt:v=>L.fmtNum(v,2)+' s'})+
+    chartCard('c_tpot','Gap between tokens','seconds · 60 s window measured by the gateway',[ser('typical (p50), 60 s window',1,['gateway','itl60_p50']),ser('slow (p95), 60 s window',2,['gateway','itl60_p95'])],{yFmt:v=>L.fmtNum(v,2)+' s',valFmt:v=>L.fmtNum(v,3)+' s'})+
     chartCard('c_q','Work in flight','requests',[ser('engine running',1,['engine','running']),ser('engine waiting',2,['engine','waiting']),ser('gateway lanes in use',3,['gateway','inflight'])],{yFmt:v=>L.fmtNum(v,0),valFmt:v=>L.fmtNum(v,1)})+
     chartCard('c_kv','KV cache','% of GPU memory pool in use',[ser('KV cache',1,['engine','kv_cache_pct'])],{yMax:100,yFmt:v=>v.toFixed(0)+'%',valFmt:v=>L.fmtNum(v,0)+'%',unit:''});
 });
@@ -1260,6 +1323,14 @@ reg('rt_reasons',['capacity','stats','config','series'],()=>{
       '<td class="wrapc"><div class="rwhy">'+esc(r.plain)+'</div>'+(r.fix?'<div class="xs" style="margin-top:2px">&rarr; '+esc(r.fix)+'</div>':'')+'</td><td class="wrapc sm">'+(r.setting?'<a href="#" data-act="goto" data-field="'+esc(r.setting.field)+'">'+esc(r.setting.field)+' = '+esc(String(r.setting.value))+'</a> '+CONF():'<span class="mut">&mdash;</span>')+'</td></tr>').join('')+'</tbody></table>'+
     '<div class="cap">'+L.fmtInt(total)+' requests went to the paid provider in this window. '+(REASON_WIN==='life'?MEAS('all time','Persistent counters'):MEAS(REASON_WIN,'From the gateway’s routing ledger'))+'</div>';
 });
+reg('rt_reason_shares',['capacity','stats','log24h'],()=>{
+  const rs=L.reasonShares(S.cap,S.stats,S.hist);
+  if(!rs.cols.length){$('#rt_reason_shares').innerHTML=empty('No routing counters yet.');return;}
+  const cell=c=>c.n?'<span class="num">'+L.fmtInt(c.n)+'</span> <span class="mut">('+L.fmtPct(c.pct,1)+')</span>':'<span class="mut">&mdash;</span>';
+  $('#rt_reason_shares').innerHTML='<table><thead><tr><th>Reason</th>'+rs.cols.map(c=>'<th class="num">'+esc(c.label)+'<div class="xs mut">'+L.fmtInt(c.total)+' paid</div></th>').join('')+'</tr></thead><tbody>'+
+    rs.rows.map(r=>'<tr><td><span class="pill">'+esc(r.key)+'</span>'+(r.documented?'':' <span class="pill warn">undocumented</span>')+'<div class="xs mut">'+(r.explicit===true?'forced / requested':r.explicit===false?'chosen by the gateway':'')+'</div></td>'+r.cells.map(c=>'<td class="num">'+cell(c)+'</td>').join('')+'</tr>').join('')+'</tbody></table>'+
+    '<div class="cap">'+rs.cols.map(c=>esc(c.label)+': '+MEAS(c.key==='life'?'all time':c.label,c.source)).join(' · ')+(rs.partial.length?' · <b>'+rs.partial.map(c=>esc(c.label)).join(', ')+'</b> only covers '+(rs.partial.every(c=>isNum(c.covered))?'the '+esc(L.fmtDur(Math.min.apply(null,rs.partial.map(c=>c.covered))))+' since this gateway process started':'the time since this gateway process started')+' (the routing ledger is in memory).':'')+'</div>';
+});
 reg('rt_localfirst',['stats','config'],()=>{
   const lf=get(S.stats,['local_first'])||{},cfg=S.cfg||{},kept=Object.entries(lf.kept_local||{}).sort((a,b)=>b[1]-a[1]),still=L.stillRemoteRows(S.stats);
   $('#rt_localfirst').innerHTML='<h3>Local-first policy</h3>'+kv([
@@ -1360,8 +1431,25 @@ reg('classes',['capacity','stats','lanes','config','telemetry'],()=>{
     ['Held for a warming prefix now',L.fmtInt(a.prefix_holds_now)+' '+LIVE()],
     ['Callers that hung up while queued',L.fmtInt(ct.client_gone)+' '+MEAS('since the process started')]]);
 });
+reg('cls_remote',['capacity','log24h'],()=>{
+  const rc=L.remoteByClass(S.cap,S.hist);
+  if(!rc.cols.length){$('#cls_remote').innerHTML=empty('No per-class routing data from this gateway yet.');return;}
+  const cell=c=>c.n?L.fmtInt(c.n)+' <span class="mut">('+L.fmtPct(c.pct,0)+')</span>':'<span class="mut">&mdash;</span>';
+  const unk=rc.untagged.some(u=>u!=null&&u>50);
+  $('#cls_remote').innerHTML=(unk?'<div class="note warn" style="margin:0 0 8px"><b>Mostly untagged</b><span class="why">Most paid requests in a window carry no class. This gateway version records the class only for requests that were queued locally; after the update every route records it.</span></div>':'')+
+    '<table><thead><tr><th>Class</th>'+rc.cols.map(c=>'<th class="num">'+esc(c.label)+'<div class="xs mut">'+L.fmtInt(c.total)+' paid</div></th>').join('')+'</tr></thead><tbody>'+
+    rc.rows.filter(r=>r.cls!=='?'||r.cells.some(c=>c.n)).map(r=>'<tr><td class="nowrap">'+(CLS_COLOR[r.cls]?'<span class="sw '+CLS_COLOR[r.cls]+'"></span>':'')+'<b>'+esc(r.cls==='?'?'untagged':r.cls)+'</b></td>'+r.cells.map(c=>'<td class="num">'+cell(c)+'</td>').join('')+'</tr>').join('')+'</tbody></table>'+
+    '<div class="cap">'+rc.cols.map(c=>esc(c.label)+': '+MEAS(c.label,c.source)).join(' · ')+'. Order of importance is kevin &gt; halo &gt; runner &gt; background; paid use by the lower classes is the cost to look at first.</div>';
+});
 reg('cls_clients',['telemetry','config'],()=>{
   const map=L.parseClassMap(get(S.cfg,['flow_class_map'])),pc=get(S.telem,['per_client'])||{};
+  const recorded=Object.values(pc).some(c=>c&&c.by_class);
+  if(recorded){
+    const rows=Object.entries(pc).map(([n,c])=>({n,c,tot:Object.values(c.by_class||{}).reduce((a,b)=>a+b,0)})).sort((a,b)=>b.c.requests-a.c.requests);
+    $('#cls_clients').innerHTML='<div class="cap" style="margin:6px 0">'+MEAS('since this gateway process started','The gateway’s own record of the class it gave each request')+' Not inferred: this is the class the gateway actually used (header, model alias, prompt marker, client map, or background flag).</div>'+
+      '<div class="tw"><table><thead><tr><th>Client</th><th>Classes recorded</th><th class="num">Requests</th><th class="num">Local</th><th class="num">Paid</th><th class="num">Errors</th></tr></thead><tbody>'+rows.map(r=>'<tr><td>'+clientDisplay(r.n)+'</td><td class="wrapc sm">'+Object.entries(r.c.by_class||{}).sort((a,b)=>b[1]-a[1]).map(([k,v])=>(CLS_COLOR[k]?'<span class="sw '+CLS_COLOR[k]+'"></span>':'')+esc(k==='?'?'untagged':k)+' '+L.fmtInt(v)).join(' · ')+'</td><td class="num">'+L.fmtInt(r.c.requests)+'</td><td class="num">'+L.fmtInt(r.c.local)+'</td><td class="num">'+L.fmtInt(r.c.remote)+'</td><td class="num">'+L.fmtInt(r.c.errors)+'</td></tr>').join('')+'</tbody></table></div>';
+    return;
+  }
   const rows=Object.entries(pc).map(([n,c])=>({n,cls:L.classOfClient(n,map),c})).sort((a,b)=>(L.CLASSES.indexOf(a.cls||'zz'))-(L.CLASSES.indexOf(b.cls||'zz'))||b.c.requests-a.c.requests);
   $('#cls_clients').innerHTML='<div class="cap" style="margin:6px 0">'+EST('The gateway does not log the class; this matches the friendly client name against the class map (first substring match). The real class can also come from a header, the model name, or a prompt marker.')+'</div>'+
     '<div class="tw"><table><thead><tr><th>Client</th><th>Class (inferred)</th><th class="num">Requests</th><th class="num">Local</th><th class="num">Paid</th><th class="num">Errors</th></tr></thead><tbody>'+rows.map(r=>'<tr><td>'+clientDisplay(r.n)+'</td><td>'+(r.cls?'<span class="sw '+CLS_COLOR[r.cls]+'"></span>'+esc(r.cls):'<span class="mut">unmapped (kevin, or background if flagged)</span>')+'</td><td class="num">'+L.fmtInt(r.c.requests)+'</td><td class="num">'+L.fmtInt(r.c.local)+'</td><td class="num">'+L.fmtInt(r.c.remote)+'</td><td class="num">'+L.fmtInt(r.c.errors)+'</td></tr>').join('')+'</tbody></table></div>';
@@ -1421,8 +1509,7 @@ function buildUnified(){
       age:a.elapsed_s||0,meta:esc(a.ep)+(a.ptok?' · '+L.fmtTok(a.ptok)+' in':'')+(a.maxtok?' · '+a.maxtok+' max out':'')+(a.stream?' · streaming':''),sortkey:(a.name||'')+' '+(a.preview||'')});
   });
   (La.lanes||[]).forEach(l=>{
-    const stt=l.status||'',m=stt.match(/^(RUNNING|DONE|BLOCKED)\s*\|\s*([^|]*)\|\s*(.*)$/),head=stt.slice(0,90),stg=m?m[1]:(/\bSTALE\b/.test(head)?'STALE':/\bBLOCKED\b/.test(head)?'BLOCKED':/\bDONE\b|\bAPPLIED\b/.test(head)?'DONE':(stt?'RUNNING':'UNKNOWN')),text=m?m[3].trim():(stt||('newest file: '+l.newest));
-    const stale=stg==='STALE'||(stg==='RUNNING'&&l.age_s>900),state=stg==='DONE'?'done':stg==='BLOCKED'?'blocked':stale?'stale':stg==='RUNNING'?'run':'empty';
+    const ls=L.laneStage(l.status,l.age_s),text=ls.text!=null?ls.text:(l.status||('newest file: '+l.newest)),state=ls.state;
     rows.push({kind:'lane',who:'<b>'+esc(l.lane)+'</b>',what:esc(text),state,badgeText:state==='done'?'done':state==='blocked'?'blocked':state==='stale'?'no heartbeat for '+L.fmtDur(l.age_s):state==='run'?'working':'idle',age:l.age_s||0,meta:esc((l.root||'').replace(/^\/home\/kevin\//,'~/')),sortkey:l.lane||''});
   });
   (La.research||[]).forEach(j=>{
@@ -1441,6 +1528,9 @@ $('#n_legend').innerHTML='<span class="sq run"></span>working <span class="sq qu
 reg('now',['lanes','windows','config'],()=>{
   const all=buildUnified(),sum={request:0,lane:0,window:0,research:0};
   all.forEach(r=>{if(r.state==='run')sum[r.kind]++;});
+  const LS=get(S.lanes,['summary']);
+  if(LS&&LS.lanes_by_state&&isNum(LS.lanes_by_state.run))sum.lane=LS.lanes_by_state.run;      // the whole-fleet count, not just the rows we were sent
+  if(LS&&isNum(LS.research_running))sum.research=LS.research_running;
   $('#now_sub').textContent=sum.request+' requests · '+sum.lane+' agent lanes · '+sum.window+' windows · '+sum.research+' research running';
   $('#now_chips').innerHTML=[['','All'],['request','Requests'],['lane','Agent lanes'],['window','Windows'],['research','Research']].map(([k,l])=>'<button type="button" class="chip" data-act="nfilter" data-k="'+k+'" aria-pressed="'+(nFilter===k)+'">'+l+'</button>').join('');
   const showDone=$('#n_showdone').checked;
@@ -1452,11 +1542,13 @@ reg('now',['lanes','windows','config'],()=>{
   $('#n_rows').innerHTML=pg.slice.map(r=>'<tr><td><span class="sq '+r.state+'"></span></td><td><span class="badge kind">'+esc(KIND_LABEL[r.kind]||r.kind)+'</span></td><td class="wrapc"><div><b>'+r.who+'</b></div><div class="dim sm">'+r.what+'</div></td><td class="wrapc"><span class="badge">'+esc(r.badgeText)+'</span></td><td class="num">'+L.fmtDur(r.age)+'</td><td class="sm dim">'+(r.meta||'')+'</td></tr>').join('')||'<tr><td colspan="6" class="empty">'+(all.length?'Nothing matches this filter right now.':'Nothing in flight. The gateway is idle, which is normal.')+'</td></tr>';
   wirePager('now','#n_prev','#n_next','#n_page',pg.pages,()=>R.find(x=>x.name==='now').fn());
   $('#n_err').textContent=[(S.lanes&&S.lanes.errors)||[],(S.windows&&S.windows.errors)||[]].flat().join(', ');
+  const ln=$('#n_lanes_note');
+  if(ln)ln.innerHTML=LS&&LS.form==='light'?'Agent lanes: showing '+L.fmtInt(LS.lanes_returned)+' of '+L.fmtInt(LS.lanes_total)+' (finished lanes and lanes silent for over a day are left out). '+'Tick the box above to load every lane.':(LS?'Agent lanes: all '+L.fmtInt(LS.lanes_total)+' loaded.':'');
 });
 reg('recent',['stats'],()=>{
   const ev=(S.stats&&S.stats.events)||[],pg=paginate(ev,'ev',25),now=NOW();
   $('#req_summary').textContent=pg.total?pg.total+' events in memory · showing '+(pg.from+1)+'–'+pg.to+'. Restored across restarts, so older ones may predate this process.':'No requests logged yet.';
-  $('#ev').innerHTML=pg.slice.map(e=>'<tr><td class="dim num">'+esc(L.fmtAgo(e.t,now))+'</td><td>'+esc(e.ep)+'</td><td>'+clientDisplay(e.client)+'</td><td><span class="pill '+routeClass(e.d)+'">'+esc(e.d)+'</span></td><td class="dim sm">'+esc(e.r||'')+'</td><td class="num">'+L.fmtTok(e.ptok||0)+' &rarr; '+(e.maxtok||0)+(e.stream?' · stream':'')+'</td><td class="num">'+(e.waited?e.waited+' s':'')+'</td></tr>').join('')||'<tr><td colspan="7" class="empty">No requests logged yet.</td></tr>';
+  $('#ev').innerHTML=pg.slice.map(e=>'<tr><td class="dim num">'+esc(L.fmtAgo(e.t,now))+'</td><td>'+esc(e.ep)+'</td><td>'+clientDisplay(e.client)+'</td><td><span class="pill '+routeClass(e.d)+'">'+esc(e.d)+'</span></td><td class="dim sm">'+esc(e.r||'')+'</td><td class="sm">'+(e.cls?'<span class="sw '+(CLS_COLOR[e.cls]||'')+'"></span>'+esc(e.cls):'<span class="mut">&mdash;</span>')+'</td><td class="num">'+L.fmtTok(e.ptok||0)+' &rarr; '+(e.maxtok||0)+(e.stream?' · stream':'')+'</td><td class="num">'+(e.waited?e.waited+' s':'')+'</td></tr>').join('')||'<tr><td colspan="8" class="empty">No requests logged yet.</td></tr>';
   wirePager('ev','#ev_prev','#ev_next','#ev_page',pg.pages,()=>R.find(x=>x.name==='recent').fn());
 });
 let hPage=1,hTimer=null,hDue=0,hBusy=false;
@@ -1601,7 +1693,13 @@ document.addEventListener('click',ev=>{
 });
 $('#range_seg').addEventListener('click',ev=>{const b=ev.target.closest('button[data-r]');if(!b)return;RANGE=b.dataset.r;$$('#range_seg button').forEach(x=>x.setAttribute('aria-pressed',x===b));VER.series++;schedule();});
 $('#reason_seg').addEventListener('click',ev=>{const b=ev.target.closest('button[data-w]');if(!b)return;REASON_WIN=b.dataset.w;$$('#reason_seg button').forEach(x=>x.setAttribute('aria-pressed',x===b));VER.capacity++;schedule();});
-$('#n_showdone').addEventListener('change',()=>{PAGE.now=1;R.find(x=>x.name==='now').fn();});
+$('#n_showdone').addEventListener('change',()=>{
+  PAGE.now=1;
+  // the light feed leaves out finished and long-silent lanes: ticking the box needs the full list, so switch the feed (and refresh it now)
+  const f=FEEDS.find(x=>x.name==='lanes'),full=$('#n_showdone').checked;
+  f.url=full?LANES_FULL:LANES_LIGHT;f.every=full?15000:5000;FS.lanes.url=f.url;FS.lanes.every=f.every;FS.lanes.due=0;
+  R.find(x=>x.name==='now').fn();
+});
 $$('#n_table th.sortable').forEach(th=>th.addEventListener('click',()=>{const k=th.dataset.sort,s=SORT.now;s.dir=(s.key===k)?-s.dir:1;s.key=k;R.find(x=>x.name==='now').fn();}));
 $('#n_csv').addEventListener('click',()=>{
   const rows=buildUnified().filter(r=>!nFilter||r.kind===nFilter),q=v=>{v=String(v==null?'':v);return /[",\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v;};

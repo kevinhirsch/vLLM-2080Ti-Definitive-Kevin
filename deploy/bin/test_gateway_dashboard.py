@@ -332,6 +332,70 @@ class DashLibMapping(unittest.TestCase):
         self.assertIn("unhealthy", rows[0]["plain"])
         self.assertIn("no free lane", rows[2]["plain"])
 
+    # ---- Lane DB2: shares by window, real work classes, lane stage, gateway latency ----
+    def test_reason_shares_put_15_min_24_h_and_all_time_side_by_side(self):
+        cap = {"remote_use": {"windows": {"15m": {"remote": 10, "by_reason": {"local-offline": 8, "big-out": 2}, "covered_s": 900}}}}
+        stats = {"remote": 1000, "remote_reasons": {"perf": 600, "big-out": 300, "local-offline": 100}}
+        hist = {"remote_by_reason": {"local-offline": 60, "big-out": 30, "mystery": 10}}
+        r = self.js("L.reasonShares(cap,stats,hist)", cap=cap, stats=stats, hist=hist)
+        self.assertEqual([c["key"] for c in r["cols"]], ["15m", "24h", "life"])
+        self.assertEqual(r["cols"][1]["total"], 100)
+        self.assertEqual(r["cols"][1]["source"], "on-disk request log")
+        rows = {x["key"]: x for x in r["rows"]}
+        self.assertEqual(rows["local-offline"]["cells"][0], {"n": 8, "pct": 80.0})
+        self.assertEqual(rows["local-offline"]["cells"][1], {"n": 60, "pct": 60.0})
+        self.assertEqual(rows["local-offline"]["cells"][2], {"n": 100, "pct": 10.0})
+        self.assertEqual(rows["perf"]["cells"][0]["n"], 0)
+        self.assertEqual(rows["perf"]["cells"][2]["pct"], 60.0)
+        self.assertEqual(r["undocumented"], ["mystery"])
+
+    def test_reason_shares_fall_back_to_the_in_memory_24_h_window_and_say_it_is_partial(self):
+        cap = {"remote_use": {"windows": {"15m": {"remote": 4, "by_reason": {"perf": 4}, "covered_s": 900},
+                                          "24h": {"remote": 50, "by_reason": {"perf": 50}, "covered_s": 9000}}}}
+        r = self.js("L.reasonShares(cap,{remote:50,remote_reasons:{perf:50}},null)", cap=cap)
+        self.assertEqual([c["key"] for c in r["cols"]], ["15m", "24h", "life"])
+        self.assertEqual([c["key"] for c in r["partial"]], ["24h"])
+
+    def test_reason_shares_add_an_other_row_when_a_window_lists_fewer_reasons_than_its_total(self):
+        cap = {"remote_use": {"windows": {"15m": {"remote": 10, "by_reason": {"perf": 6}}}}}
+        r = self.js("L.reasonShares(cap,null,null)", cap=cap)
+        other = [x for x in r["rows"] if x["key"] == "(other)"][0]
+        self.assertEqual(other["cells"][0], {"n": 4, "pct": 40.0})
+
+    def test_remote_by_class_uses_the_log_for_24_h_and_flags_untagged(self):
+        cap = {"remote_use": {"windows": {"15m": {"remote": 10, "by_class": {"?": 9, "kevin": 1}, "covered_s": 900},
+                                          "1h": {"remote": 20, "by_class": {"halo": 5, "runner": 15}},
+                                          "24h": {"remote": 999, "by_class": {"?": 999}}}}}
+        hist = {"per_class": {"halo": {"requests": 50, "remote": 30}, "background": {"requests": 20, "remote": 10},
+                              "kevin": {"requests": 5, "remote": 0}}}
+        r = self.js("L.remoteByClass(cap,hist)", cap=cap, hist=hist)
+        self.assertEqual([(c["key"], c["source"]) for c in r["cols"]],
+                         [("15m", "routing ledger (gateway memory)"), ("1h", "routing ledger (gateway memory)"), ("24h", "on-disk request log")])
+        rows = {x["cls"]: x for x in r["rows"]}
+        self.assertEqual(rows["halo"]["cells"][2], {"n": 30, "pct": 75.0})
+        self.assertEqual(rows["background"]["cells"][2], {"n": 10, "pct": 25.0})
+        self.assertEqual(rows["kevin"]["cells"][2]["n"], 0)                       # kevin had requests but none went remote
+        self.assertEqual(r["untagged"][0], 90.0)
+
+    def test_remote_by_class_without_the_log_uses_the_memory_window(self):
+        cap = {"remote_use": {"windows": {"24h": {"remote": 10, "by_class": {"halo": 10}}}}}
+        r = self.js("L.remoteByClass(cap,null)", cap=cap)
+        self.assertEqual([c["source"] for c in r["cols"]], ["routing ledger (gateway memory)"])
+
+    def test_lane_stage_matches_the_gateways_server_side_classifier(self):
+        from test_gateway_dashboard_feeds import LaneState as LaneStateCases      # the shared table of statuses
+        for status, age, _want in LaneStateCases.CASES:
+            js = self.js("L.laneStage(s,a).state", s=status, a=age)
+            self.assertEqual(js, shim.lane_state(status, age), (status, age))
+            self.assertEqual(js, _want, (status, age))
+
+    def test_gateway_latency_view(self):
+        telem = {"windowed_latency": {"windows": {"60s": {"local": {"n": 3, "ttft_p50": 1.2, "ttft_p95": 4.0, "itl_n": 2, "itl_p50": 0.04, "itl_p95": 0.06}}}}}
+        v = self.js("L.gatewayLatency(t,'60s','local')", t=telem)
+        self.assertEqual((v["n"], v["ttft50"], v["itl95"], v["itlN"]), (3, 1.2, 0.06, 2))
+        self.assertIsNone(self.js("L.gatewayLatency({},'60s','local')"))                  # an older gateway
+        self.assertIsNone(self.js("L.gatewayLatency(null)"))
+
     # ---- work classes ----
     def test_class_map_matches_like_the_gateway_does(self):
         m = "halo-=halo,estate-entity=halo,pi /=kevin,overseer-=background,bad,x=nonsense"

@@ -1072,7 +1072,7 @@ _ENGINE_METRICS = {"ok": False, "at": 0.0, "err": None, "text": "", "families": 
 _PER_CLIENT = collections.defaultdict(lambda: {
     "requests": 0, "local": 0, "remote": 0, "tokens_out": 0, "tokens_out_exact": 0,
     "tokens_out_lb": 0, "wait_sum": 0.0, "wait_n": 0, "ttft_sum": 0.0, "ttft_n": 0,
-    "errors": 0, "cost_est_usd": 0.0})
+    "errors": 0, "cost_est_usd": 0.0, "classes": collections.Counter()})
 _ERROR_FEED = collections.deque(maxlen=200)
 # gw-admission-computed-token-cost safety AC: a request whose actual computed tokens exceed
 # what predict_computed_tokens() would have charged it by > 2x, regardless of whether
@@ -1499,6 +1499,77 @@ async def _scrape_engine_metrics():
     }
 
 
+# ---- Lane DB2: windowed latency quantiles from the gateway's OWN per-request telemetry ----
+# The engine's TTFT / inter-token windowed quantile is a delta over one 2 s scrape interval, so it is null whenever no
+# request finished inside it (non-null in about 20% of samples). The gateway sees every request, so it keeps one small
+# tuple per finished streaming request and computes quantiles over a real 60 s (and 5 min, 15 min) window.
+#   ttft = gateway-observed time from the upstream POST to the first streamed byte (engine queue + prefill + one hop);
+#   itl  = decode_time / (output tokens - 1): mean gap between tokens of ONE request, only when the output token
+#          count is exact (usage trailer) and the request produced at least 2 tokens.
+# Only requests whose first byte was timed are counted (streaming); a non-streaming response has no ttft and is skipped.
+LAT_WINDOWS_S = (60, 300, 900)
+_REQ_LAT = collections.deque(maxlen=20000)       # (t_end, route, ttft_s, itl_s_or_None, class)
+
+
+def lat_note_request(now, route, ttft, duration, waited, outtok, flow_class=None):
+    """Called once per finished request from _telemetry_note_request(). Never raises."""
+    try:
+        if route not in ("local", "remote") or ttft is None or ttft < 0:
+            return
+        itl = None
+        if outtok is not None and outtok >= 2 and duration is not None:
+            dec = decompose_timing(waited, ttft, duration).get("decode_time")
+            if dec is not None and dec > 0:
+                v = dec / (outtok - 1)
+                if v < 120:
+                    itl = round(v, 5)
+        _REQ_LAT.append((now, route, round(float(ttft), 4), itl, flow_class))
+    except Exception:
+        pass
+
+
+def _quantile(vals, q):
+    """Linear-interpolated quantile of an unsorted list; None for an empty list."""
+    v = sorted(vals)
+    if not v:
+        return None
+    if len(v) == 1:
+        return v[0]
+    pos = q * (len(v) - 1)
+    lo = int(pos)
+    hi = min(lo + 1, len(v) - 1)
+    return v[lo] + (v[hi] - v[lo]) * (pos - lo)
+
+
+def req_latency_windows(now=None, windows=LAT_WINDOWS_S):
+    """{"60s": {"local": {"n","ttft_p50","ttft_p95","itl_n","itl_p50","itl_p95"}, "remote": {...}}, ...}"""
+    now = time.time() if now is None else now
+    rows = list(_REQ_LAT)
+    out = {}
+    for w in windows:
+        inwin = [r for r in rows if now - r[0] <= w]
+        d = {}
+        for route in ("local", "remote"):
+            rr = [r for r in inwin if r[1] == route]
+            tt = [r[2] for r in rr]
+            it = [r[3] for r in rr if r[3] is not None]
+            f = lambda x, nd: None if x is None else round(x, nd)
+            d[route] = {"n": len(tt),
+                        "ttft_p50": f(_quantile(tt, 0.50), 3), "ttft_p95": f(_quantile(tt, 0.95), 3),
+                        "itl_n": len(it),
+                        "itl_p50": f(_quantile(it, 0.50), 4), "itl_p95": f(_quantile(it, 0.95), 4)}
+        out["%ds" % w] = d
+    return out
+
+
+def req_latency_facts(now=None):
+    return {"source": "gateway per-request telemetry: every streaming request that finished inside the window",
+            "ttft": "seconds from the upstream POST to the first streamed byte (engine queue + prefill + one hop); excludes the "
+                    "gateway's own admission wait",
+            "itl": "mean seconds between tokens within one request = decode time / (output tokens - 1); exact token counts only",
+            "windows": req_latency_windows(now)}
+
+
 async def _take_sample():
     loop = asyncio.get_running_loop()
     gpu, host, engine = await asyncio.gather(
@@ -1506,9 +1577,16 @@ async def _take_sample():
         loop.run_in_executor(None, _host_stats_blocking),
         _scrape_engine_metrics(),
     )
+    _now = time.time()
+    try:
+        _l60 = req_latency_windows(_now, (60,))["60s"]["local"]
+    except Exception:
+        _l60 = {}
     return {
-        "t": time.time(), "gpu": gpu, "host": host, "engine": engine,
-        "gateway": {"inflight": _inflight, "budget": effective_budget(), "waiting": _waiting,
+        "t": _now, "gpu": gpu, "host": host, "engine": engine,
+        "gateway": {"ttft60_p50": _l60.get("ttft_p50"), "ttft60_p95": _l60.get("ttft_p95"),
+                    "itl60_p50": _l60.get("itl_p50"), "itl60_p95": _l60.get("itl_p95"), "lat60_n": _l60.get("n"),
+                    "inflight": _inflight, "budget": effective_budget(), "waiting": _waiting,
                     "backoff_s": max(0, int(_backoff_until - time.time())),
                     "local_healthy": _health.get("ok", False),
                     "remote_share_pct": _remote_share_delta(),
@@ -1540,6 +1618,9 @@ def _downsample(samples):
         "remote_share_pct": _avg(s["gateway"].get("remote_share_pct") for s in samples),
         "perf_breaker": any(s["gateway"].get("perf_breaker", False) for s in samples),
         "perf_reason": last["gateway"].get("perf_reason", ""),
+        **{k: _avg(s["gateway"].get(k) for s in samples)
+           for k in ("ttft60_p50", "ttft60_p95", "itl60_p50", "itl60_p95")},
+        "lat60_n": last["gateway"].get("lat60_n"),
     }
     out["host"] = {k: _avg(s["host"].get(k) for s in samples) for k in
                    ("cpu_pct", "ram_used_gb", "ram_total_gb", "disk_free_gb", "models_disk_free_gb")}
@@ -2948,6 +3029,7 @@ def _telemetry_note_request(info, resp=None):
             status = info.get("http_status")
         c = _PER_CLIENT[name]
         c["requests"] += 1
+        c["classes"][info.get("flow_class") or "?"] += 1          # Lane DB2: the real work class, per client
         if route in ("local", "remote"):
             c[route] += 1
         if outtok is not None:
@@ -2958,6 +3040,8 @@ def _telemetry_note_request(info, resp=None):
         ttft = info.get("ttft")
         if ttft is not None:
             c["ttft_sum"] += ttft; c["ttft_n"] += 1
+            if status is None or status < 400:
+                lat_note_request(now, route, ttft, duration, waited, outtok, info.get("flow_class"))
         req_cost, cost_basis = 0.0, None
         if route == "remote" and info.get("remote_sent") and info.get("cost_policy") != "free":
             req_cost, cost_basis = _request_remote_cost(info)
@@ -3372,6 +3456,8 @@ def _history_summary_blocking(since_ts, max_files, hard_line_cap=500000):
                                                     "remote_cost_usd": 0.0,
                                                     "exact_body_repeats": 0})
     per_route = collections.defaultdict(lambda: {"requests": 0, "tokens_out": 0, "errors": 0})
+    remote_by_reason = collections.Counter()      # Lane DB2: why requests went to the paid provider, from the on-disk log
+    per_class = collections.defaultdict(lambda: {"requests": 0, "remote": 0})     # work class (flow_class) -> counts
     durations, ttfts = [], []
     latency_rows = []   # gw-ttft-decomposition-telemetry: (is_bg, admission_wait, queue_plus_prefill, decode_time)
     files_scanned = []
@@ -3431,6 +3517,11 @@ def _history_summary_blocking(since_ts, max_files, hard_line_cap=500000):
                         pc["remote_cost_usd"] += float(rec.get("cost_est") or 0.0)
                     if is_err:
                         pc["errors"] += 1
+                    pcl = per_class[rec.get("flow_class") or "?"]
+                    pcl["requests"] += 1
+                    if route == "remote":
+                        pcl["remote"] += 1
+                        remote_by_reason[rec.get("reason") or "?"] += 1
                     pr = per_route[route]
                     pr["requests"] += 1
                     pr["tokens_out"] += outtok or 0
@@ -3453,6 +3544,7 @@ def _history_summary_blocking(since_ts, max_files, hard_line_cap=500000):
         pc["remote_cost_usd"] = round(pc["remote_cost_usd"], 6)
     return {
         "per_client": dict(per_client), "per_route": dict(per_route),
+        "remote_by_reason": dict(remote_by_reason.most_common()), "per_class": dict(per_class),
         "latency_by_class": _latency_class_pctls(latency_rows),
         "duration_p50": _raw_pctl(durations, 0.50), "duration_p95": _raw_pctl(durations, 0.95),
         "ttft_p50": _raw_pctl(ttfts, 0.50), "ttft_p95": _raw_pctl(ttfts, 0.95),
@@ -3504,6 +3596,7 @@ def record_event(decision, reason, request, units, waited, ptok=0, maxtok=0, str
                         "ep": request.path.rsplit("/", 1)[-1],
                         "ptok": ptok, "maxtok": maxtok, "stream": stream,
                         "alias": _rinfo.get("alias"), "alias_kind": _rinfo.get("alias_kind"),
+                        "cls": _rinfo.get("flow_class"),
                         "ttft": _rinfo.get("ttft"), "outtok": _outtok, "outtok_lb": _outtok_lb,
                         "cost_est": (_remote_cost_estimate(ptok, _outtok if _outtok is not None else _outtok_lb)
                                      if decision == "remote" else 0.0)})
@@ -4656,9 +4749,10 @@ def flow_remote_use(now=None):
         rows = [r for r in _FLOW_ROUTES if now - r[0] <= secs]
         remote = [r for r in rows if r[1] == "remote"]
         avoidable = [r for r in remote if r[2] not in _FLOW_EXPLICIT]
-        out[label] = {"requests": len(rows), "remote": len(remote),
+        # the ring lives in memory: a window longer than the process has been up is only partly covered
+        out[label] = {"covered_s": round(min(secs, now - _PROCESS_STARTED), 0), "requests": len(rows), "remote": len(remote),
                       "remote_share": round(len(remote) / len(rows), 3) if rows else None,
-                      "by_reason": dict(collections.Counter(r[2] for r in remote).most_common(8)),
+                      "by_reason": dict(collections.Counter(r[2] for r in remote).most_common()),
                       "by_class": dict(collections.Counter(r[3] or "?" for r in remote)),
                       "gateway_chosen_remote": len(avoidable),
                       "remote_while_local_had_headroom": sum(1 for r in avoidable if r[4])}
@@ -6984,6 +7078,13 @@ async def _route_completions(request, _no_overflow=False):
     tiny = is_tiny(body)
     background = is_background(body, request)
     halo_control = _halo_control_request(request, body)
+    # Lane DB2: record the work class on the live request BEFORE any routing decision, so every route -- remote, alias,
+    # vision, forced, local-offline, failover, rejected -- reaches record_event()/flow_note_route() with a real class
+    # (it used to be set only on the local admission path: 407 of 410 remote requests showed class "?").
+    try:
+        _active_set(request, flow_class=flow_class_of(request, body, background, halo_control))
+    except Exception:
+        pass
     # gw-admission-computed-token-cost: predicted UNCONDITIONALLY (not gated on
     # USE_COMPUTED_COST, which only decides whether admission COST uses this number) so the
     # card's own accuracy gate has real predicted-vs-actual data to grade from the moment this
@@ -7858,6 +7959,7 @@ async def gateway_telemetry(request):
             "wait_avg_s": round(c["wait_sum"] / c["wait_n"], 2) if c["wait_n"] else None,
             "ttft_avg_s": round(c["ttft_sum"] / c["ttft_n"], 3) if c["ttft_n"] else None,
             "errors": c["errors"], "cost_est_usd": round(c["cost_est_usd"], 4),
+            "by_class": dict(c["classes"]),
         }
     return web.json_response({
         "at": time.time(),
@@ -7868,6 +7970,7 @@ async def gateway_telemetry(request):
         "errors": list(_ERROR_FEED)[:60],
         "mis_estimates": list(_MISESTIMATE_FEED)[:60],
         "percentiles": pct,
+        "windowed_latency": req_latency_facts(),
         "engine_scrape": {"ok": _ENGINE_METRICS["ok"],
                           "age_s": round(time.time() - _ENGINE_METRICS["at"], 1) if _ENGINE_METRICS["at"] else None,
                           "err": _ENGINE_METRICS["err"]},
@@ -8567,6 +8670,101 @@ async def gateway_research_detail(request):
     return web.Response(text=html, content_type="text/html")
 
 
+_LANE_STAGE_RE = re.compile(r"^(RUNNING|DONE|BLOCKED)\s*\|\s*([^|]*)\|\s*(.*)$", re.ASCII)
+_LANE_TERMINAL_RESEARCH = frozenset({"done", "failed", "error", "degraded", "cancelled"})
+
+
+def lane_state(status, age_s, newest=None):
+    """Server-side mirror of DashLib.laneStage() in gateway_dashboard.html (a test compares the two on a table of
+    statuses). A lane's STATUS heartbeat is free text written by many agents; classify on the first 90 characters
+    so a long note that merely mentions a word later does not change its state.
+    -> run | stale | done | blocked | empty"""
+    stt = status or ""
+    m = _LANE_STAGE_RE.match(stt)
+    head = stt[:90]
+    if m:
+        stg = m.group(1)
+    elif re.search(r"\bSTALE\b", head, re.ASCII):
+        stg = "STALE"
+    elif re.search(r"\bBLOCKED\b", head, re.ASCII):
+        stg = "BLOCKED"
+    elif re.search(r"\bDONE\b|\bAPPLIED\b", head, re.ASCII):
+        stg = "DONE"
+    else:
+        stg = "RUNNING" if stt else "UNKNOWN"
+    stale = stg == "STALE" or (stg == "RUNNING" and (age_s or 0) > 900)
+    if stg == "DONE":
+        return "done"
+    if stg == "BLOCKED":
+        return "blocked"
+    if stale:
+        return "stale"
+    return "run" if stg == "RUNNING" else "empty"
+
+
+def _q_int(q, name, default, lo=0, hi=5000):
+    try:
+        v = int(str(q.get(name)).strip())
+    except (TypeError, ValueError):
+        return default
+    if v < lo:
+        return default
+    return min(hi, v)
+
+
+def _lanes_view(data, q):
+    """Trim a /gateway/lanes payload server-side (Lane DB2: the full feed is ~400 KB -- 1,200 agent-lane rows and 200
+    research rows -- and the dashboard polls it every 5 s).
+
+      (no parameters)      the full list, exactly as before, plus a `summary` object
+      ?active=1            only what is going on: lanes not done and not silent for over `max_age_s` (default 1 day),
+                           research jobs that have not finished
+      ?limit=N             at most N lanes, freshest first (default 200 with active=1, unlimited otherwise)
+      ?research_limit=N    at most N research rows, newest first
+      ?max_age_s=S         lane age cutoff for active=1
+
+    `summary` always carries the totals (by state, by age, research counts), so a trimmed reader still knows what it did
+    not receive. The cached payload is never modified."""
+    lanes_all = data.get("lanes") or []
+    research_all = data.get("research") or []
+    active = str(q.get("active", "")).lower() in ("1", "true", "yes")
+    has_limit = "limit" in q
+    has_rlimit = "research_limit" in q
+    by_state = collections.Counter()
+    by_age = {"le_5m": 0, "le_1h": 0, "le_1d": 0, "le_7d": 0, "older": 0}
+    states = []
+    for l in lanes_all:
+        st = lane_state(l.get("status"), l.get("age_s"), l.get("newest"))
+        states.append(st)
+        by_state[st] += 1
+        a = l.get("age_s") or 0
+        by_age["le_5m" if a <= 300 else "le_1h" if a <= 3600 else "le_1d" if a <= 86400 else "le_7d" if a <= 604800 else "older"] += 1
+    max_age = _q_int(q, "max_age_s", 86400, lo=0, hi=10 * 365 * 86400)
+    lanes, research = lanes_all, research_all
+    if active:
+        lanes = [l for l, st in zip(lanes_all, states) if st != "done" and (l.get("age_s") or 0) <= max_age]
+        research = [j for j in research_all if j.get("status") not in _LANE_TERMINAL_RESEARCH]
+    lim = _q_int(q, "limit", 200 if active else 0)
+    if lim:
+        lanes = lanes[:lim]
+    rlim = _q_int(q, "research_limit", 0)
+    if rlim or has_rlimit:
+        research = research[:rlim]
+    out = dict(data)
+    out["lanes"], out["research"] = lanes, research
+    out["summary"] = {
+        "form": "light" if (active or has_limit or has_rlimit) else "full",
+        "filter": {"active": active, "limit": lim or None, "research_limit": rlim if has_rlimit else None,
+                   "max_age_s": max_age if active else None},
+        "lanes_total": len(lanes_all), "lanes_returned": len(lanes), "lanes_truncated": len(lanes) < len(lanes_all),
+        "lanes_by_state": {k: by_state.get(k, 0) for k in ("run", "stale", "blocked", "empty", "done")},
+        "lanes_by_age": by_age,
+        "research_total": len(research_all), "research_returned": len(research),
+        "research_running": sum(1 for j in research_all if j.get("status") not in _LANE_TERMINAL_RESEARCH),
+    }
+    return out
+
+
 async def gateway_lanes(request):
     """Read-only aggregate of ongoing work: research jobs (remote service),
     frontier-queue windows, and agent-lane scratchpad artifacts. Cached 5s.
@@ -8591,7 +8789,7 @@ async def _gateway_lanes_impl(request):
         data = dict(_LANES_CACHE["data"])
         data["active"] = _active_snapshot(now)          # live requests are never served stale
         data.update(inflight=_inflight, waiting=_waiting, budget=effective_budget())
-        return web.json_response(data)
+        return web.json_response(_lanes_view(data, request.query))
     out = {"ts": now, "research": [], "research_counts": {}, "queue": {}, "lanes": [],
            "active": _active_snapshot(now), "inflight": _inflight, "waiting": _waiting,
            "budget": effective_budget(), "errors": []}
@@ -8675,7 +8873,7 @@ async def _gateway_lanes_impl(request):
     if not dev:
         _LANES_CACHE["t"] = now
         _LANES_CACHE["data"] = out
-    return web.json_response(out)
+    return web.json_response(_lanes_view(out, request.query))
 
 
 # ---- WINDOWS (added): /gateway/windows + /gateway/windows/{name}/log -- a per-window drill-down
