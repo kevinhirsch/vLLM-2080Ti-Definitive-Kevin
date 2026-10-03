@@ -49,7 +49,9 @@ BUDGET = BLOCK + 16  # production shape: the step budget is one block plus a lit
 MAX_LEN = 16384
 
 
-def _build(monkeypatch, prefix_aware: bool) -> Scheduler:
+def _build(
+    monkeypatch, prefix_aware: bool, barrier: bool = False, budget: int = BUDGET
+) -> Scheduler:
     monkeypatch.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
     monkeypatch.setenv("VLLM_SCHED_SHORT_FIRST", "1")
     monkeypatch.setenv("VLLM_SCHED_SHORT_FIRST_RUN", "1")
@@ -64,7 +66,7 @@ def _build(monkeypatch, prefix_aware: bool) -> Scheduler:
     )
     scheduler_config = SchedulerConfig(
         max_num_seqs=8,
-        max_num_batched_tokens=BUDGET,
+        max_num_batched_tokens=budget,
         max_model_len=MAX_LEN,
         enable_chunked_prefill=True,
         long_prefill_token_threshold=0,
@@ -84,6 +86,7 @@ def _build(monkeypatch, prefix_aware: bool) -> Scheduler:
         cache_config=cache_config,
         parallel_config=ParallelConfig(),
         observability_config=ObservabilityConfig(),
+        additional_config={"prefill_batch_barrier": True} if barrier else {},
     )
     kv_cache_config = KVCacheConfig(
         num_blocks=2048,
@@ -218,3 +221,69 @@ def test_warm_but_long_uncached_does_not_yield(monkeypatch):
     out = _step(s)
     assert out.num_scheduled_tokens.get("cold") == BLOCK
     assert s.num_short_first_prefix_yields == 0
+
+
+# ------------------------------------------------------------ prefill-batch barrier
+# The barrier advances only the largest remaining-prompt frontier so peers finish
+# prefill together. A waiting warm continuation used to be sized by its WHOLE prompt:
+# it set a phantom frontier, the running cold peer sat the step out, and the warm turn
+# (really ~350 uncached tokens) finished prefill alone -- the opposite of the barrier.
+
+
+def _barrier_case(monkeypatch, prefix_aware: bool):
+    s = _build(monkeypatch, prefix_aware, barrier=True, budget=2 * BLOCK + 64)
+    t1 = _request("turn1", SESSION)
+    s.add_request(t1)
+    for _ in range(40):
+        _step(s)
+        if t1.is_finished():
+            break
+    assert t1.is_finished()
+    cold = _request("cold", [5 + i % 991 for i in range(4 * BLOCK + 40)])
+    s.add_request(cold)
+    _step(s)
+    assert 0 < cold.num_computed_tokens < cold.num_prompt_tokens
+    t2 = _request("turn2", SESSION + [3] * 150)  # 6 blocks cached, ~250 uncached
+    s.add_request(t2)
+    return s, cold, t2
+
+
+def test_barrier_warm_peer_does_not_set_a_whole_prompt_frontier(monkeypatch):
+    s, cold, t2 = _barrier_case(monkeypatch, prefix_aware=True)
+    before = cold.num_computed_tokens
+    out = _step(s)
+    assert out.num_scheduled_tokens.get("cold", 0) > 0, "running cold peer must keep advancing"
+    assert cold.num_computed_tokens > before
+    # The barrier still holds: the warm peer joins when the cohort frontier reaches it,
+    # and both peers finish prefill (sample their first token) within one step.
+    done = {}
+    for step in range(60):
+        _step(s)
+        for r in (cold, t2):
+            if r.request_id not in done and r.num_output_tokens > 0:
+                done[r.request_id] = step
+        if len(done) == 2:
+            break
+    assert len(done) == 2, f"barrier stalled: {done}"
+    assert abs(done["cold"] - done["turn2"]) <= 1, done
+
+
+def test_barrier_default_off_keeps_previous_sizing(monkeypatch):
+    s, cold, t2 = _barrier_case(monkeypatch, prefix_aware=False)
+    out = _step(s)
+    # documents the trap the flag removes: whole-prompt sizing pauses the cold peer
+    assert "cold" not in out.num_scheduled_tokens
+    assert "turn2" in out.num_scheduled_tokens
+
+
+def test_barrier_and_short_first_never_produce_an_empty_step(monkeypatch):
+    """Short-first used to yield under the barrier: the running prefill sat out and
+    the barrier skipped the short request below its frontier, so nothing ran."""
+    s = _build(monkeypatch, prefix_aware=False, barrier=True, budget=2 * BLOCK + 64)
+    cold = _request("cold", [5 + i % 991 for i in range(8 * BLOCK)])
+    s.add_request(cold)
+    _step(s)
+    s.add_request(_request("short", [9] * 200))  # a genuinely short prompt
+    out = _step(s)
+    assert out.num_scheduled_tokens, "empty step while a prefill was runnable"
+    assert s.num_short_first_yields == 0
