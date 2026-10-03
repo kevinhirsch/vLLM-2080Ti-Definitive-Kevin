@@ -327,6 +327,35 @@ def _get_shared_flashinfer_prefill_workspace(
     return workspace
 
 
+def _tq_private_plan_indptrs(plan_kwargs: dict[str, Any]) -> dict[str, Any]:
+    """[FORK][LANE EF2] Give plan() indptr sources nobody else can overwrite.
+
+    FlashInfer's ``plan()`` copies ``qo_indptr``/``kv_indptr`` host->device with
+    ``non_blocking=True``. When the source is a pinned CPU tensor that its owner
+    rewrites later (a per-impl scratch buffer, or the model runner's persistent
+    ``query_start_loc`` buffer), the rewrite can land before the queued DMA runs:
+    the cached wrapper then holds another request's lengths on the device while its
+    host-built schedule describes this one, and every later cache hit on that key
+    reads/writes out of bounds (L134: the legacy tree's per-impl
+    ``_fi_single_*_indptr_cpu`` buffers did exactly this for a continuation row
+    followed by a first-chunk row, 2026-10-01 14:40 Xid 31). A fresh pinned copy is
+    tracked by PyTorch's caching host allocator until its copy completes, so the
+    race is impossible whatever the caller passes. Only runs on a plan-cache miss.
+    """
+    out = dict(plan_kwargs)
+    for name in ("qo_indptr", "kv_indptr"):
+        t = out.get(name)
+        if isinstance(t, torch.Tensor) and t.device.type == "cpu":
+            fresh = torch.empty(t.shape, dtype=t.dtype, pin_memory=t.is_pinned())
+            fresh.copy_(t)
+            out[name] = fresh
+    if out.get("kv_indptr") is not None and plan_kwargs.get("kv_indptr") is plan_kwargs.get(
+        "qo_indptr"
+    ):
+        out["kv_indptr"] = out["qo_indptr"]
+    return out
+
+
 def _get_or_plan_tq_flashinfer_prefill_wrapper(
     device: torch.device,
     plan_key: tuple[Any, ...],
@@ -345,13 +374,14 @@ def _get_or_plan_tq_flashinfer_prefill_wrapper(
             "NHD",
             backend=_DEFAULT_TQ_FI_BACKEND,
         )
-        wrapper.plan(**plan_kwargs)
+        wrapper.plan(**_tq_private_plan_indptrs(plan_kwargs))
         return wrapper
 
     norm_device = _normalize_cuda_device(device)
     cache_key = (str(norm_device), _DEFAULT_TQ_FI_BACKEND, *plan_key)
     wrapper = _prepare_tq_flashinfer_prefill_wrapper_cache(cache_key)
     if wrapper is None:
+        plan_kwargs = _tq_private_plan_indptrs(plan_kwargs)
         workspace = _get_shared_flashinfer_prefill_workspace(
             norm_device, _DEFAULT_TQ_FI_BACKEND
         )
