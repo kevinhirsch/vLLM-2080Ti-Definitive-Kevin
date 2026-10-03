@@ -36,10 +36,22 @@ def main():
     ap.add_argument("--out", default=None); a = ap.parse_args()
     rank = int(os.environ["RANK"]); dev = torch.device(f"cuda:{rank}"); torch.cuda.set_device(dev)
     port = int(os.environ.get("MASTER_PORT", "29511")) + 7
+    # torchrun sets TORCHELASTIC_USE_AGENT_STORE=True, which makes rank 0 a CLIENT of the agent's store on
+    # MASTER_PORT; with our own tcp:// port nobody listens (window 09:32: 600 s c10d connect timeout). Own the store.
+    os.environ.pop("TORCHELASTIC_USE_AGENT_STORE", None)
+    t_init = time.time()
+    def init_wd():
+        while not res_init.get("done"):
+            time.sleep(2)
+            if time.time() - t_init > 120:
+                print(json.dumps(dict(rank=rank, INIT_TIMEOUT=True)), flush=True); os._exit(4)
+    res_init = {}
+    threading.Thread(target=init_wd, daemon=True).start()
     with set_current_vllm_config(VllmConfig()):
         init_distributed_environment(world_size=2, rank=rank, distributed_init_method=f"tcp://127.0.0.1:{port}",
                                      local_rank=rank)
         ensure_model_parallel_initialized(2, 1)
+    res_init["done"] = True
     tp = get_tp_group(); cpu = tp.cpu_group
     dc = tp.device_communicator; caA = dc.ca_comm; ncA = dc.pynccl_comm
     torch.distributed.all_reduce(torch.zeros(1, device=dev), group=tp.device_group); torch.cuda.synchronize()

@@ -71,6 +71,9 @@ def main():
     ap.add_argument('--out', default=None)
     a = ap.parse_args()
     dev = f'cuda:{a.gpu}'; torch.cuda.set_device(a.gpu)
+    free, total = torch.cuda.mem_get_info(a.gpu)
+    if free < 9 * 2**30:  # 64 layers ~6.3 GiB + quantization temporaries; never share a GPU with the engine
+        print(json.dumps(dict(gpu=a.gpu, SKIPPED=f"only {free/2**30:.1f} GiB free")), flush=True); return
     lo_p, hi_p = torch.cuda.Stream.priority_range()
     s_lo = torch.cuda.Stream(priority=0); s_hi = torch.cuda.Stream(priority=hi_p); s_eq = torch.cuda.Stream(priority=0)
     layers, ws, qt = build(a.layers, dev)
