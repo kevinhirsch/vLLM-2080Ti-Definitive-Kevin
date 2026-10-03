@@ -717,7 +717,7 @@ class Window:
     def remote_tick(self):
         """One poll of the remote watch: two consecutive unhealthy polls (~30 s) = abort. The running step's unit is
         stopped at once so the window reaches its step boundary and restores local now, not after a 20-minute bench."""
-        if self.remote_bad:
+        if self.remote_bad or self.spec.get("allow_no_remote"):
             return
         ok, why = remote_health(0)
         if ok:
@@ -741,7 +741,7 @@ class Window:
     def check_between_steps(self):
         if self.remote_bad:
             raise WindowAbort("aborted-remote", f"remote valve unhealthy while local was offline: {self.remote_bad}")
-        ok, why = remote_health(0)
+        ok, why = (True, "") if self.spec.get("allow_no_remote") else remote_health(0)
         if not ok:
             raise WindowAbort("aborted-remote", f"remote valve unhealthy while local was offline: {why}")
         if time.time() - self.t0 > self.max_s:
