@@ -15,6 +15,16 @@ Actions (every one writes an event to the estate event log, source "engine", so 
   announce-start              (ExecStartPost) emit a "engine is back" observation with the flags that are active
   restart-status              state of the last/running planned restart
 
+LV (2026-10-03) -- this file is also the ONE engine-liveness authority (see the block above main() and
+deploy/docs/engine-liveness-authority.md):
+  tick [--no-act]             observe -> verify own actions -> classify into the declared state machine -> publish
+                              liveness-state.json -> take the declared exit (start an unowned DOWN engine, recover a STUCK_BOOT /
+                              UNRESPONSIVE one) under the one lock, rate limit, backoff and breaker. vllm-watchdog.sh runs it each minute.
+  recover --cause C --by B    a detector (the watchdog's confirmed wedge) asks for a kill+restart; refused/deferred when not allowed
+  hold acquire|release|renew|run|status   TTL-bounded holds. kind engine = a window owns the engine (no automatic action, no
+                              probes, planned restarts only by the holder via --hold); kind quiesce = a release (gateway publish) is in flight
+  liveness                    print the published state;   reset-breaker --by --reason   close an open breaker
+
 The allow-list is DIAG below: a fixed map name -> env vars. Nothing else can be set through this tool. Every change is
 reversible (stage-diag --clear) and recorded. Flags only take effect at the next engine start.
 """
@@ -539,6 +549,17 @@ def do_restart(a):
         print(json.dumps({"refused": "another planned restart is already running"}))
         return 3
     by, reason = a.by, a.reason
+    # LV: a planned restart is refused while someone else holds the engine (a window) or a release is in flight (quiesce:
+    # a gateway publish is draining). The holder itself passes --hold <lease>.
+    mine = getattr(a, "hold", None)
+    blocking = [h for h in active_holds() if h.get("lease") != mine]
+    if blocking:
+        h = blocking[0]
+        refused = {"refused": f"{h.get('kind')} hold held by {h.get('by')} until {datetime.fromtimestamp(h['until']).isoformat(timespec='seconds')}: "
+                              f"{h.get('reason')}", "hint": "the holder passes --hold <lease>; otherwise wait for release/expiry"}
+        emit("observation", f"planned engine restart by {by} refused: {refused['refused']}"[:300], {"action": "restart-refused-hold", "by": by, "reason": reason, **refused})
+        print(json.dumps(refused))
+        return 3
     token = admin_token()
     # RS: a restart whose only purpose is to apply flags the RUNNING engine already has is a pure no-op that still costs a full
     # outage (drain + ~4 min boot, every request refused). Refuse it unless --force; Halo can still restart for any other reason.
@@ -650,6 +671,8 @@ def spawn_detached(a):
         cmd += ["--force"]
     if getattr(a, "health_wait_s", None) is not None:
         cmd += ["--health-wait-s", str(a.health_wait_s)]
+    if getattr(a, "hold", None):
+        cmd += ["--hold", a.hold]
     # refuse early (and visibly) if one is running
     try:
         j = json.load(open(JOB))
@@ -713,6 +736,593 @@ def announce_start(_a):
     return 0
 
 
+# ================================================================== LV (2026-10-03): the ONE engine-liveness authority
+# Before this, five owners (vllm-watchdog.sh, estate-watchdog.sh, this actuator, the fault collector, the gateway's local-down
+# flag) each had their own probe, cooldown and kill/restart path; windows stopped the watchdog TIMER to keep it off their engine
+# (DFT left it stopped 4.5 h), and nothing at all restarted an engine that was stopped and abandoned, or one whose API never came
+# up. Now: every automatic stop/start/kill goes through recover()/tick() here, under ONE lock (LOCK, shared with planned restarts),
+# ONE rate limit with backoff, ONE circuit breaker, and ONE published state (LSTATE) that everything else reads.
+# Windows take a TTL-bounded HOLD instead of stopping the timer: a hold expires by itself, so a dead window can never leave the
+# engine unwatched. Design: deploy/docs/engine-liveness-authority.md.
+#
+# Doctrine split (EF2 + Never Stuck By Construction): the AUTOMATIC actions here only restore the declared default ("the engine is
+# up unless a holder says otherwise") -- they are the declared exits of stuck states. Discretionary restarts (flags, configs,
+# arms) stay with Halo via `restart`; a crash loop or an open breaker is handed to Halo, never "fixed" by guessing.
+HOLDS = f"{BASE}/liveness-holds.json"
+HOLDS_LOCK = f"{BASE}/liveness-holds.lock"
+LSTATE = f"{BASE}/liveness-state.json"
+LACTIONS = f"{BASE}/liveness-actions.jsonl"
+LPAUSE = f"{BASE}/LIVENESS_PAUSE"                 # kill switch: observe + publish state only, never act
+WD_STATE = f"{BASE}/watchdog-state.json"          # vllm-watchdog.sh probe counters (read-only here)
+FQ_RUNNING = f"{BASE}/frontier-queue/RUNNING"     # legacy frontier-queue window flag (runner trusts it for 3 h)
+FQ_RUNNING_MAX_S = 10800
+#: legacy windows that neither hold nor stop the timer (lane window.sh / *_window.sh / *_driver.sh, the frontier runner's own guard
+#: pattern): treated as an implicit engine hold for at most HOLD_MAX_TTL_S of their runtime, until every window takes a real hold
+WINDOW_PROC_RE = re.compile(r"^(?:\S*/)?bash\s+\S*(?:_window|_driver|/window)\.sh(?:\s|$)")
+HOLD_KINDS = ("engine", "quiesce")                # engine: the holder owns the engine. quiesce: a release (gateway publish) is in flight
+
+def _env_i(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+HOLD_MAX_TTL_S = _env_i("LIVENESS_HOLD_MAX_TTL_S", 8 * 3600)   # DFT's 16000 s fine-tune window fits; nothing holds forever
+BOOT_DEADLINE_S = _env_i("LIVENESS_BOOT_DEADLINE_S", 900)       # cold compile+capture ~4-5 min; window boot budgets use 900
+UNRESPONSIVE_S = _env_i("LIVENESS_UNRESPONSIVE_S", 180)         # API was up this boot, then stopped answering for this long
+DOWN_GRACE_S = _env_i("LIVENESS_DOWN_GRACE_S", 180)            # systemd relaunches crashes in 15 s; leave stop->start pairs room
+AUTO_MAX_PER_HOUR = _env_i("LIVENESS_AUTO_MAX_PER_HOUR", 2)     # the watchdog's long-standing rail, now for ALL automatic actions
+AUTO_MIN_GAP_S = _env_i("LIVENESS_AUTO_MIN_GAP_S", 600)         # base gap; doubles per consecutive failed action (backoff)
+BACKOFF_MAX_S = _env_i("LIVENESS_BACKOFF_MAX_S", 7200)
+BREAKER_FAILS = _env_i("LIVENESS_BREAKER_FAILS", 3)            # consecutive automatic actions that did not bring /health back
+VERIFY_S = BOOT_DEADLINE_S + 60                                 # an action is judged failed when /health is still down after this
+CRASH_LOOP_FAULTS = _env_i("LIVENESS_CRASH_LOOP_FAULTS", 5)     # FAULT ledger rows ...
+CRASH_LOOP_WINDOW_S = _env_i("LIVENESS_CRASH_LOOP_WINDOW_S", 1800)  # ... inside this window, engine still not healthy
+
+#: The declared machine (Never Stuck By Construction): every non-terminal state names its owner, its deadline and its exits.
+#: Published verbatim in LSTATE so the estate's generic progress invariant can hold each state to its own declaration.
+STATES = {
+    "UP":             {"kind": "resting", "owner": "-", "deadline_s": None, "exits": ["SUSPECT", "UNRESPONSIVE", "DOWN", "PLANNED", "HELD"]},
+    "SUSPECT":        {"kind": "active", "owner": "vllm-watchdog.sh probes", "deadline_s": UNRESPONSIVE_S,
+                       "exits": ["UP", "RECOVERING (wedge confirmed -> recover)", "UNRESPONSIVE"]},
+    "BOOTING":        {"kind": "active", "owner": "systemd + warm-up hook", "deadline_s": BOOT_DEADLINE_S,
+                       "exits": ["UP", "STUCK_BOOT", "DOWN (process died; systemd Restart=always relaunches)"]},
+    "STOPPING":       {"kind": "active", "owner": "systemd (TimeoutStopSec, then SIGKILL)", "deadline_s": 120, "exits": ["DOWN", "BOOTING"]},
+    "DOWN":           {"kind": "active", "owner": "liveness authority (start)", "deadline_s": DOWN_GRACE_S, "exits": ["BOOTING", "BREAKER_OPEN"]},
+    "STUCK_BOOT":     {"kind": "active", "owner": "liveness authority (recover)", "deadline_s": 0, "exits": ["RECOVERING", "BREAKER_OPEN"]},
+    "UNRESPONSIVE":   {"kind": "active", "owner": "liveness authority (recover)", "deadline_s": 0, "exits": ["RECOVERING", "BREAKER_OPEN"]},
+    "RECOVERING":     {"kind": "active", "owner": "liveness authority (verifies its own action)", "deadline_s": VERIFY_S,
+                       "exits": ["UP", "action failed -> backoff / BREAKER_OPEN"]},
+    "PLANNED":        {"kind": "active", "owner": "engine-actuator planned restart (restart.lock holder)", "deadline_s": 2400,
+                       "exits": ["UP", "BOOTING", "lock holder died -> job reconciled 'abandoned'"]},
+    "HELD":           {"kind": "active", "owner": "the hold's holder", "deadline_s": HOLD_MAX_TTL_S,
+                       "exits": ["release", "TTL expiry", "holder pid died (run mode) -> re-evaluated"]},
+    "OFFLINE_WINDOW": {"kind": "active", "owner": "the gateway offline-window lease holder", "deadline_s": 3600,
+                       "exits": ["window closed or lease expired -> re-evaluated"]},
+    "CRASH_LOOP":     {"kind": "active", "owner": "Halo (hand-off engine-crash-loop)", "deadline_s": None,
+                       "exits": ["UP", "Halo planned restart / rollback", "BREAKER_OPEN"]},
+    "BREAKER_OPEN":   {"kind": "active", "owner": "liveness authority (half-open retry) + Halo hand-off", "deadline_s": BACKOFF_MAX_S,
+                       "exits": ["half-open single attempt at next_try", "UP", "reset-breaker"]},
+    "PAUSED":         {"kind": "active", "owner": "Kevin (kill switch LIVENESS_PAUSE)", "deadline_s": 86400,
+                       "exits": ["rm LIVENESS_PAUSE"]},
+}
+NO_PROBE_STATES = ("HELD", "OFFLINE_WINDOW", "PLANNED", "PAUSED")   # vllm-watchdog.sh does not probe (or count) in these
+
+
+# ------------------------------------------------------------------ holds
+def _proc_start(pid):
+    try:
+        with open(f"/proc/{int(pid)}/stat") as fh:
+            return fh.read().rsplit(")", 1)[1].split()[19]
+    except (OSError, ValueError, IndexError, TypeError):
+        return None
+
+
+def _hold_owner_dead(h):
+    """A `hold run` record is void the moment its wrapper is gone (or its pid reused). Plain `acquire` holds are never presumed
+    dead: the CLI that wrote them exits by design; their TTL is their exit."""
+    if h.get("mode") not in ("run", "owned") or not isinstance(h.get("pid"), int):
+        return False
+    cur = _proc_start(h["pid"])
+    return cur is None or (bool(h.get("pid_start")) and h["pid_start"] != cur)
+
+
+def _hold_valid(h, now):
+    return float(h.get("until") or 0) > now and not _hold_owner_dead(h)
+
+
+@contextlib.contextmanager
+def _holds_locked():
+    fh = open(HOLDS_LOCK, "a+")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+
+
+def _holds_read():
+    try:
+        rows = json.load(open(HOLDS))
+        return rows if isinstance(rows, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def _holds_write(rows):
+    tmp = HOLDS + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(rows, fh, indent=1)
+    os.replace(tmp, HOLDS)
+
+
+def active_holds(now=None, kind=None):
+    now = time.time() if now is None else now
+    return [h for h in _holds_read() if _hold_valid(h, now) and (kind is None or h.get("kind") == kind)]
+
+
+def hold_acquire(kind, by, reason, ttl_s, mode="acquire", pid=None):
+    if kind not in HOLD_KINDS:
+        return {"refused": f"kind must be one of {HOLD_KINDS}"}
+    reason = (reason or "").strip()
+    if len(reason) < 8:
+        return {"refused": "reason is required (what the hold protects)"}
+    if not 60 <= int(ttl_s) <= HOLD_MAX_TTL_S:
+        return {"refused": f"ttl_s must be 60..{HOLD_MAX_TTL_S}"}
+    now = time.time()
+    with _holds_locked():
+        rows = _holds_read()
+        live = [h for h in rows if _hold_valid(h, now)]
+        expired = [h for h in rows if not _hold_valid(h, now)]
+        clash = [h for h in live if h.get("kind") == kind]
+        if clash:
+            return {"refused": f"a {kind} hold is already held", "holder": {k: clash[0].get(k) for k in ("by", "reason", "until", "lease")}}
+        pid = os.getpid() if pid is None else pid
+        h = {"lease": os.urandom(8).hex(), "kind": kind, "by": by, "reason": reason[:200], "acquired": now, "until": now + int(ttl_s),
+             "ttl_s": int(ttl_s), "mode": mode, "pid": pid, "pid_start": _proc_start(pid)}
+        _holds_write(live + [h])
+    for e in expired:
+        emit("observation", f"liveness hold by {e.get('by')} ended without release ({'holder died' if _hold_owner_dead(e) else 'TTL expired'})",
+             {"action": "liveness-hold-expired", **{k: e.get(k) for k in ("kind", "by", "reason", "lease", "until")}})
+    emit("action", f"liveness {kind} hold taken by {by} for {int(ttl_s)}s: {reason}"[:300],
+         {"action": "liveness-hold-acquired", **{k: h[k] for k in ("kind", "by", "reason", "lease", "until", "mode")}})
+    return {"lease": h["lease"], "kind": kind, "until": h["until"]}
+
+
+def hold_release(lease=None, by=None):
+    now = time.time()
+    with _holds_locked():
+        rows = _holds_read()
+        gone = [h for h in rows if (lease and h.get("lease") == lease) or (not lease and by and h.get("by") == by)]
+        _holds_write([h for h in rows if h not in gone and _hold_valid(h, now)])
+    for h in gone:
+        emit("action", f"liveness {h.get('kind')} hold released by {h.get('by')} after {round(now - float(h.get('acquired') or now))}s",
+             {"action": "liveness-hold-released", **{k: h.get(k) for k in ("kind", "by", "reason", "lease")}})
+    return {"released": len(gone)}
+
+
+def hold_renew(lease, ttl_s):
+    if not 60 <= int(ttl_s) <= HOLD_MAX_TTL_S:
+        return {"refused": f"ttl_s must be 60..{HOLD_MAX_TTL_S}"}
+    now = time.time()
+    with _holds_locked():
+        rows = _holds_read()
+        for h in rows:
+            if h.get("lease") == lease and _hold_valid(h, now):
+                h["until"] = now + int(ttl_s)
+                h["renewed"] = int(h.get("renewed") or 0) + 1
+                _holds_write([r for r in rows if _hold_valid(r, now)])
+                emit("action", f"liveness hold by {h.get('by')} renewed for {int(ttl_s)}s", {"action": "liveness-hold-renewed", "lease": lease, "until": h["until"]})
+                return {"lease": lease, "until": h["until"]}
+    return {"refused": "no such live hold (released, expired, or its holder died)"}
+
+
+def hold_run(kind, by, reason, ttl_s, cmd, ensure_up=True):
+    """Take a hold, run cmd, ALWAYS release, then make sure the engine is coming back (the old per-window 'ALWAYS a healthy engine
+    at exit' trap, once, here). The hold is void the moment this wrapper dies, so a SIGKILLed window strands nothing."""
+    got = hold_acquire(kind, by, reason, ttl_s, mode="run")
+    if "lease" not in got:
+        print(json.dumps(got), file=sys.stderr)
+        return 75
+    rc = 1
+    child = None
+    try:
+        with terminate_as_exception():
+            child = subprocess.Popen(cmd)
+            rc = child.wait()
+    except Terminated as t:
+        rc = 128 + t.signum
+        if child and child.poll() is None:
+            with shielded():
+                child.terminate()
+                try:
+                    child.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+    finally:
+        with shielded():
+            hold_release(got["lease"])
+            if ensure_up and kind == "engine":
+                print(json.dumps({"ensure_up": ensure_engine_up(by=f"{by} (hold run exit)")}), file=sys.stderr)
+    return rc
+
+
+# ------------------------------------------------------------------ observation
+def _unit_facts():
+    kv = {}
+    for l in sh(["systemctl", "show", UNIT, "--timestamp=unix", "-p",
+                 "ActiveState,SubState,MainPID,NRestarts,ExecMainStartTimestamp,ActiveEnterTimestamp,InactiveEnterTimestamp,Result"]).splitlines():
+        if "=" in l:
+            k, v = l.split("=", 1)
+            kv[k] = v
+    for k in ("ExecMainStartTimestamp", "ActiveEnterTimestamp", "InactiveEnterTimestamp"):
+        v = kv.get(k, "")
+        try:
+            kv[k] = float(v[1:]) if v.startswith("@") else None
+        except ValueError:
+            kv[k] = None
+    return kv
+
+
+def _lock_held():
+    try:
+        fh = open(LOCK, "a+")
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        fh.close()
+
+
+def _window_procs():
+    """[(pid, elapsed_s, argv)] of running legacy window scripts (ps; empty when unreadable)."""
+    out = []
+    for l in sh(["ps", "-eo", "pid=,etimes=,args="], timeout=10).splitlines():
+        parts = l.strip().split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit() and WINDOW_PROC_RE.match(parts[2]):
+            out.append((int(parts[0]), int(parts[1]), parts[2][:160]))
+    return out
+
+
+def _gateway_offline():
+    try:
+        d = http(f"{GATEWAY}/gateway/offline", timeout=3)
+        return {"offline": bool(d.get("offline")), "by": d.get("by"), "reason": d.get("reason"), "remaining_s": d.get("remaining_s")}
+    except Exception:  # noqa: BLE001  gateway down: no window can be open on it
+        return {"offline": False, "unreadable": True}
+
+
+def _actions():
+    rows, outcomes = [], {}
+    try:
+        for l in open(LACTIONS):
+            try:
+                r = json.loads(l)
+            except ValueError:
+                continue
+            if r.get("outcome_of"):
+                outcomes[r["outcome_of"]] = r
+            else:
+                rows.append(r)
+    except OSError:
+        pass
+    for r in rows:
+        if r.get("reset"):
+            r["outcome"] = "reset"
+            continue
+        o = outcomes.get(r.get("id"))
+        r["outcome"] = o.get("outcome") if o else "pending"
+    return rows
+
+
+def _actions_append(row):
+    with open(LACTIONS, "a") as fh:
+        fh.write(json.dumps(row) + "\n")
+
+
+def gate(now, actions=None):
+    """The ONE rate limit + backoff + breaker over every automatic action. Returns facts incl. allowed and why."""
+    allrows = [a for a in (_actions() if actions is None else actions) if not a.get("dry_run")]
+    acts = [a for a in allrows if not a.get("reset")]
+    hour = [a for a in acts if now - float(a.get("t") or 0) < 3600]
+    fails = 0
+    for a in reversed(allrows):
+        if a.get("outcome") == "failed":
+            fails += 1
+        elif a.get("outcome") in ("ok", "reset"):
+            break
+        # pending: neither breaks nor extends the run
+    last = acts[-1] if acts else None
+    gap = min(BACKOFF_MAX_S, AUTO_MIN_GAP_S * (2 ** fails)) if fails else AUTO_MIN_GAP_S
+    since_last = now - float(last["t"]) if last else None
+    out = {"actions_last_hour": len(hour), "max_per_hour": AUTO_MAX_PER_HOUR, "consecutive_failed": fails, "gap_s": gap,
+           "since_last_s": None if since_last is None else round(since_last), "breaker": "closed", "allowed": True, "why": ""}
+    if fails >= BREAKER_FAILS:
+        out["breaker"] = "open"
+        out["next_try"] = float(last["t"]) + gap
+        if since_last is not None and since_last >= gap:
+            out["breaker"] = "half-open"          # one attempt; its outcome closes or re-opens with a longer gap
+        else:
+            out.update(allowed=False, why=f"breaker open after {fails} failed automatic actions; next try in {round(gap - since_last)}s")
+            return out
+    if last and last.get("outcome") == "pending" and since_last is not None and since_last < VERIFY_S:
+        out.update(allowed=False, why=f"previous automatic action {last.get('id')} still being verified ({round(since_last)}s of {VERIFY_S}s)")
+    elif len(hour) >= AUTO_MAX_PER_HOUR:
+        out.update(allowed=False, why=f"{len(hour)} automatic actions in the last hour (max {AUTO_MAX_PER_HOUR})")
+    elif since_last is not None and since_last < gap:
+        out.update(allowed=False, why=f"min gap {gap}s since the last automatic action not reached ({round(since_last)}s)")
+    return out
+
+
+def _recent_fault_times(now):
+    """Epoch times of FAULT ledger rows inside the crash-loop window (classify keeps only those after the last healthy moment)."""
+    since = datetime.fromtimestamp(now - CRASH_LOOP_WINDOW_S).isoformat(timespec="seconds")
+    out = []
+    for r in ledger_rows(since=since):
+        if r.get("kind") != "FAULT":
+            continue
+        try:
+            out.append(datetime.fromisoformat(r["ts"]).timestamp())
+        except (KeyError, ValueError, TypeError):
+            pass
+    return out
+
+
+def observe(now=None):
+    now = time.time() if now is None else now
+    try:
+        wd = json.load(open(WD_STATE))
+    except (OSError, ValueError):
+        wd = {}
+    try:
+        fq = os.path.getmtime(FQ_RUNNING)
+        fq_age = now - fq if now - fq < FQ_RUNNING_MAX_S else None
+    except OSError:
+        fq_age = None
+    try:
+        job = json.load(open(JOB))
+    except (OSError, ValueError):
+        job = None
+    return {"now": now, "paused": os.path.exists(LPAUSE), "unit": _unit_facts(), "healthy": engine_healthy(),
+            "planned_lock": _lock_held(), "job": job, "holds": active_holds(now), "offline": _gateway_offline(),
+            "frontier_window_age_s": fq_age, "window_procs": [w for w in _window_procs() if w[1] < HOLD_MAX_TTL_S],
+            "watchdog_failures": int(wd.get("consecutive_failures") or 0),
+            "fault_times": _recent_fault_times(now), "gate": gate(now)}
+
+
+def classify(f, prev):
+    """Pure: facts + previous published state -> (state, reason, facts-to-carry). Ordered: who owns the engine first, then health."""
+    now, u = f["now"], f.get("unit") or {}
+    prev = prev or {}
+    boot_t = u.get("ExecMainStartTimestamp")
+    carry = {"boot_started": boot_t, "last_healthy": prev.get("last_healthy")}
+    if f["healthy"]:
+        carry["last_healthy"] = now
+    if f.get("paused"):
+        return "PAUSED", "kill switch LIVENESS_PAUSE present: observing only", carry
+    if f.get("planned_lock"):
+        j = f.get("job") or {}
+        return "PLANNED", f"planned restart in progress (by {j.get('by')}: {str(j.get('reason'))[:80]}; state {j.get('state')})", carry
+    eh = [h for h in f.get("holds") or [] if h.get("kind") == "engine"]
+    if eh:
+        h = eh[0]
+        return "HELD", f"engine held by {h.get('by')} until {datetime.fromtimestamp(h['until']).strftime('%H:%M:%S')}: {h.get('reason')}", carry
+    off = f.get("offline") or {}
+    if off.get("offline"):
+        return "OFFLINE_WINDOW", f"gateway planned-offline window by {off.get('by')} ({off.get('remaining_s')}s left): {off.get('reason')}", carry
+    if f.get("frontier_window_age_s") is not None:
+        return "HELD", f"legacy frontier-queue window running ({round(f['frontier_window_age_s'])}s; runner trusts it {FQ_RUNNING_MAX_S}s)", carry
+    if f.get("window_procs"):
+        w = f["window_procs"][0]
+        return "HELD", f"legacy window process running without a hold (pid {w[0]}, {w[1]}s, bounded {HOLD_MAX_TTL_S}s): {w[2]}", carry
+    pend = [a for a in _actions_cached(f) if a.get("outcome") == "pending" and now - float(a.get("t") or 0) < VERIFY_S]
+    if f["healthy"]:
+        if f.get("watchdog_failures"):
+            return "SUSPECT", f"API up but {f['watchdog_failures']} consecutive generation probe failure(s)", carry
+        return "UP", "healthy", carry
+    g = f.get("gate") or {}
+    # faults since the engine was last healthy only: a window's own failed arms, followed by a healthy restore, do not count
+    faults = [t for t in f.get("fault_times") or [] if t > float(carry.get("last_healthy") or 0)]
+    f["faults_window"] = len(faults)
+    if len(faults) >= CRASH_LOOP_FAULTS:
+        return "CRASH_LOOP", f"{len(faults)} engine faults in the last {CRASH_LOOP_WINDOW_S}s since it was last healthy, and not healthy now", carry
+    if g.get("breaker") == "open" and not g.get("allowed"):
+        return "BREAKER_OPEN", g.get("why"), carry
+    if pend:
+        return "RECOVERING", f"automatic action {pend[-1].get('id')} ({pend[-1].get('action')}, cause {pend[-1].get('cause')}) awaiting /health", carry
+    st = u.get("ActiveState", "")
+    if u.get("SubState") == "auto-restart":
+        return "BOOTING", "systemd is relaunching the engine after it exited (Restart=always)", carry
+    if st == "deactivating":
+        return "STOPPING", "unit stopping", carry
+    if st in ("inactive", "failed", ""):
+        since = u.get("InactiveEnterTimestamp") or prev.get("down_since") or now
+        carry["down_since"] = since
+        return "DOWN", f"unit {st or 'unknown'} for {round(now - since)}s (result {u.get('Result')})", carry
+    # process exists (active, or activating while the warm-up hook runs) but /health does not answer
+    age = now - boot_t if boot_t else 0
+    if carry["last_healthy"] and boot_t and carry["last_healthy"] >= boot_t:
+        down_for = now - carry["last_healthy"]
+        if down_for >= UNRESPONSIVE_S:
+            return "UNRESPONSIVE", f"API answered this boot but not for {round(down_for)}s (process alive)", carry
+        return "SUSPECT", f"API not answering for {round(down_for)}s after being up this boot", carry
+    if age >= BOOT_DEADLINE_S:
+        return "STUCK_BOOT", f"process up {round(age)}s and /health never answered (deadline {BOOT_DEADLINE_S}s)", carry
+    return "BOOTING", f"boot {round(age)}s old", carry
+
+
+def _actions_cached(f):
+    if "_actions" not in f:
+        f["_actions"] = _actions()
+    return f["_actions"]
+
+
+def _verify_actions(f):
+    """Judge pending automatic actions by their effect: /health back on a boot that started after the action = ok;
+    still down after VERIFY_S = failed. This is what moves the breaker."""
+    now = f["now"]
+    for a in _actions_cached(f):
+        if a.get("outcome") != "pending" or a.get("dry_run"):
+            continue
+        t = float(a.get("t") or 0)
+        boot = (f.get("unit") or {}).get("ExecMainStartTimestamp") or 0
+        verdict = None
+        if f["healthy"] and boot >= t - 5:
+            verdict = "ok"
+        elif now - t >= VERIFY_S:
+            verdict = "failed"
+        if verdict:
+            _actions_append({"outcome_of": a["id"], "outcome": verdict, "t": now, "after_s": round(now - t)})
+            a["outcome"] = verdict
+            emit("outcome", f"automatic engine {a.get('action')} ({a.get('cause')}) {verdict}: "
+                 f"{'healthy' if verdict == 'ok' else 'still not healthy'} {round(now - t)}s later",
+                 {"action": "liveness-action-verified", "id": a["id"], "outcome": verdict, "cause": a.get("cause")})
+
+
+def _publish_state(state, reason, carry, f, extra=None):
+    try:
+        prev = json.load(open(LSTATE))
+    except (OSError, ValueError):
+        prev = {}
+    since = prev.get("since") if prev.get("state") == state else f["now"]
+    out = {"as_of": f["now"], "as_of_iso": now_iso(), "state": state, "since": since, "reason": reason,
+           "declared": STATES[state], "probe": state not in NO_PROBE_STATES, **carry,
+           "unit": {k: (f.get("unit") or {}).get(k) for k in ("ActiveState", "SubState", "MainPID", "NRestarts", "ExecMainStartTimestamp")},
+           "healthy": f["healthy"], "holds": [{k: h.get(k) for k in ("kind", "by", "reason", "until", "mode")} for h in f.get("holds") or []],
+           "gate": f.get("gate"), "faults_window": f.get("faults_window"), "last_action": (_actions_cached(f) or [None])[-1]}
+    if extra:
+        out.update(extra)
+    tmp = LSTATE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(out, fh, indent=1, default=str)
+    os.replace(tmp, LSTATE)
+    if prev.get("state") != state:
+        emit("observation", f"engine liveness {prev.get('state') or '?'} -> {state}: {reason}"[:300],
+             {"action": "liveness-state", "from": prev.get("state"), "to": state, "reason": reason,
+              "owner": STATES[state]["owner"], "deadline_s": STATES[state]["deadline_s"]})
+        if state in ("CRASH_LOOP", "BREAKER_OPEN"):
+            emit("observation", f"engine {state}: {reason}. Automatic recovery is not fixing it; a planned restart with a different "
+                 f"configuration, or a rollback, is the move.", {"state": state, "reason": reason, "gate": f.get("gate"),
+                 "faults_24h": faults_summary(24)}, handoff=True, action=f"engine-{state.lower().replace('_', '-')}",
+                 fingerprint=f"engine-{state}-{int(f['now'] // 3600)}")
+    return out
+
+
+def _act(action, cause, by, evidence, f, dry_run=False):
+    """Run ONE automatic action under the shared LOCK. Never blocks on the engine boot (--no-block): the verdict is taken by a
+    later tick from /health, so a 60 s watchdog oneshot can never be killed mid-recovery."""
+    g = gate(f["now"], _actions_cached(f))
+    if not g["allowed"]:
+        return {"acted": False, "refused": g["why"], "gate": g}
+    lk = open(LOCK, "a+")
+    try:
+        fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lk.close()
+        return {"acted": False, "refused": "a planned restart or another automatic action holds restart.lock"}
+    try:
+        aid = f"lv-{int(f['now'])}-{os.getpid()}"
+        row = {"id": aid, "t": f["now"], "action": action, "cause": cause, "by": by, "evidence": (evidence or "")[:300],
+               "dry_run": bool(dry_run), "half_open": g.get("breaker") == "half-open"}
+        if dry_run:
+            return {"acted": False, "dry_run": True, "would": row}
+        _actions_append(row)
+        steps = []
+        if action == "recover":
+            if cause == "wedge":
+                try:   # the collector reads this marker: a FAULT for Halo, not a planned stop
+                    with open(f"{BASE}/wedge-restart.json", "w") as fh:
+                        json.dump({"ts": now_iso(), "by": by, "wedge": True, "evidence": evidence}, fh)
+                except OSError:
+                    pass
+                # RS: record the death BEFORE the kill (journal intact; ExecStopPost then dedupes)
+                steps.append(("pre-kill", subprocess.run([sys.executable, f"{BASE}/engine-fault-collector.py", "--pre-kill"],
+                                                         capture_output=True, text=True, timeout=60).returncode))
+            steps.append(("reset-failed", _sudo(["reset-failed", UNIT])))
+            # a confirmed wedge / stuck boot has never honoured SIGTERM (2026-09-02, 09-05): kill the control group up front
+            steps.append(("kill", _sudo(["kill", "-s", "KILL", UNIT])))
+            time.sleep(3)
+            steps.append(("restart", _sudo(["restart", "--no-block", UNIT])))
+        elif action == "start":
+            steps.append(("reset-failed", _sudo(["reset-failed", UNIT])))
+            steps.append(("start", _sudo(["start", "--no-block", UNIT])))
+        row["steps"] = steps
+        emit("action", f"liveness authority: automatic engine {action} (cause {cause}) by {by}: {evidence}"[:300],
+             {"action": f"liveness-{action}", "id": aid, "cause": cause, "by": by, "evidence": evidence, "steps": steps, "gate": g})
+        return {"acted": True, "id": aid, "action": action, "cause": cause, "steps": steps, "gate": g}
+    finally:
+        fcntl.flock(lk, fcntl.LOCK_UN)
+        lk.close()
+
+
+def _sudo(args):
+    try:
+        return subprocess.run(["sudo", "-n", "systemctl", *args], capture_output=True, text=True, timeout=60).returncode
+    except Exception:  # noqa: BLE001
+        return -1
+
+
+def tick(by="liveness-tick", act=True):
+    """One authority cycle: observe -> verify earlier actions -> classify -> publish -> take the declared exit, if it is ours."""
+    f = observe()
+    _verify_actions(f)
+    f["gate"] = gate(f["now"], _actions_cached(f))
+    try:
+        prev = json.load(open(LSTATE))
+    except (OSError, ValueError):
+        prev = {}
+    state, reason, carry = classify(f, prev)
+    result = None
+    if act and not f.get("paused"):
+        if state == "DOWN" and f["now"] - float(carry.get("down_since") or f["now"]) >= DOWN_GRACE_S:
+            result = _act("start", "down-unowned", by, reason, f)
+        elif state in ("STUCK_BOOT", "UNRESPONSIVE"):
+            result = _act("recover", state.lower(), by, reason, f)
+        if result and result.get("acted"):
+            f.pop("_actions", None)
+            state, reason = "RECOVERING", f"automatic {result['action']} issued ({result['id']}) for: {reason}"
+    if not f.get("planned_lock"):     # a job left non-terminal by a dead actuator: reconcile it (it can never finish on its own)
+        j = f.get("job") or {}
+        if j.get("state") in ("starting", "draining", "stopping", "starting-engine"):
+            write_job(state="abandoned", finished=now_iso(), result={"abandoned": "restart.lock not held: the actuator that ran this job is gone"})
+            emit("observation", f"planned restart job by {j.get('by')} abandoned (its actuator died in state {j.get('state')})",
+                 {"action": "restart-abandoned", "job": j})
+    out = _publish_state(state, reason, carry, f, {"tick_result": result} if result else None)
+    return out
+
+
+def ensure_engine_up(by):
+    """Called when a holder lets go: if nothing else owns the engine and it is not running, start it now (not after DOWN_GRACE_S)."""
+    f = observe()
+    state, reason, _c = classify(f, {})
+    if state == "DOWN":
+        return _act("start", "hold-released", by, reason, f)
+    return {"acted": False, "state": state, "reason": reason}
+
+
+def recover(cause, by, evidence, dry_run=False):
+    """The ONLY entry for an automatic kill/restart requested by a detector (vllm-watchdog.sh's confirmed generation wedge).
+    The detector decides THAT the engine is wedged; the authority decides WHETHER acting is allowed now (holds, windows, planned
+    restarts, rate limit, breaker) and does it the one way."""
+    f = observe()
+    _verify_actions(f)
+    state, reason, _c = classify(f, {})
+    if f.get("paused"):
+        return {"acted": False, "refused": "LIVENESS_PAUSE kill switch present", "state": state}
+    if state in ("PLANNED", "HELD", "OFFLINE_WINDOW"):
+        out = {"acted": False, "refused": f"deferred: {reason}", "state": state}
+        emit("observation", f"automatic engine recover ({cause}) by {by} deferred: {reason}"[:300],
+             {"action": "liveness-recover-deferred", "cause": cause, "by": by, "evidence": evidence, "state": state})
+        return out
+    return _act("recover", cause, by, evidence, f, dry_run=dry_run)
+
+
 def main():
     ap = argparse.ArgumentParser()
     sp = ap.add_subparsers(dest="cmd", required=True)
@@ -729,8 +1339,29 @@ def main():
     p.add_argument("--no-drain", action="store_true"); p.add_argument("--foreground", action="store_true")
     p.add_argument("--force", action="store_true", help="restart even when the requested diag flags are already active")
     p.add_argument("--health-wait-s", type=int, default=HEALTH_WAIT_S, help="after start, wait this long for /health before calling the restart failed")
+    p.add_argument("--hold", default=None, help="LV: the lease of the engine hold this caller owns (a window restarting its own engine)")
     p = sp.add_parser("announce-start"); p.add_argument("--wait-healthy", action="store_true", help=argparse.SUPPRESS)
     sp.add_parser("restart-status")
+    # LV: the liveness authority
+    p = sp.add_parser("tick", help="one authority cycle (vllm-watchdog.sh runs it every minute)"); p.add_argument("--by", default="liveness-tick")
+    p.add_argument("--no-act", action="store_true", help="observe + publish only")
+    p = sp.add_parser("recover", help="a detector asks for an automatic kill+restart")
+    p.add_argument("--cause", required=True); p.add_argument("--by", required=True); p.add_argument("--evidence", default="")
+    p.add_argument("--dry-run", action="store_true")
+    sp.add_parser("liveness", help="print the published liveness state")
+    p = sp.add_parser("reset-breaker"); p.add_argument("--by", required=True); p.add_argument("--reason", required=True)
+    p = sp.add_parser("hold", help="TTL-bounded holds: engine (a window owns the engine) | quiesce (a release is in flight)")
+    hs = p.add_subparsers(dest="hcmd", required=True)
+    q = hs.add_parser("acquire"); q.add_argument("--kind", default="engine", choices=HOLD_KINDS); q.add_argument("--by", required=True)
+    q.add_argument("--reason", required=True); q.add_argument("--ttl", type=int, required=True)
+    q.add_argument("--owner-pid", type=int, default=None, help="the long-lived process this hold belongs to: void when it dies")
+    q = hs.add_parser("release"); q.add_argument("--lease"); q.add_argument("--by")
+    q = hs.add_parser("renew"); q.add_argument("--lease", required=True); q.add_argument("--ttl", type=int, required=True)
+    q = hs.add_parser("run"); q.add_argument("--kind", default="engine", choices=HOLD_KINDS); q.add_argument("--by", required=True)
+    q.add_argument("--reason", required=True); q.add_argument("--ttl", type=int, required=True)
+    q.add_argument("--no-ensure-up", action="store_true", help="do not start the engine when the command ends")
+    q.add_argument("argv", nargs=argparse.REMAINDER)
+    hs.add_parser("status")
     a = ap.parse_args()
     if a.cmd == "status":
         print(json.dumps(status(), default=str))
@@ -753,6 +1384,36 @@ def main():
         return announce_start(a)
     elif a.cmd == "restart-status":
         print(open(JOB).read() if os.path.exists(JOB) else "{}")
+    elif a.cmd == "tick":
+        print(json.dumps(tick(by=a.by, act=not a.no_act), default=str))
+    elif a.cmd == "recover":
+        r = recover(a.cause, a.by, a.evidence, dry_run=a.dry_run)
+        print(json.dumps(r, default=str))
+        return 0 if r.get("acted") or r.get("dry_run") else 3
+    elif a.cmd == "liveness":
+        print(open(LSTATE).read() if os.path.exists(LSTATE) else "{}")
+    elif a.cmd == "reset-breaker":
+        _actions_append({"id": f"reset-{int(time.time())}", "t": time.time(), "reset": True, "by": a.by, "reason": a.reason})
+        emit("action", f"liveness breaker reset by {a.by}: {a.reason}"[:300], {"action": "liveness-breaker-reset", "by": a.by, "reason": a.reason})
+        print(json.dumps({"reset": True}))
+    elif a.cmd == "hold":
+        if a.hcmd == "acquire":
+            r = hold_acquire(a.kind, a.by, a.reason, a.ttl, **({"mode": "owned", "pid": a.owner_pid} if a.owner_pid else {}))
+        elif a.hcmd == "release":
+            if not (a.lease or a.by):
+                print(json.dumps({"refused": "pass --lease or --by"})); return 2
+            r = hold_release(a.lease, a.by)
+        elif a.hcmd == "renew":
+            r = hold_renew(a.lease, a.ttl)
+        elif a.hcmd == "run":
+            argv = a.argv[1:] if a.argv[:1] == ["--"] else a.argv
+            if not argv:
+                print(json.dumps({"refused": "nothing to run (hold run ... -- CMD ARGS)"})); return 2
+            return hold_run(a.kind, a.by, a.reason, a.ttl, argv, ensure_up=not a.no_ensure_up)
+        else:
+            r = {"holds": active_holds(), "max_ttl_s": HOLD_MAX_TTL_S}
+        print(json.dumps(r, default=str))
+        return 3 if r.get("refused") else 0
     return 0
 
 

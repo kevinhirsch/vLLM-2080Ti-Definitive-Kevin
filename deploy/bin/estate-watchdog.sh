@@ -401,8 +401,8 @@ check_vllm_services() {
       # 2026-09-05: every benchmark/promotion window stops the ENGINE watchdog timer on purpose
       # (so it cannot restart the engine mid-arm) and re-arms it in its restore step. While a
       # window marker (done/*.running) exists that is expected -> WARN with a reason, not CRIT.
-      if [ "$unit" = "vllm-qwen27b-watchdog.timer" ] && frontier_benchmark_active; then
-        [ "$worst" = "CRIT" ] || worst="WARN"; note=" (engine watchdog timer stopped by an active window, tolerated)"
+      if [ "$unit" = "vllm-qwen27b-watchdog.timer" ] && engine_window_active; then
+        [ "$worst" = "CRIT" ] || worst="WARN"; note=" (engine watchdog timer stopped by an active window, tolerated; windows should take a liveness hold instead)"
       else
         worst="CRIT"
       fi
@@ -411,6 +411,53 @@ check_vllm_services() {
   done
   CHECK_STATUS="$worst"
   CHECK_DETAIL="$(IFS='; '; echo "${parts[*]}")${note}"
+}
+
+# (e4) LV 2026-10-03: the ONE engine-liveness authority (engine-actuator.py tick, run by the watchdog timer each minute) publishes
+# the declared engine state. This check READS it -- it never probes or acts on the engine itself. A stale file means the authority
+# is not ticking (timer stopped, or the actuator crashing): that is the one thing nothing else would notice.
+LIVENESS_STATE="${LIVENESS_STATE:-$HOME/.local/share/vllm-qwen27b/liveness-state.json}"
+LIVENESS_HOLDS="${LIVENESS_HOLDS:-$HOME/.local/share/vllm-qwen27b/liveness-holds.json}"
+LIVENESS_STALE_SEC="${LIVENESS_STALE_SEC:-300}"
+TIMER_REARM_SEC="${TIMER_REARM_SEC:-1800}"
+check_engine_liveness() {
+  if [ ! -s "$LIVENESS_STATE" ]; then
+    CHECK_STATUS="WARN"; CHECK_DETAIL="no ${LIVENESS_STATE} (liveness authority not deployed yet?)"; return
+  fi
+  local st as_of reason age
+  st=$(jq -r '.state // "?"' "$LIVENESS_STATE" 2>/dev/null)
+  as_of=$(jq -r '(.as_of // 0) | floor' "$LIVENESS_STATE" 2>/dev/null)
+  reason=$(jq -r '.reason // ""' "$LIVENESS_STATE" 2>/dev/null | cut -c1-160)
+  case "$as_of" in ''|*[!0-9]*) as_of=0 ;; esac
+  age=$(( $(date +%s) - as_of ))
+  if [ "$age" -gt "$LIVENESS_STALE_SEC" ]; then
+    CHECK_STATUS="CRIT"; CHECK_DETAIL="liveness authority has not ticked for ${age}s (last state ${st}; watchdog timer $(systemctl is-active vllm-qwen27b-watchdog.timer 2>&1))"; return
+  fi
+  case "$st" in
+    UP|BOOTING|PLANNED|HELD|OFFLINE_WINDOW|RECOVERING|STOPPING) CHECK_STATUS="OK" ;;
+    CRASH_LOOP|BREAKER_OPEN) CHECK_STATUS="CRIT" ;;
+    *) CHECK_STATUS="WARN" ;;
+  esac
+  CHECK_DETAIL="${st} (${age}s ago): ${reason}"
+}
+
+# Timer re-arm eligibility: the watchdog timer is the authority's clock. Windows take a TTL-bounded hold now instead of stopping it;
+# a timer still found stopped long after every window has ended (DFT 10-02: 4.5 h) is re-armed by --fix.
+engine_window_active() {
+  frontier_benchmark_active && return 0
+  [ -s "$LIVENESS_HOLDS" ] && jq -e --argjson now "$(date +%s)" 'any(.[]?; .kind == "engine" and (.until // 0) > $now)' "$LIVENESS_HOLDS" >/dev/null 2>&1 && return 0
+  [ "$(curl -s -m 3 "${GATEWAY_URL}/gateway/offline" 2>/dev/null | jq -r '.offline // false' 2>/dev/null)" = "true" ] && return 0
+  pgrep -f "bash [^ ]*(_window|_driver|/window)\.sh" >/dev/null 2>&1 && return 0
+  return 1
+}
+
+timer_stopped_for() {   # seconds the engine watchdog timer has been inactive (0 when active / unknown)
+  local st since
+  st=$(systemctl is-active vllm-qwen27b-watchdog.timer 2>/dev/null)
+  [ "$st" = "active" ] && { echo 0; return; }
+  since=$(systemctl show vllm-qwen27b-watchdog.timer -p InactiveEnterTimestamp --timestamp=unix --value 2>/dev/null | tr -d '@')
+  case "$since" in ''|*[!0-9]*) echo 0; return ;; esac
+  echo $(( $(date +%s) - since ))
 }
 
 # (e2) vault MCP hub reachability (2026-09-05): the shared-brain write path for every agent.
@@ -572,6 +619,20 @@ fix_record() {
 }
 
 do_fix() {
+  # LV: re-arm the liveness authority's clock when it was left stopped and no window owns the engine any more.
+  local tstop; tstop=$(timer_stopped_for)
+  if [ "$tstop" -ge "$TIMER_REARM_SEC" ] && ! engine_window_active; then
+    local tsig trec=0
+    tsig=$(fix_signature "watchdog-timer-stopped|$(sha256sum "$0" 2>/dev/null | cut -d' ' -f1)")
+    if fix_allowed "watchdog-timer" "$tsig"; then
+      log_line "FIX: vllm-qwen27b-watchdog.timer stopped for ${tstop}s with no window owning the engine; re-arming"
+      timeout 10 sudo -n systemctl start vllm-qwen27b-watchdog.timer >/dev/null 2>&1 && \
+        [ "$(systemctl is-active vllm-qwen27b-watchdog.timer 2>/dev/null)" = "active" ] && trec=1
+      fix_record "watchdog-timer" "$tsig" "$trec"
+      [ "$trec" = "1" ] || log_line "FIX: watchdog timer re-arm did not verify; retained alert"
+    fi
+  fi
+
   if [ "${ST[agentsprod-egress]:-}" = "CRIT" ]; then
     local sig out recovered=0 _t0 _t1
     sig=$(fix_signature "${DET[agentsprod-egress]}|$(sha256sum "$0" 2>/dev/null | cut -d' ' -f1)")
@@ -643,6 +704,7 @@ CHECK_LIST=(
   "gateway-health:check_gateway_health"
   "engine-health:check_engine_health"
   "vllm-services:check_vllm_services"
+  "engine-liveness:check_engine_liveness"
   "vault-mcp:check_vault_mcp"
   "disk-free:check_disk_free"
   "gpu-count:check_gpu_count"
