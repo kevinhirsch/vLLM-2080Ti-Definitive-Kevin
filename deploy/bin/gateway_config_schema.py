@@ -290,6 +290,7 @@ _k("SHIM_MICRO_HISTORY", "int", "16", "Outputs remembered per signature.", gname
 _k("SHIM_MICRO_MAX_OUT", "int", "96", "Output length that counts as micro.", unit="tokens", gname="MICRO_MAX_OUT")
 _k("SHIM_MICRO_MAX_PROMPT", "int", "6000", "Largest prompt a micro admission may carry.", unit="tokens", gname="MICRO_MAX_PROMPT")
 _k("SHIM_PROBE_SYNTH", "bool", "1", "Answer liveness probes from fresh engine evidence (kill: 0).", gname="PROBE_SYNTH", kill=True)
+_k("SHIM_REMOTE_ALIAS_DEGRADE", "bool", "1", "Serve an estate-remote request locally (header X-Gateway-Degraded) when the remote is unusable: balance exhausted, breaker open, none configured, or no daily-cap room (kill: 0 restores forward-and-fail).", gname="REMOTE_ALIAS_DEGRADE", kill=True, owner="GW3")
 _k("SHIM_PROBE_FRESH_S", "float", "120", "Engine evidence fresher than this lets a probe be synthesised.", unit="s", gname="PROBE_FRESH_S")
 _k("SHIM_PROBE_REAL_EVERY", "int", "12", "Every Nth probe still goes through for real.", lo=1, gname="PROBE_REAL_EVERY")
 _k("SHIM_LOCAL_MODEL_NAME", "str", "qwen-local", "Model name used for gateway-originated local calls.")

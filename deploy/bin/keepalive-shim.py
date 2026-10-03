@@ -3942,12 +3942,13 @@ def _cap_exhausted_unavailable(why):
                              status=503, headers={"Retry-After": "60"})
 
 
-def _spend_allows_overflow(ptok, maxtok):
+def _spend_allows_overflow(ptok, maxtok, model=None):
     """May an OVERFLOW (gateway-chosen, not caller-requested) request go remote right now?
     False when the cap is exhausted or the ledger is unusable -- the router then serves it
-    locally (queueing for a lane) instead of refusing it."""
+    locally (queueing for a lane) instead of refusing it. `model` prices a non-default row
+    (estate-remote-pro) exactly as the hold will."""
     try:
-        return _spend().can_hold(_spend_hold_estimate(ptok, maxtok))
+        return _spend().can_hold(_spend_hold_estimate(ptok, maxtok, model))
     except Exception as _e:
         _swallowed("_spend_allows_overflow", _e)
         return False
@@ -3986,6 +3987,61 @@ def _stall_brake_not_applied(why, client):
     Counted so the capacity surface shows how much stalled-state traffic the gateway carried rather than refused."""
     _STALL_BRAKE_NOT_APPLIED[why] += 1
     log.info("stalled-delivery brake not applied (%s, client=%s): remote is the only place this can be served", why, client)
+
+
+# ---- lane GW3 (2026-10-03): an explicit remote request is served LOCALLY when the remote cannot be used ----
+# Kevin's rule "Local First Remote For Spikes": remote is an optional valve, never a dependency. Halo's mind sends
+# model "estate-remote" (the builtin-remote alias, its top tier); with the provider out of balance the gateway still
+# forwarded it and _forward_remote answered 503 "no remote overflow configured" -- 16 requests with 28.9K-token prompts
+# thrown away in one day. "Usable" is the capacity mode's predicate (flow_mode_now: configured, not full-local, no open
+# breaker/dead window, balance not exhausted, daily cap has room), asked through the same two primitives the router
+# uses (remote_ok + _spend_allows_overflow) so it cannot disagree with them; test_gateway_remote_alias_degrade pins
+# the equivalence with flow_mode_now()["remote_usable"].
+REMOTE_ALIAS_DEGRADE = _env_flag(os.environ.get("SHIM_REMOTE_ALIAS_DEGRADE", "1"), True)      # kill: SHIM_REMOTE_ALIAS_DEGRADE=0
+_REMOTE_ALIAS_DEGRADED = collections.Counter()
+
+
+def remote_unusable_reason(body, ptok, maxtok, model=None, reserved=False):
+    """None when a paid remote call for this request can go out right now; else why not (a short slug)."""
+    if not remote_ok():
+        if not REMOTE_ENABLED:
+            return "no-remote-configured"
+        if LOCAL_ONLY:
+            return "full-local"
+        if _REMOTE_BALANCE["exhausted"]:
+            return "balance-exhausted"
+        return "breaker-open"
+    if reserved:        # the caller's reservation already holds the money; the ledger arbitrates any shortfall
+        return None
+    try:
+        upper = _spend_prompt_token_upper(body, ptok)       # what _spend_hold_for will actually hold against
+    except Exception:
+        upper = ptok
+    room = _spend_allows_overflow(upper, maxtok, model) if model else _spend_allows_overflow(upper, maxtok)
+    return None if room else "cap-no-room"
+
+
+def _degrade_remote_alias(request, body, kind, why, rewrite=True):
+    """Mark the request degraded and return its body re-addressed to the local served model."""
+    _REMOTE_ALIAS_DEGRADED[f"{kind}:{why}"] += 1
+    _active_set(request, degraded=f"{kind}-local", degraded_reason=why)
+    log.warning("route %s %s: remote unusable (%s) -> served locally", request.path, kind, why)
+    if not rewrite:
+        return body
+    try:
+        j = json.loads(body)
+        j["model"] = _local_model_name()
+        return json.dumps(j).encode()
+    except Exception as _e:
+        _swallowed("_degrade_remote_alias", _e)
+        return body
+
+
+def _degraded_headers(info):
+    if info and info.get("degraded"):
+        return {"X-Gateway-Degraded": str(info["degraded"]),
+                "X-Gateway-Degraded-Reason": str(info.get("degraded_reason") or "")}
+    return {}
 
 
 def _spend_hold_for(request, body, prices=None, model=None):
@@ -4908,6 +4964,10 @@ def record_event(decision, reason, request, units, waited, ptok=0, maxtok=0, str
     # A post-commit stream watchdog has a more specific outcome than the admission reason
     # (usually "-" for a normal local request). Preserve it in the receipt and history.
     final_reason = "stream-idle-timeout" if prior.get("stream_watchdog") else reason
+    # lane GW3: a request the gateway re-addressed to local because its remote was unusable is recorded under that
+    # reason (route stays local) so Halo and the Medic can count it; the admission reason rides along as "ar".
+    if prior.get("degraded") and decision in ("local", "held") and reason != "local-failed" and not prior.get("stream_watchdog"):
+        final_reason = str(prior["degraded"]).replace("-local", "-degraded")      # remote-alias-local -> remote-alias-degraded
     _active_set(request, route=decision, reason=final_reason,
                 phase=("done" if decision in ("local", "held") else "remote"))
     _stats["total"] += 1
@@ -4941,6 +5001,8 @@ def record_event(decision, reason, request, units, waited, ptok=0, maxtok=0, str
                         "ptok": ptok, "maxtok": maxtok, "stream": stream,
                         "alias": _rinfo.get("alias"), "alias_kind": _rinfo.get("alias_kind"),
                         "cls": _rinfo.get("flow_class"),
+                        "degraded": _rinfo.get("degraded"), "degraded_why": _rinfo.get("degraded_reason"),
+                        "ar": reason if final_reason != reason else None,
                         "ttft": _rinfo.get("ttft"), "outtok": _outtok, "outtok_lb": _outtok_lb,
                         "cost_est": (_remote_cost_estimate(ptok, _outtok if _outtok is not None else _outtok_lb)
                                      if decision == "remote" else 0.0)})
@@ -6299,6 +6361,7 @@ def flow_capacity_facts(now=None, cls=None, ptok=None):
         "offline_window": _offline_status(),
         "counters": dict(_FLOW_STATS),
         "stall_brake_not_applied": dict(_STALL_BRAKE_NOT_APPLIED),
+        "remote_alias_degraded": dict(_REMOTE_ALIAS_DEGRADED),
         "cannot_measure": ([] if eng else ["engine /metrics scrape failing: throughput and engine queue unknown"]),
     }
     if cls in FLOW_CLASSES:
@@ -8424,6 +8487,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
             "X-Gateway-Context-Prompt": str(info.get("context_prompt_tokens") or ""),
             "X-Gateway-Context-Compacted": "1" if info.get("context_compacted") else "0",
             "X-Gateway-Context-Omitted": str(info.get("context_omitted") or "0"),
+            **_degraded_headers(info),
         }
     try:
         if streaming:
@@ -9379,6 +9443,7 @@ async def _route_completions(request, _no_overflow=False):
     alias_kind = alias.get("kind")
     alias_local_only = alias_kind == "builtin-local"
     alias_force_remote = alias_kind == "builtin-remote"
+    _pin_name = "estate-local"
     custom_endpoint = alias.get("endpoint") if alias_kind == "custom-remote" else None
     _active_set(request, alias=alias.get("name"), alias_kind=alias_kind)
     # K4 PROBE synth: a trivial "Reply with the single word: X" liveness probe is answered here while the engine has
@@ -9506,11 +9571,29 @@ async def _route_completions(request, _no_overflow=False):
         return web.json_response({"error": {"message": f"gateway alias {alias.get('name')} is disabled",
                                               "type": "alias_disabled"}}, status=409)
     if alias_force_remote:
-        log.info("route %s alias=estate-remote -> remote(alias)", path)
-        record_event("remote", "alias", request, units, 0, **ev)
-        if alias.get("model"):
-            return await _forward_remote(request, path, body, streaming, model=alias["model"])
-        return await _forward_remote(request, path, body, streaming)
+        # lane GW3: the remote is a valve, not a dependency. When it cannot take this request (balance exhausted, breaker
+        # open, none configured, daily cap without room) serve it LOCALLY through the normal path -- admission, capacity
+        # and deadlines all apply -- instead of forwarding into a certain 503/429. The caller's work is not thrown away.
+        _why_down = (remote_unusable_reason(body, ptok, maxtok, alias.get("model"), bool(alias.get("reservation")))
+                     if REMOTE_ALIAS_DEGRADE else None)
+        if _why_down is None:
+            log.info("route %s alias=estate-remote -> remote(alias)", path)
+            record_event("remote", "alias", request, units, 0, **ev)
+            if alias.get("model"):
+                _resp = await _forward_remote(request, path, body, streaming, model=alias["model"])
+            else:
+                _resp = await _forward_remote(request, path, body, streaming)
+            # The first call after the balance runs out is the one that learns it (402 arms the breaker). Do not hand
+            # that request the raw 402 either: the breaker is open now, so a second pass serves it locally.
+            if (REMOTE_ALIAS_DEGRADE and not _no_overflow and getattr(_resp, "status", None) == 402
+                    and remote_unusable_reason(body, ptok, maxtok, alias.get("model"),
+                                               bool(alias.get("reservation"))) in ("balance-exhausted", "breaker-open")):
+                log.warning("route %s alias=%s got 402 from the remote -> re-routing locally", path, alias.get("name"))
+                return await _route_completions(request, _no_overflow=True)
+            return _resp
+        body = _degrade_remote_alias(request, body, "remote-alias", _why_down)
+        alias_force_remote, alias_local_only = False, True
+        _pin_name = "estate-remote (remote unusable: %s; served locally)" % _why_down
 
     # TEXT-ONLY GUARD (lane GW): the local engine does not take image/video/audio parts. Decide here, once, instead of
     # letting the engine answer 400 "At most 0 image(s)": the remote vision provider when one is declared and the hard
@@ -9568,9 +9651,14 @@ async def _route_completions(request, _no_overflow=False):
     # explicit brain escalation), but the gateway still checks overflow_ok and local-pin before
     # making the provider decision.  This keeps routing authority in one place.
     if remote_intent and automatic_paid_ok and remote_ok() and not local_pin and not alias_local_only:
-        log.info("route %s gateway route intent=%s -> remote(intent)", path, route_intent)
-        record_event("remote", "intent", request, units, 0, **ev)
-        return await _forward_remote(request, path, body, streaming)
+        # lane GW3: remote_ok() already sent an unusable remote (balance/breaker/none) down to the local path; the one
+        # case it let through into a guaranteed 429 was a daily cap with no room for this request. Same answer: local.
+        _why_down = remote_unusable_reason(body, ptok, maxtok) if REMOTE_ALIAS_DEGRADE else None
+        if _why_down is None:
+            log.info("route %s gateway route intent=%s -> remote(intent)", path, route_intent)
+            record_event("remote", "intent", request, units, 0, **ev)
+            return await _forward_remote(request, path, body, streaming)
+        _degrade_remote_alias(request, body, "remote-intent", _why_down, rewrite=False)
 
     # size cap: too-big-for-this-box requests OOM local even at budget=1 -> send straight to remote
     if overflow_ok and not local_pin and not alias_local_only and over_local_cap(body):
@@ -9646,7 +9734,7 @@ async def _route_completions(request, _no_overflow=False):
             record_event("remote", "local-down", request, units, 0, **ev)
             return await _overflow_forward()
         elif alias_local_only:
-            return web.json_response({"error": {"message": "estate-local requires the local engine, which is currently unavailable",
+            return web.json_response({"error": {"message": _pin_name + " requires the local engine, which is currently unavailable",
                                                   "type": "local_unavailable"}}, status=503)
         elif remote_ok():
             # local DOWN and the remote cap has no room for this overflow: nothing can serve it now
@@ -9794,7 +9882,7 @@ async def _route_completions(request, _no_overflow=False):
                 if alias_local_only:
                     record_event("held", "local-failed", request, units, 0, **ev)
                     return web.json_response({"error": {
-                        "message": "estate-local local attempt failed; paid failover is disabled",
+                        "message": _pin_name + " local attempt failed; paid failover is disabled",
                         "type": "local_only_unavailable"}}, status=503)
                 if not remote_ok():
                     record_event("held", "local-failed", request, units, 0, **ev)
@@ -9979,7 +10067,7 @@ async def _route_completions(request, _no_overflow=False):
         if alias_local_only:
             record_event("held", reason, request, units, waited, **ev)
             return web.json_response({"error": {
-                "message": "estate-local capacity unavailable; paid overflow is disabled",
+                "message": _pin_name + " capacity unavailable; paid overflow is disabled",
                 "type": "local_only_unavailable"}}, status=503)
         record_event("remote", reason, request, units, waited, **ev)
         return await _overflow_forward()
@@ -10035,7 +10123,7 @@ async def _route_completions(request, _no_overflow=False):
         if alias_local_only:
             record_event("held", "local-failed", request, units, waited, **ev)
             return web.json_response({"error": {
-                "message": "estate-local local attempt failed; paid failover is disabled",
+                "message": _pin_name + " local attempt failed; paid failover is disabled",
                 "type": "local_only_unavailable"}}, status=503)
         if not remote_ok():
             record_event("held", "local-failed", request, units, waited, **ev)
