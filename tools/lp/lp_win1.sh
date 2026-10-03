@@ -3,7 +3,7 @@
 #   Phase A (small-footprint IDLE engine, ~10 min incl. boot): kernel microbench both GPUs (per-rank shapes, M=16..3632, correctness vs CPU emulation)
 #            + 25 s sustained gate_up per format per GPU (SM clock / power / temp under int8 vs fp16).
 #   Phase B (engine UP with int8 activations, ~25 min; W4A8G = per-(row,128) act scales if its kernel gate passes): B1 cold prefill x3, quick decode, 12-body estate pass x3,
-#            det cold vs stack ref, evalkit tool_call+code_exec+long_ctx, needle 71K; then restore whatever override was live.
+#            det cold vs stack ref, evalkit tool_call+code_exec+long_ctx, needle 262K; then restore whatever override was live.
 # Run under the gateway offline lease, exactly like S4 windows:
 #   python3 /home/kevin/Desktop/wt-integrate/deploy/bin/gateway-offline.py run --reason "LP W1 W4A8" --by LP --ttl 3000 --wait-s 90 -- bash /home/kevin/Desktop/wt-lp/tools/lp/lp_win1.sh
 # Env: LP_ONLY='<regex>' to restrict int8 to matching layers (e.g. 'gate_up_proj|linear_attn|self_attn' keeps down_proj W4A16).
@@ -65,7 +65,7 @@ python3 /home/kevin/Desktop/wt-integrate/tools/s2-bench/quick.py 2>&1 | tail -1
 python3 det.py det_${LABEL}_cold.json; echo "vs stack ref (cold):"; python3 det.py --cmp det_s4_stack_ref.json det_${LABEL}_cold.json | tail -7
 ./w11.sh $LABEL 3 "12:0" >/dev/null 2>&1; python3 analyze_cliff.py $LABEL | cut -c1-150
 echo "== evalkit $(date)"; (cd /home/kevin/Desktop/qwen38-evalkit && python3 run_eval.py --tag lp-$LABEL --categories tool_call,code_exec,long_ctx 2>&1 | grep -E "passed=False|/60|passed,")
-echo "== needle 71K $(date)"; python3 /home/kevin/Desktop/wt-integrate/tools/up-bench/needle_long.py --tokens 71000 --depth 0.5 2>&1 | tail -1 | cut -c1-200
+echo "== needle 262K (pre-7004df6ae8 --tokens 71000 = 262K) $(date)"; python3 /home/kevin/Desktop/wt-integrate/tools/up-bench/needle_long.py --tokens 262000 --depth 0.5 2>&1 | tail -1 | cut -c1-200
 echo "xid: $(( $(journalctl -k --no-pager | grep -c 'NVRM: Xid') - X0 )) OOMwarn=$(journalctl -u vllm-qwen27b --since '-45 min' --no-pager | grep -c 'allocation failed with OOM')"
 # ---- Phase C (optional, LP_SECOND=1, ~18 min): STOCK per-token int8 everywhere EXCEPT mlp.down_proj (worst activation SQNR, 18 dB) ----
 if [ "${LP_SECOND:-1}" = "1" ] && [ -z "${LP_ONLY:-}" ]; then
