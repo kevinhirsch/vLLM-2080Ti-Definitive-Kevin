@@ -31,8 +31,31 @@ def sh(cmd, timeout=40):
         return f"<{e!r}>"
 
 
+def engine_pids(journal: str) -> set:
+    """S4 2026-10-03: pids of THIS engine boot's process tree (APIServer/EngineCore/Worker_TP*), from the journal itself."""
+    return {int(x) for x in re.findall(r"\bpid=(\d+)", journal)} | {int(x) for x in re.findall(r"serve-active\.sh\[(\d+)\]", journal)}
+
+
+def own_kernel_lines(journal: str, kernel: str) -> str:
+    """Keep only kernel Xid/NVRM lines that belong to the engine's process tree.  Lines of the form `NVRM: Xid (PCI:...): 31, pid=N`
+    with N outside the engine tree come from OTHER GPU processes sharing the cards (concurrent lane experiments) and must not be blamed
+    on the engine (2026-10-03 06:32/06:34: two foreign Xid 31s labelled a planned stop 'cuda-illegal-address').  Without any engine pid in
+    the journal slice we keep everything (old behaviour)."""
+    pids = engine_pids(journal)
+    if not pids:
+        return kernel
+    keep = []
+    for line in kernel.splitlines():
+        m = re.search(r"Xid\s*\(PCI:[^)]*\):\s*\d+,\s*pid=(\d+)", line)
+        if m and int(m.group(1)) not in pids:
+            continue
+        keep.append(line)
+    return "\n".join(keep)
+
+
 def classify(journal: str, kernel: str):
     sig, detail = "unknown-exit", ""
+    kernel = own_kernel_lines(journal, kernel)
     if "repeats may not contain negative values" in journal:
         sig = "sched-negative-num-scheduled-tokens"
     elif re.search(r"illegal memory access|cudaErrorIllegalAddress", journal) or re.search(r"Xid.*\b31\b", kernel):
