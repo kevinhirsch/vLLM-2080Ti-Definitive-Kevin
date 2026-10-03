@@ -54,8 +54,8 @@ The order is: who owns the engine first, then health.
 | PLANNED | active | planned restart (`restart.lock` holder) | 2400 s | UP or BOOTING; holder died → job reconciled `abandoned` |
 | HELD | active | the holder | the hold's TTL (≤ 8 h) | release, TTL expiry, holder pid died |
 | OFFLINE_WINDOW | active | the gateway offline-lease holder | gateway TTL (≤ 3600 s) | window closed or expired |
-| CRASH_LOOP | active | Halo (hand-off `engine-crash-loop`) | — | UP; a Halo planned restart or rollback |
-| BREAKER_OPEN | active | authority (half-open retry) plus a Halo hand-off | backoff (≤ 7200 s) | half-open attempt at `next_try`; UP; `reset-breaker` |
+| CRASH_LOOP | active | Halo (hand-off `engine-crash-loop`) **and** a need of kind `decision` sent to Kevin (Discord + thread, deduped while open). Hand-offs have no consumer until Halo spec 02 lands. | — | UP; a Halo planned restart or rollback |
+| BREAKER_OPEN | active | authority (half-open retry), plus a Halo hand-off and a need sent to Kevin | backoff (≤ 7200 s) | half-open attempt at `next_try`; UP; `reset-breaker` |
 | PAUSED | active | Kevin (`LIVENESS_PAUSE` file) | 24 h (flagged after) | remove the file |
 
 The watchdog neither probes nor counts in HELD, OFFLINE_WINDOW, PLANNED or PAUSED. This replaces "stop the timer during a window".

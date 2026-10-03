@@ -289,9 +289,15 @@ def status():
         job = json.load(open(JOB))
     except Exception:  # noqa: BLE001
         pass
+    try:   # LV: the liveness authority's published state + holds (what engine_status shows Halo)
+        live = json.load(open(LSTATE))
+        live = {k: live.get(k) for k in ("state", "since", "reason", "as_of", "gate", "last_action", "declared")}
+    except Exception:  # noqa: BLE001
+        live = None
     return {"as_of": now_iso(), "unit": unit_view(), "engine_healthy": engine_healthy(), "gateway": gateway_view(),
             "diag": {"staged_for_next_start": staged_flags(), "active_in_running_engine": active_flags()},
-            "faults_24h": faults_summary(24), "recent_ledger": ledger_rows(limit=5), "restart_job": job}
+            "faults_24h": faults_summary(24), "recent_ledger": ledger_rows(limit=5), "restart_job": job,
+            "liveness": live, "holds": active_holds()}
 
 
 # ------------------------------------------------------------------ actions
@@ -1185,6 +1191,31 @@ def _verify_actions(f):
                  {"action": "liveness-action-verified", "id": a["id"], "outcome": verdict, "cause": a.get("cause")})
 
 
+NEED_WHAT = {
+    "CRASH_LOOP": "The local vLLM engine is crash-looping; automatic recovery cannot fix it. It needs a different configuration or a rollback.",
+    "BREAKER_OPEN": "The local vLLM engine's automatic recovery failed repeatedly; the liveness breaker is open.",
+}
+
+
+def _raise_need(state, reason, f):
+    """AU 2026-10-03: hand-offs have no consumer yet (spec 02), so a CRASH_LOOP / BREAKER_OPEN also files a NEED (kind decision ->
+    Kevin, Discord DM + thread), deduped by signature while it stays open. Serving continues on the remote valve meanwhile (the
+    gateway routes around an unhealthy local engine by itself). Best effort: never fails the tick."""
+    try:
+        if ESTATE not in sys.path:
+            sys.path.insert(0, ESTATE)
+        from tools import halo_needs
+        r = halo_needs.raise_need(kind="decision", what=NEED_WHAT[state], why=reason[:600], raised_by="probe",
+                                  evidence=[{"source": "engine-actuator liveness", "state": state, "reason": reason[:300],
+                                             "gate": f.get("gate"), "faults_24h": faults_summary(24).get("by_signature")}],
+                                  proposed_resolution="engine_restart with a known-good profile/flags (or roll back active-serve), "
+                                                      "then `engine-actuator.py reset-breaker` if the breaker is open")
+        return r.get("id") if isinstance(r, dict) else None
+    except Exception as e:  # noqa: BLE001
+        print(f"[engine-actuator] need filing failed: {e!r}", file=sys.stderr)
+        return None
+
+
 def _publish_state(state, reason, carry, f, extra=None):
     try:
         prev = json.load(open(LSTATE))
@@ -1211,6 +1242,12 @@ def _publish_state(state, reason, carry, f, extra=None):
                  f"configuration, or a rollback, is the move.", {"state": state, "reason": reason, "gate": f.get("gate"),
                  "faults_24h": faults_summary(24)}, handoff=True, action=f"engine-{state.lower().replace('_', '-')}",
                  fingerprint=f"engine-{state}-{int(f['now'] // 3600)}")
+            need = _raise_need(state, reason, f)
+            if need:
+                out["need"] = need
+                with open(tmp, "w") as fh:
+                    json.dump(out, fh, indent=1, default=str)
+                os.replace(tmp, LSTATE)
     return out
 
 

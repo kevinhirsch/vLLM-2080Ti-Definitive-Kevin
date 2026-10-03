@@ -33,6 +33,7 @@ class Base(unittest.TestCase):
         self.events, self.sudo = [], []
         self.ledger = []
         self.windows = []
+        self.needs = []
         paths = {"BASE": d, "HOLDS": f"{d}/holds.json", "HOLDS_LOCK": f"{d}/holds.lock", "LSTATE": f"{d}/state.json",
                  "LACTIONS": f"{d}/actions.jsonl", "LPAUSE": f"{d}/PAUSE", "WD_STATE": f"{d}/wd.json",
                  "FQ_RUNNING": f"{d}/fq/RUNNING", "JOB": f"{d}/job.json", "LOCK": f"{d}/restart.lock", "PLANNED": f"{d}/planned.json"}
@@ -46,7 +47,8 @@ class Base(unittest.TestCase):
                          "_sudo": lambda args: (self.sudo.append(args), 0)[1],
                          "ledger_rows": lambda limit=None, since=None: [r for r in self.ledger if not since or r["ts"] >= since],
                          "now_iso": lambda: "2027-01-15T00:00:00+00:00",
-                         "_window_procs": lambda: list(self.windows)}.items():
+                         "_window_procs": lambda: list(self.windows),
+                         "_raise_need": lambda st, r, f: (self.needs.append(st), "need-1")[1]}.items():
             p = patch.object(ea, name, fn)
             p.start()
             self.addCleanup(p.stop)
@@ -248,6 +250,11 @@ class Exits(Base):
         self.assertEqual(out["state"], "CRASH_LOOP")
         self.assertEqual(self.sudo, [])
         self.assertTrue(any(k.get("handoff") for _a, k in self.events))
+        # hand-offs have no consumer yet: a need (-> Kevin) is the observable second exit, filed once per entry
+        self.assertEqual(self.needs, ["CRASH_LOOP"])
+        self.assertEqual(self.state()["need"], "need-1")
+        ea.tick()
+        self.assertEqual(self.needs, ["CRASH_LOOP"])
 
     def test_faults_before_last_healthy_do_not_make_a_crash_loop(self):
         for i in range(ea.CRASH_LOOP_FAULTS):
@@ -389,6 +396,15 @@ class PlannedRestartHonoursHolds(Base):
 
 
 class Cli(Base):
+    def test_status_shows_liveness_and_holds(self):
+        ea.tick()
+        ea.hold_acquire("engine", "W", "window W owns engine", 600)
+        with patch.object(ea, "unit_view", lambda: {}), patch.object(ea, "gateway_view", lambda: {}), \
+                patch.object(ea, "active_flags", lambda: []), patch.object(ea, "staged_flags", lambda: []):
+            st = ea.status()
+        self.assertEqual(st["liveness"]["state"], "UP")
+        self.assertEqual(st["holds"][0]["by"], "W")
+
     def test_spawn_detached_forwards_hold(self):
         seen = {}
 
