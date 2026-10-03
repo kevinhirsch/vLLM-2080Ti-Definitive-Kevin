@@ -193,6 +193,7 @@ def main():
                     "~/projects/lanes/windows/gpuok.sh; on refusal it checkpoints and exits 3 (re-run resumes)")
     ap.add_argument("--gpu-need-mib", type=int, default=1000)
     ap.add_argument("--gpu-rows", type=int, default=2048, help="GPU mode: output rows per weight chunk")
+    ap.add_argument("--gpu-cap-mib", type=int, default=400, help="GPU mode: hard allocator cap (the CUDA context ~300 MiB is extra)")
     a = ap.parse_args()
     VARS = a.variants.split(",")
     for v in VARS: assert v in VARIANTS, f"unknown variant {v}; have {list(VARIANTS)}"
@@ -205,12 +206,15 @@ def main():
     GPU = dev.type == "cuda"
     ck = a.out + ".resume.pt"
 
-    def gate_ok():
+    def gate_ok(need=None):
         if not GPU:
             return True
+        need = a.gpu_need_mib if need is None else need
         import subprocess
+        if not (os.environ.get("GPU_CAP_MIB") or os.environ.get("GPU_IN_WINDOW") == "1" or os.environ.get("WINDOW_ID")):
+            log("RL rule: GPU mode must run under gpuok.sh --run (cap runner) or inside a window"); return False
         g = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0] or "0"
-        r = subprocess.run([os.path.expanduser("~/projects/lanes/windows/gpuok.sh"), g, str(a.gpu_need_mib)], capture_output=True, text=True)
+        r = subprocess.run([os.path.expanduser("~/projects/lanes/windows/gpuok.sh"), g, str(need)], capture_output=True, text=True)
         if r.returncode != 0:
             log("gpuok refused:", r.stdout.strip())
         return r.returncode == 0
@@ -224,6 +228,9 @@ def main():
             return dict.__contains__(self, k) or k in ("w", "s", "qz")
 
     if GPU:
+        # hard cap so the caching allocator can never eat the engine's headroom (K7 10:17 incident: uncapped run drove
+        # GPU1 free VRAM to ~40 MiB for ~15 s; the engine did not fault).  Start needs cap + context + >=800 MiB margin.
+        a.gpu_need_mib = max(a.gpu_need_mib, a.gpu_cap_mib + 300 + 800)
         _rope = R.rope_cos_sin
         R.rope_cos_sin = lambda T_: tuple(t.to(dev) for t in _rope(T_))
 
@@ -266,9 +273,11 @@ def main():
             xs, i0 = c["xs"], c["next"]; log(f"resumed at layer {i0}")
     if GPU and not gate_ok():
         sys.exit(3)
+    if GPU:  # CUDA context is created only after the gate said go
+        torch.cuda.set_per_process_memory_fraction(a.gpu_cap_mib / (torch.cuda.get_device_properties(0).total_memory / 2**20))
     xs = {v: t.to(dev) for v, t in xs.items()}
     for i in range(i0, a.layers):
-        if GPU and i > i0 and not gate_ok():
+        if GPU and i > i0 and not gate_ok(100):  # in-run: our own footprint is already resident; window/boot/offline/health still gate
             torch.save({"xs": {v: t.cpu() for v, t in xs.items()}, "next": i, "variants": VARS, "windows": a.windows}, ck)
             log(f"checkpointed at layer {i}; exiting 3 (re-run to resume)"); sys.exit(3)
         tl = time.time(); QI.clear(); W = load(i)

@@ -1,6 +1,8 @@
 """Lane LP contended mini speed probe (<100 MB tensors): real gate_proj/down_proj rows, N=2048 slice, M=16..3632,
 W4A16 Marlin vs stock W4A8 vs LP_A8G (incl. Triton quant), interleaved, min of reps. GPU shared with production -> ratios only."""
 import os as _os, subprocess as _sp, sys as _sys
+if not _os.environ.get("GPU_CAP_MIB") and _os.environ.get("LP_IN_WINDOW") != "1" and not _os.environ.get("WINDOW_ID"):
+    _sys.exit("RL rule: launch via ~/projects/lanes/windows/gpuok.sh --run --lane LP --job <name> --gpu <N> --cap <MiB> -- <cmd> (or inside a window)")
 _g = _sp.run(["/home/kevin/projects/lanes/windows/gpuok.sh", _os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0], "800"], capture_output=True, text=True)
 if _g.returncode != 0:
     _sys.exit("gpuok.sh refused: " + _g.stdout.strip() + " " + _g.stderr.strip())

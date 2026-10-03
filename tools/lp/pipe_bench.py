@@ -7,6 +7,8 @@ Real checkpoint per-rank shapes. Arms:
   stock8  : stock W4A8 (per-token int8);  pe0 : LP_PIPE + LP_A8E with EMAX=0 (== stock8 numerics);  pe3 : LP_PIPE + LP_A8E EMAX 3
 Usage (window): LP_IN_WINDOW=1 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=wt-lp:wt-integrate/tools/u2 python tools/lp/pipe_bench.py --json out.json"""
 import os as _os, subprocess as _sp, sys as _sys
+if not _os.environ.get("GPU_CAP_MIB") and _os.environ.get("LP_IN_WINDOW") != "1" and not _os.environ.get("WINDOW_ID"):
+    _sys.exit("RL rule: launch via ~/projects/lanes/windows/gpuok.sh --run --lane LP --job <name> --gpu <N> --cap <MiB> -- <cmd> (or inside a window)")
 _g = _sp.run(["/home/kevin/projects/lanes/windows/gpuok.sh", _os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0], "2500"], capture_output=True, text=True)
 if _g.returncode != 0 and _os.environ.get("LP_IN_WINDOW") != "1" and not _os.environ.get("WINDOW_ID"):
     _sys.exit("gpuok.sh refused: " + _g.stdout.strip())
