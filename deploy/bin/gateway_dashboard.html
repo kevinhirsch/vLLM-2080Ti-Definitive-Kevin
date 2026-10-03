@@ -1314,7 +1314,7 @@ reg('capacity',['stats','capacity','telemetry','config'],()=>{
   const pre='<div class="card"><h3>Prefill pressure '+srcTag(pf.source==='measured'?'measured':'configured',(pf.validMin||'?')+' min')+'<span class="sub">is prompt work arriving faster than the engine can read it?</span></h3>'+
     '<div class="bigv">'+L.fmtNum(cv.backlog,1)+' <small class="dim">s of prompt work queued (target '+L.fmtNum(cv.backlogTarget,0)+' s)</small></div>'+
     (isNum(cv.backlog)&&cv.backlogTarget?bar([{pct:Math.min(100,100*cv.backlog/cv.backlogTarget),c:cv.backlog>cv.backlogTarget?'bad':cv.backlog>0.75*cv.backlogTarget?'warn':'c1',label:'backlog'}]):'')+
-    kv([['Demand vs capacity',isNum(dr)?'<b>'+L.fmtNum(dr,2)+'×</b> '+MEAS('last 5 min')+' '+(dr>1?st('bad','arriving faster than it can be computed'):st('ok','keeping up')):DASH],
+    kv([['Demand vs capacity',isNum(dr)?'<b>'+L.fmtNum(dr,2)+'×</b> '+EST(DEMAND_PRE_HELP)+' '+(dr>1?st('bad','arriving faster than it can be computed'):st('ok','keeping up')):DASH],
         ['Prefill rate used for planning',L.fmtNum(pf.effective,0)+' tok/s '+srcTag(pf.source==='measured'?'measured':'configured','p75')+'<div class="xs mut">'+esc(pf.detail||'')+'</div>'],
         pf.configured!=null?['Configured fallback',L.fmtNum(pf.configured,0)+' tok/s '+CONF()]:null,
         pf.range?['Measured range',esc(JSON.stringify(pf.range))+' tok/s']:null])+'</div>';
@@ -1376,7 +1376,7 @@ reg('rt_mix',['capacity','stats','log24h'],()=>{
       '<div class="xs dim">paid '+L.fmtInt(r.remote)+' ('+L.fmtFrac(r.share,1)+') · of those, chosen by the gateway '+L.fmtInt(r.chosen)+' · while local had room '+L.fmtInt(r.headroom)+'</div></div>';}).join('')||empty('No routing counters yet.');
   html+=legend([['c3','served locally (or held / rejected)'],['c2','sent to the paid provider'],['c1','held: background paused until local recovers, never billed'],['neutral','rejected: background refused during a deliberate remote window']]);
   const pr=h.per_route;
-  if(pr)html+='<h4 class="sm" style="margin:14px 0 4px">By outcome, last 24 h '+MEAS('24 h','Request log')+'</h4><div class="tw"><table><thead><tr><th>Outcome</th><th class="num">Requests</th><th class="num">Tokens out</th><th class="num">Errors</th></tr></thead><tbody>'+Object.entries(pr).map(([k,v])=>'<tr><td><span class="pill '+(k==='local'?'local':k==='remote'?'remote':k==='held'?'held':k==='rejected-bg'?'reject':'')+'">'+esc(k==='?'?'unclassified':k)+'</span></td><td class="num">'+L.fmtInt(v.requests)+'</td><td class="num">'+L.fmtTok(v.tokens_out)+'</td><td class="num">'+L.fmtInt(v.errors)+'</td></tr>').join('')+'</tbody></table></div>';
+  if(pr)html+='<h4 class="sm" style="margin:14px 0 4px">By outcome, last 24 h '+MEAS('24 h','Request log')+'</h4><div class="tw"><table><thead><tr><th>Outcome</th><th class="num">Requests</th><th class="num">Tokens out</th><th class="num">Errors</th></tr></thead><tbody>'+Object.entries(pr).map(([k,v])=>'<tr><td><span class="pill '+(k==='local'?'local':k==='remote'?'remote':k==='held'?'held':k==='rejected-bg'?'reject':'')+'">'+esc(k==='?'?'unclassified':k)+'</span></td><td class="num">'+L.fmtInt(v.requests)+'</td><td class="num">'+L.fmtTok(v.tokens_out)+(v.tokens_out_lb>0?' <span class="mut" title="includes chunk-count lower bounds where no usage count came back">(~)</span>':'')+'</td><td class="num">'+L.fmtInt(v.errors)+'</td></tr>').join('')+'</tbody></table></div>';
   $('#rt_mix').innerHTML=html;
 });
 let REASON_WIN='1h';
@@ -1473,19 +1473,24 @@ reg('spend',['spend','capacity','config'],()=>{
 
 /* ====================== WORK CLASSES ====================== */
 const CLS_COLOR={kevin:'c1',halo:'c2',runner:'c3',background:'c4'};
+// lane SH (truth in labels): the demand facts are built from the gateway's PRE-ROUTING numbers -- its char-based prompt
+// estimate and the cache model's predicted uncached tokens over the planning prefill rate -- so they are estimates
+// over a measured 5 min window, not measurements. (Request counts per minute ARE counted.)
+const DEMAND_TOK_HELP='Last 5 min: the gateway\'s own estimate of each request\'s prompt (chars per token), not the engine\'s count';
+const DEMAND_PRE_HELP='Last 5 min: uncached prompt tokens PREDICTED by the cache model, divided by the planning prefill rate';
 reg('classes',['capacity','stats','lanes','config','telemetry'],()=>{
   const rows=L.workClassRows(S.cap,S.stats,S.lanes),c=S.cap||{};
   const th=(t,tg)=>'<th class="num">'+t+(tg||'')+'</th>';
   $('#cls_table').innerHTML='<table><thead><tr><th>Class</th>'+th('Priority weight',CONF())+th('Backlog it may leave',CONF('Seconds of uncached prefill this class may leave queued in the engine; 0/none = no limit'))+th('Must start within',CONF())+
     th('Running now',LIVE())+th('Waiting now',LIVE())+th('Oldest wait',LIVE())+th('Expected wait',EST('Backlog and queue ahead, at the planning prefill rate'))+th('Wait typical / slow',MEAS('15 min'))+th('Admitted',MEAS('15 min'))+th('Refused (total)',MEAS('process lifetime'))+
-    th('Asking',MEAS('5 min / 60 min'))+th('Prompt tokens',MEAS('5 min'))+th('Prefill work asked',MEAS('5 min / 60 min'))+'<th>Held because</th></tr></thead><tbody>'+
+    th('Asking',MEAS('5 min / 60 min'))+th('Prompt tokens',EST(DEMAND_TOK_HELP))+th('Prefill work asked',EST(DEMAND_PRE_HELP))+'<th>Held because</th></tr></thead><tbody>'+
     rows.map(r=>'<tr><td class="nowrap"><span class="sw '+CLS_COLOR[r.cls]+'"></span><b>'+esc(r.cls)+'</b></td><td class="num">'+L.fmtNum(r.share,0)+'</td><td class="num">'+(r.ceiling?L.fmtNum(r.ceiling,0)+' s':'no limit')+'</td><td class="num">'+(r.deadline?L.fmtDur(r.deadline):'no deadline')+'</td>'+
       '<td class="num">'+L.fmtInt(r.running)+'</td><td class="num">'+L.fmtInt(r.waiting)+(r.queuedNow?' <span class="mut">('+r.queuedNow+' in lanes feed)</span>':'')+'</td><td class="num">'+L.fmtDur(r.oldest)+'</td><td class="num">'+L.fmtDur(r.expected)+'</td>'+
       '<td class="num">'+L.fmtDur(r.p50)+' / '+L.fmtDur(r.p95)+'</td><td class="num">'+L.fmtInt(r.admitted)+'</td><td class="num">'+L.fmtInt(r.refused)+'</td><td class="num">'+L.fmtNum(r.rpm5,1)+' / '+L.fmtNum(r.rpm60,1)+' req/min</td><td class="num">'+L.fmtTok(r.tokpm5)+' /min</td><td class="num">'+L.fmtNum(r.pre5,1)+' / '+L.fmtNum(r.pre60,1)+' s/min</td>'+
       '<td class="wrapc sm">'+(Object.keys(r.heldBy).length?esc(Object.entries(r.heldBy).map(([k,v])=>v+' × '+k).join(', ')):'<span class="mut">&mdash;</span>')+'</td></tr>').join('')+'</tbody></table>'+
     '<div class="cap">Order of service is kevin &gt; halo &gt; runner &gt; background by weight; a class over its backlog ceiling waits unless it has been starved for '+L.fmtDur(get(S.cfg,['flow_starve_s']))+'. Running now counts requests in the live feed whose class the gateway tagged; untagged: '+L.fmtInt(L.activeByClass(S.lanes)['?'].running)+'.</div>';
   const tot=rows.reduce((a,r)=>a+(r.pre5||0),0),cap60=60;
-  $('#cls_pressure').innerHTML='<h3>Who is asking for the engine '+MEAS('last 5 min')+'</h3><div class="sm dim">Uncached prefill work each class asked for, in seconds of engine time per minute. The engine can do at most 60 s of work per minute.</div>'+
+  $('#cls_pressure').innerHTML='<h3>Who is asking for the engine '+EST(DEMAND_PRE_HELP)+'</h3><div class="sm dim">Uncached prefill work each class asked for, in seconds of engine time per minute. The engine can do at most 60 s of work per minute.</div>'+
     bar(rows.map(r=>({pct:100*(r.pre5||0)/Math.max(cap60,tot),c:CLS_COLOR[r.cls],label:r.cls+' '+L.fmtNum(r.pre5,1)+' s/min'})))+legend(rows.map(r=>[CLS_COLOR[r.cls],esc(r.cls)+' '+L.fmtNum(r.pre5,1)+' s/min']))+
     '<div class="sm" style="margin-top:6px">Total <b>'+L.fmtNum(tot,1)+' s/min</b> of 60 — '+(tot>cap60?st('bad','more than the engine can compute'):tot>0.75*cap60?st('warn','close to capacity'):st('ok','within capacity'))+'</div>';
   const a=c.affinity||{},ct=c.counters||{};
@@ -1640,14 +1645,18 @@ reg('errors',['telemetry'],()=>{
   wirePager('ef','#ef_prev','#ef_next','#ef_page',pg.pages,()=>R.find(x=>x.name==='errors').fn());
 });
 let pcWindow='process';
+// lane SH (L161): input tokens are summed from usage.prompt_tokens where the engine/provider returned it; the gateway's
+// pre-routing estimate fills only the rest, and that part is shown and tagged as an estimate, never as a measurement.
+const TOK_EST_HELP='Prompt tokens the gateway estimated (chars / chars-per-token) because no engine or provider usage count came back';
+const tokIn=c=>c.tokens_in==null?DASH:L.fmtTok(c.tokens_in)+(c.tokens_in_est>0?' <span class="mut" title="'+esc(TOK_EST_HELP)+'">(incl. '+L.fmtTok(c.tokens_in_est)+' est)</span>':'');
 reg('perclient',['telemetry','log24h'],()=>{
   let list;
-  if(pcWindow==='process'){const pc=get(S.telem,['per_client'])||{};list=Object.keys(pc).map(n=>({n,c:pc[n]}));$('#pc_note').innerHTML=MEAS('since this process started')+' cost is an '+EST('Token counts x configured legacy prices');}
-  else{const pc=get(S.hist,['per_client'])||{};list=Object.keys(pc).map(n=>({n,c:{requests:pc[n].requests,local:pc[n].local,remote:pc[n].remote,tokens_out:pc[n].tokens_out,tokens_in:pc[n].tokens_in,errors:pc[n].errors,wait_avg_s:null,ttft_avg_s:null,cost_est_usd:pc[n].remote_cost_usd}}));$('#pc_note').innerHTML=MEAS('24 h','On-disk request log')+' cost is an '+EST('From token counts and configured prices');}
+  if(pcWindow==='process'){const pc=get(S.telem,['per_client'])||{};list=Object.keys(pc).map(n=>({n,c:pc[n]}));$('#pc_note').innerHTML=MEAS('since this process started')+' counts; tokens are engine/provider counts except the parts marked '+EST(TOK_EST_HELP)+'; cost is an '+EST('Token counts x configured legacy prices');}
+  else{const pc=get(S.hist,['per_client'])||{};list=Object.keys(pc).map(n=>({n,c:{requests:pc[n].requests,local:pc[n].local,remote:pc[n].remote,tokens_out:pc[n].tokens_out,tokens_out_lb:pc[n].tokens_out_lb,tokens_in:pc[n].tokens_in,tokens_in_est:pc[n].tokens_in_est,errors:pc[n].errors,wait_avg_s:null,ttft_avg_s:null,cost_est_usd:pc[n].remote_cost_usd}}));$('#pc_note').innerHTML=MEAS('24 h','On-disk request log')+' counts; tokens are engine/provider counts except the parts marked '+EST(TOK_EST_HELP)+'; cost is an '+EST('From token counts and configured prices');}
   list.sort((a,b)=>b.c.requests-a.c.requests);
   const pg=paginate(list,'pc',25);
-  $('#pc_table').innerHTML='<table><thead><tr><th>Client</th><th class="num">Requests</th><th class="num">Local</th><th class="num">Paid</th><th class="num">Tokens out</th><th class="num" title="Average seconds waiting for a free lane">Avg wait</th><th class="num">Avg TTFT</th><th class="num">Errors</th><th class="num">Est. cost</th></tr></thead><tbody>'+
-    (pg.slice.map(x=>{const c=x.c;return '<tr><td><a href="#" data-act="filterclient" data-n="'+esc(x.n)+'">'+clientDisplay(x.n)+'</a></td><td class="num">'+L.fmtInt(c.requests)+'</td><td class="num">'+L.fmtInt(c.local)+'</td><td class="num">'+L.fmtInt(c.remote)+'</td><td class="num">'+L.fmtTok(c.tokens_out)+(c.tokens_out_lb>0?' <span class="mut" title="includes chunk-count lower bounds">(~)</span>':'')+'</td><td class="num">'+(c.wait_avg_s!=null?c.wait_avg_s+' s':DASH)+'</td><td class="num">'+(c.ttft_avg_s!=null?c.ttft_avg_s+' s':DASH)+'</td><td class="num">'+L.fmtInt(c.errors)+'</td><td class="num">'+(c.cost_est_usd?'$'+c.cost_est_usd.toFixed(4):DASH)+'</td></tr>';}).join('')||'<tr><td colspan="9" class="empty">No completed requests in this window yet.</td></tr>')+'</tbody></table>';
+  $('#pc_table').innerHTML='<table><thead><tr><th>Client</th><th class="num">Requests</th><th class="num">Local</th><th class="num">Paid</th><th class="num" title="Prompt tokens: the engine\'s or provider\'s usage count; the gateway\'s own estimate only where no count came back (shown separately)">Tokens in</th><th class="num">Tokens out</th><th class="num" title="Average seconds waiting for a free lane">Avg wait</th><th class="num">Avg TTFT</th><th class="num">Errors</th><th class="num">Est. cost</th></tr></thead><tbody>'+
+    (pg.slice.map(x=>{const c=x.c;return '<tr><td><a href="#" data-act="filterclient" data-n="'+esc(x.n)+'">'+clientDisplay(x.n)+'</a></td><td class="num">'+L.fmtInt(c.requests)+'</td><td class="num">'+L.fmtInt(c.local)+'</td><td class="num">'+L.fmtInt(c.remote)+'</td><td class="num">'+tokIn(c)+'</td><td class="num">'+L.fmtTok(c.tokens_out)+(c.tokens_out_lb>0?' <span class="mut" title="includes chunk-count lower bounds">(~)</span>':'')+'</td><td class="num">'+(c.wait_avg_s!=null?c.wait_avg_s+' s':DASH)+'</td><td class="num">'+(c.ttft_avg_s!=null?c.ttft_avg_s+' s':DASH)+'</td><td class="num">'+L.fmtInt(c.errors)+'</td><td class="num">'+(c.cost_est_usd?'$'+c.cost_est_usd.toFixed(4):DASH)+'</td></tr>';}).join('')||'<tr><td colspan="10" class="empty">No completed requests in this window yet.</td></tr>')+'</tbody></table>';
   wirePager('pc','#pc_prev','#pc_next','#pc_page',pg.pages,()=>R.find(x=>x.name==='perclient').fn());
 });
 

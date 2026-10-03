@@ -1271,7 +1271,8 @@ _ENGINE_METRICS = {"ok": False, "at": 0.0, "err": None, "text": "", "families": 
 _PER_CLIENT = collections.defaultdict(lambda: {
     "requests": 0, "local": 0, "remote": 0, "tokens_out": 0, "tokens_out_exact": 0,
     "tokens_out_lb": 0, "wait_sum": 0.0, "wait_n": 0, "ttft_sum": 0.0, "ttft_n": 0,
-    "errors": 0, "cost_est_usd": 0.0, "classes": collections.Counter()})
+    "errors": 0, "cost_est_usd": 0.0, "classes": collections.Counter(),
+    "tokens_in_exact": 0, "tokens_in_est": 0})        # lane SH (L161): engine/provider count vs gateway estimate
 # lane SH: keyed by the caller-supplied X-Client/X-Title (or IP), so a client that varies its header grew this table
 # -- and the per-client /metrics label set -- without bound. Past CLIENT_KEYS_MAX distinct names, new names share
 # one "(other)" row; existing rows keep counting.
@@ -4177,6 +4178,12 @@ def _telemetry_note_request(info, resp=None):
             c["tokens_out"] += outtok; c["tokens_out_exact"] += outtok
         elif outtok_lb is not None:
             c["tokens_out"] += outtok_lb; c["tokens_out_lb"] += outtok_lb
+        _ptx = (info.get("ptok_exact") if info.get("ptok_exact") is not None
+                else (info.get("ptok_exact_local") if route in ("local", "held") else None))
+        if _ptx is not None:
+            c["tokens_in_exact"] += _ptx
+        else:
+            c["tokens_in_est"] += info.get("ptok") or 0
         c["wait_sum"] += waited; c["wait_n"] += 1
         ttft = info.get("ttft")
         if ttft is not None and route == "remote" and (status is None or status < 400):
@@ -4642,11 +4649,18 @@ def _history_summary_blocking(since_ts, max_files, hard_line_cap=500000):
     now = time.time()
     per_client = collections.defaultdict(lambda: {"requests": 0, "local": 0, "remote": 0,
                                                     "tokens_in": 0, "tokens_out": 0, "errors": 0,
+                                                    # lane SH (L161): tokens_in = exact + est. exact = the engine's
+                                                    # or provider's usage.prompt_tokens (row ptok_exact); est = the
+                                                    # gateway's estimate for rows with no count. tokens_out likewise:
+                                                    # exact usage vs. chunk-count lower bounds.
+                                                    "tokens_in_exact": 0, "tokens_in_est": 0,
+                                                    "tokens_out_exact": 0, "tokens_out_lb": 0,
                                                     "remote_cache_hit_tokens": 0,
                                                     "remote_cache_miss_tokens": 0,
                                                     "remote_cost_usd": 0.0,
                                                     "exact_body_repeats": 0})
-    per_route = collections.defaultdict(lambda: {"requests": 0, "tokens_out": 0, "errors": 0})
+    per_route = collections.defaultdict(lambda: {"requests": 0, "tokens_out": 0, "errors": 0,
+                                                 "tokens_out_exact": 0, "tokens_out_lb": 0})
     remote_by_reason = collections.Counter()      # Lane DB2: why requests went to the paid provider, from the on-disk log
     per_class = collections.defaultdict(lambda: {"requests": 0, "remote": 0})     # work class (flow_class) -> counts
     durations, ttfts = [], []
@@ -4687,14 +4701,21 @@ def _history_summary_blocking(since_ts, max_files, hard_line_cap=500000):
                               or rec.get("reason") == "failover"
                               or rec.get("stream_watchdog"))
                     outtok = rec.get("outtok")
+                    out_exact = outtok is not None
                     if outtok is None:
                         outtok = rec.get("outtok_lb") or 0
+                    ptok_exact = rec.get("ptok_exact")
                     pc = per_client[name]
                     pc["requests"] += 1
                     if route in ("local", "remote"):
                         pc[route] += 1
-                    pc["tokens_in"] += rec.get("ptok") or 0
+                    if ptok_exact is not None:
+                        pc["tokens_in_exact"] += ptok_exact
+                    else:
+                        pc["tokens_in_est"] += rec.get("ptok") or 0
+                    pc["tokens_in"] = pc["tokens_in_exact"] + pc["tokens_in_est"]
                     pc["tokens_out"] += outtok or 0
+                    pc["tokens_out_exact" if out_exact else "tokens_out_lb"] += outtok or 0
                     body_sha = rec.get("request_body_sha256")
                     if body_sha:
                         body_key = (name, body_sha)
@@ -4716,6 +4737,7 @@ def _history_summary_blocking(since_ts, max_files, hard_line_cap=500000):
                     pr = per_route[route]
                     pr["requests"] += 1
                     pr["tokens_out"] += outtok or 0
+                    pr["tokens_out_exact" if out_exact else "tokens_out_lb"] += outtok or 0
                     if is_err:
                         pr["errors"] += 1
                     if rec.get("duration") is not None:
@@ -10067,6 +10089,8 @@ async def gateway_telemetry(request):
             "requests": c["requests"], "local": c["local"], "remote": c["remote"],
             "tokens_out": c["tokens_out"], "tokens_out_exact": c["tokens_out_exact"],
             "tokens_out_lb": c["tokens_out_lb"],
+            "tokens_in": c["tokens_in_exact"] + c["tokens_in_est"], "tokens_in_exact": c["tokens_in_exact"],
+            "tokens_in_est": c["tokens_in_est"],
             "wait_avg_s": round(c["wait_sum"] / c["wait_n"], 2) if c["wait_n"] else None,
             "ttft_avg_s": round(c["ttft_sum"] / c["ttft_n"], 3) if c["ttft_n"] else None,
             "errors": c["errors"], "cost_est_usd": round(c["cost_est_usd"], 4),
