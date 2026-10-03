@@ -25,6 +25,11 @@ export FLASHINFER_ENABLE_AOT=${FLASHINFER_ENABLE_AOT:-1} FLASHINFER_WORKSPACE_BA
 # retired 0.1.x-only knobs: make sure a stale env file cannot leak them into the new tree
 # Model Runner V2 is the 0.2.x default but is 5-6x slower on TurboQuant+hybrid GDN+MTP here (10-15 vs 64-68 tok/s natural text, 2026-10-02); this script defaults to the V1 runner (V02_RUNNER=v2 to override).
 if [ "${V02_RUNNER:-v1}" = "v1" ]; then export VLLM_USE_V2_MODEL_RUNNER=0; fi
+# lane S2 (2026-10-02): grouped sm_75 TurboQuant decode attention (vllm/v1/attention/ops/tq_gqa_ext). The stock Triton TQ decode kernel
+# dequantizes each cached token once per query head x speculative row (24x redundant) and was 81% of GPU time at 12 streams x 28K context.
+# VLLM_TQ_GQA_CUDA=0 restores the stock kernel (instant rollback via v02.override.env). Prebuilt into $V02_ROOT/.deps/tq_gqa_build.
+export VLLM_TQ_GQA_CUDA=${VLLM_TQ_GQA_CUDA:-1}
+export VLLM_TQ_GQA_BUILD_DIR=${VLLM_TQ_GQA_BUILD_DIR:-$V02_ROOT/.deps/tq_gqa_build}
 CC_DEFAULT='{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64],"max_cudagraph_capture_size":64}'
 unset VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK VLLM_PREFIX_CACHE_USE_RETAINED_MTP_BLOCK VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS || true
 SPEC_DEFAULT='{"method":"mtp","num_speculative_tokens":3,"disable_eagle_block_drop":true}'

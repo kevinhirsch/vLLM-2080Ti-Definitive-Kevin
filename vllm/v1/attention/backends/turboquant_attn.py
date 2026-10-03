@@ -65,6 +65,7 @@ from vllm.v1.attention.ops.flydsl_turboquant_decode import (
     is_flydsl_gqa6_available,
 )
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
+from vllm.v1.attention.ops import tq_gqa_cuda as _gqa_cuda
 from vllm.v1.attention.ops.triton_turboquant_decode import (
     _fp8_format_code,
     _tq_full_dequant_kv,
@@ -1900,7 +1901,23 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             )
         prefix_lse = torch.empty(q_len, Hq, dtype=torch.float32, device=query.device)
         prefix_out = torch.empty_like(query)
-        if _TQ_CUDAGRAPH_SPEC_PREFIX_ROWS and not isinstance(cached_len, int):
+        if (
+            _gqa_cuda.enabled()
+            and query.dtype == torch.float16
+            and _gqa_cuda.gqa_eligible(
+                Hq=Hq, Hk=Hk, D=D, mse_bits=self.tq_config.key_mse_bits,
+                value_quant_bits=self.tq_config.effective_value_quant_bits,
+                key_fp8=self.tq_config.key_fp8, key_packed_size=self.tq_config.key_packed_size,
+            )
+        ):
+            # lane S2: all q_len speculative rows share the same cached prefix -> one grouped kernel call
+            # (each cached token dequantized once, scored against q_len * GQA-group rows on tensor cores).
+            _gqa_cuda.tq_gqa_decode_attention(
+                query, kv_cache, safe_block_table, prefix_seq_lens[:1].to(torch.int32), Pi, centroids,
+                self.scale, self.tq_config.norm_correction, q_per_seq=q_len,
+                num_splits=self.max_num_kv_splits, PiT=PiT, output_buf=prefix_out, lse_buf=prefix_lse,
+            )
+        elif _TQ_CUDAGRAPH_SPEC_PREFIX_ROWS and not isinstance(cached_len, int):
             # All MTP candidates attend to the same compressed prefix. On
             # SM75, capture the fixed-width candidates as individual B=1 TQ
             # decodes to avoid the B=4 materialized page-table path. This is

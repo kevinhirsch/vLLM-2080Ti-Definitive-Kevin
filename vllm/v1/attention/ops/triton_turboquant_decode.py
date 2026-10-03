@@ -16,6 +16,7 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops import tq_gqa_cuda as _gqa_cuda
 from vllm.v1.attention.ops.triton_decode_attention import (
     _fwd_kernel_stage2,
 )
@@ -781,6 +782,20 @@ def triton_turboquant_decode_attention(
     block_size = kv_cache.shape[1]
     kv_group_size = Hq // Hk
     device = query.device
+
+    if (
+        _gqa_cuda.enabled()
+        and query.dtype == torch.float16
+        and _gqa_cuda.gqa_eligible(
+            Hq=Hq, Hk=Hk, D=D, mse_bits=mse_bits, value_quant_bits=value_quant_bits,
+            key_fp8=key_fp8, key_packed_size=key_packed_size,
+        )
+    ):
+        # lane S2: grouped sm_75 kernel (dequantizes each cached token once per CTA instead of once per query head)
+        return _gqa_cuda.tq_gqa_decode_attention(
+            query, kv_cache, block_table, seq_lens, Pi, centroids, scale, norm_correction,
+            q_per_seq=1, num_splits=max_num_kv_splits, PiT=PiT, output_buf=output_buf, lse_buf=lse_buf, mid_buf=mid_o_buf,
+        )
 
     cfg = _get_layout(D, mse_bits, value_quant_bits, key_packed_size)
 
