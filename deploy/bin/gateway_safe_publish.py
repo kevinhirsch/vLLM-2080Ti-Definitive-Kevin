@@ -29,6 +29,10 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 SOURCE = HERE / "keepalive-shim.py"
 RUNTIME = Path("/home/kevin/.local/share/vllm-qwen27b/keepalive-shim.py")
+# The dashboard page ships beside the shim (the shim reads it per request from its own directory and falls back to its
+# inline copy when absent), so a page-only change needs no restart.
+DASH_SOURCE = HERE / "gateway_dashboard.html"
+DASH_RUNTIME = RUNTIME.with_name("gateway_dashboard.html")
 TOKEN_FILE = Path("/home/kevin/.local/share/vllm-qwen27b/admin.token")
 DROPIN = REPO / "deploy/systemd/vllm-keepalive-shim.service.d/zz-graceful-stop.conf"
 DROPIN_LIVE = Path("/etc/systemd/system/vllm-keepalive-shim.service.d/zz-graceful-stop.conf")
@@ -83,6 +87,25 @@ def _atomic_write(path: Path, data: bytes, mode: int = 0o755) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _install_dashboard(source_bytes: bytes | None = None) -> dict:
+    """Ship gateway_dashboard.html next to the live shim. Atomic; returns what changed so a failed publish can undo it."""
+    new = DASH_SOURCE.read_bytes() if source_bytes is None else source_bytes
+    old = DASH_RUNTIME.read_bytes() if DASH_RUNTIME.is_file() else None
+    if old == new:
+        return {"dashboard": "current", "previous": old, "changed": False}
+    _atomic_write(DASH_RUNTIME, new, 0o644)
+    return {"dashboard": "installed", "previous": old, "changed": True}
+
+
+def _restore_dashboard(state: dict) -> None:
+    if not state.get("changed"):
+        return
+    if state.get("previous") is None:
+        DASH_RUNTIME.unlink(missing_ok=True)       # first install: the shim falls back to its inline page
+    else:
+        _atomic_write(DASH_RUNTIME, state["previous"], 0o644)
 
 
 def _halo_active_runs() -> list[str]:
@@ -201,11 +224,17 @@ def publish(timeout_s: float = 1500, halo_wait_s: float = 1800) -> dict:
     committed = subprocess.check_output(["git", "show", "HEAD:deploy/bin/keepalive-shim.py"], cwd=REPO)
     if source != committed:
         raise RuntimeError("gateway source differs from committed HEAD")
+    dash = DASH_SOURCE.read_bytes()
+    dash_committed = subprocess.check_output(["git", "show", "HEAD:deploy/bin/gateway_dashboard.html"], cwd=REPO)
+    if dash != dash_committed:
+        raise RuntimeError("dashboard source differs from committed HEAD")
     if not RUNTIME.is_file():
         raise RuntimeError("live gateway file is missing")
     previous = RUNTIME.read_bytes()
     if previous == source:
-        return {"status": "current", "sha256": _sha(source)}
+        # Same gateway code: the page alone may still be new. It is read per request, so no drain or restart is needed.
+        state = _install_dashboard(dash)
+        return {"status": "current", "sha256": _sha(source), "dashboard": state["dashboard"], "dashboard_sha256": _sha(dash)}
     token = os.environ.get("SHIM_ADMIN_TOKEN") or TOKEN_FILE.read_text().strip()
     if _http("/health", token=token).get("http_status") != 200:
         raise RuntimeError("gateway health unreadable")
@@ -219,6 +248,7 @@ def publish(timeout_s: float = 1500, halo_wait_s: float = 1800) -> dict:
     halo_pause = _begin_halo_quiesce(halo_wait_s, timeout_s)
     lease = None
     installed = False
+    dash_state = {"changed": False}
     try:
         _assert_halo_quiesce_live(halo_pause)
         _wait_halo_quiet(halo_wait_s)
@@ -242,6 +272,7 @@ def publish(timeout_s: float = 1500, halo_wait_s: float = 1800) -> dict:
             active = _halo_active_runs()
             if active:
                 raise RuntimeError(f"Halo became active during gateway drain: {active[:6]}")
+            dash_state = _install_dashboard(dash)      # before the restart: the new shim finds its page at once
             _atomic_write(RUNTIME, source)
             installed = True
             _run("sudo", "-n", "systemctl", "restart", SERVICE)
@@ -252,8 +283,8 @@ def publish(timeout_s: float = 1500, halo_wait_s: float = 1800) -> dict:
                 if (health.get("http_status") == 200 and new_spend.get("gateway_sha256") == _sha(source)
                         and new_spend.get("enforce") and new_spend.get("durable")
                         and new_spend.get("attribution_gap_usd", 0) == 0):
-                    return {"status": "published", "sha256": _sha(source),
-                            "backup": str(backup), "spent": new_spend.get("spent")}
+                    return {"status": "published", "sha256": _sha(source), "dashboard": dash_state["dashboard"] if "dashboard" in dash_state else "current",
+                            "dashboard_sha256": _sha(dash), "backup": str(backup), "spent": new_spend.get("spent")}
             except Exception:
                 pass
             time.sleep(1)
@@ -274,7 +305,10 @@ def publish(timeout_s: float = 1500, halo_wait_s: float = 1800) -> dict:
                     raise RuntimeError(
                         f"gateway rollback refused while Halo runs are active: {active[:6]}") from publish_error
                 _atomic_write(RUNTIME, previous)
+                _restore_dashboard(dash_state)
                 _run("sudo", "-n", "systemctl", "restart", SERVICE)
+        else:
+            _restore_dashboard(dash_state)
         raise
     finally:
         if lease:
@@ -294,7 +328,10 @@ def main() -> None:
     args = parser.parse_args()
     if not args.apply:
         print(json.dumps({"status": "preview", "source_sha256": _sha(SOURCE.read_bytes()),
-                          "live_sha256": _sha(RUNTIME.read_bytes())}, sort_keys=True))
+                          "live_sha256": _sha(RUNTIME.read_bytes()),
+                          "dashboard_source_sha256": _sha(DASH_SOURCE.read_bytes()),
+                          "dashboard_live_sha256": _sha(DASH_RUNTIME.read_bytes()) if DASH_RUNTIME.is_file() else None},
+                         sort_keys=True))
         return
     lock_path = Path("/tmp/vllm-gateway-publish.lock")
     with lock_path.open("a+") as lock:
