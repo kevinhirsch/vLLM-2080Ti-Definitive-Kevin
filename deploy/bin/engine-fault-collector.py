@@ -31,8 +31,85 @@ def sh(cmd, timeout=40):
         return f"<{e!r}>"
 
 
+def engine_pids(journal: str) -> set:
+    """S4 2026-10-03: pids of THIS engine boot's process tree (APIServer/EngineCore/Worker_TP*), from the journal itself."""
+    return {int(x) for x in re.findall(r"\bpid=(\d+)", journal)} | {int(x) for x in re.findall(r"serve-active\.sh\[(\d+)\]", journal)}
+
+
+def own_kernel_lines(journal: str, kernel: str) -> str:
+    """Keep only kernel Xid/NVRM lines that belong to the engine's process tree.  Lines of the form `NVRM: Xid (PCI:...): 31, pid=N`
+    with N outside the engine tree come from OTHER GPU processes sharing the cards (concurrent lane experiments) and must not be blamed
+    on the engine (2026-10-03 06:32/06:34: two foreign Xid 31s labelled a planned stop 'cuda-illegal-address').  Without any engine pid in
+    the journal slice we keep everything (old behaviour)."""
+    pids = engine_pids(journal)
+    if not pids:
+        return kernel
+    keep = []
+    for line in kernel.splitlines():
+        m = re.search(r"Xid\s*\(PCI:[^)]*\):\s*\d+,\s*pid=(\d+)", line)
+        if m and int(m.group(1)) not in pids:
+            continue
+        keep.append(line)
+    return "\n".join(keep)
+
+
+def _unitrun():
+    """unitrun.py (lane RL) lives next to this file in the fork and is deployed beside it; absent = live /proc only."""
+    for d in (os.path.dirname(os.path.abspath(__file__)), f"{HOME}/Desktop/vLLM-2080Ti-Definitive/deploy/bin"):
+        p = os.path.join(d, "unitrun.py")
+        if os.path.exists(p):
+            try:
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("unitrun", p)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                return mod
+            except Exception:  # noqa: BLE001
+                return None
+    return None
+
+
+def _xid_ts(line: str):
+    m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)", line or "")
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").timestamp()
+    except ValueError:
+        return None
+
+
+def foreign_xid_owners(journal: str, kernel: str, resolver=None) -> list:
+    """RL (2026-10-03, L106): own_kernel_lines() drops Xids raised by pids outside the engine tree; THIS names who raised
+    them: the systemd unit (and lane) that owned the pid -- live from /proc/<pid>/cgroup, else from the unit pid registry
+    that unitrun.py samples for every lane job (`systemd-run --user --unit=<lane>-<job>`), so a pid that died with its Xid
+    is still attributed. Returns [{pid, unit, lane, job, how, comm, xid, line}] (unit None = not a unit-run job)."""
+    pids = engine_pids(journal)
+    if not pids:
+        return []
+    ur = resolver if resolver is not None else _unitrun()
+    out = []
+    for line in (kernel or "").splitlines():
+        m = re.search(r"Xid\s*\(PCI:[^)]*\):\s*(\d+),\s*pid=(\d+)", line)
+        if not m or int(m.group(2)) in pids:
+            continue
+        pid = int(m.group(2))
+        own = None
+        if ur is not None:
+            try:
+                own = ur.owner_of_pid(pid, _xid_ts(line))
+            except Exception:  # noqa: BLE001
+                own = None
+        name = re.search(r"name=([^,\s]+)", line)
+        out.append({"pid": pid, "xid": int(m.group(1)), "unit": (own or {}).get("unit"), "lane": (own or {}).get("lane"),
+                    "job": (own or {}).get("job"), "how": (own or {}).get("how") or "unattributed",
+                    "comm": (own or {}).get("comm") or (name.group(1) if name else None), "line": line[:240]})
+    return out
+
+
 def classify(journal: str, kernel: str):
     sig, detail = "unknown-exit", ""
+    kernel = own_kernel_lines(journal, kernel)
     if "repeats may not contain negative values" in journal:
         sig = "sched-negative-num-scheduled-tokens"
     elif re.search(r"illegal memory access|cudaErrorIllegalAddress", journal) or re.search(r"Xid.*\b31\b", kernel):
@@ -139,10 +216,11 @@ def emit_event(row, a):
         kind = "observation"
         summ = (f"engine death recorded ({row['kind']} {row['signature']}{' ' + row['detail'] if row.get('detail') else ''})"
                 f"{' [backfilled]' if row.get('reconciled') else ''} at {row['ts']}"
-                f"{'; cause: ' + row['cause'] if row.get('cause') else ''}")
+                f"{'; cause: ' + row['cause'] if row.get('cause') else ''}"
+                f"{'; foreign Xids (not the engine): ' + ', '.join(str(x.get('xid')) + ' pid ' + str(x.get('pid')) + ' unit=' + str(x.get('unit')) for x in row['foreign_xids']) if row.get('foreign_xids') else ''}")
         ea.emit(kind, summ, {"action": "engine-death", **{k: row.get(k) for k in
                 ("kind", "signature", "detail", "uptime_s", "xid_incident", "incident_dir", "wedge", "planned_by",
-                 "planned_reason", "in_flight", "reconciled")}})
+                 "planned_reason", "in_flight", "reconciled", "foreign_xids")}})
     except Exception as e:  # noqa: BLE001
         print("emit_event error", repr(e), file=sys.stderr)
 
@@ -283,6 +361,9 @@ def main():
     xid = nearest_xid_dir(now)
     if xid:
         row["xid_incident"] = xid
+    foreign = foreign_xid_owners(journal, kernel)
+    if foreign:
+        row["foreign_xids"] = foreign      # Xids on the cards that were NOT the engine's, with the owning unit/lane
     if a.cause:
         row["cause"] = a.cause
     if a.reconciled:
