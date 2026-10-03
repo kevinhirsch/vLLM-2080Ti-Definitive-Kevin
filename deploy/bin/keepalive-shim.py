@@ -209,6 +209,12 @@ CHARS_PER_TOK = 3.5
 # Exact tokenisation for routing decisions. See _tokenize_exact().
 EXACT_TOKENS      = _env_flag(os.environ.get("SHIM_EXACT_TOKENS", "1"), True)
 MIN_CHARS_PER_TOK = float(os.environ.get("SHIM_MIN_CHARS_PER_TOK", "2.0"))
+# [L104 / lane A6] _est_tokens used to ignore assistant tool_call name+arguments (and history reasoning) although the chat
+# template renders them: pi undercounts by 2.6K tokens on average, growing with size (exact/estimate 1.06 < 10K -> 1.25 > 60K).
+# SHIM_EST_TOOLCALLS=1 counts them (tool_calls at CHARS_PER_TOK like the tool definitions; reasoning_content only for turns after
+# the last user message, as the Qwen templates keep). Off by default: GW2 measured that exact sizes alone raise threshold flips
+# until the L105 cache-credit fix is live, so flip it together with or after that.
+EST_TOOLCALLS = _env_flag(os.environ.get("SHIM_EST_TOOLCALLS", "0"), False)
 TOKENIZE_TIMEOUT  = float(os.environ.get("SHIM_TOKENIZE_TIMEOUT", "5"))
 # Adaptive first-token deadline: base + est_prompt_tokens/prefill_rate. Big-context prefills
 # legitimately take a while, so this scales with prompt size; a WEDGED backend (accepts the
@@ -602,6 +608,7 @@ _CFG = {
     "SHIM_STREAM_IDLE_TIMEOUT_SECS": ("STREAM_IDLE_TIMEOUT_SECS", float),
     # [GW2 / L100] Lane CR knobs, hot-reloadable so the warm-priority A/B can alternate arms without restarts
     "SHIM_CHAIN_TELEMETRY": ("CHAIN_TELEMETRY", lambda v: _cfg_flag(v)),
+    "SHIM_EST_TOOLCALLS": ("EST_TOOLCALLS", lambda v: _cfg_flag(v)),     # [L104] hot-reloadable with the L105 credit fix
     "SHIM_WARM_PRIORITY": ("WARM_PRIORITY", lambda v: _cfg_flag(v)),
     "SHIM_WARM_PRIORITY_MIN_CREDIT": ("WARM_PRIORITY_MIN_CREDIT", int),
     "SHIM_WARM_PRIORITY_MAX_COMPUTED": ("WARM_PRIORITY_MAX_COMPUTED", int),
@@ -6659,6 +6666,42 @@ def _crash_adaptive_note_local_completion(ptok):
                     "big-prompt local completions", restored, BIG_PROMPT_RESTORE_N)
 
 
+def _history_extra_chars(msgs):
+    """[L104] Characters the chat template renders that `content` does not carry: assistant tool_calls (function name +
+    arguments, string or object) and the reasoning of turns after the last user message (earlier reasoning is dropped by the
+    Qwen templates). Never raises: a malformed history counts what it can."""
+    if not isinstance(msgs, list):
+        return 0
+    last_user = -1
+    for i, m in enumerate(msgs):
+        if isinstance(m, dict) and m.get("role") == "user":
+            last_user = i
+    n = 0
+    for i, m in enumerate(msgs):
+        if not isinstance(m, dict):
+            continue
+        tcs = m.get("tool_calls")
+        for tc in (tcs if isinstance(tcs, list) else []):
+            fn = tc.get("function") if isinstance(tc, dict) else None
+            if not isinstance(fn, dict):
+                continue
+            n += len(fn.get("name") or "") if isinstance(fn.get("name"), str) else 0
+            a = fn.get("arguments")
+            if isinstance(a, str):
+                n += len(a)
+            elif a is not None:
+                try:
+                    n += len(json.dumps(a))
+                except (TypeError, ValueError):
+                    pass
+        if i > last_user:
+            for k in ("reasoning_content", "reasoning"):
+                if isinstance(m.get(k), str):
+                    n += len(m[k])
+                    break
+    return n
+
+
 def _est_tokens(body):
     try:
         j = json.loads(body)
@@ -6684,8 +6727,9 @@ def _est_tokens(body):
     tools = j.get("tools")
     if tools:
         chars += len(json.dumps(tools))
+    extra = _history_extra_chars(msgs) if EST_TOOLCALLS else 0          # [L104] tool_call args + live reasoning
     if not EXACT_TOKENS:
-        return int(chars / CHARS_PER_TOK)
+        return int((chars + extra) / CHARS_PER_TOK)
     # A char count can only ever correspond to FEWER tokens than chars/MIN_CHARS_PER_TOK.
     # If even that pessimistic bound is under every decision threshold, the exact number
     # cannot change any routing decision, so skip the round-trip. This is an optimisation
@@ -6697,6 +6741,8 @@ def _est_tokens(body):
     # only counts message text, not tool schemas
     if exact is not None and tools:
         exact += int(len(json.dumps(tools)) / CHARS_PER_TOK)
+    if exact is not None and extra:
+        exact += int(extra / CHARS_PER_TOK)                   # /tokenize of _prompt_text() saw neither tool_calls nor reasoning
     return exact if exact is not None else int(chars / CHARS_PER_TOK)
 
 

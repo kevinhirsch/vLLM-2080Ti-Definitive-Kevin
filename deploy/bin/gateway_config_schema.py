@@ -191,6 +191,7 @@ _k("SHIM_TINY_EXTRA_LANES", "int", "2", "Extra lanes for tiny calls above the bu
 _k("SHIM_INTERACTIVE_NEVER_OVERFLOW", "int", "1", "Interactive traffic waits for local instead of overflowing (0 = old behaviour).", lo=0, hi=1, gname="INTERACTIVE_NEVER_OVERFLOW", tunable=True, kill=True)
 _k("SHIM_FOREIGN_LOAD_GUARD", "int", "1", "Route away when the engine runs more than the gateway admitted (0 = off).", lo=0, hi=1, gname="FOREIGN_LOAD_GUARD", kill=True)
 _k("SHIM_EXACT_TOKENS", "bool", "1", "Count prompt tokens with the engine tokenizer (0 = char estimate).", gname="EXACT_TOKENS", kill=True)
+_k("SHIM_EST_TOOLCALLS", "bool", "0", "Prompt-size estimate also counts assistant tool_call name+arguments and live-turn reasoning (L104). Flip with or after the L105 cache-credit fix: exact sizes alone raise routing-threshold flips.", gname="EST_TOOLCALLS", tunable=True, kill=True, owner="A6")
 _k("SHIM_MIN_CHARS_PER_TOK", "float", "2.0", "Char/token ratio floor of the estimate.", gname="MIN_CHARS_PER_TOK")
 _k("SHIM_TOKENIZE_TIMEOUT", "float", "5", "Engine /tokenize timeout.", unit="s", gname="TOKENIZE_TIMEOUT")
 _k("SHIM_CRASH_ADAPTIVE", "bool", "0", "Lower BIG_PROMPT after a local crash, restore after clean completions.", gname="CRASH_ADAPTIVE", kill=True)
