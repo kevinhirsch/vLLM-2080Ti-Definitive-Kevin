@@ -613,3 +613,93 @@ class OwnUncached(unittest.TestCase):
         with patch.object(shim, "anchored_credit", lambda chain, est, now=None: (17840, 5.0)):
             self.assertEqual(f({}, 9999, 29000, pm_chain=[(b"k", 1)]), (11160, "anchor"))
         self.assertEqual(f(None, None, None), (0, "model"))
+
+
+class BalanceBreaker(unittest.IsolatedAsyncioTestCase):
+    """L172: a 402 Insufficient Balance is persistent. Measured 2026-10-03: the timer breaker reopened remote at 09:51:58
+    with zero remote 200s while a 5-token probe at 09:55 still got 402."""
+
+    async def asyncSetUp(self):
+        self.reply = (200, {"is_available": False, "balance_infos": [{"currency": "USD", "total_balance": "0.00"}]})
+        self.hits = []
+
+        async def bal(request):
+            self.hits.append(request.headers.get("Authorization", "")[:7])
+            st, body = self.reply
+            return web.json_response(body, status=st) if body is not None else web.Response(status=st)
+
+        app = web.Application()
+        app.router.add_get("/user/balance", bal)
+        self.runner = web.AppRunner(app)
+        await self.runner.setup()
+        site = web.TCPSite(self.runner, "127.0.0.1", 0)
+        await site.start()
+        base = "http://127.0.0.1:%d" % self.runner.addresses[0][1]
+        self._p = [patch.object(shim, "REMOTE_BASE", base + "/v1"), patch.object(shim, "REMOTE_KEY", "sk-test"),
+                   patch.object(shim, "REMOTE_ENABLED", True), patch.object(shim, "LOCAL_ONLY", 0),
+                   patch.dict(shim._REMOTE_BALANCE, {"exhausted": False, "since": None, "detail": None, "count": 0,
+                                                     "probe_at": 0.0, "probes": 0, "probe_status": None, "available": None,
+                                                     "balance": None, "probe_supported": None, "closed_at": None,
+                                                     "closed_by": None}),
+                   patch.object(shim, "_remote_dead_until", 0.0), patch.object(shim, "_remote_dead_count", 0),
+                   patch.object(shim, "_REMOTE_DEAD_PERSIST", False)]
+        for p in self._p:
+            p.start()
+
+    async def asyncTearDown(self):
+        for p in self._p:
+            p.stop()
+        await self.runner.cleanup()
+
+    async def test_402_stays_open_past_the_timer_until_a_probe_shows_balance(self):
+        shim._note_remote_status("https://api.deepseek.com", 402, '{"error":{"message":"Insufficient Balance"}}')
+        self.assertFalse(shim.remote_ok())
+        shim._remote_dead_until = 0.0                          # the old timer has run out...
+        self.assertFalse(shim.remote_ok())                     # ...but the balance breaker has not
+        facts = shim.remote_balance_facts()
+        self.assertTrue(facts["remote_balance_exhausted"])
+        self.assertEqual(facts["kevin_needs"][0]["need"], "top up the remote provider balance")
+        self.assertFalse(await shim.remote_balance_probe())   # still empty
+        self.assertEqual((shim._REMOTE_BALANCE["available"], shim._REMOTE_BALANCE["balance"]), (False, 0.0))
+        self.reply = (200, {"is_available": True, "balance_infos": [{"currency": "USD", "total_balance": "10.00"}]})
+        self.assertTrue(await shim.remote_balance_probe())    # topped up
+        self.assertTrue(shim.remote_ok())
+        self.assertEqual(shim.remote_balance_facts()["kevin_needs"], [])
+        self.assertEqual(self.hits, ["Bearer ", "Bearer "])    # /v1 stripped; key sent, never logged here
+
+    async def test_a_remote_200_closes_it_and_local_status_is_ignored(self):
+        shim._note_remote_status(shim.LOCAL, 402)
+        self.assertFalse(shim._REMOTE_BALANCE["exhausted"])
+        shim._note_remote_status("https://api.deepseek.com", 402)
+        shim._note_remote_status("https://api.deepseek.com", 200)
+        self.assertFalse(shim._REMOTE_BALANCE["exhausted"])
+        self.assertEqual(shim._REMOTE_BALANCE["closed_by"], "remote 200")
+
+    async def test_provider_without_balance_endpoint_falls_back_to_the_timer(self):
+        shim._note_remote_status("https://other", 402)
+        self.reply = (404, None)
+        shim._remote_dead_until = time.time() + 100
+        self.assertFalse(await shim.remote_balance_probe())
+        self.assertIs(shim._REMOTE_BALANCE["probe_supported"], False)
+        shim._remote_dead_until = 0.0
+        self.assertTrue(await shim.remote_balance_probe())
+        self.assertIn("timer", shim._REMOTE_BALANCE["closed_by"])
+
+    async def test_capacity_mode_and_persistence(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td, patch.object(shim, "_REMOTE_DEAD_FILE", os.path.join(td, "rd.json")), \
+                patch.object(shim, "_REMOTE_DEAD_PERSIST", True), patch.object(shim, "_spend_allows_overflow", lambda a, b: True), \
+                patch.dict(shim._health, {"ok": True}):
+            shim._note_remote_status("https://api.deepseek.com", 402, "Insufficient Balance")
+            m = shim.flow_mode_now()
+            self.assertEqual((m["mode"], m["remote_usable"], m["remote_balance_exhausted"]), ("local-only", False, True))
+            self.assertTrue(any("balance exhausted" in w for w in m["why"]))
+            shim._REMOTE_BALANCE["exhausted"] = False           # a restart forgets memory...
+            shim._remote_dead_load()
+            self.assertTrue(shim._REMOTE_BALANCE["exhausted"])  # ...but not the empty balance
+            self.assertEqual(shim._REMOTE_BALANCE["probe_at"], 0.0)   # and probes soon after startup
+
+    def test_balance_parse(self):
+        self.assertEqual(shim._balance_parse({"is_available": True, "balance_infos": [{"total_balance": "1.5"},
+                                                                                      {"total_balance": "x"}]}), (True, 1.5))
+        self.assertIsNone(shim._balance_parse({"error": "no"}))

@@ -640,3 +640,11 @@ def test_remote_health_unreadable_capacity_is_unhealthy(monkeypatch):
     monkeypatch.setattr(wc, "http_json", lambda *a, **k: {"error": "connection refused"})
     ok, why = wc.remote_health(900)
     assert not ok and "unreadable" in why
+def test_refused_while_the_remote_balance_is_exhausted(world, tmp_path):
+    """GW2/L172: with the remote balance empty, an engine window would leave the estate with no serving path."""
+    world.cap.update(remote_balance_exhausted=True)
+    s = wc.Window(spec(tmp_path)).run()
+    assert s["status"] == "refused" and any("balance exhausted" in p for p in s["why"])
+    assert not world.units
+    s = wc.Window(spec(tmp_path, results=str(tmp_path / "r2"), allow_no_remote=True)).run()
+    assert s["status"] != "refused" or not any("balance exhausted" in p for p in s["why"])
