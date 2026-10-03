@@ -24,6 +24,7 @@ gpu_clean_wait() {  # wait up to 600 s for no non-engine GPU compute processes b
 }
 ABORT=0
 boot() {  # boot LABEL EXTRA_LINES...   (override = saved override + extra export lines)
+  [ -n "${WQ_ABORT_FLAG:-}" ] && [ -e "$WQ_ABORT_FLAG" ] && { echo "SKIP: remote valve abort"; ABORT=1; return 1; }
   local lab=$1; shift; cp $L/override.saved $O; for kv in "$@"; do echo "export $kv" >> $O; done
   for p in $(pgrep -f "[w]armup-after-start.sh"); do kill $p; done
   gpu_clean_wait $lab
@@ -43,9 +44,14 @@ boot() {  # boot LABEL EXTRA_LINES...   (override = saved override + extra expor
 }
 measure() {  # measure LABEL
   local lab=$1
+  wq() { [ -n "${WQ_ABORT_FLAG:-}" ] && [ -e "$WQ_ABORT_FLAG" ] && { echo "SKIP: remote valve abort"; ABORT=1; return 1; }; return 0; }
+  wq || return 1
   echo "== $lab cold prefill x3 $(date +%T)"; (cd $S2 && ESTATE_FR=$S2/fr python3 /home/kevin/Desktop/wt-lp/tools/lp/cold_prefill.py 3 $L/cold_$lab.json 2>&1 | tail -4)
+  wq || return 1
   echo "== $lab quick $(date +%T)"; python3 $I/tools/s2-bench/quick.py 2>&1 | tail -1 | tee $L/quick_$lab.json
+  wq || return 1
   echo "== $lab det $(date +%T)"; (cd $S2 && python3 det.py $L/det_$lab.json >/dev/null 2>&1; python3 det.py --cmp det_s4_stack_ref.json $L/det_$lab.json 2>&1 | tail -7)
+  wq || return 1
   echo "== $lab estate 12 bodies prime+3 $(date +%T)"; (cd $S2 && ./w11.sh k9$lab 3 "12:0" >/dev/null 2>&1; python3 analyze_cliff.py k9$lab | cut -c1-160)
 }
 echo "== base = running production engine, MainPID $(systemctl show -p MainPID --value vllm-qwen27b), no restart"; measure base
@@ -53,16 +59,19 @@ if [ "$ABORT" = 1 ]; then echo "SKIP K9 arm: a boot failed or was refused -> str
 else
   boot k9 "V02_ROOT=$K9" "VLLM_K9_GDN_CHUNK=1" "VLLM_K9_GDN_BUILD_DIR=${K9_GDN_BUILD:-/home/kevin/projects/lanes/k9/gdn_build_arm}" && {
     measure k9
-    EL=$(( $(date +%s) - T_START ))
+    EL=$(( $(date +%s) - T_START )); [ -n "${WQ_ABORT_FLAG:-}" ] && [ -e "$WQ_ABORT_FLAG" ] && EL=99999
     if [ $EL -lt 1900 ]; then echo "== k9 evalkit $(date +%T) (elapsed $EL s)"; (cd /home/kevin/Desktop/qwen38-evalkit && timeout $(( 2900 - EL )) python3 run_eval.py --tag k9-gdnchunk --categories tool_call,code_exec,long_ctx 2>&1 | grep -E "passed=False|/60|passed,"); else echo "evalkit skipped (elapsed $EL s): run window (b)"; fi
-    EL=$(( $(date +%s) - T_START ))
+    EL=$(( $(date +%s) - T_START )); [ -n "${WQ_ABORT_FLAG:-}" ] && [ -e "$WQ_ABORT_FLAG" ] && EL=99999
     if [ $EL -lt 2300 ]; then echo "== k9 needle 262K $(date +%T)"; timeout $(( 2950 - EL )) python3 $I/tools/up-bench/needle_long.py --tokens 262000 --depth 0.5 2>&1 | tail -1 | cut -c1-200; else echo "needle skipped: window time budget"; fi
     echo "k9 errors in journal: $(journalctl -u vllm-qwen27b --since '-45 min' --no-pager | grep -cE 'Traceback|CUDA error|illegal memory') OOMwarn=$(journalctl -u vllm-qwen27b --since '-45 min' --no-pager | grep -c 'allocation failed with OOM')"
   }
 fi
-echo "== restore $(date +%T)"; cp $L/override.saved $O; gpu_clean_wait restore
+echo "== restore $(date +%T)"; cp $L/override.saved $O
+if [ -n "${WQ_ABORT_FLAG:-}" ] && [ -e "$WQ_ABORT_FLAG" ]; then echo "SKIP restore boot: remote valve abort (WQ watcher already restored local)"; else
+gpu_clean_wait restore
 PIDR=$(systemctl show -p MainPID --value vllm-qwen27b); echo "restore starts at elapsed $(( $(date +%s) - T_START )) s"; python3 $SD/engine-actuator.py restart --by K9 --reason "K9 window restore" --no-drain --foreground > $L/boot_restore.log 2>&1 &
 sleep 20; t0=$(date +%s); until [ "$(systemctl show -p MainPID --value vllm-qwen27b)" != "$PIDR" ] && curl -s -m 2 -o /dev/null -w "%{http_code}" localhost:8001/health | grep -q 200; do [ $(( $(date +%s) - t0 )) -ge 900 ] && { echo "RESTORE BOOT NOT CONFIRMED (MainPID $PIDR unchanged or unhealthy)"; break; }; sleep 4; done
+fi
 cmp -s $O $L/override.saved && echo "override restored verbatim"
 [ "$WD0" = active ] && sudo -n systemctl start vllm-qwen27b-watchdog.timer; echo "watchdog timer now: $(systemctl is-active vllm-qwen27b-watchdog.timer)"
 echo "restored health $(curl -s -m3 -o /dev/null -w '%{http_code}' localhost:8001/health) KV: $(journalctl -u vllm-qwen27b --since '-10 min' --no-pager | grep -E 'GPU KV cache size' | tail -1 | sed 's/.*INFO//' | cut -c1-80) Xid delta=$(( $(journalctl -k --no-pager | grep -c 'NVRM: Xid') - X0 )) $(date)"
