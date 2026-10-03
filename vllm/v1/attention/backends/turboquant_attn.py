@@ -1629,7 +1629,8 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         prefix_out = torch.empty_like(query)
         _gqa_cuda.tq_gqa_decode_attention(
             query, kv_cache, safe_block_table, cached, Pi, centroids, self.scale,
-            self.tq_config.norm_correction, q_per_seq=ql, num_splits=self.max_num_kv_splits, PiT=PiT,
+            self.tq_config.norm_correction, q_per_seq=ql,
+            num_splits=_k5_tq.num_splits(self.max_num_kv_splits, num_reqs, hk, hq // hk, ql), PiT=PiT,
             output_buf=prefix_out, lse_buf=prefix_lse,
         )
         row_has = has_prefix.view(num_reqs, 1).expand(num_reqs, ql).reshape(rows)

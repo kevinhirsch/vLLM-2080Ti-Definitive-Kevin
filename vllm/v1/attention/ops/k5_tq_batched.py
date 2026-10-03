@@ -28,6 +28,25 @@ def enabled() -> bool:
     return _ENABLED
 
 
+# Optional: size the GQA KV-split count by batch instead of a fixed 128.  stage1 writes and stage2 re-reads an fp32
+# scratch of rows x Hq x splits x (D+1); at 12 requests x 4 rows that is 75 MB per layer call, which dominates short
+# contexts.  With VLLM_K5_TQ_CTA_TARGET=T the split count becomes ceil(T / (S * Hk * row-groups)) clamped to
+# [VLLM_K5_TQ_MIN_SPLITS, max_splits], i.e. about T CTAs per call whatever the batch.  The grid stays a function of the
+# batch shape only (graph-safe).  Unset = the configured max_num_kv_splits (stock behaviour).
+_CTA_TARGET = int(os.getenv("VLLM_K5_TQ_CTA_TARGET", "0"))
+_MIN_SPLITS = int(os.getenv("VLLM_K5_TQ_MIN_SPLITS", "4"))
+
+
+def num_splits(max_splits: int, num_seqs: int, hk: int, group: int, q_per_seq: int, cta_target: int | None = None) -> int:
+    target = _CTA_TARGET if cta_target is None else cta_target
+    if target <= 0:
+        return max_splits
+    qs = max(1, min(q_per_seq, 16 // max(group, 1)))
+    row_groups = (q_per_seq + qs - 1) // qs
+    per_split = max(1, num_seqs * hk * row_groups)
+    return max(min(_MIN_SPLITS, max_splits), min(max_splits, (target + per_split - 1) // per_split))
+
+
 @triton.jit
 def _k5_merge_batched_kernel(
     Q_ptr, K_ptr, V_ptr, Prefix_out_ptr, Prefix_lse_ptr, Out_ptr,

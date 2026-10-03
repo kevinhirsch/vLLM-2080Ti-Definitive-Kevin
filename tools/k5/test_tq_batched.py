@@ -60,8 +60,9 @@ def make(N, ctx):
     return q, kc, vc, kv, md
 
 
-def call(on, args):
+def call(on, args, cta=0):
     k5._ENABLED = on
+    k5._CTA_TARGET = cta
     q, kc, vc, kv, md = args
     return run(q, kc, vc, kv, md, H, cent, H)
 
@@ -104,8 +105,18 @@ for N, ctx_each in ((1, 2000), (4, 2000), (12, 2000), (4, 28000), (12, 8000)):
     ok &= good
     t_loop = gtime(lambda: call(False, args))
     t_bat = gtime(lambda: call(True, args))
+    # adaptive split count (VLLM_K5_TQ_CTA_TARGET): different split partition -> fp32 merge order differs, so tolerance
+    ada = {}
+    for cta in (272, 544, 1088):
+        y = call(True, args, cta)
+        torch.cuda.synchronize()
+        da = (ref.float() - y.float()).abs().max().item()
+        ok_a = (not bool(torch.isnan(y).any())) and da <= 2e-3
+        ada[cta] = dict(splits=k5.num_splits(impl.max_num_kv_splits, N, HK, HQ // HK, QL, cta), maxabs=da,
+                        us=round(gtime(lambda: call(True, args, cta)), 1), pass_=ok_a)
     row = dict(N=N, ctx=ctx_each, maxabs=diff, bitwise=bool(diff == 0.0), nan=nan, loop_us=round(t_loop, 1),
-               batched_us=round(t_bat, 1), saved_us_per_step_16_layers=round(16 * (t_loop - t_bat), 1), pass_=good)
+               batched_us=round(t_bat, 1), saved_us_per_step_16_layers=round(16 * (t_loop - t_bat), 1), pass_=good,
+               adaptive=ada)
     res["cases"].append(row)
     print(row, flush=True)
     del args

@@ -61,6 +61,12 @@ echo "kernel test pass=$KPASS variant=$VAR"
 ( . $L/envbuild.sh; cd $K5 && CUDA_VISIBLE_DEVICES=1 VLLM_TQ_GQA_CUDA=1 VLLM_TQ_GQA_BUILD_DIR=$K5/.deps/tq_gqa_build PYTHONPATH=$K5 timeout 600 python tools/k5/test_tq_batched.py ) 2>&1 | grep -vE "^W1003|warn" | tail -8
 TPASS=$(python3 -c "import json;print(json.load(open('$L/test_tq_batched.json'))['pass'])" 2>/dev/null || echo False)
 TQ_ON=0; [ "$TPASS" = "True" ] && TQ_ON=1
+# adaptive split target: the fastest passing target at N=12 x 2K (0 = stock 128 splits)
+CTA=$(python3 -c "
+import json;c=[r for r in json.load(open('$L/test_tq_batched.json'))['cases'] if r['N']==12 and r['ctx']==2000][0]
+ok={int(k):v for k,v in c.get('adaptive',{}).items() if v['pass_'] and v['us']<c['batched_us']}
+print(min(ok,key=lambda k:ok[k]['us']) if ok else 0)" 2>/dev/null || echo 0)
+echo "adaptive split CTA target=$CTA"
 echo "tq batched test pass=$TPASS -> VLLM_K5_TQ_BATCHED=$TQ_ON"
 # 2. BASE arm
 ABORT=0
@@ -68,7 +74,7 @@ boot base "$(prof_extra $L/win/prof_base)" && measure base
 # 3. K5 arm (only if the kernel test passed)
 if [ "$ABORT" = 1 ]; then echo "SKIP K5 arm: a boot failed or was refused -> straight to restore"
 elif [ "$KPASS" = "True" ]; then
-  boot k5 "$(prof_extra $L/win/prof_k5)" "V02_ROOT=$K5" "VLLM_K5_GDN_FUSED=1" "VLLM_K5_GDN_VARIANT=$VAR" "VLLM_K5_TQ_BATCHED=$TQ_ON" "VLLM_K5_GDN_BUILD_DIR=$L/ext" && {
+  boot k5 "$(prof_extra $L/win/prof_k5)" "V02_ROOT=$K5" "VLLM_K5_GDN_FUSED=1" "VLLM_K5_GDN_VARIANT=$VAR" "VLLM_K5_TQ_BATCHED=$TQ_ON" "VLLM_K5_TQ_CTA_TARGET=$CTA" "VLLM_K5_GDN_BUILD_DIR=$L/ext" && {
     journalctl -u vllm-qwen27b --since '-15 min' --no-pager | grep -iE "k5|gdn_mtp" | tail -3
     measure k5
     echo "== k5 evalkit $(date +%T)"; (cd /home/kevin/Desktop/qwen38-evalkit && timeout 1500 python3 run_eval.py --tag k5-gdnfused --categories tool_call,code_exec,long_ctx 2>&1 | grep -E "passed=False|/60")
