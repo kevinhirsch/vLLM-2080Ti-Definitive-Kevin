@@ -156,6 +156,20 @@ def _load_gateway_module(fname, modname, required=True):
         return None
 
 
+def _include_gateway_part(fname):
+    """Lane SH: execute a gateway_part_*.py file INSIDE this module's own namespace, at the point of the call -- a
+    pure file split of this shim (see gateway_parts.py). Required: a missing or broken part stops the gateway at
+    startup (gateway_safe_publish ships every part and verifies its sha256 via GET /gateway/modules)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), fname)
+    rec = _GATEWAY_MODULES_LOADED[fname] = {"sha256": None, "loaded": False, "required": True, "error": None,
+                                            "kind": "part"}
+    with open(path, "rb") as fh:
+        data = fh.read()
+    rec["sha256"] = hashlib.sha256(data).hexdigest()
+    exec(compile(data, path, "exec"), globals())
+    rec["loaded"] = True
+
+
 def _load_cfg_schema():
     try:
         _mod = _load_gateway_module("gateway_config_schema.py", "gateway_config_schema", required=False)
