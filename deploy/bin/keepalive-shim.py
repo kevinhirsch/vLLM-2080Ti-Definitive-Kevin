@@ -28,6 +28,7 @@ NEVER manages the vLLM process (that's vllm-qwen27b.service + its watchdog).
 """
 import asyncio, os, sys, json, time, logging, collections, subprocess, re, hmac, math, hashlib
 import fcntl
+import threading
 import copy
 import datetime
 import urllib.request
@@ -570,6 +571,9 @@ _CFG = {
     "SHIM_REASONING_CHARS_PER_TOKEN": ("REASONING_CHARS_PER_TOKEN", float),
     "SHIM_THINK_BUDGET_EXPLICIT": ("THINK_BUDGET_EXPLICIT", int),
     "SHIM_CREDIT_ANCHOR": ("CREDIT_ANCHOR", lambda v: str(v).strip().lower()),
+    "SHIM_CREDIT_PROBE": ("CREDIT_PROBE", lambda v: str(v).strip().lower()),
+    "SHIM_CREDIT_PROBE_TIMEOUT_S": ("CREDIT_PROBE_TIMEOUT_S", float),
+    "SHIM_CREDIT_PROBE_MIN_TOKENS": ("CREDIT_PROBE_MIN_TOKENS", int),
     # LOCAL-FIRST (L1, 2026-09-25) -- see the block after STREAM_IDLE_TIMEOUT_SECS below.
     "SHIM_LOCAL_FIRST":      ("LOCAL_FIRST", lambda v: str(v).lower() not in ("0", "false", "off", "")),
     "SHIM_LOCAL_FIRST_REASONS": ("LOCAL_FIRST_REASONS", lambda v: _parse_reason_set(v)),
@@ -709,6 +713,15 @@ THINK_BUDGET_EXPLICIT = int(os.environ.get("SHIM_THINK_BUDGET_EXPLICIT", "0"))
 # own usage.prompt_tokens of the finished local request, and logs pm_credit_anchored = that exact prefix rounded down to
 # the engine's cache block for the next turn of the chain. Routing still uses pm_credit; the log sizes the switch.
 CREDIT_ANCHOR = os.environ.get("SHIM_CREDIT_ANCHOR", "off").strip().lower()
+# [LANE GW2 / L105] Engine-reported cache credit. With the engine booted with VLLM_FORK_PREFIX_PROBE=1 (fork branch
+# lane-gw2-engine), POST /v1/fork/prefix_cache_probe answers from the engine's own block table: exact prompt_tokens
+# (same render as /tokenize) and the prefix-cache hit an admission would get right now.
+#  SHIM_CREDIT_PROBE=off|shadow|live   shadow logs pm_credit_probe beside pm_credit; live routes on it (credit and
+#      uncached computed = probe prompt_tokens - cached), falling back to the anchored credit (SHIM_CREDIT_ANCHOR=live)
+#      and then to the model. A probe that is late, fails or is absent never delays routing past the timeout.
+CREDIT_PROBE = os.environ.get("SHIM_CREDIT_PROBE", "off").strip().lower()
+CREDIT_PROBE_TIMEOUT_S = float(os.environ.get("SHIM_CREDIT_PROBE_TIMEOUT_S", "0.3"))
+CREDIT_PROBE_MIN_TOKENS = int(os.environ.get("SHIM_CREDIT_PROBE_MIN_TOKENS", "4096"))
 
 # ---------------- LOCAL-FIRST overflow policy (L1, 2026-09-25) ----------------
 # Kevin 2026-09-25: "Is the GPU being used? Otherwise ... we're wasting money and/or time
@@ -3959,7 +3972,7 @@ def _telemetry_note_request(info, resp=None):
                         name, est_computed, computed_actual, computed_actual / max(1, est_computed))
             _MISESTIMATE_FEED.appendleft({"t": round(now, 1), "client": name,
                                           "est_computed": est_computed, "computed_actual": computed_actual})
-        if CREDIT_ANCHOR != "off" and route in ("local", "held") and info.get("ptok_exact_local"):
+        if (CREDIT_ANCHOR != "off" or CREDIT_PROBE != "off") and route in ("local", "held") and info.get("ptok_exact_local"):
             try:
                 _anchor_note((_PM_INFLIGHT.get(info.get("pm_ref")) or {}).get("chain") or [], info["ptok_exact_local"], now)
             except Exception:
@@ -4055,8 +4068,11 @@ def _telemetry_note_request(info, resp=None):
             "computed_actual": info.get("computed_actual"),
             "cached_actual": info.get("cached_actual"),
             "pm_credit": info.get("pm_credit"), "pm_age_s": info.get("pm_age_s"),
-            **({"pm_credit_anchored": info.get("pm_credit_anchored"), "pm_anchor_age_s": info.get("pm_anchor_age_s")}
-               if CREDIT_ANCHOR != "off" else {}),
+            **({"pm_credit_anchored": info.get("pm_credit_anchored"), "pm_anchor_age_s": info.get("pm_anchor_age_s"),
+                "pm_credit_probe": info.get("pm_credit_probe"), "probe_prompt_tokens": info.get("probe_prompt_tokens"),
+                "probe_ms": info.get("probe_ms"), "credit_source": info.get("credit_source"),
+                "pm_credit_model": info.get("pm_credit_model")}
+               if (CREDIT_ANCHOR != "off" or CREDIT_PROBE != "off") else {}),
             "flow_class": info.get("flow_class"), "flow_expected_wait": info.get("flow_expected_wait_s"),
             "flow_held": info.get("flow_held"), "flow_adjacent": info.get("flow_adjacent"),
             **({"chain_prev_route": info.get("chain_prev_route"), "chain_prev_age_s": info.get("chain_prev_age_s"),
@@ -6250,6 +6266,20 @@ def _prompt_text(j):
 
 
 _tok_fail_until = 0.0
+_TOK_MEMO = collections.OrderedDict()          # [GW2] sha1(prompt text) -> engine token count (bounded LRU)
+_TOK_STATS = collections.Counter()
+_TOK_LOCK = threading.Lock()                   # the warm step runs on a worker thread
+
+
+async def _warm_token_estimate(body):
+    """[GW2] Run this request's one /tokenize call on a worker thread BEFORE routing, so the ~7 synchronous
+    _est_tokens() calls on the routing path all hit the memo instead of blocking the event loop."""
+    if not EXACT_TOKENS:
+        return
+    try:
+        await asyncio.get_running_loop().run_in_executor(None, _est_tokens, body)
+    except Exception:
+        pass
 
 def _tokenize_exact(text):
     """Ask the engine for the REAL token count instead of guessing chars/3.5.
@@ -6262,15 +6292,38 @@ def _tokenize_exact(text):
     Falls back to the estimate (and stops trying for a minute) if the endpoint misbehaves,
     so routing never depends on it being up."""
     global _tok_fail_until
+    # [GW2 2026-10-03] Memoised: _est_tokens runs ~7 times per request (registration, size cap, tiny lane, units,
+    # flow class, route...) and each call was a SYNCHRONOUS /tokenize round trip on the gateway's event loop (10 ms
+    # small, 140-270 ms for a 34K-token prompt) -- measured 4,456 /tokenize calls for 642 requests in 15 min. Every
+    # one of those blocked every other stream the gateway was relaying. Same text -> same count, so one call each.
+    key = hashlib.sha1(text.encode("utf-8", "surrogatepass")).digest()
+    with _TOK_LOCK:
+        hit = _TOK_MEMO.get(key)
+        if hit is not None:
+            _TOK_MEMO.move_to_end(key)
+            _TOK_STATS["memo_hits"] += 1
+            return hit
     if time.time() < _tok_fail_until:
         return None
     try:
+        t0 = time.perf_counter()
         req = urllib.request.Request(
             LOCAL.rstrip("/") + "/tokenize",
             json.dumps({"model": _local_model_name(), "prompt": text}).encode(),
             {"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=TOKENIZE_TIMEOUT) as r:
-            return int(json.load(r).get("count"))
+            n = int(json.load(r).get("count"))
+        dt = time.perf_counter() - t0
+        _TOK_STATS["calls"] += 1
+        _TOK_STATS["ms_sum"] += dt * 1000
+        if threading.current_thread() is threading.main_thread():
+            _TOK_STATS["calls_on_loop"] += 1          # a call the warm step did not pre-empt (blocked the loop)
+            _TOK_STATS["ms_on_loop"] += dt * 1000
+        with _TOK_LOCK:
+            _TOK_MEMO[key] = n
+            while len(_TOK_MEMO) > 512:
+                _TOK_MEMO.popitem(last=False)
+        return n
     except Exception as e:
         _tok_fail_until = time.time() + 60
         log.warning("tokenize failed (%s) -> falling back to estimate for 60s", str(e)[:80])
@@ -6419,6 +6472,109 @@ def anchored_credit(chain, est, now=None):
             a = max(1, PREFIX_CREDIT_UNIT if PREFIX_CREDIT_UNIT > 0 else prefix_align_tokens())
             return max(0, min((node[0] // a) * a, int(est or 0) - 1)), now - node[1]
     return 0, None
+
+
+_PROBE = {"disabled_until": 0.0, "why": None, "session": None}
+_PROBE_STATS = collections.Counter()
+_PROBE_LAT = collections.deque(maxlen=1000)
+_PROBE_ERR = collections.deque(maxlen=2000)     # (model credit, probe cached, anchored credit) -- the replay record
+
+
+def _probe_session():
+    s = _PROBE.get("session")
+    if s is None or s.closed:
+        s = _PROBE["session"] = aiohttp.ClientSession()
+    return s
+
+
+async def credit_probe(body, now=None):
+    """(cached_tokens, prompt_tokens, ms) from the engine's prefix-cache probe, or None (late, failed, absent,
+    disabled). Never raises and never waits past CREDIT_PROBE_TIMEOUT_S. An engine without the endpoint (404) or
+    with it switched off backs the probe off for 10 minutes instead of paying the timeout on every request."""
+    now = time.time() if now is None else now
+    if now < _PROBE["disabled_until"]:
+        _PROBE_STATS["skipped_backoff"] += 1
+        return None
+    try:
+        j = json.loads(body)
+        payload = {"model": _local_model_name(), "messages": j["messages"]}
+        for k in ("tools", "chat_template_kwargs", "add_generation_prompt", "continue_final_message"):
+            if j.get(k) is not None:
+                payload[k] = j[k]
+    except Exception:
+        _PROBE_STATS["unprobeable"] += 1
+        return None
+    t0 = time.perf_counter()
+    try:
+        async with _probe_session().post(LOCAL.rstrip("/") + "/v1/fork/prefix_cache_probe", json=payload,
+                                         timeout=aiohttp.ClientTimeout(total=CREDIT_PROBE_TIMEOUT_S)) as r:
+            if r.status == 404:
+                _PROBE.update(disabled_until=now + 600, why="endpoint absent (engine without VLLM_FORK_PREFIX_PROBE=1)")
+                _PROBE_STATS["absent"] += 1
+                return None
+            if r.status != 200:
+                _PROBE_STATS["http_%d" % r.status] += 1
+                return None
+            d = await r.json()
+    except asyncio.TimeoutError:
+        _PROBE_STATS["timeout"] += 1
+        return None
+    except Exception as e:
+        _PROBE.update(disabled_until=now + 30, why="error: %s" % str(e)[:80])
+        _PROBE_STATS["error"] += 1
+        return None
+    if not d.get("enabled"):
+        _PROBE.update(disabled_until=now + 600, why="engine reports the probe disabled")
+        _PROBE_STATS["disabled"] += 1
+        return None
+    ms = (time.perf_counter() - t0) * 1000
+    _PROBE_STATS["ok"] += 1
+    _PROBE_LAT.append(ms)
+    _PROBE.update(why=None)
+    return int(d.get("cached_tokens") or 0), int(d.get("prompt_tokens") or 0), ms
+
+
+async def _credit_sources(request, pm, body, ptok):
+    """Shadow-log (and in live mode apply) the engine-reported / engine-anchored credit for this request.
+    Mutates pm["credit"] / pm["computed"] only in live mode. Returns the credit source used for routing."""
+    model_credit = int(pm.get("credit") or 0)
+    src = "model"
+    anch = None
+    if CREDIT_ANCHOR != "off":
+        try:
+            anch, _aa = anchored_credit(pm["chain"], ptok)
+            _active_set(request, pm_credit_anchored=anch, pm_anchor_age_s=None if _aa is None else round(_aa, 1))
+            if _aa is None:
+                anch = None
+        except Exception:
+            anch = None
+    pr = None
+    if CREDIT_PROBE in ("shadow", "live") and ptok >= CREDIT_PROBE_MIN_TOKENS and not _local_offline():
+        pr = await credit_probe(body)
+        if pr is not None:
+            _active_set(request, pm_credit_probe=pr[0], probe_prompt_tokens=pr[1], probe_ms=round(pr[2], 1))
+            _PROBE_ERR.append((model_credit, pr[0], anch))
+    if CREDIT_PROBE == "live" and pr is not None:
+        pm["credit"], pm["computed"], src = pr[0], max(1, pr[1] - pr[0]), "probe"
+    elif CREDIT_ANCHOR == "live" and anch:
+        pm["credit"], pm["computed"], src = anch, max(1, int(pm.get("est") or ptok) - anch), "anchor"
+    if src != "model":
+        _active_set(request, pm_credit_model=model_credit)
+    _active_set(request, credit_source=src)
+    return src
+
+
+def _credit_probe_summary():
+    lat = sorted(_PROBE_LAT)
+    n = len(lat)
+    errs = list(_PROBE_ERR)
+    return {"mode": CREDIT_PROBE, "anchor_mode": CREDIT_ANCHOR, "timeout_s": CREDIT_PROBE_TIMEOUT_S,
+            "min_tokens": CREDIT_PROBE_MIN_TOKENS, "stats": dict(_PROBE_STATS),
+            "backoff_s": max(0, round(_PROBE["disabled_until"] - time.time())), "why": _PROBE["why"],
+            "latency_ms": {"n": n, "p50": round(lat[n // 2], 1) if n else None,
+                           "p95": round(lat[min(n - 1, int(n * 0.95))], 1) if n else None},
+            "model_minus_probe": _err_dist([(m, p) for m, p, _ in errs]),
+            "anchor_minus_probe": _err_dist([(a, p) for _, p, a in errs if a is not None])}
 
 
 def warm_continuation(pm):
@@ -8374,6 +8530,7 @@ def _with_stream_usage(relay_body):
 async def handle_completions(request):
     """Register the request as live work for the dashboard, then run the router (below)."""
     body = await request.read()          # aiohttp caches the body; the router re-reads it for free
+    await _warm_token_estimate(body)     # [GW2] the one /tokenize round trip, off the event loop
     # Check after the await and before _ACTIVE registration, with no await in
     # between. The drain endpoint runs on this same event loop: every request
     # accepted before its fence is visible to the deployer, and every later
@@ -8515,6 +8672,11 @@ async def _route_completions(request, _no_overflow=False):
     except Exception:
         _pm_body = body          # malformed request: it is rejected further down; just don't crash here
     _pm = _pm_predict(_pm_body, ptok)
+    if CREDIT_ANCHOR != "off" or CREDIT_PROBE != "off":
+        try:
+            await _credit_sources(request, _pm, _pm_body, ptok)     # [GW2 / L105] engine-reported credit
+        except Exception:
+            pass
     est_computed = _pm["computed"]
     units = estimate_units(body, client=client, computed=est_computed)
     # The chain holds raw digests (not JSON-serialisable), so it lives in a side table keyed by the
@@ -8527,12 +8689,6 @@ async def _route_completions(request, _no_overflow=False):
             _cr_route, _cr_age, _ = _chain_route_lookup(_pm["chain"])
             _active_set(request, chain_prev_route=_cr_route,
                         chain_prev_age_s=None if _cr_age is None else round(_cr_age, 1), pm_match_tok=_pm.get("matched"))
-        except Exception:
-            pass
-    if CREDIT_ANCHOR in ("shadow",):
-        try:
-            _ac, _aa = anchored_credit(_pm["chain"], ptok)
-            _active_set(request, pm_credit_anchored=_ac, pm_anchor_age_s=None if _aa is None else round(_aa, 1))
         except Exception:
             pass
     _cr_warm = warm_continuation(_pm)
@@ -9360,6 +9516,8 @@ async def gateway_stats(request):
         "cache_model": _pm_summary(),
         "response_shape": _shape_stats_summary(),      # [GW2 / L94+L95]
         "estimate_error": _est_err_summary(),          # [GW2] gateway prompt/computed estimate vs engine usage
+        "credit_probe": _credit_probe_summary(),       # [GW2 / L105] engine-reported cache credit
+        "tokenize": dict(_TOK_STATS, memo_size=len(_TOK_MEMO)),   # [GW2] /tokenize calls, memo hits, loop-blocking ms
         "inflight_reserved_tokens": _inflight_reserved_tokens,
         "halo_control_lane_limit": admission_lane_limit(
             False, effective_budget(), FG_RESERVED, halo_control=True,
