@@ -427,7 +427,7 @@ REP_MIN_PATTERN = int(os.environ.get("SHIM_REP_MIN_PATTERN", "8"))
 REP_MAX_PATTERN = int(os.environ.get("SHIM_REP_MAX_PATTERN", "64"))
 REP_MIN_COUNT   = int(os.environ.get("SHIM_REP_MIN_COUNT", "6"))
 # [LANE RA / L143] cross-turn identical tool-call loop note (see repeated_tool_call_note()).
-REPEAT_NOTE     = os.environ.get("SHIM_REPEAT_NOTE", "1") not in ("0", "false", "")
+REPEAT_NOTE     = _env_flag(os.environ.get("SHIM_REPEAT_NOTE", "1"), True)
 REPEAT_NOTE_MIN = int(os.environ.get("SHIM_REPEAT_NOTE_MIN", "3"))
 THINK_BUDGET_FRAC = float(os.environ.get("SHIM_THINK_BUDGET_FRAC", "0.5"))
 THINK_BUDGET_MIN  = int(os.environ.get("SHIM_THINK_BUDGET_MIN", "128"))
@@ -576,7 +576,7 @@ _CFG = {
     "SHIM_REP_MIN_PATTERN":  ("REP_MIN_PATTERN", int),
     "SHIM_REP_MAX_PATTERN":  ("REP_MAX_PATTERN", int),
     "SHIM_REP_MIN_COUNT":    ("REP_MIN_COUNT", int),
-    "SHIM_REPEAT_NOTE":      ("REPEAT_NOTE",  lambda v: str(v).lower() not in ("0","false","")),
+    "SHIM_REPEAT_NOTE":      ("REPEAT_NOTE",  lambda v: _cfg_flag(v)),
     "SHIM_REPEAT_NOTE_MIN":  ("REPEAT_NOTE_MIN", int),
     "SHIM_THINK_BUDGET_FRAC":("THINK_BUDGET_FRAC", float),
     "SHIM_THINK_BUDGET_MIN": ("THINK_BUDGET_MIN", int),
