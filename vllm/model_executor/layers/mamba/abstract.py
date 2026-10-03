@@ -15,6 +15,20 @@ from vllm.v1.attention.selector import get_mamba_attn_backend
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 
+def _gdn_fine_grained_tail_ok(layer) -> bool:
+    """[FORK][LANE CR] True only for GDN layers with VLLM_GDN_TAIL_PUBLISH=copy."""
+    from vllm.v1.core.single_type_kv_cache_manager import eager_tail_publish_enabled
+
+    if not eager_tail_publish_enabled():
+        return False
+    try:
+        from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+
+        return getattr(layer, "mamba_type", None) == MambaAttentionBackendEnum.GDN_ATTN
+    except Exception:
+        return False
+
+
 class MambaBase(AttentionLayerBase):
     """
     Base class for Mamba-like layers which support the v1 engine.
@@ -86,8 +100,13 @@ class MambaBase(AttentionLayerBase):
             # Concrete backends with an internal checkpoint exporter must opt
             # in when extending this spec (for example KDA/FlashKDA).
             supports_prefill_checkpoint=False,
-            supports_fine_grained_prefix_cache=False,
+            # [FORK][LANE CR] GDN may opt in to sub-block (prompt-tail) reuse
+            # only with copy-based tail publication (VLLM_GDN_TAIL_PUBLISH=copy),
+            # which never advertises a state no kernel wrote (weicj #240/#241).
+            supports_fine_grained_prefix_cache=_gdn_fine_grained_tail_ok(self),
         )
+
+
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         """Get the attention backend class for this Mamba layer."""
