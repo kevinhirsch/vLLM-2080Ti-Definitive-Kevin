@@ -33,6 +33,7 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.layers.mamba.gdn import gdn_sm75_cuda as _k5_gdn
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -1207,6 +1208,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
         ba, _ = self.in_proj_ba(hidden_states)
 
+        if _k5_gdn.enabled() and self._k5_spec_decode(mixed_qkvz, ba, output):
+            return
+
         use_fused_gdn_decode = (
             self.enable_fused_gdn_decode
             and hidden_states.dtype == torch.bfloat16
@@ -1268,6 +1272,109 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # Part 3: Output Projection
         # ============================================================
         output.copy_(self._output_projection(core_attn_out, z))
+
+    def _k5_spec_decode(
+        self,
+        mixed_qkvz: torch.Tensor,
+        ba: torch.Tensor,
+        output: torch.Tensor,
+    ) -> bool:
+        """Lane K5: pure spec-decode batch on fp16/sm_75 -> conv1d update + ONE fused kernel
+        (l2norm, gating, delta-rule state update per MTP position, RMSNormGated) + out_proj.
+        Returns False (caller runs the stock path) for anything it does not cover."""
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return False
+        md = attn_metadata.get(self.prefix)
+        if not isinstance(md, GDNAttentionMetadata):
+            return False
+        sidx = md.spec_state_indices_tensor
+        if (
+            md.spec_sequence_masks is None
+            or md.num_prefills > 0
+            or md.num_decodes > 0
+            or md.num_spec_decodes <= 0
+            or sidx is None
+            or sidx.dim() != 2
+            or sidx.size(1) > 8
+            or not sidx[: md.num_spec_decodes].is_contiguous()
+            or md.num_accepted_tokens is None
+            or md.spec_query_start_loc is None
+        ):
+            return False
+        ssm_state = self.kv_cache[1]
+        if (
+            self.A_log.dtype != torch.float32
+            or not _k5_gdn.eligible(
+                head_k_dim=self.head_k_dim,
+                head_v_dim=self.head_v_dim,
+                num_k_heads=self.num_k_heads // self.tp_size,
+                num_v_heads=self.num_v_heads // self.tp_size,
+                act_dtype=mixed_qkvz.dtype,
+                state_dtype=ssm_state.dtype,
+                interleaved=self.gqa_interleaved_layout,
+                activation=self.norm.activation,
+                norm_before_gate=self.norm.norm_before_gate,
+                group_size=self.norm.group_size,
+            )
+        ):
+            return False
+
+        n = md.num_actual_tokens
+        num_req = md.num_spec_decodes
+        qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
+        mixed_qkv = mixed_qkvz[:n, :qkv_size]
+        z = mixed_qkvz[:n, qkv_size:].reshape(n, -1, self.head_v_dim)
+        b, a = self.split_ba(ba)
+
+        conv_state = (
+            self.kv_cache[0]
+            if is_conv_state_dim_first()
+            else self.kv_cache[0].transpose(-1, -2)
+        )
+        conv_weights = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
+        mixed_qkv = causal_conv1d_update(
+            mixed_qkv,
+            conv_state,
+            conv_weights,
+            self.conv1d.bias,
+            self.activation,
+            conv_state_indices=sidx[:, 0][:num_req],
+            num_accepted_tokens=md.num_accepted_tokens,
+            query_start_loc=md.spec_query_start_loc,
+            max_query_len=sidx.size(-1),
+            null_block_id=PAD_SLOT_ID,
+            validate_data=False,
+        )
+
+        core_attn_out = torch.zeros(
+            (mixed_qkvz.size(0), self.num_v_heads // self.tp_size, self.head_v_dim),
+            dtype=mixed_qkvz.dtype,
+            device=mixed_qkvz.device,
+        )
+        _k5_gdn.gdn_mtp(
+            mixed_qkv,
+            a[:n],
+            b[:n],
+            self.A_log,
+            self.dt_bias,
+            sidx[:num_req],
+            md.spec_query_start_loc[: num_req + 1],
+            md.num_accepted_tokens[:num_req],
+            ssm_state,
+            z,
+            self.norm.weight,
+            core_attn_out[:n],
+            self.head_k_dim**-0.5,
+            self.norm.eps,
+            PAD_SLOT_ID,
+            self.norm.activation == "sigmoid",
+        )
+        projected_output, _ = self.out_proj(core_attn_out.flatten(-2))
+        output.copy_(projected_output)
+        return True
 
     def forward_xpu(
         self,
