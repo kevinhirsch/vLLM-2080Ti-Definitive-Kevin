@@ -267,3 +267,13 @@ class OneBooleanVocabulary(unittest.TestCase):
             self.assertEqual(m.LOCAL_ONLY, 0)
             self.assertEqual(m.apply_config({"bg_local_only": "maybe"}), [])   # refused, value unchanged
             self.assertIs(m.BG_LOCAL_ONLY, False)
+
+
+class PerRequestEnvParseCannotKillRequests(unittest.TestCase):
+    def test_bad_flightrec_min_tok_serves_the_request(self):
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"SHIM_FLIGHTREC_MIN_TOK": "15k"}):
+            out = G.run_scenario(dict(req=dict(fields=dict(messages=G._msgs(60_000)))), 0)
+        self.assertEqual(out["response"]["status"], 200, out["response"])
+        self.assertEqual(len(out.get("flightrec") or []), 1)              # the default threshold (15000) applied

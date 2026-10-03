@@ -8409,6 +8409,18 @@ def classify_remote_response(payload):
     return out
 
 
+def _flightrec_min_tok():
+    """SHIM_FLIGHTREC_MIN_TOK, read per call (as before). Lane SH: a bad value used to raise inside the local
+    path's try/finally -> every request >= that size died as a bare 500 when the schema module was absent; it
+    now means the default (15000) and is counted."""
+    raw = os.environ.get("SHIM_FLIGHTREC_MIN_TOK", "15000")
+    try:
+        return int(raw)
+    except (TypeError, ValueError) as e:
+        _swallowed("_flightrec_min_tok", e)
+        return 15000
+
+
 def _flightrec_dir():
     """Resolve the flight-recorder directory. Configurable via SHIM_FLIGHTREC_DIR (added by
     the shim-remote-observability lane, 2026-09-05 -- the path was previously hardcoded inline
@@ -8490,7 +8502,7 @@ async def _note_remote_response(request, payload, body):
             log.warning("remote returned EMPTY content (finish_reason=%s, completion_tokens=%s)",
                         cls["finish_reason"], cls["completion_tokens"])
         ptok = _est_tokens(body)
-        min_tok = int(os.environ.get("SHIM_FLIGHTREC_MIN_TOK", "15000"))
+        min_tok = _flightrec_min_tok()
         if ptok >= min_tok or empty_no_tool:
             fr = _flightrec_dir()
             stem = f"{int(time.time())}_remote_{ptok}tok"
@@ -9454,7 +9466,7 @@ async def _route_completions(request, _no_overflow=False):
     # Directory made configurable (SHIM_FLIGHTREC_DIR, default unchanged) by the
     # shim-remote-observability lane, 2026-09-05 -- see _flightrec_dir()'s docstring.
     try:
-        if ptok >= int(os.environ.get("SHIM_FLIGHTREC_MIN_TOK", "15000")):
+        if ptok >= _flightrec_min_tok():
             try:
                 fr = _flightrec_dir()
                 fn = f"{fr}/{int(time.time())}_{ptok}tok.json"
