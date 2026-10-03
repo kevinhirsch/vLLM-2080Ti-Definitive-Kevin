@@ -8,6 +8,9 @@ echo "==============================================="
 echo " Restarting ${SERVICE} — KDE will ask for your"
 echo " password (polkit). Model load takes ~1-2 min."
 echo "==============================================="
+# LV 2026-10-03: give the engine back to the liveness authority (a 'vLLM - Stop' hold, if any, ends now).
+[ -f /home/kevin/.local/share/vllm-qwen27b/engine-actuator.py ] && \
+  /usr/bin/python3 /home/kevin/.local/share/vllm-qwen27b/engine-actuator.py hold release --by kevin-desktop >/dev/null 2>&1
 systemctl reset-failed "$SERVICE" 2>/dev/null
 if ! systemctl restart "$SERVICE"; then
     echo
