@@ -140,8 +140,8 @@ def _isolated_env(tmp):
     return keep
 
 
-def _fresh_shim(tmp, n):
-    with patch.dict(os.environ, _isolated_env(tmp), clear=True):
+def _fresh_shim(tmp, n, extra_env=None):
+    with patch.dict(os.environ, {**_isolated_env(tmp), **(extra_env or {})}, clear=True):
         spec = importlib.util.spec_from_file_location(f"shim_golden_{n}", str(SHIM_PATH))
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
