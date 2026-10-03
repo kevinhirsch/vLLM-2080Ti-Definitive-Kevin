@@ -94,6 +94,8 @@ logger = init_logger(__name__)
 
 MAX_FUSED_GDN_MTP_TOKENS = 8
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
+from vllm.model_executor.layers.mamba.gdn import k9_gdn_chunk as _k9_gdn_chunk  # Lane K9 (L102), opt-in
+
 _flashqla_legacy_module: ModuleType | None = None
 
 
@@ -361,6 +363,12 @@ def flashqla_legacy_chunk_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool = True,
 ):
     """Run the forward-only FlashQLA kernel used by SM70/SM75 builds."""
+    if _k9_gdn_chunk.ENABLED and q.shape[0] == 1:
+        # Lane K9 (L102): chunked tensor-core GDN prefill, same contract (single sequence = cu_seqlens [0, T])
+        cu = torch.tensor([0, q.shape[1]], dtype=torch.int32, device=q.device)
+        return flashqla_legacy_varlen_chunk_gated_delta_rule(
+            q, k, v, g, beta, initial_state, output_final_state, cu, use_qk_l2norm_in_kernel
+        )
     chunk_gated_delta_rule_fwd_legacy = _flashqla_legacy_forward()
 
     if use_qk_l2norm_in_kernel:
@@ -411,6 +419,20 @@ def flashqla_legacy_varlen_chunk_gated_delta_rule(
     state_dtype = initial_state.dtype
     qkv_dtype = _flashqla_legacy_qkv_dtype(v.dtype)
     scale = q.shape[-1] ** -0.5
+    if _k9_gdn_chunk.ENABLED and qkv_dtype == torch.float16:
+        output, final_state = _k9_gdn_chunk.gdn_chunk_fwd_varlen(
+            q.to(qkv_dtype).contiguous(),
+            k.to(qkv_dtype).contiguous(),
+            v.to(qkv_dtype).contiguous(),
+            g.to(torch.float32).contiguous(),
+            beta.to(torch.float32).contiguous(),
+            cu_seqlens.to(torch.int32).contiguous(),
+            scale,
+            initial_state.to(torch.float32).contiguous(),
+        )
+        output = output.to(output_dtype)
+        final_state = final_state.to(state_dtype) if output_final_state else None
+        return output, final_state
     output, final_state = chunk_gated_delta_rule_fwd_legacy_varlen(
         q.to(qkv_dtype).contiguous(),
         k.to(qkv_dtype).contiguous(),
