@@ -8,10 +8,11 @@
            Halo (halo-hermes) TTFT p50/p95, cold local TTFT p95 (pm_credit < 4096), warm-priority marks, preemptions.
   Keep ON only if the warm remote share falls, Halo TTFT p50/p95 regress <= 10 %, cold p95 regresses <= 15 %, preemptions 0.
 """
-import argparse, glob, json, os, sys, time, urllib.request
+import argparse, glob, json, os, signal, sys, time, urllib.request
 
-GW = "http://127.0.0.1:8000"
-TOKEN_FILE = os.path.expanduser("~/.local/share/vllm-qwen27b/admin.token")
+GW = os.environ.get("WARM_AB_GATEWAY", "http://127.0.0.1:8000")
+ENGINE = os.environ.get("WARM_AB_ENGINE", "http://127.0.0.1:8001")
+TOKEN_FILE = os.environ.get("WARM_AB_TOKEN_FILE", os.path.expanduser("~/.local/share/vllm-qwen27b/admin.token"))
 TDIR = os.path.expanduser("~/.local/share/vllm-qwen27b/telemetry")
 
 
@@ -26,7 +27,7 @@ def http(path, body=None, base=GW, timeout=10):
 
 
 def preemptions():
-    txt = urllib.request.urlopen("http://127.0.0.1:8001/metrics", timeout=10).read().decode()
+    txt = urllib.request.urlopen(ENGINE + "/metrics", timeout=10).read().decode()
     return sum(float(l.rsplit(" ", 1)[1]) for l in txt.splitlines() if l.startswith("vllm:num_preemptions_total"))
 
 
@@ -36,7 +37,15 @@ def set_arm(on):
     assert int(cur.get("warm_priority")) == (1 if on else 0), cur.get("warm_priority")
 
 
+def _exit_on_signal(signum, _frame):
+    # L77 class (lane A6): an outer `timeout`/kill sends SIGTERM, which does not run `finally` by itself. Turn it into SystemExit so the
+    # restore below always runs; otherwise SHIM_WARM_PRIORITY stays ON (a live routing change) until someone notices.
+    raise SystemExit(128 + signum)
+
+
 def run(a):
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, _exit_on_signal)
     log = open(a.out, "a")
     note = lambda **k: (log.write(json.dumps(dict(t=round(time.time(), 1), **k)) + "\n"), log.flush(), print(k, flush=True))
     try:
@@ -46,7 +55,7 @@ def run(a):
             set_arm(on); p0 = preemptions(); t0 = time.time()
             note(event="arm_start", arm=i, on=on, preemptions=p0)
             while time.time() - t0 < a.arm_min * 60:
-                time.sleep(15)
+                time.sleep(a.poll_s)
                 p = preemptions()
                 if on and p > p0:
                     note(event="abort", why="engine preemption during ON arm", delta=p - p0); set_arm(False); return 2
@@ -104,5 +113,6 @@ if __name__ == "__main__":
     ap.add_argument("--out", default="/home/kevin/projects/lanes/gw2/l100/ab.jsonl")
     ap.add_argument("--arm-min", type=float, default=15)
     ap.add_argument("--arms", type=int, default=4)
+    ap.add_argument("--poll-s", type=float, default=15)
     a = ap.parse_args()
     sys.exit(run(a) if a.cmd == "run" else (analyze(a) and 0))
