@@ -9,6 +9,11 @@
 
 import torch
 
+from vllm.third_party.flash_linear_attention.ops.sr_convert import (
+    get_sr_seed,
+    sr_enabled,
+    sr_fp32_to_fp16,
+)
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
@@ -19,9 +24,10 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
         "IS_CONTINUOUS_BATCHING": lambda args: args["ssm_state_indices"] is not None,
         "IS_SPEC_DECODING": lambda args: args["num_accepted_tokens"] is not None,
+        "USE_SR": lambda args: args["sr_seed"] is not None,
     }
 )
-@triton.jit(do_not_specialize=["N", "T"])
+@triton.jit(do_not_specialize=["N", "T", "sr_salt"])
 def fused_sigmoid_gating_delta_rule_update_kernel(
     A_log,
     a,
@@ -39,6 +45,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     ssm_state_indices,
     num_accepted_tokens,
     scale,
+    sr_seed,  # int32[1] device buffer (None => plain round-to-nearest-even stores)
+    sr_salt,  # per-layer int salt for the SR random stream
     N: tl.int64,  # num of sequences
     T: tl.int64,  # num of tokens
     B: tl.constexpr,
@@ -59,6 +67,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     IS_VARLEN: tl.constexpr,
     IS_CONTINUOUS_BATCHING: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
+    USE_SR: tl.constexpr,  # stochastic rounding of the fp16 state stores (S4, VLLM_GDN_SR=1)
     IS_KDA: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -179,11 +188,30 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             if final_state_idx >= 0 and final_state_idx != null_block_id:
                 p_ht = ht + final_state_idx * stride_final_state_token
                 p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-                tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+                if USE_SR:
+                    sr_base = (
+                        final_state_idx * 40503
+                        + i_hv.to(tl.int64) * 1640531527
+                        + i_t.to(tl.int64) * 1103515245
+                        + sr_salt
+                    ).to(tl.int32)
+                    sr_off = o_v[:, None] * K + o_k[None, :] + sr_base
+                    sr_rand = tl.randint(tl.load(sr_seed), sr_off.to(tl.int32))
+                    tl.store(p_ht, sr_fp32_to_fp16(b_h, sr_rand), mask=mask_h)
+                else:
+                    tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
         else:
             p_ht = ht + (bos + i_t) * stride_final_state_token
             p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-            tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+            if USE_SR:
+                sr_base = (
+                    (bos + i_t) * 40503 + i_hv.to(tl.int64) * 1640531527 + i_t.to(tl.int64) * 1103515245 + sr_salt
+                ).to(tl.int32)
+                sr_off = o_v[:, None] * K + o_k[None, :] + sr_base
+                sr_rand = tl.randint(tl.load(sr_seed), sr_off.to(tl.int32))
+                tl.store(p_ht, sr_fp32_to_fp16(b_h, sr_rand), mask=mask_h)
+            else:
+                tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
         # Update pointers for next timestep
         p_q += H * K
@@ -255,6 +283,12 @@ def fused_sigmoid_gating_delta_rule_update(
     else:
         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
 
+    # S4: stochastic rounding of fp16 state stores (VLLM_GDN_SR=1); None => the unchanged RNE store.
+    sr_seed, sr_salt = None, 0
+    if sr_enabled() and final_state.dtype == torch.float16:
+        sr_seed = get_sr_seed(final_state.device)
+        sr_salt = (A_log.data_ptr() >> 4) & 0x3FFFFFFF  # stable per-layer salt
+
     grid = (NK, NV, N * HV)
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
@@ -273,6 +307,8 @@ def fused_sigmoid_gating_delta_rule_update(
         ssm_state_indices=ssm_state_indices,
         num_accepted_tokens=num_accepted_tokens,
         scale=scale,
+        sr_seed=sr_seed,
+        sr_salt=sr_salt,
         N=N,
         T=T,
         B=B,

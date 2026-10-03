@@ -8,6 +8,10 @@ from typing import Literal
 import torch
 
 from vllm.config import VllmConfig
+from vllm.third_party.flash_linear_attention.ops.sr_convert import (
+    bump_sr_seed,
+    sr_enabled,
+)
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -219,6 +223,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         fast_build: bool = False,
     ) -> GDNAttentionMetadata:
         m = common_attn_metadata
+
+        if sr_enabled():  # S4: advance the stochastic-rounding seed once per step (outside any cudagraph)
+            bump_sr_seed(m.query_start_loc.device)
 
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu

@@ -10,6 +10,11 @@
 
 import torch
 
+from vllm.third_party.flash_linear_attention.ops.sr_convert import (
+    get_sr_seed,
+    sr_enabled,
+    sr_fp32_to_fp16,
+)
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
@@ -282,6 +287,8 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     ht,
     ssm_state_indices,
     scale,
+    sr_seed,  # S4: int32[1] seed buffer (None => RNE store)
+    sr_salt,
     stride_mixed_qkv_tok: tl.constexpr,
     stride_a_tok: tl.constexpr,
     stride_b_tok: tl.constexpr,
@@ -298,6 +305,7 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     SPLIT_BATCH_HEAD_GRID: tl.constexpr,
+    USE_SR: tl.constexpr,
 ):
     if SPLIT_BATCH_HEAD_GRID:
         i_v, i_hv, i_n = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -355,7 +363,12 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
 
     p_ht = ht + state_idx * stride_final_state_token
     p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-    tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+    if USE_SR:
+        sr_base = (state_idx * 40503 + i_hv.to(tl.int64) * 1640531527 + sr_salt).to(tl.int32)
+        sr_rand = tl.randint(tl.load(sr_seed), (o_v[:, None] * K + o_k[None, :] + sr_base).to(tl.int32))
+        tl.store(p_ht, sr_fp32_to_fp16(b_h, sr_rand), mask=mask_h)
+    else:
+        tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
 
 def fused_recurrent_gated_delta_rule_packed_decode(
@@ -468,6 +481,11 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     stride_final_state_token = initial_state.stride(0)
     stride_indices_seq = ssm_state_indices.stride(0)
 
+    sr_seed, sr_salt = None, 0
+    if sr_enabled() and initial_state.dtype == torch.float16:
+        sr_seed = get_sr_seed(initial_state.device)
+        sr_salt = (A_log.data_ptr() >> 4) & 0x3FFFFFFF
+
     NV = triton.cdiv(V, BV)
     # CUDA limits grid Y/Z dimensions to 65535.
     split_batch_head_grid = B * HV > 65535
@@ -483,6 +501,8 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         ht=initial_state,
         ssm_state_indices=ssm_state_indices,
         scale=scale,
+        sr_seed=sr_seed,
+        sr_salt=sr_salt,
         stride_mixed_qkv_tok=stride_mixed_qkv_tok,
         stride_a_tok=stride_a_tok,
         stride_b_tok=stride_b_tok,
@@ -499,6 +519,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         SPLIT_BATCH_HEAD_GRID=split_batch_head_grid,
+        USE_SR=sr_seed is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )
