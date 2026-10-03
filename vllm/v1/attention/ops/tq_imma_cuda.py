@@ -103,7 +103,14 @@ def _lut_for(centroids: torch.Tensor, norm_correction: bool):
     key = (centroids.data_ptr(), centroids.device.index, bool(norm_correction))
     v = _LUT_CACHE.get(key)
     if v is None:
-        v = int8_lut(tuple(float(x) for x in centroids.float().cpu().tolist()), bool(norm_correction))
+        if torch.cuda.is_current_stream_capturing():
+            # no device->host read inside a CUDA graph capture: rebuild the (deterministic) Lloyd-Max table on host
+            from vllm.model_executor.layers.quantization.turboquant.centroids import get_centroids
+
+            vals = get_centroids(256, 3).tolist()
+        else:
+            vals = centroids.float().cpu().tolist()
+        v = int8_lut(tuple(float(x) for x in vals), bool(norm_correction))
         _LUT_CACHE[key] = v
     return v
 

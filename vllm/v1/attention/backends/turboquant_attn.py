@@ -1896,6 +1896,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         """Lane K2: batch all continuation requests with q_len <= _CONTINUATION_DECODE_THRESHOLD whose rows fit one
         IMMA CTA (q_len * GQA <= 32) into one tq_imma call per q_len.  Same math as the per-request continuation
         decode (each row attends to the TQ cache up to its own causal length).  Returns the request ids handled."""
+        if torch.cuda.is_current_stream_capturing():
+            # host-built row lengths cannot be baked into a CUDA graph; captured batches keep the per-request
+            # continuation calls (which dispatch to the same kernel through device-side seq_lens)
+            return set()
         Hq, D = query.shape[1], query.shape[2]
         Hk = kv_cache.shape[2]
         if not _imma_cuda.eligible(
