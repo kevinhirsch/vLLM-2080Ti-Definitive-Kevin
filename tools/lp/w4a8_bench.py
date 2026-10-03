@@ -112,6 +112,19 @@ for name in a.shapes.split(","):
     t = {k: v.contiguous() for k, v in t.items()}
     t["weight_scale"] = t["weight_scale"].half()
     l16, s16 = make_marlin_layer({k: v for k, v in t.items()}, N, K, device="cuda")
+    from vllm.model_executor.layers.quantization.utils import lp_w8x as W8
+    st8x = W8.W8XState(l16.weight_packed.data, l16.weight_scale.data, l16.weight_zero_point.data, K, N)
+    # exactness of the expansion on the REAL CUDA-repacked layout vs a CPU computation from the CT tensors
+    _w8 = W8.expand(st8x).cpu().float()
+    _sh = torch.arange(8, dtype=torch.int32) * 4
+    _q = ((t["weight_packed"].unsqueeze(-1) >> _sh) & 15).reshape(N, K // 128, 128).float()
+    _z = ((t["weight_zero_point"].unsqueeze(1) >> _sh.view(1, 8, 1)) & 15).reshape(N, -1).float()
+    _s = t["weight_scale"].half().float(); _sch = _s.amax(1, keepdim=True) * 15.0 / 127.0
+    _v = ((_q - _z.unsqueeze(-1)) * (_s / _sch).unsqueeze(-1)).reshape(N, K)
+    _v = torch.clamp(torch.where(_v >= 0, torch.floor(_v + 0.5), torch.ceil(_v - 0.5)), -127, 127)
+    w8x_exact_frac = float((_w8 == _v).float().mean()); w8x_maxdiff = float((_w8 - _v).abs().max())
+    print(f"  W8X expand vs CT-reference: exact {w8x_exact_frac:.6f} maxdiff {w8x_maxdiff}", flush=True)
+    del _w8, _q, _z, _v
     os.environ["VLLM_MARLIN_INPUT_DTYPE"] = "int8"
     try:
         l8, s8 = make_marlin_layer({k: v for k, v in t.items()}, N, K, device="cuda")
@@ -142,7 +155,8 @@ for name in a.shapes.split(","):
     for M in Ms:
         x = torch.randn(M, K, device="cuda", dtype=torch.float16); x[:, :8] *= 20
         fns = {"w4a16": lambda: s16.apply_weights(l16, x, None), "w4a8": lambda: s8.apply_weights(l8, x, None),
-               "quant": lambda: ops.scaled_int8_quant(x, None, None, symmetric=True)}
+               "quant": lambda: ops.scaled_int8_quant(x, None, None, symmetric=True),
+               "w8x": lambda: W8.gemm(x, st8x), "w8x_expand": lambda: W8.expand(st8x, W8.scratch(x.device, N * K).view(N, K))}
         if g8 is not None:
             fns["w4a8g"] = lambda: g8.forward(x, G8.quant_act_g128_triton)
             fns["quant_g"] = lambda: G8.quant_act_g128_triton(x)
@@ -154,23 +168,27 @@ for name in a.shapes.split(","):
             for k, fn in fns.items():
                 ts[k].append(timeit(fn))
         fl = 2.0 * M * N * K
-        r = {"shape": name, "M": M, "N": N, "K": K, "layers": nl, **{f"corr_{k}": v for k, v in corr.items()}}
+        r = {"shape": name, "M": M, "N": N, "K": K, "layers": nl, **{f"corr_{k}": v for k, v in corr.items()},
+             "w8x_exact_frac": w8x_exact_frac, "w8x_maxdiff": w8x_maxdiff}
         for k in ts:
             r[k] = {"med": statistics.median(ts[k]), "min": min(ts[k]), "p25": sorted(ts[k])[len(ts[k]) // 4]}
             r[k]["tflops_min"] = fl / r[k]["min"] / 1e9
         r["speedup_min"] = r["w4a16"]["min"] / r["w4a8"]["min"]; r["speedup_med"] = r["w4a16"]["med"] / r["w4a8"]["med"]
+        r["speedup_w8x_min"] = r["w4a16"]["min"] / r["w8x"]["min"]
+        yx = W8.gemm(x[:64], st8x).float(); y1 = s16.apply_weights(l16, x[:64], None).float()
+        r["w8x_rel_vs_w4a16"] = ((yx - y1).norm() / y1.norm()).item()
         if "w4a8g" in r: r["speedup_g_min"] = r["w4a16"]["min"] / r["w4a8g"]["min"]; r["speedup_e2_min"] = r["w4a16"]["min"] / r["w4a8e2"]["min"]
         rows.append(r)
         print(f"  M={M:5d} w4a16 {r['w4a16']['min']:7.3f}/{r['w4a16']['med']:7.3f} ms ({r['w4a16']['tflops_min']:5.1f} TF)  "
               f"w4a8 {r['w4a8']['min']:7.3f}/{r['w4a8']['med']:7.3f} ms ({r['w4a8']['tflops_min']:5.1f} TOPS)  quant {r['quant']['min']:.3f}  "
-              f"speedup min {r['speedup_min']:.2f}x med {r['speedup_med']:.2f}x" +
+              f"speedup min {r['speedup_min']:.2f}x med {r['speedup_med']:.2f}x | W8X {r['w8x']['min']:.3f} x{r['speedup_w8x_min']:.2f} (expand {r['w8x_expand']['min']:.3f}, rel {r['w8x_rel_vs_w4a16']:.4f})" +
               (f" | w4a8g {r['w4a8g']['min']:7.3f} ms ({r['w4a8g']['tflops_min']:5.1f}) x{r['speedup_g_min']:.2f} quant_g {r['quant_g']['min']:.3f} | e2 x{r['speedup_e2_min']:.2f}" if "w4a8g" in r else ""), flush=True)
         del x
     del l16, l8, g8, e2; torch.cuda.empty_cache()
 tot = {}
 for r in rows:
     if r["M"] == max(Ms):
-        for k in ("w4a16", "w4a8", "w4a8g", "w4a8e2"):
+        for k in ("w4a16", "w4a8", "w4a8g", "w4a8e2", "w8x"):
             if k in r: tot[k] = tot.get(k, 0) + r[k]["min"] * r["layers"]
 print("PER-CHUNK linear time (min, ms, all layers, M=%d): %s  ratio %.2fx" % (max(Ms), {k: round(v, 1) for k, v in tot.items()}, tot["w4a16"] / tot["w4a8"]))
 sustain = {}

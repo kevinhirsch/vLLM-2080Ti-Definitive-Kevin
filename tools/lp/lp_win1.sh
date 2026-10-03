@@ -27,31 +27,35 @@ for g in 0 1; do
 done
 # ---- Phase A2 (~5-10 min, small idle engine still up): full-model kernel-exact fidelity gate on GPU0 (K7's --device cuda mode)
 GPU_IN_WINDOW=1 CUDA_VISIBLE_DEVICES=0 timeout 600 $PY /home/kevin/Desktop/wt-lp/tools/lp/variant_gate.py --device cuda --gpu-need-mib 1500 \
-   --variants w4a8e3,w4a8g,w4a8 --out $OUT/gate_gpu_win.json > $OUT/gate_gpu_win.log 2>&1; echo "gpu fidelity gate rc=$?"
-grep -E "^\[.*\] (w4a8e3|w4a8g|w4a8) \{" $OUT/gate_gpu_win.log | cut -c1-260
+   --variants w8x,w4a8e3,w4a8g --out $OUT/gate_gpu_win.json > $OUT/gate_gpu_win.log 2>&1; echo "gpu fidelity gate rc=$?"
+grep -E "^\[.*\] (w8x|w4a8e3|w4a8g) \{" $OUT/gate_gpu_win.log | cut -c1-260
 # ---- Phase B: engine with int8 activations (from the wt-lp tree; everything else = the override that was live) ----
 # Gate: the LP_A8G kernel (per-(row,128) act scales) must match its CPU emulation on every real shape and odd M (rel <= 5e-3);
 # then Phase B runs W4A8G on all linears, else stock per-token W4A8 on all linears.
 G8OK=$(python3 - <<PY
 import json,glob
-# pick the LP mode for Phase B: e (int-exponent, EMAX ${LP_EMAX:-3}) if its kernel matches emulation and is faster than stock-W4A16 on the chunk;
-# else g (float scales) if correct; else 0 (stock per-token W4A8)
-okg=oke=True; n=0; tot={}
+# Phase B config, by value: w8x (prefill-only int8 IMMA via expansion; decode untouched) if the expansion is exact on the real
+# repacked layout and the W8X chunk time beats W4A16 by >= 10% on gate_up+in_proj; else LP mode e/g if correct and faster; else 0.
+okg=oke=okx=True; n=0; tot={}; w8x_gain=[]
 for f in glob.glob("$OUT/w4a8_bench_gpu*.json"):
     d=json.load(open(f))
     for r in d["rows"]:
         for k,v in r.items():
             if k.startswith("corr_rel_w4a8g_vs_emul"): n+=1; okg = okg and v <= 5e-3
             if k.startswith("corr_rel_w4a8e2_vs_emul"): oke = oke and v <= 5e-3
+        okx = okx and r.get("w8x_exact_frac", 0) >= 0.9999
+        if r["shape"] in ("gate_up", "gdn_qkvz") and r["M"] >= 2048: w8x_gain.append(r["w4a16"]["min"] / r["w8x"]["min"])
     for k,v in d["chunk_ms"].items(): tot[k]=tot.get(k,0)+v
 fe = tot.get("w4a8e2", 9e9) < tot.get("w4a16", 0); fg = tot.get("w4a8g", 9e9) < tot.get("w4a16", 0)
-print("e" if n and oke and fe else ("g" if n and okg and fg else "0"))
+if okx and w8x_gain and min(w8x_gain) >= 1.10: print("x")
+else: print("e" if n and oke and fe else ("g" if n and okg and fg else "0"))
 PY
 )
 echo "LP mode chosen for Phase B (e/g/0=stock): $G8OK"
 mapfile -t LIVE < <(grep -E '^export ' $OUT/override.before | sed 's/^export //')
 EXTRA=("V02_ROOT=/home/kevin/Desktop/wt-lp" "VLLM_MARLIN_INPUT_DTYPE=int8")
-if [ "$G8OK" != "0" ]; then EXTRA+=("VLLM_LP_W4A8G=1" "VLLM_LP_W4A8G_MODE=$G8OK" "VLLM_LP_A8E_EMAX=${LP_EMAX:-3}"); LABEL=${LABEL}$G8OK
+if [ "$G8OK" = "x" ]; then EXTRA=("V02_ROOT=/home/kevin/Desktop/wt-lp" "VLLM_LP_W8X=1" "VLLM_LP_W8X_MIN_M=2048"); LABEL=lpw8x   # no int8 decode path
+elif [ "$G8OK" != "0" ]; then EXTRA+=("VLLM_LP_W4A8G=1" "VLLM_LP_W4A8G_MODE=$G8OK" "VLLM_LP_A8E_EMAX=${LP_EMAX:-3}"); LABEL=${LABEL}$G8OK
 else EXTRA+=("VLLM_LP_INT8_ONLY='gate_up_proj|linear_attn|self_attn'"); LABEL=${LABEL}nd; fi   # per-token int8 is unfit for down_proj
 [ -n "${LP_ONLY:-}" ] && EXTRA+=("VLLM_LP_INT8_ONLY='${LP_ONLY}'")
 BOOT_TIMEOUT=900 ./boot2.sh $LABEL "${LIVE[@]}" "${EXTRA[@]}" || { echo "BOOT FAILED"; ./boot2.sh restore-$LABEL "${LIVE[@]}" >/dev/null 2>&1; cp $OUT/override.before $OV; exit 1; }

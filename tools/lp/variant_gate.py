@@ -16,6 +16,7 @@ Built-in variants:
   w4a8gd     w4a8 but down_proj uses per-(row,128-group) activation scales (MX-style int8 epilogue)
   w4a8g      per-(row,128-group) activation scales on every linear
   w4a8e3     kernel-exact LP_A8E: per-token int8 with a 2^-e (e<=3) exponent per (row,128) + 512-level int weight scales
+  w8x        LP W8X prefill path: gate/up + GDN in_proj on W8-per-channel (expanded from W4) x per-token int8; rest W4A16
   w4a8hd     w4a8 but down_proj input block-Hadamard rotated (weights re-quantized RTN asym g128 from the W4 dequant)
   w4a4tok    naive per-token int4 activations (no rotation) on asym W4 -- the "no tricks" W4A4 floor
   w4a4had    QuaRot-style: block-Hadamard(128) on the K dim of act and weight, weights re-quantized RTN asym g128, per-token int4 act
@@ -125,6 +126,19 @@ def v_w4a8e3(n, x, info, emax=3):
         s16 = info["s"].half().float(); smax = s16.max(); s_int = torch.round(s16 / smax * (4096 >> emax))
         info["we3"] = (info["qz"] * (s_int * smax / (4096 >> emax)).unsqueeze(-1)).reshape(info["w"].shape)
     return q_rel(x.half().float(), emax) @ info["we3"].T
+
+
+def v_w8x(n, x, info):
+    """kernel-exact LP W8X (prefill path): gate/up + GDN in_proj_qkv/z: W8 per-output-channel grid expanded from the W4
+    (s_ch = max_g s * 15/127, round half away) x per-token int8 activations; every other linear stays W4A16 (fp16 act)."""
+    if not any(n.endswith(t) for t in ("gate_proj", "up_proj", "in_proj_qkv", "in_proj_z")):
+        return v_fp16(n, x, info)
+    if "w8x" not in info:
+        s16 = info["s"].half().float(); sch = s16.amax(1, keepdim=True) * 15.0 / 127.0
+        v = (info["qz"] * (s16 / sch).unsqueeze(-1)).reshape(info["w"].shape)
+        v = torch.clamp(torch.where(v >= 0, torch.floor(v + 0.5), torch.ceil(v - 0.5)), -127, 127)
+        info["w8x"] = v * sch
+    return q_tok(x.half().float(), 8) @ info["w8x"].T
 
 
 def v_w4a8hd(n, x, info):
