@@ -74,9 +74,13 @@ def replay(rows, shim, *, long_out=None):
     for r in rows:
         word = shim.probe_word(json.dumps({"messages": [{"role": "user", "content": r.get("preview") or ""}]}).encode())
         # the log keeps only a 70-char preview: a probe's injected-context tail is cut, which is still a probe
-        if word and r.get("alias_kind") in (None, "", "builtin-local") and r.get("route") != "rejected":
+        if word and r.get("alias_kind") in shim.PROBE_SYNTH_ALIAS_KINDS and r.get("route") != "rejected":
             m["probe_requests"] += 1
-            if r["t"] - last_ok <= shim.PROBE_FRESH_S:
+            # the live gateway never synthesises inside a forced-remote / planned-offline window or while local is down
+            in_window = r.get("reason") in ("forced", "local-offline", "force-remote", "local-down")
+            if in_window:
+                m["probe_in_window"] += 1
+            if not in_window and r["t"] - last_ok <= shim.PROBE_FRESH_S:
                 seen += 1
                 if not (shim.PROBE_REAL_EVERY > 0 and seen % shim.PROBE_REAL_EVERY == 0):
                     m["probe_synth"] += 1
