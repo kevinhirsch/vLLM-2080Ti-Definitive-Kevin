@@ -582,6 +582,16 @@ def aot_compile_hash_factors(vllm_config: VllmConfig) -> list[str]:
     config_hash = vllm_config.compute_hash()
     factors.append(config_hash)
 
+    # 1b. [FORK][LANE S3] Lane U2 opt-in int4 head/MTP/embedding loaders change which parameters
+    #     (weight vs weight_packed/scale/zero) the compiled graphs index, but VLLM_U2_* are not registered
+    #     vLLM env vars, so they never reached factor 0 and a baseline artifact was loaded by the int4
+    #     arm (KeyError: 'weight' in qwen3_5_mtp.forward). Add them only when set so existing keys stay valid.
+    u2 = sorted(
+        f"{k}={v}" for k, v in os.environ.items() if k.startswith("VLLM_U2_") and k != "VLLM_U2_CACHE_DIR"
+    )
+    if u2:
+        factors.append(hash_factors({"u2": u2}))
+
     # 2. inductor factors if applicable
     if envs.VLLM_USE_MEGA_AOT_ARTIFACT:
         factors.extend(get_inductor_factors())
