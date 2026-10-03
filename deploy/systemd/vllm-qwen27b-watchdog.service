@@ -2,7 +2,10 @@
 Description=vllm-qwen27b generation watchdog (probe; restart only on confirmed alive-but-not-generating wedge)
 Documentation=file:///home/kevin/Desktop/vLLM-2080Ti-Definitive/WEDGE-ROOTCAUSE-2026-08-10.md
 After=vllm-qwen27b.service
-Wants=vllm-qwen27b.service
+# LV 2026-10-03: NO Wants=/Requires= on vllm-qwen27b.service. Wants= made systemd START a stopped engine every time this timer
+# fired (each minute), before vllm-watchdog.sh could see a liveness hold and defer -- so a window's hold could not keep its
+# engine down. Starting a DOWN engine is the liveness authority's declared exit (engine-actuator.py tick: unowned DOWN for
+# 180 s -> start, under the one rate limit/breaker), which honours holds. The engine's own boot-start is WantedBy=multi-user.target.
 
 [Service]
 Type=oneshot
