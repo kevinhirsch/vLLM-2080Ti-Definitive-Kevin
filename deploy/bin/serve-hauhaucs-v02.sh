@@ -74,10 +74,22 @@ ARGS=(
   --additional-config '{"gdn_prefill_backend":"flashqla_legacy"}'
 )
 # Optional upstream #243 SSD prefix-KV persistence (experimental, opt-in): V02_SSD_KV_DIR=/path V02_SSD_KV_CPU_BYTES=N
+# Lane IR hardening (tools/ir/offload_kv_config.py): refuses a host staging tier below the estate working set (default 12 GiB; lane UP's
+# 4 GiB run was a cyclic-LRU thrash), sets kv_load_failure_policy=recompute (default "fail" aborts the request), pins engine_id and removes
+# orphaned /dev/shm/vllm_offload_*.mmap files that no live process holds. V02_SSD_KV_ALLOW_SMALL=1 overrides the size guard,
+# V02_SSD_KV_STORE_THRESHOLD=2 stores only chunks offered twice (replayed estate prefixes, not one-off tool output).
 if [ -n "${V02_SSD_KV_DIR:-}" ]; then
   export PYTHONHASHSEED=0
   FP=$("$V02_ROOT/.venv/bin/python" "$V02_ROOT/tools/checkpoint_fingerprint.py" /home/kevin/Desktop/models/Qwen3.8-27B-HauhauCS-Aggressive-W4A16-twolven "")
-  ARGS+=( --kv-transfer-config "$(python3 -c 'import json,os,sys;print(json.dumps({"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":int(sys.argv[2]),"spec_name":"TieringOffloadingSpec","secondary_tiers":[{"type":"fs","root_dir":os.path.join(sys.argv[1],"checkpoint-"+sys.argv[3])}]}},separators=(",",":")))' "$V02_SSD_KV_DIR" "${V02_SSD_KV_CPU_BYTES:-8589934592}" "$FP")" )
+  IR_TOOL="$V02_ROOT/tools/ir/offload_kv_config.py"
+  if [ -f "$IR_TOOL" ]; then
+    python3 "$IR_TOOL" clean-stale || true
+    KVT=$(python3 "$IR_TOOL" config --root "$V02_SSD_KV_DIR" --cpu-bytes "${V02_SSD_KV_CPU_BYTES:-12884901888}" --fingerprint "$FP" \
+          --store-threshold "${V02_SSD_KV_STORE_THRESHOLD:-0}" ${V02_SSD_KV_ALLOW_SMALL:+--allow-small}) || { echo "serve: offload tier config refused (see above)" >&2; exit 2; }
+    ARGS+=( --kv-transfer-config "$KVT" )
+  else
+    ARGS+=( --kv-transfer-config "$(python3 -c 'import json,os,sys;print(json.dumps({"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":int(sys.argv[2]),"spec_name":"TieringOffloadingSpec","secondary_tiers":[{"type":"fs","root_dir":os.path.join(sys.argv[1],"checkpoint-"+sys.argv[3])}]}},separators=(",",":")))' "$V02_SSD_KV_DIR" "${V02_SSD_KV_CPU_BYTES:-8589934592}" "$FP")" )
+  fi
 fi
 if [ -n "${VLLM_SERVE_EXTRA_ARGS:-}" ]; then
   # shellcheck disable=SC2206
