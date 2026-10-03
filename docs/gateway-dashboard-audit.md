@@ -148,3 +148,5 @@ section 3. Every number on it carries a source tag: LIVE, MEASURED (with its win
 | Overflow reasons | `remote_use.windows.*.by_reason` now lists every reason (was top 8). A test fails if a reason the page documents is no longer emitted (literal calls, the final overflow ladder, the stream watchdog) or the reverse | "Each reason's share, side by side": 15 min (routing ledger), 24 h (on-disk log), all time (persistent counters); a column that only reaches back to process start says so |
 
 All 23 documented reasons are still emitted. On the live gateway the 24 h in-memory ring covered 6,439 of 17,568 requests of the log (it restarts with the process), which is why the 24 h column prefers the log.
+
+Follow-on in the same lane: the routing ring is rebuilt from the request log at startup (`flow_routes_restore_blocking`, kill switch `SHIM_FLOW_RESTORE=0`), so a restart no longer empties the 15 min / 1 h / 24 h windows. Restored rows carry no headroom flag (unknown, never counted in `remote_while_local_had_headroom`); each window reports `restored` and an honest `covered_s`. Verified by restarting a candidate gateway: 971 rows restored, windows full at once.

@@ -153,6 +153,57 @@ class HistorySummary(unittest.TestCase):
         self.assertEqual(sum(got["remote_by_reason"].values()), got["per_route"]["remote"]["requests"])
 
 
+class RoutingRingRestore(unittest.TestCase):
+    """A restart no longer empties the 15 min / 1 h / 24 h routing windows: they are rebuilt from the request log."""
+
+    def write_log(self, td, rows):
+        path = pathlib.Path(td) / "requests.jsonl"
+        path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        return path
+
+    def test_rows_before_the_process_start_are_restored_oldest_first(self):
+        now = time.time()
+        start = now - 600
+        rows = [{"t": now - 90000, "route": "remote", "reason": "too-old"},                        # older than 24 h
+                {"t": now - 3 * 3600, "route": "remote", "reason": "perf", "flow_class": "halo"},
+                {"t": now - 1200, "route": "local", "reason": "-", "flow_class": "kevin"},
+                {"t": now - 100, "route": "remote", "reason": "after-start"}]                        # the live ring owns these
+        with tempfile.TemporaryDirectory() as td:
+            path = self.write_log(td, rows)
+            with patch.object(shim, "_history_day_file", lambda e: str(path) if now - e < 43200 else "/nonexistent/day"):
+                got = shim.flow_routes_restore_blocking(now, start)
+        self.assertEqual([r[2] for r in got], ["perf", "-"])
+        self.assertEqual(got[0], (rows[1]["t"], "remote", "perf", "halo", None))
+        self.assertLess(got[0][0], got[1][0])
+
+    def test_the_restored_rows_fill_the_windows_and_say_so(self):
+        now = time.time()
+        live = (now - 5, "remote", "alias", "kevin", True)
+        restored = [(now - 7200, "remote", "perf", "halo", None), (now - 400, "remote", "big-out", "runner", None),
+                    (now - 400, "local", "-", "kevin", None)]
+        with patch.object(shim, "_FLOW_ROUTES", shim.collections.deque([live], maxlen=100)), \
+                patch.object(shim, "_FLOW_RESTORED", {"from": None, "n": 0}), patch.object(shim, "_PROCESS_STARTED", now - 60):
+            self.assertEqual(shim.flow_routes_restore(restored), 3)
+            w = shim.flow_remote_use(now)["windows"]
+        self.assertEqual((w["15m"]["requests"], w["15m"]["remote"]), (3, 2))
+        self.assertEqual((w["1h"]["requests"], w["24h"]["requests"]), (3, 4))
+        self.assertEqual(w["24h"]["restored"], 3)
+        self.assertEqual(w["24h"]["covered_s"], 7200)                      # reaches back to the oldest restored row
+        self.assertEqual(w["15m"]["covered_s"], 900)
+        self.assertEqual(w["24h"]["remote_while_local_had_headroom"], 0)   # unknown headroom is never counted as a defect
+
+    def test_without_a_restore_the_window_reaches_only_to_the_process_start(self):
+        now = time.time()
+        with patch.object(shim, "_FLOW_ROUTES", shim.collections.deque(maxlen=10)), \
+                patch.object(shim, "_FLOW_RESTORED", {"from": None, "n": 0}), patch.object(shim, "_PROCESS_STARTED", now - 300):
+            self.assertEqual(shim.flow_remote_use(now)["windows"]["24h"]["covered_s"], 300)
+
+    def test_an_empty_or_missing_log_restores_nothing(self):
+        with patch.object(shim, "_history_day_file", lambda _e: "/nonexistent/requests.jsonl"):
+            self.assertEqual(shim.flow_routes_restore_blocking(), [])
+        self.assertEqual(shim.flow_routes_restore([]), 0)
+
+
 class OverflowReasons(unittest.TestCase):
     """Every reason the dashboard documents is still emitted by the shim, and every reason the shim emits is documented."""
 

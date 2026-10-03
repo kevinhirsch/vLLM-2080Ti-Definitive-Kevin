@@ -4742,15 +4742,65 @@ def flow_note_route(decision, reason, request):
         pass
 
 
+# Lane DB2: the routing ring is in memory, so every restart emptied the "24 h" window (live: 6,439 of the 17,568 requests
+# the on-disk log held). At startup the last 24 h are rebuilt from the request log. A restored row cannot know whether
+# local had headroom at the time, so its headroom flag is None (never counted as a defect) and it is reported as `restored`.
+FLOW_RESTORE = os.environ.get("SHIM_FLOW_RESTORE", "1").lower() not in ("0", "false", "off")
+_FLOW_RESTORED = {"from": None, "n": 0}
+
+
+def flow_routes_restore_blocking(now=None, before=None, max_rows=30000, per_file_cap=64 * 1024 * 1024):
+    """Blocking (run in an executor). Rows (t, decision, reason, class, None) from the last 24 h of the request log that
+    finished before `before` (the process start), oldest first, newest `max_rows` kept."""
+    now = time.time() if now is None else now
+    before = now if before is None else before
+    since = now - 86400
+    rows = []
+    for day_i in range(2):
+        fn = _history_day_file(now - day_i * 86400)
+        for raw in _read_lines_reverse(fn, per_file_cap):
+            try:
+                rec = json.loads(raw)
+            except Exception:
+                continue
+            t = rec.get("t")
+            if not isinstance(t, (int, float)) or t >= before:
+                continue
+            if t < since:
+                break
+            rows.append((t, rec.get("route") or "?", rec.get("reason") or "?", rec.get("flow_class"), None))
+            if len(rows) >= max_rows:
+                break
+        if len(rows) >= max_rows:
+            break
+    rows.sort(key=lambda r: r[0])
+    return rows
+
+
+def flow_routes_restore(rows):
+    """Prepend restored rows (older than anything live) to the ring."""
+    if not rows:
+        return 0
+    live = list(_FLOW_ROUTES)
+    _FLOW_ROUTES.clear()
+    _FLOW_ROUTES.extend(rows)
+    _FLOW_ROUTES.extend(live)
+    _FLOW_RESTORED.update(**{"from": rows[0][0], "n": len(rows)})
+    return len(rows)
+
+
 def flow_remote_use(now=None):
     now = time.time() if now is None else now
     out = {}
+    # how far back the ring really reaches: the oldest restored row, else the process start
+    reach_from = min(_PROCESS_STARTED, _FLOW_RESTORED["from"]) if _FLOW_RESTORED["from"] else _PROCESS_STARTED
     for label, secs in (("15m", 900), ("1h", 3600), ("24h", 86400)):
         rows = [r for r in _FLOW_ROUTES if now - r[0] <= secs]
         remote = [r for r in rows if r[1] == "remote"]
         avoidable = [r for r in remote if r[2] not in _FLOW_EXPLICIT]
         # the ring lives in memory: a window longer than the process has been up is only partly covered
-        out[label] = {"covered_s": round(min(secs, now - _PROCESS_STARTED), 0), "requests": len(rows), "remote": len(remote),
+        out[label] = {"covered_s": round(min(secs, now - reach_from), 0), "restored": sum(1 for r in rows if r[4] is None),
+                      "requests": len(rows), "remote": len(remote),
                       "remote_share": round(len(remote) / len(rows), 3) if rows else None,
                       "by_reason": dict(collections.Counter(r[2] for r in remote).most_common()),
                       "by_class": dict(collections.Counter(r[3] or "?" for r in remote)),
@@ -10419,6 +10469,14 @@ async def _on_startup(app):
     _REMOTE_DEAD_PERSIST = True
     _remote_dead_load()
     _load_stats()
+    if FLOW_RESTORE:
+        try:
+            _now = time.time()
+            _rows = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: flow_routes_restore_blocking(_now, _PROCESS_STARTED))
+            log.info("routing ring restored: %d rows from the request log", flow_routes_restore(_rows))
+        except Exception as e:                                   # never block startup on a history read
+            log.warning("routing ring restore failed: %s", e)
     _spend()   # R2: load (and, for a mid-day ledger, import today's recorded spend) before serving
     app["saver"] = asyncio.create_task(_stats_saver())
     app["telemetry_sampler"] = asyncio.create_task(_telemetry_sampler())   # TELEMETRY
