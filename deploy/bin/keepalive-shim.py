@@ -6882,6 +6882,25 @@ async def _credit_sources(request, pm, body, ptok):
     return src
 
 
+def own_uncached_tokens(info, est_computed, ptok, pm_chain=None, now=None):
+    """(uncached tokens, source) of a request's OWN prefill by the best evidence available, independent of whether
+    that evidence is live for routing: the engine probe (probe_prompt_tokens - pm_credit_probe) > the engine-anchored
+    credit of this conversation's previous local turn > the routing estimate. For consumers that must follow the most
+    accurate figure (lane CFG's QoL) without re-probing: it reads what _credit_sources() already recorded."""
+    info = info or {}
+    if info.get("pm_credit_probe") is not None and info.get("probe_prompt_tokens"):
+        return max(0, int(info["probe_prompt_tokens"]) - int(info["pm_credit_probe"])), "probe"
+    anch, age = (info.get("pm_credit_anchored"), info.get("pm_anchor_age_s"))
+    if anch is None and pm_chain:
+        try:
+            anch, age = anchored_credit(pm_chain, ptok, now=now)
+        except Exception:
+            anch, age = None, None
+    if anch and age is not None:
+        return max(0, int(ptok or 0) - int(anch)), "anchor"
+    return max(0, int(est_computed or 0)), "model"
+
+
 def _credit_probe_summary():
     lat = sorted(_PROBE_LAT)
     n = len(lat)
