@@ -160,6 +160,33 @@ class EstimateError(unittest.TestCase):
         json.dumps(summ)
 
 
+class AnchoredCredit(unittest.TestCase):
+    """Shadow engine-anchored cache credit: next turn's credit = previous turn's ENGINE prompt_tokens, block-rounded."""
+
+    def setUp(self):
+        for p in (patch.object(shim, "_PM_ANCHOR", type(shim._PM_ANCHOR)()),
+                  patch.object(shim, "_PM_NODES", type(shim._PM_NODES)()),
+                  patch.object(shim, "PREFIX_CREDIT_UNIT", 0), patch.object(shim, "prefix_align_tokens", lambda: 3568)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_continuation_gets_exact_block_rounded_credit(self):
+        t1 = shim._pm_predict(C.convo("A", 10), 20000)["chain"]
+        shim._anchor_note(t1, 21000, now=1000.0)
+        t2 = shim._pm_predict(C.convo("A", 11), 22000)["chain"]
+        self.assertEqual(shim.anchored_credit(t2, 22000, now=1010.0), (5 * 3568, 10.0))
+        self.assertEqual(shim.anchored_credit(t2, 10000, now=1010.0)[0], 9999)            # capped below the prompt
+        other = shim._pm_predict(C.convo("B", 11), 22000)["chain"]
+        self.assertEqual(shim.anchored_credit(other, 22000, now=1010.0), (0, None))       # other conversation
+        self.assertEqual(shim.anchored_credit(t2, 22000, now=1000.0 + shim.PREFIX_MODEL_TTL_SECS + 1), (0, None))
+        shim._pm_reset("test")
+        self.assertEqual(shim.anchored_credit(t2, 22000, now=1010.0), (0, None))         # engine cache gone
+
+    def test_knob_is_hot_reloadable_and_default_off(self):
+        self.assertIn("SHIM_CREDIT_ANCHOR", shim._CFG)
+        self.assertEqual(shim.CREDIT_ANCHOR, "off")
+
+
 class ThinkBudgetExplicit(unittest.TestCase):
     def body(self, **kw):
         return json.dumps(dict({"messages": [], "max_tokens": 16384}, **kw)).encode()

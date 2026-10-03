@@ -548,6 +548,7 @@ _CFG = {
     "SHIM_REASONING_BUDGET_TOKENS": ("REASONING_BUDGET_TOKENS", int),
     "SHIM_REASONING_CHARS_PER_TOKEN": ("REASONING_CHARS_PER_TOKEN", float),
     "SHIM_THINK_BUDGET_EXPLICIT": ("THINK_BUDGET_EXPLICIT", int),
+    "SHIM_CREDIT_ANCHOR": ("CREDIT_ANCHOR", lambda v: str(v).strip().lower()),
     # LOCAL-FIRST (L1, 2026-09-25) -- see the block after STREAM_IDLE_TIMEOUT_SECS below.
     "SHIM_LOCAL_FIRST":      ("LOCAL_FIRST", lambda v: str(v).lower() not in ("0", "false", "off", "")),
     "SHIM_LOCAL_FIRST_REASONS": ("LOCAL_FIRST_REASONS", lambda v: _parse_reason_set(v)),
@@ -680,6 +681,13 @@ REASONING_WATCHDOG = os.environ.get("SHIM_REASONING_WATCHDOG", "off").strip().lo
 REASONING_BUDGET_TOKENS = int(os.environ.get("SHIM_REASONING_BUDGET_TOKENS", "8192"))
 REASONING_CHARS_PER_TOKEN = float(os.environ.get("SHIM_REASONING_CHARS_PER_TOKEN", "4.0"))
 THINK_BUDGET_EXPLICIT = int(os.environ.get("SHIM_THINK_BUDGET_EXPLICIT", "0"))
+# [LANE GW2 2026-10-03] Engine-anchored cache credit, SHADOW only. The cost model's credit is a guess (matched chars /
+# total chars x the ESTIMATED prompt, shaved by trust, block-rounded); measured over 7,687 local rows it under-credits by
+# up to 14.3K tokens at p05 and over-credits by 3.6K at p95, and that error -- not the prompt-size estimate -- drives the
+# light/heavy/big-prompt threshold flips. SHIM_CREDIT_ANCHOR=shadow remembers, per conversation chain end, the ENGINE's
+# own usage.prompt_tokens of the finished local request, and logs pm_credit_anchored = that exact prefix rounded down to
+# the engine's cache block for the next turn of the chain. Routing still uses pm_credit; the log sizes the switch.
+CREDIT_ANCHOR = os.environ.get("SHIM_CREDIT_ANCHOR", "off").strip().lower()
 
 # ---------------- LOCAL-FIRST overflow policy (L1, 2026-09-25) ----------------
 # Kevin 2026-09-25: "Is the GPU being used? Otherwise ... we're wasting money and/or time
@@ -3930,6 +3938,11 @@ def _telemetry_note_request(info, resp=None):
                         name, est_computed, computed_actual, computed_actual / max(1, est_computed))
             _MISESTIMATE_FEED.appendleft({"t": round(now, 1), "client": name,
                                           "est_computed": est_computed, "computed_actual": computed_actual})
+        if CREDIT_ANCHOR != "off" and route in ("local", "held") and info.get("ptok_exact_local"):
+            try:
+                _anchor_note((_PM_INFLIGHT.get(info.get("pm_ref")) or {}).get("chain") or [], info["ptok_exact_local"], now)
+            except Exception:
+                pass
         if CHAIN_TELEMETRY or WARM_PRIORITY:
             try:
                 _chain_route_note((_PM_INFLIGHT.get(info.get("pm_ref")) or {}).get("chain") or [], route, now)
@@ -4021,6 +4034,8 @@ def _telemetry_note_request(info, resp=None):
             "computed_actual": info.get("computed_actual"),
             "cached_actual": info.get("cached_actual"),
             "pm_credit": info.get("pm_credit"), "pm_age_s": info.get("pm_age_s"),
+            **({"pm_credit_anchored": info.get("pm_credit_anchored"), "pm_anchor_age_s": info.get("pm_anchor_age_s")}
+               if CREDIT_ANCHOR != "off" else {}),
             "flow_class": info.get("flow_class"), "flow_expected_wait": info.get("flow_expected_wait_s"),
             "flow_held": info.get("flow_held"), "flow_adjacent": info.get("flow_adjacent"),
             **({"chain_prev_route": info.get("chain_prev_route"), "chain_prev_age_s": info.get("chain_prev_age_s"),
@@ -6353,6 +6368,33 @@ def _chain_route_note(chain, route, now=None):
         _CHAIN_ROUTE.popitem(last=False)
 
 
+_PM_ANCHOR = collections.OrderedDict()     # [GW2] chain-end key of a finished LOCAL request -> [engine prompt_tokens, t]
+
+
+def _anchor_note(chain, prompt_tokens, now=None):
+    """Remember the engine's exact prompt size for this request's whole conversation (its deepest chain node)."""
+    if not chain or not prompt_tokens:
+        return
+    k = chain[-1][0]
+    _PM_ANCHOR[k] = [int(prompt_tokens), time.time() if now is None else now]
+    _PM_ANCHOR.move_to_end(k)
+    while len(_PM_ANCHOR) > max(1000, PREFIX_MODEL_MAX_NODES):
+        _PM_ANCHOR.popitem(last=False)
+
+
+def anchored_credit(chain, est, now=None):
+    """(credit, age_s) from the deepest chain node a finished local request ended on, within the prefix-model TTL:
+    that request's exact engine prompt_tokens rounded DOWN to the engine's cache block, capped below `est`.
+    (0, None) when the conversation has no anchored predecessor."""
+    now = time.time() if now is None else now
+    for i in range(len(chain) - 1, -1, -1):
+        node = _PM_ANCHOR.get(chain[i][0])
+        if node is not None and now - node[1] <= PREFIX_MODEL_TTL_SECS:
+            a = max(1, PREFIX_CREDIT_UNIT if PREFIX_CREDIT_UNIT > 0 else prefix_align_tokens())
+            return max(0, min((node[0] // a) * a, int(est or 0) - 1)), now - node[1]
+    return 0, None
+
+
 def warm_continuation(pm):
     """[LANE CR] True when the cost model says this request is a warm continuation of a local chain."""
     return (WARM_PRIORITY and int(pm.get("credit") or 0) >= WARM_PRIORITY_MIN_CREDIT
@@ -6480,6 +6522,7 @@ def _pm_reset(reason):
     if _PM_NODES:
         log.info("prefix model reset (%s): %d nodes dropped", reason, len(_PM_NODES))
     _PM_NODES.clear()
+    _PM_ANCHOR.clear()                  # [GW2] the engine's cache is gone, so are its exact anchors
     _PM_STATS["resets"] += 1
 
 
@@ -8450,6 +8493,12 @@ async def _route_completions(request, _no_overflow=False):
             _cr_route, _cr_age, _ = _chain_route_lookup(_pm["chain"])
             _active_set(request, chain_prev_route=_cr_route,
                         chain_prev_age_s=None if _cr_age is None else round(_cr_age, 1), pm_match_tok=_pm.get("matched"))
+        except Exception:
+            pass
+    if CREDIT_ANCHOR in ("shadow",):
+        try:
+            _ac, _aa = anchored_credit(_pm["chain"], ptok)
+            _active_set(request, pm_credit_anchored=_ac, pm_anchor_age_s=None if _aa is None else round(_aa, 1))
         except Exception:
             pass
     _cr_warm = warm_continuation(_pm)
