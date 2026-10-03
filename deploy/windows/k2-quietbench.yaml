@@ -1,0 +1,35 @@
+# K2 quiet-GPU microbench (GPU1 only, torch-free ./bench, peak ~262 MiB) as windowctl's FIRST live window
+# (WQ/main 2026-10-03: prove the framework on a low-stakes row first). Engine stays UP, no boots, gateway fenced.
+# What the framework adds over a hand-run: gateway offline window (renewed, always closed), snapshot + exact restore
+# (override bytes, timers, prod .so hashes; no restart because nothing booted and the engine stays healthy), Xid
+# baseline/abort with unit attribution, spend pause, dead-man, the GPU busy signal (gpuok.sh lets THIS window through
+# via WINDOW_ID), and the script runs from a read-only snapshot (snaprun) in its own unit k2-k2-quietbench-quiet.
+#   validate:  python3 deploy/bin/windowctl.py validate deploy/windows/k2-quietbench.yaml
+#   run (WQ):  python3 deploy/bin/windowctl.py submit deploy/windows/k2-quietbench.yaml --wait
+lane: k2
+window: k2-quietbench
+reason: "K2 quiet-GPU microbench on GPU1 beside the idle engine (windowctl first live run)"
+by: K2
+max_s: 1500
+ttl_s: 1500            # renewed every 60 s
+wait_s: 120            # let accepted local work finish before the bench (the bench needs a quiet engine)
+spend_pause_usd: 20
+gpu_gate_wait_s: 0     # no boots in this window
+conflicts: [trial_guard.sh]
+pause_timers: [vllm-qwen27b-watchdog.timer]   # per WQ; restored exactly by restore + dead-man
+on_new_xid: abort
+vars:
+  K2: /home/kevin/projects/lanes/k2
+steps:
+  - name: preflight
+    timeout_s: 60
+    run: "curl -s -m 5 -o /dev/null -w 'engine health %{http_code}\\n' http://127.0.0.1:8001/health; nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv,noheader"
+  - name: quiet
+    script: ["{{K2}}/quietbench.sh"]
+    timeout_s: 1200
+    capture:
+      QUIET_OUT: {regex: "K2 quietbench done: (\\S+)", default: ""}
+  - name: collect
+    timeout_s: 60
+    run: "test -n '{{QUIET_OUT}}' && ls -la {{K2}}/{{QUIET_OUT}} && tail -3 {{K2}}/{{QUIET_OUT}}/decode.log"
+    on_fail: continue

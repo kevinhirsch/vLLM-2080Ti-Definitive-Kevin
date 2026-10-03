@@ -1,4 +1,4 @@
-"""RL (L107 + L104): serve-hauhaucs-v02.sh / serve-profile-v02.sh honor an override PYTHONPATH (it used to be re-exported
+"""RL (L107 + L146): serve-hauhaucs-v02.sh / serve-profile-v02.sh honor an override PYTHONPATH (it used to be re-exported
 after sourcing v02.override.env and silently dropped) and boot the release `current` pointer, resolved once."""
 import os
 import subprocess

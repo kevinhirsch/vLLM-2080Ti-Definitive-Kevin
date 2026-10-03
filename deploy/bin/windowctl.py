@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""windowctl.py -- ONE framework for engine windows (lane RL, 2026-10-03, lead L105).
+"""windowctl.py -- ONE framework for engine windows (lane RL, 2026-10-03, lead L147).
 
 Lanes used to hand-write a window script each (k5_win.sh, k6_win.sh, k3_win.sh, lp_win1.sh, ...), and every one of them
 re-implemented override save/restore, boots, leases and health waits. The leftovers were real: the watchdog timer was
@@ -42,7 +42,8 @@ Spec (YAML):
   gpu_gate_wait_s: 300
   conflicts: [trial_guard.sh]   # refuse to start while such a process runs (exact /proc scan, never matches itself)
   watch_timers: [vllm-qwen27b-watchdog.timer]   # snapshotted + restored exactly (default)
-  pause_timers: []              # stopped for the window, restarted by restore AND by the dead-man
+  pause_timers: []              # stopped for the window, restarted by restore AND by the dead-man. The engine watchdog
+                                # timer is added automatically when any step stops the engine (keep_watchdog_timer: true opts out)
   on_new_xid: abort             # abort | continue
   snapshot_files: []            # extra files restored verbatim (e.g. a deployed serve script)
   promote: {release: ID, files: [...]}   # ONLY when every step passed: becomes the new restore target (prod default)
@@ -52,6 +53,7 @@ Spec (YAML):
       engine: stop                        # stop | start
     - name: test
       run: "cd {{K5}} && python tools/k5/test_gdn_mtp.py"   # str = bash -c, list = argv
+      # or  script: [/path/lane_script.sh, args...]   -> runs from a read-only snapshot taken at step start (snaprun)
       timeout_s: 600
       env: {CUDA_VISIBLE_DEVICES: "1"}
       outputs: ["{{L}}/test_gdn_mtp.json"]
@@ -108,7 +110,9 @@ RELEASES = os.environ.get("VLLM_RELEASES_ROOT", f"{HOME}/.local/share/vllm-relea
 JIT_DIRS = [".deps/tq_gqa_build", ".deps/FlashQLA-SM70-SM75/.torch_extensions_vllm_flashqla_legacy"]
 DEFAULT_WATCH_TIMERS = ["vllm-qwen27b-watchdog.timer"]
 VAR_RE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
-STEP_KINDS = ("run", "boot", "engine", "sleep")
+STEP_KINDS = ("run", "script", "boot", "engine", "sleep")
+WATCHDOG_TIMER = "vllm-qwen27b-watchdog.timer"   # its service Wants= the engine: a tick STARTS a stopped engine
+CODE_FILES = ("windowctl.py", "unitrun.py", "gpuguard.py", "release.py", "release_ab_probe.py", "gateway-offline.py")
 BUILTINS = ("RESULTS", "WINDOW", "LANE", "STEP", "PROD_ROOT")
 
 
@@ -331,6 +335,17 @@ def load_spec(path):
     return spec
 
 
+def pause_timers_of(spec):
+    """pause_timers + (by default) the engine watchdog timer whenever a step stops the engine: WQ 2026-10-03 08:11:58,
+    a watchdog tick (vllm-qwen27b-watchdog.service Wants=vllm-qwen27b.service) re-started the engine 52 s after K3's
+    window stopped it, and the microbench ran beside a booting engine. Opt out: keep_watchdog_timer: true."""
+    out = list(spec.get("pause_timers") or [])
+    stops = any(isinstance(st, dict) and st.get("engine") == "stop" for st in spec.get("steps") or [])
+    if stops and not spec.get("keep_watchdog_timer") and WATCHDOG_TIMER not in out:
+        out.append(WATCHDOG_TIMER)
+    return out
+
+
 def _names_in(obj):
     if isinstance(obj, str):
         return set(VAR_RE.findall(obj))
@@ -469,6 +484,7 @@ class Window:
                         "results": self.results, "spec": spec_path, "started": now_iso(), "status": "running",
                         "steps": self.steps, "boots": [], "xids": [], "notes": []}
         self._lease_stop = threading.Event()
+        self.renew_s = 60.0       # gateway TTL is capped at 3600 s: windows longer than that live on these renewals
         self._xid_count = None
 
     # -- bookkeeping
@@ -554,7 +570,7 @@ class Window:
         snap = {
             "taken": now_iso(), "override_exists": ov is not None, "override_b64": (ov or b"").hex(),
             "override_sha256": hashlib.sha256(ov or b"").hexdigest(), "override_bytes": len(ov or b""),
-            "timers": {t: timer_state(t) for t in (self.spec.get("watch_timers") or DEFAULT_WATCH_TIMERS) + list(self.spec.get("pause_timers") or [])},
+            "timers": {t: timer_state(t) for t in (self.spec.get("watch_timers") or DEFAULT_WATCH_TIMERS) + pause_timers_of(self.spec)},
             "prod_root": root, "so": so_hashes(root), "health": engine_health(),
             "kv_pool": gpuguard.kv_pool_since(), "spend": spend_usd(),
             "xid_count": len(xid_lines()), "jit_backup": {},
@@ -595,7 +611,7 @@ class Window:
 
     def _renew_loop(self):
         ttl = int(self.spec.get("ttl_s", 1800))
-        while not self._lease_stop.wait(60):
+        while not self._lease_stop.wait(self.renew_s):
             lease = self.state.get("lease")
             if not lease:
                 return
@@ -738,8 +754,38 @@ class Window:
         self.save_state()
         return {"rc": 0 if ok else 1, "unit": res.get("unit"), "kv_pool": gpuguard.kv_pool_since(time.time() - 900)}
 
+    def snapshot_scripts(self, st, cmd):
+        """snaprun for `run:` too: every existing *.sh file the command names is copied to a READ-ONLY snapshot in the
+        results dir and the command is rewritten to run the snapshot (a lane editing its script mid-window can no longer
+        make bash resume mid-line, which skipped K3's restore at 08:36). Returns (cmd, {original: snapshot})."""
+        if isinstance(cmd, str):
+            # only scripts in EXECUTION position: at a command start, optionally after bash/sh/source/./exec/nohup/timeout N
+            # (never a redirect target or a cp/install destination)
+            toks = [m.group("path") for m in re.finditer(
+                r"(?:^|[;&|\n(]\s*)(?:(?:bash|sh|source|\.|exec|nohup|timeout\s+\S+)\s+)*(?P<path>/[^\s'\";|&<>()]+\.sh)\b",
+                cmd, re.M)]
+        else:
+            argv0 = [str(x) for x in cmd]
+            toks = [argv0[1]] if len(argv0) > 1 and os.path.basename(argv0[0]) in ("bash", "sh") else argv0[:1]
+            toks = [t for t in toks if t.endswith(".sh")]
+        found = {}
+        for tok in toks:
+            if os.path.isfile(tok) and tok not in found and not tok.startswith(self.results + os.sep):
+                snap = self.path("steps", f"{st['name']}.{len(found)}.{os.path.basename(tok)[:-3]}.snap.sh")
+                if not self.dry:
+                    shutil.copy2(tok, snap)
+                    os.chmod(snap, 0o444)
+                found[tok] = snap
+        if not found:
+            return cmd, {}
+        def swap(x):
+            for k, v in found.items():
+                x = re.sub(r"(?<![\w./-])" + re.escape(k) + r"\b", v, x)
+            return x
+        return (swap(cmd) if isinstance(cmd, str) else [swap(str(x)) for x in cmd]), found
+
     def step_run(self, st, rendered):
-        cmd = rendered["run"]
+        cmd, snaps = self.snapshot_scripts(st, rendered["run"])
         argv = ["bash", "-c", cmd] if isinstance(cmd, str) else [str(x) for x in cmd]
         env = {k: str(v) for k, v in (rendered.get("env") or {}).items()}
         env.update(WINDOW_ID=self.wid, WINDOW_RESULTS=self.results, WINDOW_LANE=self.lane)
@@ -750,9 +796,25 @@ class Window:
                           cwd=rendered.get("cwd"), out=out)
         missing = [p for p in (rendered.get("outputs") or []) if not os.path.exists(p)]
         res["missing_outputs"] = missing
+        if snaps:
+            res["script_snapshots"] = snaps
         if missing and res.get("rc") == 0:
             res["rc"] = 3
             res["error"] = f"declared outputs missing: {missing}"
+        return res
+
+    def step_script(self, st, rendered):
+        """`script: [path, args...]`: the lane script runs from a READ-ONLY snapshot taken now (WQ's snaprun rule: bash
+        reads a running script incrementally, so editing it mid-run made K3's cleanup resume mid-line and skip restore)."""
+        argv = rendered["script"] if isinstance(rendered["script"], list) else shlex.split(rendered["script"])
+        src = os.path.realpath(argv[0])
+        snap = self.path("steps", f"{st['name']}.snap{os.path.splitext(src)[1] or '.sh'}")
+        if not self.dry:
+            shutil.copy2(src, snap)
+            os.chmod(snap, 0o444)
+        st2 = {**st, "run": ["bash", snap, *argv[1:]] if not src.endswith(".py") else ["python3", snap, *argv[1:]]}
+        res = self.step_run(st2, {**rendered, "run": st2["run"]})
+        res["script_sha256"] = hashlib.sha256(open(src, "rb").read()).hexdigest()[:16] if os.path.exists(src) else None
         return res
 
     def run_steps(self):
@@ -777,6 +839,8 @@ class Window:
             t = time.time()
             if row["kind"] == "run":
                 res = self.step_run(st, rendered)
+            elif row["kind"] == "script":
+                res = self.step_script(st, rendered)
             elif row["kind"] == "boot":
                 res = self.step_boot(st, rendered)
             elif row["kind"] == "engine":
@@ -873,7 +937,7 @@ class Window:
             gpuguard.set_busy(self.by, f"{self.wid} window", ttl_s=self.max_s + 1800, window=self.wid, phase="window")
             self.arm_deadman()
             self.take_hold()
-            for t in self.spec.get("pause_timers") or []:
+            for t in pause_timers_of(self.spec):
                 if self.snapshot["timers"].get(t) == "active":
                     set_timer(t, False)
                     self.log(f"paused timer {t} (restore + dead-man restart it)")
@@ -1168,9 +1232,20 @@ def main(argv=None):
                 "-p", "KillMode=mixed", f"--setenv=PATH={os.environ.get('PATH', '/usr/bin:/bin')}", f"--setenv=HOME={HOME}"]
         if a.wait:
             argv.append("--wait")
-        argv += ["--", sys.executable, os.path.abspath(__file__), "run", os.path.abspath(a.spec)]
+        # snaprun rule for the framework itself: it (and the dead-man it arms) runs from a read-only snapshot of its
+        # code + the spec taken NOW, so merging/editing deploy/bin or the spec mid-window cannot change a running window.
+        snap = os.path.join(unitrun.STATE_DIR, "windowctl-snap", f"{unit}-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
+        os.makedirs(snap, exist_ok=True)
+        for f in CODE_FILES:
+            if os.path.exists(os.path.join(HERE, f)):
+                shutil.copy2(os.path.join(HERE, f), os.path.join(snap, f))
+        spec_snap = os.path.join(snap, os.path.basename(a.spec))
+        shutil.copy2(a.spec, spec_snap)
+        for f in os.listdir(snap):
+            os.chmod(os.path.join(snap, f), 0o444)
+        argv += ["--", sys.executable, os.path.join(snap, "windowctl.py"), "run", spec_snap]
         r = subprocess.run(argv)
-        print(json.dumps({"unit": unit, "rc": r.returncode, "stop": f"systemctl --user stop {unit}  (restores first)"}))
+        print(json.dumps({"unit": unit, "rc": r.returncode, "code_snapshot": snap, "stop": f"systemctl --user stop {unit}  (restores first)"}))
         return r.returncode
     if a.cmd == "status":
         try:

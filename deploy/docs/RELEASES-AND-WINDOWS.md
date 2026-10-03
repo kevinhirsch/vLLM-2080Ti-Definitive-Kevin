@@ -1,6 +1,6 @@
 # Engine releases, the window framework, and jobs in units (lane RL, 2026-10-03)
 
-Leads: L104 (immutable releases), L105 (one window framework), L106 (jobs in systemd units), L107 (PYTHONPATH re-export bug).
+Leads: L146 (immutable releases), L147 (one window framework), L106 (jobs in systemd units), L107 (PYTHONPATH re-export bug), L110 (foreign GPU apps shrink the KV pool: boot gate), L111 (timer state restore), L123 (uvicorn access log). Commits before 2026-10-03 09:00 cite L104/L105 for L146/L147 (a concurrent leads.json write reused those ids).
 
 ## 1. Immutable engine releases (`deploy/bin/release.py`)
 
@@ -57,6 +57,10 @@ framework owns everything else:
 - **GPU busy signal:** published in `~/.local/share/vllm-qwen27b/gpu-busy.json` (see §4).
 - **Conflicts:** `conflicts:` refuses to start while a matching process runs (an exact `/proc` scan that never matches itself).
 - **Promotion:** `promote:` is the ONLY way a window changes the production default, and it happens only after every step passed.
+- **Watchdog timer:** `vllm-qwen27b-watchdog.timer` is paused automatically whenever any step stops the engine, because its service `Wants=` the engine and a tick STARTS a stopped engine (WQ 08:11:58). It is restarted by the restore and by the dead-man; `keep_watchdog_timer: true` opts out.
+- **Liveness hold:** when Lane LV's `engine-actuator.py hold` is deployed, the window holds the engine (scoped to its owner pid) and names the hold on every restart.
+- **Gateway lease:** renewed every 60 s, so a window can run longer than the gateway's 3600 s TTL cap.
+- **snaprun:** `submit` runs the framework, and the dead-man it arms, from a read-only snapshot of its code and the spec. A `script: [path, args]` step runs a lane script from a read-only snapshot taken at step start.
 - **Outputs:** a results dir with `summary.json`, `snapshot.json`, `state.json`, `window.log` and `steps/*.log`.
 
 ```

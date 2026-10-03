@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""release.py -- immutable engine releases (lane RL, 2026-10-03, lead L104).
+"""release.py -- immutable engine releases (lane RL, 2026-10-03, lead L146).
 
 Production used to boot the mutable dev worktree ~/Desktop/wt-integrate, where people also develop. Near-misses on
 2026-10-03: an uncommitted fix sat in the prod tree; lane trees symlink .venv/.deps into it, so a lane boot could

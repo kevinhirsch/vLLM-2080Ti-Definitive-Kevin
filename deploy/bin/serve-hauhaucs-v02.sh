@@ -26,7 +26,7 @@ if [ "${V02_STACK:-1}" = "1" ]; then
   export VLLM_U2_INT4_HEAD=${VLLM_U2_INT4_HEAD:-1} VLLM_U2_INT4_MTP=${VLLM_U2_INT4_MTP:-1}
   case " ${VLLM_SERVE_EXTRA_ARGS:-} " in *" --language-model-only "*) ;; *) VLLM_SERVE_EXTRA_ARGS="--language-model-only ${VLLM_SERVE_EXTRA_ARGS:-}"; export VLLM_SERVE_EXTRA_ARGS;; esac
 fi
-# RL/L104: production boots the immutable release `current` (deploy/bin/release.py) once it exists; the legacy dev tree
+# RL/L146: production boots the immutable release `current` (deploy/bin/release.py) once it exists; the legacy dev tree
 # wt-integrate is only the fallback. Resolved ONCE here: a pointer flip during a boot cannot mix two releases, and the
 # JIT build dirs see the same concrete path they were prebuilt at (a different path = a rebuild).
 if [ -z "${V02_ROOT:-}" ]; then

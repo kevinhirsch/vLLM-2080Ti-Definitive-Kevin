@@ -1,4 +1,4 @@
-# RL (L104) migration: production stops booting the mutable dev tree wt-integrate and boots the immutable release
+# RL (L146) migration: production stops booting the mutable dev tree wt-integrate and boots the immutable release
 # `current` (~/.local/share/vllm-releases/current) instead. ONE planned window, run by WQ through the window framework.
 #   1. deploy the release-aware serve scripts (+ the attributing fault collector and unitrun.py beside it). With no
 #      `current` pointer they boot wt-integrate exactly as before (proved by the BASE arm below).
@@ -15,7 +15,7 @@
 #   run (WQ):  python3 deploy/bin/windowctl.py submit deploy/windows/rl-release-migration.yaml --wait
 lane: rl
 window: rl-release-migration
-reason: "RL L104: switch production from the wt-integrate tree to the immutable release pointer (A/B identity gated)"
+reason: "RL L146: switch production from the wt-integrate tree to the immutable release pointer (A/B identity gated)"
 by: RL
 max_s: 3600            # 3 boots x ~5 min + 2 x (quick ~2 min, probe ~1 min, evalkit tool_call ~4 min)
 ttl_s: 1800

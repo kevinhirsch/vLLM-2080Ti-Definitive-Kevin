@@ -1,4 +1,4 @@
-"""RL (L105): one window framework -- declarative spec, exact snapshot/restore, gates, units, dead-man."""
+"""RL (L147): one window framework -- declarative spec, exact snapshot/restore, gates, units, dead-man."""
 import json
 import os
 import subprocess
@@ -186,8 +186,8 @@ def test_the_ported_k5_spec_validates():
     names = [x["name"] for x in s["steps"]]
     assert names[:3] == ["clean", "stop-engine", "gdn-test"] and "k5-boot" in names
     k5 = next(x for x in s["steps"] if x["name"] == "k5-boot")
-    assert k5["boot"]["release"]["sha"].startswith("bc258cf019")     # the lane arm is a release, not the tree
-    assert "trial_guard.sh" in s["conflicts"]
+    assert k5["boot"]["release"]["sha"].startswith("6235bb4956")     # the lane arm is a release, not the tree
+    assert "trial_guard.sh" in s["conflicts"] and "vllm-qwen27b-watchdog.timer" in wc.pause_timers_of(s)
     tq = next(x for x in s["steps"] if x["name"] == "tq-test")
     assert s["vars"]["K5"] == "/home/kevin/Desktop/wt-k5"
     assert "VLLM_TQ_GQA_BUILD_DIR={{K5}}/.deps/tq_gqa_build" in tq["run"] and "wt-integrate/.deps" not in tq["run"]
@@ -460,3 +460,98 @@ def test_without_lv_deployed_the_window_runs_and_says_so(world, tmp_path):
     s = wc.Window(spec(tmp_path)).run()
     assert s["status"] == "ok" and any("no `hold` yet" in n for n in s["notes"])
     assert all("--hold" not in c["cmd"] for c in world.actuator_calls)
+
+
+def test_engine_stop_auto_pauses_the_watchdog_timer_and_restores_it(world, tmp_path, monkeypatch):
+    """A watchdog tick STARTS a stopped engine (its service Wants= the engine): any `engine: stop` pauses its timer."""
+    (tmp_path / "rel").mkdir()
+    seen = {}
+    orig = world.unit_run
+
+    def run(*a, **k):
+        if a[1] == "t5-ab-stop":
+            seen["timer_during_stop"] = world.timers["vllm-qwen27b-watchdog.timer"]
+        return orig(*a, **k)
+    monkeypatch.setattr(unitrun, "run", run)
+    s = wc.Window(spec(tmp_path)).run()
+    assert seen["timer_during_stop"] == "inactive"
+    assert world.timers["vllm-qwen27b-watchdog.timer"] == "active" and s["restore"]["ok"]
+    assert wc.pause_timers_of({"steps": [{"name": "s", "engine": "stop"}]}) == ["vllm-qwen27b-watchdog.timer"]
+    assert wc.pause_timers_of({"steps": [{"name": "s", "run": "x"}]}) == []
+    assert wc.pause_timers_of({"keep_watchdog_timer": True, "steps": [{"name": "s", "engine": "stop"}]}) == []
+
+
+def test_deadman_restarts_a_paused_watchdog_timer(world, tmp_path):
+    res = tmp_path / "results"
+    res.mkdir()
+    snap = {"override_b64": world.override.read_bytes().hex(), "override_exists": True,
+            "timers": {"vllm-qwen27b-watchdog.timer": "active"}, "prod_root": str(world.root),
+            "so": wc.so_hashes(str(world.root)), "kv_pool": 960000, "xid_count": 1, "jit_backup": {}}
+    (res / "snapshot.json").write_text(json.dumps(snap))
+    world.timers["vllm-qwen27b-watchdog.timer"] = "inactive"           # the window paused it, then was SIGKILLed
+    state = {"window": "w", "lane": "t5", "results": str(res), "pid": 2 ** 22 + 7, "pid_start": "x", "boots": 0,
+             "engine_stopped": True, "deadline": time.time() + 999, "restored": False}
+    (res / "state.json").write_text(json.dumps(state))
+    wc.deadman(str(res / "state.json"))
+    assert world.timers["vllm-qwen27b-watchdog.timer"] == "active"
+
+
+def test_lease_is_renewed_so_windows_can_outlive_the_gateway_ttl_cap(world, tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(wc, "http_json", lambda url, method="GET", payload=None, timeout=8: calls.append((method, payload)) or {"lease": "LEASE1"})
+    w = wc.Window(spec(tmp_path, ttl_s=1800))
+    w.renew_s = 0.05
+    w.state["lease"] = "LEASE1"
+    import threading
+    th = threading.Thread(target=w._renew_loop, daemon=True)
+    th.start()
+    time.sleep(0.3)
+    w._lease_stop.set()
+    th.join(1)
+    posts = [p for m, p in calls if m == "POST"]
+    assert len(posts) >= 2 and all(p["lease"] == "LEASE1" and p["ttl_s"] == 1800 for p in posts)
+
+
+def test_script_steps_run_from_a_read_only_snapshot(world, tmp_path):
+    (tmp_path / "rel").mkdir()
+    lane_script = tmp_path / "lane_win.sh"
+    lane_script.write_text("echo from-script $1 > {}/script.out\n".format(tmp_path))
+    sp = spec(tmp_path, steps=[{"name": "sc", "script": [str(lane_script), "argA"]}])
+    s = wc.Window(sp).run()
+    assert s["status"] == "ok"
+    assert (tmp_path / "script.out").read_text().strip() == "from-script argA"
+    snap = tmp_path / "results" / "steps" / "sc.snap.sh"
+    assert snap.exists() and not os.access(snap, os.W_OK)
+    assert world.units[0]["cmd"] == ["bash", str(snap), "argA"]
+
+
+def test_submit_runs_the_window_from_a_code_snapshot(tmp_path, monkeypatch):
+    monkeypatch.setattr(unitrun, "STATE_DIR", str(tmp_path / "units"))
+    seen = {}
+    monkeypatch.setattr(wc.subprocess, "run", lambda argv, **k: seen.setdefault("argv", argv) and type("R", (), {"returncode": 0})())
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps(spec(tmp_path)))
+    assert wc.main(["submit", str(p)]) == 0
+    argv = seen["argv"]
+    i = argv.index("--")
+    code, spec_path = argv[i + 2], argv[i + 4]
+    assert code.startswith(str(tmp_path / "units" / "windowctl-snap")) and code.endswith("windowctl.py")
+    assert os.path.dirname(spec_path) == os.path.dirname(code) and not os.access(code, os.W_OK)
+    for f in ("unitrun.py", "gpuguard.py", "release.py", "gateway-offline.py"):
+        assert os.path.exists(os.path.join(os.path.dirname(code), f))
+    assert "--unit=win-t5-t5-ab" in argv
+
+
+def test_run_commands_naming_a_script_run_its_read_only_snapshot(world, tmp_path):
+    (tmp_path / "rel").mkdir()
+    sh = tmp_path / "lane" / "w.sh"
+    sh.parent.mkdir()
+    sh.write_text(f"echo ran $1 > {tmp_path}/w.out\n")
+    sp = spec(tmp_path, steps=[{"name": "a", "run": f"cd /tmp && bash {sh} X && echo after"}])
+    s = wc.Window(sp).run()
+    assert s["status"] == "ok" and (tmp_path / "w.out").read_text().strip() == "ran X"
+    cmd = world.units[0]["cmd"][2]
+    assert str(sh) not in cmd and ".snap.sh" in cmd
+    snap = cmd.split("bash ")[1].split()[0]
+    assert not os.access(snap, os.W_OK) and open(snap).read() == sh.read_text()
+    assert s["steps"][0]["script_snapshots"] == {str(sh): snap}

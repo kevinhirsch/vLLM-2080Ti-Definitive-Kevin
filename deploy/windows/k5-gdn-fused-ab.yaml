@@ -1,9 +1,9 @@
 # K5 (L80) decode-megakernel step 1: sm_75 fused GDN post-conv MTP decode, A/B on the live config.
-# Port of /home/kevin/Desktop/wt-k5/tools/k5/k5_win.sh (k5-megakernel @ bc258cf019) to the window framework
+# Port of /home/kevin/Desktop/wt-k5/tools/k5/k5_win.sh (k5-megakernel @ bc258cf019; arm rebased 6235bb4956) to the window framework
 # (deploy/bin/windowctl.py, lane RL 2026-10-03). Everything the old script hand-rolled is now the framework's:
 # override save/verbatim restore, gateway offline window, Xid baseline, foreign-GPU gate before every boot,
 # KV pool per boot, spend pause, dead-man restore, units per command. The K5 arm boots an immutable RELEASE built from
-# bc258cf019 (not the wt-k5 tree): its own .deps/tq_gqa_build + FlashQLA .so are prebuilt at the release path.
+# 6235bb4956 (not the wt-k5 tree): its own .deps/tq_gqa_build + FlashQLA .so are prebuilt at the release path.
 #   validate:  python3 deploy/bin/windowctl.py validate deploy/windows/k5-gdn-fused-ab.yaml
 #   run (WQ):  python3 deploy/bin/windowctl.py submit deploy/windows/k5-gdn-fused-ab.yaml --wait
 lane: k5
@@ -17,6 +17,7 @@ wait_s: 90
 spend_pause_usd: 20
 gpu_gate_wait_s: 300
 conflicts: [trial_guard.sh]
+pause_timers: [vllm-qwen27b-watchdog.timer]   # explicit (the framework also adds it for any `engine: stop`): its tick STARTS a stopped engine
 on_new_xid: abort
 vars:
   L: /home/kevin/projects/lanes/k5
@@ -74,7 +75,7 @@ steps:
   - name: k5-boot
     when: "{{KPASS}} == True"
     boot:
-      release: {sha: bc258cf019, label: k5}
+      release: {sha: 6235bb4956, label: k5}   # k5-megakernel rebased on integrate 7004df6ae8 (K5 2026-10-03)
       label: k5
       env:
         VLLM_K5_GDN_FUSED: "1"
