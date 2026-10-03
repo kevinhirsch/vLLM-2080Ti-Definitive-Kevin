@@ -70,11 +70,31 @@ def classify(journal: str, kernel: str):
                 detail = "last-frame=%s:%s:%s" % frames[-1]
     elif re.search(r"Xid.*\b13\b", kernel):
         sig = "xid13-sm-exception"
+    elif "Engine core initialization failed" in journal:
+        # AU 2026-10-03: a boot that never served (bad window config, foreign GPU memory at profile time) is not a runtime
+        # death. 10-02 22:11-22:16 (KeyError 'weight', 6x) and 10-03 01:19-01:28 (no KV memory, 10x) were filed as
+        # engine-dead-other / unknown-exit. Name the boot failure and its root error line.
+        sig = "boot-failed"
+        detail = boot_failure_cause(journal)
     elif re.search(r"out of memory|OutOfMemory|CUDA OOM", journal, re.I):
         sig = "oom"
     elif "EngineDeadError" in journal or "WorkerProc hit an exception" in journal:
         sig = "engine-dead-other"
     return sig, detail
+
+
+def boot_failure_cause(journal: str) -> str:
+    """The first concrete error line of a failed engine init (what to fix), e.g. 'no-kv-memory' or "KeyError: 'weight'"."""
+    if "No available memory for the cache blocks" in journal:
+        return "no-kv-memory (another GPU process or gpu_memory_utilization at profile time)"
+    for pat in (r"Worker failed with error '(.+?)', please check", r"\b((?:Key|Value|Type|Import|File[A-Za-z]*|Assertion|NotImplemented|Runtime)Error: .+)"):
+        for line in journal.splitlines():
+            if "Engine core initialization failed" in line:
+                continue
+            m = re.search(pat, line)
+            if m:
+                return m.group(1).strip()[:160]
+    return ""
 
 
 def scheduler_dump_shape(journal: str):
@@ -123,6 +143,15 @@ def uptime_before(ts: float):
     try:
         t = datetime.strptime(m.group(1).strip().split(" MST")[0].split(" ", 1)[1], "%Y-%m-%d %H:%M:%S").timestamp()
         return round(ts - t)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def main_start_epoch():
+    """When systemd last started the engine's main process (ExecMainStartTimestamp), or None."""
+    v = sh(f"systemctl show {UNIT} -p ExecMainStartTimestamp --value 2>/dev/null").strip()
+    try:
+        return datetime.strptime(" ".join(v.split()[1:3]), "%Y-%m-%d %H:%M:%S").timestamp()
     except Exception:  # noqa: BLE001
         return None
 
@@ -256,7 +285,15 @@ def main():
                 pass
         return
     now = datetime.strptime(a.at, "%Y-%m-%d %H:%M:%S").timestamp() if a.at else time.time()
-    since = datetime.fromtimestamp(now - a.window).strftime("%Y-%m-%d %H:%M:%S")
+    since_t = now - a.window
+    if not a.at:
+        # AU 2026-10-03: ExecStopPost can run minutes after the main process died (an ExecStartPost hook still waiting); a
+        # fixed 240 s window then reads an EMPTY journal (10-03 03:08-03:30: 4 rows with no evidence). Read from this
+        # boot's start when that is earlier (bounded to 2 h).
+        st = main_start_epoch()
+        if st and now - 7200 < st < since_t:
+            since_t = st
+    since = datetime.fromtimestamp(since_t).strftime("%Y-%m-%d %H:%M:%S")
     until = datetime.fromtimestamp(now + 45).strftime("%Y-%m-%d %H:%M:%S")
     journal = sh(f'journalctl -u {UNIT} --no-pager --since "{since}" --until "{until}"')
     kernel = sh(f'journalctl -k --no-pager -o short-iso --since "{since}" --until "{until}" | grep -i "xid\\|NVRM"')
