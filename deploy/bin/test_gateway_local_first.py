@@ -242,7 +242,8 @@ class Helpers(Isolated):
             alarm.unlink()
 
 
-class Routing(Isolated, unittest.IsolatedAsyncioTestCase):
+class RoutingBase(Isolated, unittest.IsolatedAsyncioTestCase):
+    """Shared router fixture (stubs the engine relay and the remote forward); test classes below subclass it."""
     def setUp(self):
         super().setUp()
         self.events, self.calls, self.ptok = [], [], 60_000
@@ -278,6 +279,8 @@ class Routing(Isolated, unittest.IsolatedAsyncioTestCase):
         self.events.clear(); self.calls.clear()
         return await shim._route_completions(Request(**kw))
 
+
+class Routing(RoutingBase):
     async def test_full_local_refuses_explicit_remote_aliases_without_forwarding(self):
         with patch.object(shim, "LOCAL_ONLY", 1):
             response = await self.route(model="estate-remote")

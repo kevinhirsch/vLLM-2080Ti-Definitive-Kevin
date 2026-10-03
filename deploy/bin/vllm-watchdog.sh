@@ -124,12 +124,15 @@ probe_models() {
   echo "$out"
 }
 
+# The engine runs --scheduling-policy priority (lower value = served first). A probe with no priority queues FCFS behind
+# bulk prefill and timed out on 63 of 590 probes (10.7%, 2026-10-02) although the engine was healthy; priority -1 puts it
+# ahead of ordinary work (Halo control is -100). The timeout stays: a probe that waits is exactly the signal it exists for.
 probe_generation() {
   local out
   out=$(curl -s -o /dev/null -m "$GEN_TIMEOUT" -w '%{http_code} %{time_total}' \
         "$ENDPOINT_URL/v1/chat/completions" \
         -H 'Content-Type: application/json' \
-        -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: OK\"}],\"max_tokens\":5,\"chat_template_kwargs\":{\"enable_thinking\":false}}" \
+        -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: OK\"}],\"max_tokens\":5,\"priority\":-1,\"chat_template_kwargs\":{\"enable_thinking\":false}}" \
         2>/dev/null) || out="000 $GEN_TIMEOUT.000"
   echo "$out"
 }

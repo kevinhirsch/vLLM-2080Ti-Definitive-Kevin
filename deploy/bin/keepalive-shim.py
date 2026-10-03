@@ -475,6 +475,8 @@ _CFG = {
     "SHIM_CAPACITY_LIVE":    ("CAPACITY_LIVE",    lambda v: str(v).lower() not in ("0", "false", "off", "")),
     "SHIM_TOKEN_BUDGET_FRAC": ("TOKEN_BUDGET_FRAC", float),
     "SHIM_TOKEN_BUDGET_CEIL": ("TOKEN_BUDGET_CEIL", int),
+    "SHIM_LOCAL_MODALITIES": ("LOCAL_MODALITIES", lambda v: ",".join(sorted({x.strip().lower() for x in str(v).split(",") if x.strip()})) or "text"),
+    "SHIM_REMOTE_VISION":    ("REMOTE_VISION", lambda v: 1 if str(v).lower() in ("1", "true", "on") else 0),
     "SHIM_BG_WAIT_SECS":     ("BG_WAIT",          float),
     "SHIM_BG_MARKERS":       ("BG_MARKERS", lambda v: [m for m in str(v).split("|") if m]),
     "SHIM_BG_LOCAL_ONLY":    ("BG_LOCAL_ONLY", lambda v: str(v).lower() not in ("0","false","")),
@@ -546,6 +548,16 @@ TOKEN_BUDGET_FRAC = float(os.environ.get("SHIM_TOKEN_BUDGET_FRAC") or 0) or (TOK
 # grows with concurrent context (activations do), so a larger pool alone must not raise the budget past what was exercised;
 # raise this only after a new breaking-point bench. 0 = no ceiling.
 TOKEN_BUDGET_CEIL = int(os.environ.get("SHIM_TOKEN_BUDGET_CEIL", "680000"))
+# MODALITIES (lane GW, 2026-10-02). The default engine stack serves --language-model-only: an image/video/audio part gets
+# HTTP 400 "At most 0 image(s)" from the engine, and before this guard the gateway passed that bare 400 to the caller
+# on every local alias. LOCAL_MODALITIES declares what the local engine accepts ("text"; add "image" when a vision stack
+# is served); REMOTE_VISION=1 declares that the default remote provider accepts images (DeepSeek's chat API is text-only,
+# so the default is 0). A media request the local engine cannot take goes to the remote provider when it can take it and
+# the hard daily cap has room, otherwise it gets one clear 400 -- never the engine's bare error.
+LOCAL_MODALITIES = ",".join(sorted({x.strip().lower() for x in os.environ.get("SHIM_LOCAL_MODALITIES", "text").split(",") if x.strip()})) or "text"
+REMOTE_VISION = 1 if os.environ.get("SHIM_REMOTE_VISION", "0").lower() in ("1", "true", "on") else 0
+_MEDIA_PART_TYPES = {"image_url": "image", "input_image": "image", "image": "image", "video_url": "video", "input_video": "video",
+                     "video": "video", "input_audio": "audio", "audio_url": "audio", "audio": "audio"}
 DEFAULT_MAX_OUT  = int(os.environ.get("SHIM_DEFAULT_MAX_OUT", "8192"))
 # --- TINY fast-lane (2026-08-13) ---
 # Micro-calls (title-gen, classification, keepalive probes: est. prompt+max_out <= TINY_TOKENS)
@@ -4236,7 +4248,7 @@ async def gateway_offline(request):
 
 
 _FLOW_ROUTES = collections.deque(maxlen=30000)       # (t, decision, reason, class, local_had_headroom)
-_FLOW_EXPLICIT = frozenset({"alias", "intent", "forced", "local-down", "local-offline", "failover", "full-local-remote-alias"})
+_FLOW_EXPLICIT = frozenset({"alias", "intent", "forced", "local-down", "local-offline", "failover", "full-local-remote-alias", "vision"})
 
 
 @_flow_failopen(None)
@@ -6677,6 +6689,36 @@ async def _route_completions(request, _no_overflow=False):
             return await _forward_remote(request, path, body, streaming, model=alias["model"])
         return await _forward_remote(request, path, body, streaming)
 
+    # TEXT-ONLY GUARD (lane GW): the local engine does not take image/video/audio parts. Decide here, once, instead of
+    # letting the engine answer 400 "At most 0 image(s)": the remote vision provider when one is declared and the hard
+    # daily cap has room (never for callers pinned to local), else one clear 400 that names the reason.
+    _media = request_media(body)
+    _unsupported = _media - set(local_input_modalities())
+    if _unsupported:
+        _pinned = alias_local_only or "local-pin" in (request.headers.get("X-Client") or "").lower() or LOCAL_ONLY
+        if REMOTE_VISION and _unsupported <= {"image"} and not _pinned and remote_ok():
+            if _spend_allows_overflow(ptok, maxtok):
+                log.info("route %s %s content, local is text-only -> remote(vision)", path, "/".join(sorted(_unsupported)))
+                record_event("remote", "vision", request, units, 0, **ev)
+                return await _overflow_forward(reentry=False)
+            _active_set(request, route="rejected", reason="vision-cap-exhausted")
+            return _cap_exhausted_unavailable(
+                "this request carries %s content the local engine cannot read and the daily remote cap has no room for the vision provider"
+                % "/".join(sorted(_unsupported)))
+        if _pinned:
+            why = "this caller/alias is pinned to the local engine; send it to a vision-capable alias or strip the media"
+        elif not remote_ok():
+            why = "no remote provider is available to take it; strip the media or send it to a vision-capable alias"
+        elif not REMOTE_VISION or not _unsupported <= {"image"}:
+            why = "the configured remote provider does not accept %s content either; send it to a vision-capable alias or strip the media" % "/".join(sorted(_unsupported))
+        else:
+            why = "strip the media or send it to a vision-capable alias"
+        _active_set(request, route="rejected", reason="text-only")
+        log.info("route %s %s content refused: local model is text-only", path, "/".join(sorted(_unsupported)))
+        return web.json_response({"error": {"message": text_only_guard_message(_unsupported, why),
+                                            "type": "invalid_request_error", "code": "local_model_text_only",
+                                            "param": "messages"}}, status=400)
+
     # MASTER SWITCH: full-remote mode (maintenance/debug) — everything -> DeepSeek.  The
     # estate-local alias is the one explicit per-request exception.
     if remote_ok() and effective_force_remote() and not alias_local_only:
@@ -7166,6 +7208,51 @@ async def _passthrough(request):
             return web.Response(body=data, status=up.status, content_type=ct)
 
 
+def request_media(body):
+    """Set of non-text modalities ('image', 'video', 'audio') present in the content parts of a chat/responses request."""
+    found = set()
+    try:
+        data = json.loads(body)
+    except Exception:
+        return found
+    if not isinstance(data, dict):
+        return found
+
+    def scan(items):
+        for it in items if isinstance(items, list) else []:
+            if not isinstance(it, dict):
+                continue
+            content = it.get("content")
+            for part in content if isinstance(content, list) else []:
+                kind = _MEDIA_PART_TYPES.get(str(part.get("type", "")).lower()) if isinstance(part, dict) else None
+                if kind:
+                    found.add(kind)
+            if _MEDIA_PART_TYPES.get(str(it.get("type", "")).lower()):          # responses API: a bare input_image item
+                found.add(_MEDIA_PART_TYPES[str(it["type"]).lower()])
+    scan(data.get("messages"))
+    scan(data.get("input"))
+    return found
+
+
+def local_input_modalities():
+    return sorted(set(LOCAL_MODALITIES.split(",")) | {"text"})
+
+
+def remote_input_modalities():
+    return ["text", "image"] if REMOTE_VISION else ["text"]
+
+
+def text_only_guard_message(media, why):
+    return ("local model is text-only (%s content is not accepted by the local engine, which serves with --language-model-only); %s"
+            % ("/".join(sorted(media)), why))
+
+
+def _modalities_fields(mods):
+    mods = sorted(set(mods))
+    return {"input_modalities": mods, "output_modalities": ["text"], "modalities": {"input": mods, "output": ["text"]},
+            "capabilities": {"vision": "image" in mods}}
+
+
 def _alias_model_rows():
     """The gateway's own routable model names, in OpenAI /v1/models shape.
 
@@ -7182,14 +7269,18 @@ def _alias_model_rows():
                        ("estate-local", "gateway-local"),
                        ("estate-remote", "gateway-remote"),
                        ("estate-remote-pro", "gateway-remote-pro")):
+        mods = local_input_modalities() if name == "estate-local" else sorted(set(local_input_modalities()) | set(remote_input_modalities()))
+        if name in ("estate-remote", "estate-remote-pro"):
+            mods = remote_input_modalities()
         rows.append({"id": name, "object": "model", "created": now,
-                     "owned_by": "gateway", "gateway_alias": kind})
+                     "owned_by": "gateway", "gateway_alias": kind, **_modalities_fields(mods)})
     for name, rec in sorted(_ALIASES.items()):
         if not rec.get("enabled", True):
             continue
         rows.append({"id": name, "object": "model", "created": now,
                      "owned_by": "gateway", "gateway_alias": "custom-remote",
-                     "gateway_target": rec.get("model") or "", })
+                     "gateway_target": rec.get("model") or "",
+                     **_modalities_fields(["text", "image"] if rec.get("vision") else ["text"])})
     return rows
 
 
@@ -7206,6 +7297,10 @@ async def h_models(request):
     except Exception as e:
         log.warning("h_models: local unreachable (%r)", e)
 
+    for r in local_rows:                    # the engine's own rows: advertise what it accepts
+        if isinstance(r, dict):
+            for k, v in _modalities_fields(local_input_modalities()).items():
+                r.setdefault(k, v)
     seen = {r.get("id") for r in local_rows}
     rows = list(local_rows) + [r for r in _alias_model_rows() if r["id"] not in seen]
     if not rows:
