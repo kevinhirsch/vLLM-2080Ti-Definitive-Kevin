@@ -432,6 +432,9 @@ def main():
         row.setdefault("planned_reason", (marker or {}).get("reason"))
         row["killed_after_stop_timeout"] = killed_after_timeout  # in-flight work was cut at the stop timeout (drain didn't finish)
         row["drain"] = (marker or {}).get("drain")
+        # L141 (LV): a planned stop is not a fault class. Keep what the exit looked like as a field, never as the signature
+        # (78 planned rows in 24 h read "planned-stop engine-dead-other" / "unknown-exit" to anyone counting signatures).
+        row["exit_signature"], row["signature"] = row["signature"], "planned"
     os.makedirs(INC, exist_ok=True)
     if kind == "FAULT":
         os.makedirs(f"{inc}/flightrec", exist_ok=True)
