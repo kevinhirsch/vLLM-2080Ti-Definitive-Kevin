@@ -73,3 +73,20 @@ class Dashboard(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RealDashboardAgainstRealConfig(unittest.TestCase):
+    """The shipped dashboard vs the shim's own current_config(): no dead form field, no read of a vanished key, no
+    hint that states a default the code does not have (the interactive_never_overflow hint was inverted until
+    2026-10-03, and production ran with 0 = the opposite of what the hint promised)."""
+
+    def test_shipped_dashboard_is_consistent(self):
+        import importlib.util
+        os.environ.setdefault("SHIM_EXACT_TOKENS", "0")
+        here = Path(__file__).resolve().parent
+        spec = importlib.util.spec_from_file_location("keepalive_shim_drift", here / "keepalive-shim.py")
+        shim = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(shim)
+        facts = {"gw." + k: v for k, v in shim.current_config(masked=True).items()}
+        bad = [r for r in C.check_dashboard(facts, here / "gateway_dashboard.html") if r["status"] == "MISMATCH"]
+        self.assertEqual(bad, [])

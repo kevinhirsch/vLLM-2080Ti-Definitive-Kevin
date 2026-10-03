@@ -11229,7 +11229,7 @@ details.tail pre{margin:6px 0 0;font-size:11.5px;color:var(--dim);white-space:pr
     <input id=f_local_budget type=number min=1 max=8></label>
    <label><span class=k>How long should a request wait for a free lane?</span><span class=hint>seconds &middot; used for background during peak hours, and for interactive only if "never overflow" below is off</span>
     <input id=f_local_wait_secs type=number min=0 step=1></label>
-   <label><span class=k>Should interactive traffic ever overflow while waiting?</span><span class=hint>0 = never, it queues until a lane is free (default) &middot; 1 = restores the wait-above-then-overflow behaviour</span>
+   <label><span class=k>Should interactive traffic ever overflow while waiting?</span><span class=hint>1 = never, it queues until a lane is free (default) &middot; 0 = restores the wait-above-then-overflow behaviour</span>
     <input id=f_interactive_never_overflow type=number min=0 max=1></label>
    <label><span class=k>Prompt and output tokens all lanes may reserve</span><span class=hint>estimated tokens &middot; admission memory limit</span>
     <input id=f_token_budget type=number min=0 step=50000></label>
