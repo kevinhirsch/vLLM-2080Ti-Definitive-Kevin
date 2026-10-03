@@ -16,7 +16,10 @@
 # Deterministic, no LLM (cron policy). Safe by construction:
 #   - --apply refuses non-fast-forward (never rewrites local work; prints what to do)
 #   - --restart uses the exact window sequence proven in ops (Hermes stays live on
-#     the DeepSeek failover; watchdog stopped/restarted around the engine restart)
+#     the DeepSeek failover; the engine is held by a liveness hold, never by stopping the watchdog timer)
+# L111/L153: it used to stop vllm-qwen27b-watchdog.timer and only started it again on the success path, so any failure
+# (set -e, restart refused, engine unhealthy) left the engine unwatched and the gateway forced to remote. The hold is
+# released on every exit path by the actuator, and the forced-remote flag is cleared by a trap.
 set -euo pipefail
 
 REPO=/home/kevin/Desktop/vLLM-2080Ti-Definitive
@@ -30,6 +33,10 @@ ENGINE=http://127.0.0.1:8001
 cd "$REPO"
 APPLY=0; RESTART=0
 for a in "$@"; do case "$a" in --apply) APPLY=1;; --restart) RESTART=1;; *) echo "unknown arg: $a"; exit 2;; esac; done
+if [ "$RESTART" = 1 ]; then
+  . "$REPO/deploy/bin/window_guard.sh"
+  window_guard_enter update-from-remote "engine restart after update-from-remote --apply" 3600 -- "$@"
+fi
 
 echo "== fetch =="
 git fetch "$BRANCH_REMOTE" "$BRANCH" 2>&1 | tail -1 || true
@@ -64,9 +71,9 @@ fi
 if [ "$RESTART" = 1 ]; then
   echo "== engine restart window =="
   echo "  gateway -> remote (Hermes stays live on DeepSeek failover)"
+  trap 'curl -s -m 5 -X POST "$GATEWAY/gateway/config" -H "Content-Type: application/json" -d "{\"force_remote\": 0}" >/dev/null 2>&1 || true' EXIT
   curl -s -X POST "$GATEWAY/gateway/config" -H "Content-Type: application/json" \
        -d '{"force_remote": 1}' >/dev/null
-  sudo systemctl stop vllm-qwen27b-watchdog.timer
   sudo systemctl restart vllm-qwen27b.service
   echo -n "  waiting for health"
   ok=0
@@ -79,12 +86,10 @@ if [ "$RESTART" = 1 ]; then
       -d '{"model":"qwen-local","max_tokens":8,"temperature":0,"messages":[{"role":"user","content":"Reply with exactly: OK"}]}' \
       | grep -c '"content"' || true)
     echo "  smoke: $([ "$SMOKE" -ge 1 ] && echo PASS || echo FAIL)"
-    curl -s -X POST "$GATEWAY/gateway/config" -H "Content-Type: application/json" \
-         -d '{"force_remote": 0}' >/dev/null
-    sudo systemctl start vllm-qwen27b-watchdog.timer
-    echo "  gateway -> local, watchdog -> active. DONE."
+    echo "  gateway -> local, liveness hold released at exit. DONE."
   else
-    echo "  ENGINE NOT HEALTHY after 10 min — leaving gateway on remote (traffic keeps working)."
+    echo "  ENGINE NOT HEALTHY after 10 min — gateway released to its own routing (it serves remote while local is down;"
+    echo "  a forced-remote flag left behind would keep a healthy engine idle and spend money)."
     echo "  Investigate: journalctl -u vllm-qwen27b -n 50 | rollback: git checkout pre-consolidation-rollback && $0 --restart"
     exit 1
   fi

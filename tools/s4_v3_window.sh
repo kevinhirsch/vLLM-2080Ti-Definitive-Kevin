@@ -4,8 +4,12 @@
 # B = v3 GPU merge   (async AUTO-ON, the target)
 # C = v3 GPU merge   (async forced OFF — isolates merge overhead from async gain)
 #
-# Maintenance-window only: stops prod (+watchdog), restores both on exit (trap).
+# Maintenance-window only: stops prod under a liveness hold (deploy/bin/window_guard.sh), restores prod on exit (trap).
+# L111/L153: this script used to stop vllm-qwen27b-watchdog.timer (the liveness authority's clock) and start it again
+# unconditionally at the end; a failure in between left the engine unwatched. It now takes the hold instead.
 set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/../deploy/bin/window_guard.sh"
+window_guard_enter S4 "EXP-039 v3 window: arms Z/A/B/C on the stopped engine" 21600 -- "$@"
 
 WT=/home/kevin/Desktop/.ftree-s4drafter
 PY=/home/kevin/Desktop/vLLM-2080Ti-Definitive/.venv/bin/python
@@ -36,13 +40,11 @@ restore_prod() {
   for i in $(seq 1 90); do
     curl -sf -m 3 http://127.0.0.1:8001/health >/dev/null 2>&1 && break; sleep 10
   done
-  sudo systemctl start vllm-qwen27b-watchdog.timer
   echo "[window] prod restored: $(curl -sf -m 3 http://127.0.0.1:8001/health >/dev/null && echo HEALTHY || echo NOT-HEALTHY)"
 }
 trap restore_prod EXIT
 
-echo "[window] taking engine ownership (watchdog off, prod down)"
-sudo systemctl stop vllm-qwen27b-watchdog.timer
+echo "[window] taking engine ownership (liveness hold held, prod down)"
 sudo systemctl stop vllm-qwen27b.service
 sleep 5
 
