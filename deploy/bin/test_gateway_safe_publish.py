@@ -1,5 +1,6 @@
 """The publisher refuses to restart while accepted calls remain visible."""
 import importlib.util
+import shutil
 import json
 import os
 from pathlib import Path
@@ -82,8 +83,12 @@ class SafePublish(unittest.TestCase):
             wait.assert_not_called()
 
     def test_failed_release_fences_new_arrivals_and_waits_for_accepted_calls(self):
+        # RL/live_guard 2026-10-03: this test used to write the LIVE gateway-publish-drain.json + audit log
+        tmp = Path(tempfile.mkdtemp(prefix="sp-fence-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
         with patch.object(pub, "_http", side_effect=[
                 {"draining": False, "active": 1}, {"lease": "new-release"}]) as http, \
+             patch.object(pub, "DRAIN_STATE", tmp / "drain.json"), patch.object(pub, "AUDIT_LOG", tmp / "audit.log"), \
              patch.object(pub, "_wait_empty") as wait:
             pub._fence_failed_release("token", 10)
             http.assert_any_call("/gateway/drain", "POST", {

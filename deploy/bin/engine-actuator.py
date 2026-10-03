@@ -1468,6 +1468,13 @@ def main():
     q.add_argument("argv", nargs=argparse.REMAINDER)
     hs.add_parser("status")
     a = ap.parse_args()
+    # RL 2026-10-03 10:23:12: a K6 stubbed test reached this LIVE actuator ("restart --by K6") and wrote a false
+    # restart-job "done" + two estate events. A process started from a pytest run (PYTEST_CURRENT_TEST is inherited by
+    # every child) may only read facts from the real runtime dir; mutating actions are refused.
+    if os.environ.get("PYTEST_CURRENT_TEST") and os.path.realpath(BASE) == os.path.realpath(f"{__import__('pwd').getpwuid(os.getuid()).pw_dir}/.local/share/vllm-qwen27b") \
+            and a.cmd not in ("status", "faults", "flags", "restart-status"):
+        print(json.dumps({"refused": f"engine-actuator {a.cmd} on the LIVE runtime from a test run (PYTEST_CURRENT_TEST set)"}))
+        return 4
     if a.cmd == "status":
         print(json.dumps(status(), default=str))
     elif a.cmd == "faults":

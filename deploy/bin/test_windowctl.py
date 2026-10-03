@@ -531,6 +531,7 @@ def test_script_steps_run_from_a_read_only_snapshot(world, tmp_path):
 
 def test_submit_runs_the_window_from_a_code_snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(unitrun, "STATE_DIR", str(tmp_path / "units"))
+    monkeypatch.setattr(wc, "OVERRIDE", str(tmp_path / "v02.override.env"))
     seen = {}
     monkeypatch.setattr(wc.subprocess, "run", lambda argv, **k: seen.setdefault("argv", argv) and type("R", (), {"returncode": 0})())
     p = tmp_path / "s.json"
@@ -662,3 +663,15 @@ def test_refused_while_the_remote_balance_is_exhausted(world, tmp_path):
     assert not world.units
     s = wc.Window(spec(tmp_path, results=str(tmp_path / "r2"), allow_no_remote=True)).run()
     assert s["status"] != "refused" or not any("balance exhausted" in p for p in s["why"])
+
+
+def test_live_tools_refuse_mutations_from_a_test_run():
+    """PYTEST_CURRENT_TEST is inherited by every child: the live actuator / gateway-offline / windowctl / release refuse."""
+    import subprocess as sp
+    env = dict(os.environ, PYTEST_CURRENT_TEST="x", LIVE_GUARD_OFF="1")
+    for argv in ([sys.executable, os.path.join(HERE, "engine-actuator.py"), "restart", "--reason", "from a test run", "--by", "t"],
+                 [sys.executable, os.path.join(HERE, "gateway-offline.py"), "open", "--reason", "t", "--by", "t"],
+                 [sys.executable, os.path.join(HERE, "windowctl.py"), "deadman", "--state", "/nonexistent"],
+                 [sys.executable, os.path.join(HERE, "release.py"), "rollback", "--reason", "from a test run"]):
+        r = sp.run(argv, capture_output=True, text=True, env=env, timeout=60)
+        assert r.returncode in (2, 4) and "test run" in (r.stdout + r.stderr), (argv[1], r.stdout, r.stderr)

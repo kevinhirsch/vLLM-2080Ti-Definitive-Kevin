@@ -1321,6 +1321,10 @@ def main(argv=None):
                           "steps": [{"name": s["name"], "kind": next(k for k in STEP_KINDS if k in s),
                                      "when": s.get("when")} for s in spec["steps"]]}, indent=1))
         return 0
+    if a.cmd in ("run", "submit", "deadman") and not getattr(a, "dry_run", False) and os.environ.get("PYTEST_CURRENT_TEST") \
+            and os.path.realpath(OVERRIDE) == os.path.realpath(f"{__import__('pwd').getpwuid(os.getuid()).pw_dir}/.local/share/vllm-qwen27b/v02.override.env"):
+        print(json.dumps({"refused": f"windowctl {a.cmd} against the LIVE engine from a test run (PYTEST_CURRENT_TEST set)"}))
+        return 4
     if a.cmd == "run":
         spec = load_spec(a.spec)
         w = Window(spec, os.path.abspath(a.spec), dry_run=a.dry_run, results=a.results,
