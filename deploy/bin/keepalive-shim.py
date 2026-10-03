@@ -1629,16 +1629,33 @@ def qol_choice(local_remaining_s, waited_s, remote_s, ttft_target_s=None, min_ga
     return "remote", "remote-faster"
 
 
-def qol_decide(cls, est_computed, ptok, *, units=1, waited=0.0, pm_chain=None, now=None):
-    """Predict and decide for one interactive request. Never raises; returns a flat dict for telemetry."""
-    out = {"qol_mode": QOL_OVERFLOW}
+def qol_own_tokens(info, est_computed, ptok, pm_chain=None, now=None):
+    """(own uncached tokens, source) for the QoL prediction, best source first (lane GW2's order): the engine probe
+    (probe_prompt_tokens - pm_credit_probe), the engine-anchored credit (ptok - anchored), the cost model's estimate.
+    Computed ONCE at arrival and reused while waiting: the cache only grows warmer, so it is conservative, and the
+    probe costs a full render+tokenize in the engine's API server."""
+    info = info or {}
     try:
-        own_tok = est_computed
+        if info.get("pm_credit_probe") is not None and info.get("probe_prompt_tokens"):
+            return max(0, int(info["probe_prompt_tokens"]) - int(info["pm_credit_probe"])), "probe"
+        if info.get("pm_credit_anchored") and info.get("pm_anchor_age_s") is not None:
+            return max(0, int(ptok or 0) - int(info["pm_credit_anchored"])), "anchored"
         if pm_chain:
             ac, _age = anchored_credit(pm_chain, ptok, now=now)
             if ac:
-                own_tok = max(0, int(ptok or 0) - int(ac))
-                out["qol_anchored"] = int(ac)
+                return max(0, int(ptok or 0) - int(ac)), "anchored"
+    except Exception:
+        pass
+    return max(0, int(est_computed or 0)), "model"
+
+
+def qol_decide(cls, est_computed, ptok, *, units=1, waited=0.0, pm_chain=None, now=None, own=None):
+    """Predict and decide for one interactive request. Never raises; returns a flat dict for telemetry.
+    own = (tokens, source) from qol_own_tokens(); computed here from the cost model + anchor when not given."""
+    out = {"qol_mode": QOL_OVERFLOW}
+    try:
+        own_tok, src = own if own is not None else qol_own_tokens(None, est_computed, ptok, pm_chain, now)
+        out["qol_credit_source"] = src
         pred, parts = local_first_predicted_ttft(cls if cls in FLOW_CLASSES else "kevin", own_tok, units=units, now=now)
         remote, band, n = qol_remote_ttft(ptok, now=now)
         would, why = qol_choice(pred, waited, remote)
@@ -1651,7 +1668,7 @@ def qol_decide(cls, est_computed, ptok, *, units=1, waited=0.0, pm_chain=None, n
 
 
 _QOL_FIELDS = ("qol_mode", "qol_would", "qol_why", "qol_at", "qol_legacy", "qol_pred_local_s", "qol_pred_remote_s",
-               "qol_band", "qol_remote_n", "qol_waited_s", "qol_queue_s", "qol_backlog_s", "qol_own_s", "qol_anchored")
+               "qol_band", "qol_remote_n", "qol_waited_s", "qol_queue_s", "qol_backlog_s", "qol_own_s", "qol_credit_source")
 
 
 def qol_governs(reason):
@@ -9292,12 +9309,20 @@ async def _route_completions(request, _no_overflow=False):
     _lf_res = local_reservation_estimate(ptok, maxtok)
     _lf_kept = []
 
+    _qol_own_memo = []
+
+    def _qol_own():
+        """lane CFG QoL: the request's own uncached tokens, best source first, computed once (see qol_own_tokens)."""
+        if not _qol_own_memo:
+            _qol_own_memo.append(qol_own_tokens(_ACTIVE.get(id(request)), est_computed, ptok, _pm.get("chain")))
+        return _qol_own_memo[0]
+
     def _lf_keep(reason):
         keep, why = local_first_decision(reason, background=background, units=units,
                                          reservation=_lf_res, est_computed=est_computed, cls=_early_cls,
                                          warm=_cr_warm)
         if not background and qol_governs(reason):       # lane CFG: QoL interactive overflow (shadow logs, on decides)
-            _q = qol_decide(_early_cls, est_computed, ptok, units=units, pm_chain=_pm.get("chain"))
+            _q = qol_decide(_early_cls, est_computed, ptok, units=units, own=_qol_own())
             _q.update(qol_at="guard:" + reason, qol_legacy="local" if keep else "remote")
             _active_set(request, **_q)
             _QOL_STATS["%s:%s->%s" % (reason, _q["qol_legacy"], _q["qol_would"])] += 1
@@ -9666,7 +9691,7 @@ async def _route_completions(request, _no_overflow=False):
                  and not local_pin)
     _qol_broke, _qol_next = False, 0.0
     if _qol_live:
-        _q = qol_decide(_early_cls, est_computed, ptok, units=units, pm_chain=_pm.get("chain"))
+        _q = qol_decide(_early_cls, est_computed, ptok, units=units, own=_qol_own())
         _q.update(qol_at="admission")
         _active_set(request, **_q)
         if QOL_OVERFLOW == "on":
@@ -9756,7 +9781,7 @@ async def _route_completions(request, _no_overflow=False):
                 deadline = max(deadline, t_admit0 + BG_WAIT_LOCAL)
             if _qol_live and QOL_OVERFLOW == "on" and waited >= _qol_next:
                 _qol_next = waited + 1.0
-                _q = qol_decide(_early_cls, est_computed, ptok, units=units, waited=waited, pm_chain=_pm.get("chain"))
+                _q = qol_decide(_early_cls, est_computed, ptok, units=units, waited=waited, own=_qol_own())
                 if _q.get("qol_would") == "remote":
                     _q.update(qol_at="wait", qol_legacy=None)
                     _active_set(request, **_q)
@@ -9803,7 +9828,7 @@ async def _route_completions(request, _no_overflow=False):
         if _qol_broke:
             reason = "qol"                # predicted local first token too late and remote measurably faster
         elif _qol_live and not _local_offline() and _health["ok"]:
-            _q = qol_decide(_early_cls, est_computed, ptok, units=units, waited=waited, pm_chain=_pm.get("chain"))
+            _q = qol_decide(_early_cls, est_computed, ptok, units=units, waited=waited, own=_qol_own())
             _q.update(qol_at="wait-timeout", qol_legacy="remote")
             _active_set(request, **_q)
             _QOL_STATS["wait-timeout:remote->%s" % _q["qol_would"]] += 1
