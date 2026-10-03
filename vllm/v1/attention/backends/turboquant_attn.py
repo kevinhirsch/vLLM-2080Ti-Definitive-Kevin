@@ -66,6 +66,7 @@ from vllm.v1.attention.ops.flydsl_turboquant_decode import (
 )
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.ops import tq_gqa_cuda as _gqa_cuda
+from vllm.v1.attention.ops import tq_imma_cuda as _imma_cuda
 from vllm.v1.attention.ops.triton_turboquant_decode import (
     _fp8_format_code,
     _tq_full_dequant_kv,
@@ -1702,7 +1703,15 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             self._arange_cache = _ac
         _arange_cache: torch.Tensor = _ac
 
+        # [FORK][LANE K2] one INT8 tensor-core call for every short continuation (MTP verifier rows) in the batch
+        # instead of one decode call per request.
+        done = self._imma_batched_continuations(
+            query, kv_cache, attn_metadata, qsl, seq_lens_list, num_reqs, PiT, Pi, centroids, output
+        ) if _imma_cuda.enabled() and not self._soa_store else ()
+
         for i in range(num_reqs):
+            if i in done:
+                continue
             q_start = qsl[i]
             q_end = qsl[i + 1]
             q_len = q_end - q_start
@@ -1880,6 +1889,56 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 output[q_start:q_end] = out.to(query.dtype)
 
         return output
+
+    def _imma_batched_continuations(
+        self, query, kv_cache, attn_metadata, qsl, seq_lens_list, num_reqs, PiT, Pi, centroids, output
+    ) -> set[int]:
+        """Lane K2: batch all continuation requests with q_len <= _CONTINUATION_DECODE_THRESHOLD whose rows fit one
+        IMMA CTA (q_len * GQA <= 32) into one tq_imma call per q_len.  Same math as the per-request continuation
+        decode (each row attends to the TQ cache up to its own causal length).  Returns the request ids handled."""
+        Hq, D = query.shape[1], query.shape[2]
+        Hk = kv_cache.shape[2]
+        if not _imma_cuda.eligible(
+            Hq=Hq, Hk=Hk, D=D, mse_bits=self.tq_config.key_mse_bits,
+            value_quant_bits=self.tq_config.effective_value_quant_bits, key_fp8=self.tq_config.key_fp8,
+            key_packed_size=self.tq_config.key_packed_size, q_per_seq=1, block_size=kv_cache.shape[1],
+        ) or query.dtype != torch.float16:
+            return set()
+        G = Hq // Hk
+        groups: dict[int, list[int]] = {}
+        for i in range(num_reqs):
+            q_len = qsl[i + 1] - qsl[i]
+            if q_len <= 0 or q_len >= seq_lens_list[i] or q_len > _CONTINUATION_DECODE_THRESHOLD:
+                continue
+            if _SPEC_CONTINUATION_DECODE_FASTPATH and q_len > 1:
+                continue
+            if q_len * G > 32:
+                continue
+            groups.setdefault(q_len, []).append(i)
+        done: set[int] = set()
+        dev = query.device
+        for q_len, reqs in groups.items():
+            n = len(reqs)
+            rows = [r for i in reqs for r in range(qsl[i], qsl[i] + q_len)]
+            lens = [seq_lens_list[i] - q_len + 1 + j for i in reqs for j in range(q_len)]
+            contiguous = rows == list(range(rows[0], rows[0] + len(rows)))
+            host = torch.tensor(lens + reqs + rows, dtype=torch.int32, pin_memory=True)
+            meta = host.to(dev, non_blocking=True)
+            row_lens = meta[: n * q_len]
+            req_idx = meta[n * q_len: n * q_len + n].long()
+            q_rows = query[rows[0]: rows[0] + len(rows)] if contiguous else query.index_select(0, meta[n * q_len + n:].long())
+            bt = attn_metadata.block_table.index_select(0, req_idx)
+            out, _ = _imma_cuda.tq_imma_decode_attention(
+                q_rows, kv_cache, bt, row_lens, centroids, self.scale, self.tq_config.norm_correction,
+                q_per_seq=q_len, num_seqs=n, PiT=PiT if PiT is not None else Pi.T.contiguous(),
+                max_len_hint=max(lens),
+            )
+            if contiguous:
+                output[rows[0]: rows[0] + len(rows)] = out.to(output.dtype)
+            else:
+                output.index_copy_(0, meta[n * q_len + n:].long(), out.to(output.dtype))
+            done.update(reqs)
+        return done
 
     def _spec_continuation_decode_attention(
         self,
