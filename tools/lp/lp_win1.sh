@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Lane LP window W1 (~40 min): W4A8-INT8 Marlin on the SHIPPED asymmetric W4 weights (no requant).
+# Lane LP window W1 (~60 min; ~42 min with LP_SECOND=0): W4A8-INT8 Marlin on the SHIPPED asymmetric W4 weights (no requant).
 #   Phase A (small-footprint IDLE engine, ~10 min incl. boot): kernel microbench both GPUs (per-rank shapes, M=16..3632, correctness vs CPU emulation)
 #            + 25 s sustained gate_up per format per GPU (SM clock / power / temp under int8 vs fp16).
 #   Phase B (engine UP with int8 activations, ~25 min): B1 cold prefill x3, quick decode, 12-body estate pass x3,
@@ -23,10 +23,10 @@ for g in 0 1; do
   echo "bench gpu$g rc=$? :"; grep -E "PER-CHUNK|SUSTAIN|correctness" $OUT/w4a8_bench_gpu$g.log | cut -c1-200
 done
 # ---- Phase B: engine with int8 activations (from the wt-lp tree; everything else = the override that was live) ----
-mapfile -t LIVE < <(grep -E '^export ' $OV | sed 's/^export //')
+mapfile -t LIVE < <(grep -E '^export ' $OUT/override.before | sed 's/^export //')
 EXTRA=("V02_ROOT=/home/kevin/Desktop/wt-lp" "VLLM_MARLIN_INPUT_DTYPE=int8")
 [ -n "${LP_ONLY:-}" ] && EXTRA+=("VLLM_LP_INT8_ONLY='${LP_ONLY}'")
-BOOT_TIMEOUT=900 ./boot2.sh $LABEL "${LIVE[@]}" "${EXTRA[@]}" || { echo "BOOT FAILED"; cp $OUT/override.before $OV; ./boot2.sh restore >/dev/null 2>&1; exit 1; }
+BOOT_TIMEOUT=900 ./boot2.sh $LABEL "${LIVE[@]}" "${EXTRA[@]}" || { echo "BOOT FAILED"; ./boot2.sh restore-$LABEL "${LIVE[@]}" >/dev/null 2>&1; cp $OUT/override.before $OV; exit 1; }
 echo "booted $(date): $(journalctl -u vllm-qwen27b --since '-15 min' --no-pager | grep -E 'GPU KV cache size|Model loading took|MarlinLinearKernel|int8' | sed 's/.*INFO//' | cut -c1-110 | sort -u | tr '\n' '|')"
 python3 /home/kevin/Desktop/wt-lp/tools/lp/cold_prefill.py 3 $OUT/b1_${LABEL}.json
 python3 /home/kevin/Desktop/wt-integrate/tools/s2-bench/quick.py 2>&1 | tail -1
@@ -35,9 +35,18 @@ python3 det.py det_${LABEL}_cold.json; echo "vs stack ref (cold):"; python3 det.
 echo "== evalkit $(date)"; (cd /home/kevin/Desktop/qwen38-evalkit && python3 run_eval.py --tag lp-$LABEL --categories tool_call,code_exec,long_ctx 2>&1 | grep -E "passed=False|/60|passed,")
 echo "== needle 71K $(date)"; python3 /home/kevin/Desktop/wt-integrate/tools/up-bench/needle_long.py --tokens 71000 --depth 0.5 2>&1 | tail -1 | cut -c1-200
 echo "xid: $(( $(journalctl -k --no-pager | grep -c 'NVRM: Xid') - X0 )) OOMwarn=$(journalctl -u vllm-qwen27b --since '-45 min' --no-pager | grep -c 'allocation failed with OOM')"
+# ---- Phase C (optional, LP_SECOND=1, ~18 min): int8 everywhere EXCEPT mlp.down_proj (worst activation SQNR, 18 dB) ----
+if [ "${LP_SECOND:-1}" = "1" ] && [ -z "${LP_ONLY:-}" ]; then
+  L2=${LABEL}nd
+  BOOT_TIMEOUT=900 ./boot2.sh $L2 "${LIVE[@]}" "V02_ROOT=/home/kevin/Desktop/wt-lp" "VLLM_MARLIN_INPUT_DTYPE=int8" "VLLM_LP_INT8_ONLY='gate_up_proj|linear_attn|self_attn'" \
+    && { python3 /home/kevin/Desktop/wt-lp/tools/lp/cold_prefill.py 3 $OUT/b1_${L2}.json
+         python3 det.py det_${L2}_cold.json; python3 det.py --cmp det_s4_stack_ref.json det_${L2}_cold.json | tail -1
+         (cd /home/kevin/Desktop/qwen38-evalkit && python3 run_eval.py --tag lp-$L2 --categories tool_call,code_exec,long_ctx 2>&1 | grep -E "passed=False|/60|passed,"); } \
+    || echo "phase C boot failed"
+fi
 # ---- restore exactly the override that was live before the window ----
 cp $OUT/override.before $OV
-mapfile -t LIVE < <(grep -E '^export ' $OV | sed 's/^export //')
+mapfile -t LIVE < <(grep -E '^export ' $OUT/override.before | sed 's/^export //')
 ./boot2.sh restore-$LABEL "${LIVE[@]}" >/dev/null 2>&1; cp $OUT/override.before $OV
 echo "restored health $(curl -s -m3 -o /dev/null -w '%{http_code}' localhost:8001/health) $(date)"
 echo "LP W1 end $(date)"

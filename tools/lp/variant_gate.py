@@ -13,6 +13,9 @@ Built-in variants:
   w4a8       kernel-exact s8 x u4(zp) Marlin: per-token int8 act, int16 group scales (per-layer max -> 4096)
   w4a8nd     w4a8 except mlp.down_proj stays W4A16
   w4a8sm     w4a8 with SmoothQuant-style migration on down_proj only (alpha 0.5, weights re-quantized RTN asym g128 from the W4 dequant)
+  w4a8gd     w4a8 but down_proj uses per-(row,128-group) activation scales (MX-style int8 epilogue)
+  w4a8g      per-(row,128-group) activation scales on every linear
+  w4a8hd     w4a8 but down_proj input block-Hadamard rotated (weights re-quantized RTN asym g128 from the W4 dequant)
   w4a4tok    naive per-token int4 activations (no rotation) on asym W4 -- the "no tricks" W4A4 floor
   w4a4had    QuaRot-style: block-Hadamard(128) on the K dim of act and weight, weights re-quantized RTN asym g128, per-token int4 act
   sp24       2:4 structured sparsity on the W4 weights by Wanda score (|w| * ||x_k||), kept values = original W4 values
@@ -82,6 +85,34 @@ def v_w4a8sm(n, x, info, alpha=0.5):
         sm = (ax.pow(alpha) / aw.pow(1 - alpha)).clamp(min=1e-2, max=1e2)
         info["sm"] = sm; info["wsm"] = int4_rtn_asym(info["w"] * sm)
     return q_tok((x / info["sm"]).half().float(), 8) @ info["wsm"].T
+
+
+def q_grp(x, bits, g=G):
+    """per-(row, g-block) symmetric scales (MX-style int8 with a float scale per 128-K group: needs the s8 Marlin epilogue to apply
+    a_scale[row, group] * w_scale[group, col] per group in fp32 instead of one per-row scale at the end)."""
+    qmax = 2 ** (bits - 1) - 1
+    xg = x.reshape(x.shape[0], -1, g)
+    sc = xg.abs().amax(-1, keepdim=True).clamp(min=1e-12) / qmax
+    return (torch.clamp(torch.round(xg / sc), -qmax, qmax) * sc).reshape(x.shape)
+
+
+def v_w4a8gd(n, x, info):
+    if not n.endswith("down_proj"):
+        return v_w4a8(n, x, info)
+    if "wq8" not in info: info["wq8"] = int_scales(info)
+    return q_grp(x.half().float(), 8) @ info["wq8"].T
+
+
+def v_w4a8g(n, x, info):
+    if "wq8" not in info: info["wq8"] = int_scales(info)
+    return q_grp(x.half().float(), 8) @ info["wq8"].T
+
+
+def v_w4a8hd(n, x, info):
+    if not n.endswith("down_proj"):
+        return v_w4a8(n, x, info)
+    if "wh" not in info: info["wh"] = int4_rtn_asym(blk_had(info["w"]))
+    return q_tok(blk_had(x.half().float()), 8) @ info["wh"].T
 
 
 def v_w4a4tok(n, x, info):
