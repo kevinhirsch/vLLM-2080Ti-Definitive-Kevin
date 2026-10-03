@@ -204,19 +204,49 @@ def _install_dashboard(source_bytes: bytes | None = None) -> dict:
     """Ship gateway_dashboard.html next to the live shim. Atomic; returns what changed so a failed publish can undo it."""
     new = DASH_SOURCE.read_bytes() if source_bytes is None else source_bytes
     old = DASH_RUNTIME.read_bytes() if DASH_RUNTIME.is_file() else None
+    state = _install_config_schema()
     if old == new:
-        return {"dashboard": "current", "previous": old, "changed": False}
+        return {"dashboard": "current", "previous": old, "changed": False, **state}
     _atomic_write(DASH_RUNTIME, new, 0o644)
-    return {"dashboard": "installed", "previous": old, "changed": True}
+    return {"dashboard": "installed", "previous": old, "changed": True, **state}
 
 
 def _restore_dashboard(state: dict) -> None:
+    _restore_config_schema(state)
     if not state.get("changed"):
         return
     if state.get("previous") is None:
         DASH_RUNTIME.unlink(missing_ok=True)       # first install: the shim falls back to its inline page
     else:
         _atomic_write(DASH_RUNTIME, state["previous"], 0o644)
+
+
+# Lane CFG: the gateway's typed config schema module ships beside the shim like the dashboard (the shim loads it from
+# its own directory at startup and runs unvalidated without it). Paths derive from SOURCE/RUNTIME at call time so a
+# test that redirects those never touches the production directory.
+CONFIG_SCHEMA_NAME = "gateway_config_schema.py"
+
+
+def _install_config_schema() -> dict:
+    src, dst = SOURCE.with_name(CONFIG_SCHEMA_NAME), RUNTIME.with_name(CONFIG_SCHEMA_NAME)
+    if not src.is_file():
+        return {"config_schema": "absent", "schema_changed": False}
+    new = src.read_bytes()
+    old = dst.read_bytes() if dst.is_file() else None
+    if old == new:
+        return {"config_schema": "current", "schema_changed": False}
+    _atomic_write(dst, new, 0o644)
+    return {"config_schema": "installed", "schema_previous": old, "schema_changed": True}
+
+
+def _restore_config_schema(state: dict) -> None:
+    if not state.get("schema_changed"):
+        return
+    dst = RUNTIME.with_name(CONFIG_SCHEMA_NAME)
+    if state.get("schema_previous") is None:
+        dst.unlink(missing_ok=True)
+    else:
+        _atomic_write(dst, state["schema_previous"], 0o644)
 
 
 def _halo_active_runs() -> list[str]:
@@ -413,13 +443,18 @@ def _publish(timeout_s: float, halo_wait_s: float) -> dict:
     dash_committed = subprocess.check_output(["git", "show", "HEAD:deploy/bin/gateway_dashboard.html"], cwd=REPO)
     if dash != dash_committed:
         raise RuntimeError("dashboard source differs from committed HEAD")
+    schema_src = SOURCE.with_name(CONFIG_SCHEMA_NAME)
+    if schema_src.is_file() and schema_src.read_bytes() != subprocess.check_output(
+            ["git", "show", "HEAD:deploy/bin/" + CONFIG_SCHEMA_NAME], cwd=REPO):
+        raise RuntimeError("config schema source differs from committed HEAD")
     if not RUNTIME.is_file():
         raise RuntimeError("live gateway file is missing")
     previous = RUNTIME.read_bytes()
     if previous == source:
         # Same gateway code: the page alone may still be new. It is read per request, so no drain or restart is needed.
         state = _install_dashboard(dash)
-        return {"status": "current", "sha256": _sha(source), "dashboard": state["dashboard"], "dashboard_sha256": _sha(dash)}
+        return {"status": "current", "sha256": _sha(source), "dashboard": state["dashboard"], "dashboard_sha256": _sha(dash),
+                "config_schema": state.get("config_schema")}
     token = os.environ.get("SHIM_ADMIN_TOKEN") or TOKEN_FILE.read_text().strip()
     if _http("/health", token=token).get("http_status") != 200:
         raise RuntimeError("gateway health unreadable")
@@ -473,7 +508,8 @@ def _publish(timeout_s: float, halo_wait_s: float) -> dict:
                         and new_spend.get("enforce") and new_spend.get("durable")
                         and new_spend.get("attribution_gap_usd", 0) == 0):
                     return {"status": "published", "sha256": _sha(source), "dashboard": dash_state["dashboard"] if "dashboard" in dash_state else "current",
-                            "dashboard_sha256": _sha(dash), "backup": str(backup), "spent": new_spend.get("spent")}
+                            "dashboard_sha256": _sha(dash), "backup": str(backup), "spent": new_spend.get("spent"),
+                            "config_schema": dash_state.get("config_schema")}
             except Exception:
                 pass
             time.sleep(1)

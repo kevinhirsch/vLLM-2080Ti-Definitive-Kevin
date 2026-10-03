@@ -453,7 +453,7 @@ dl.gl dt{display:inline;font-weight:650} dl.gl dd{display:inline;margin:0 0 0 4p
     <input id=f_local_budget type=number min=1 max=8></label>
    <label><span class=k>How long should a request wait for a free lane?</span><span class=hint>seconds &middot; used for background during peak hours, and for interactive only if "never overflow" below is off</span>
     <input id=f_local_wait_secs type=number min=0 step=1></label>
-   <label><span class=k>Should interactive traffic ever overflow while waiting?</span><span class=hint>0 = never, it queues until a lane is free (default) &middot; 1 = restores the wait-above-then-overflow behaviour</span>
+   <label><span class=k>Should interactive traffic ever overflow while waiting?</span><span class=hint>1 = never, it queues until a lane is free (default) &middot; 0 = restores the wait-above-then-overflow behaviour</span>
     <input id=f_interactive_never_overflow type=number min=0 max=1></label>
    <label><span class=k>Prompt and output tokens all lanes may reserve</span><span class=hint>tokens &middot; <b>auto</b> = a fixed fraction of the live KV pool (recommended) &middot; a number pins it &middot; 0 = no cap</span>
     <input id=f_token_budget type=text inputmode=numeric placeholder="auto" pattern="auto|[0-9]+"></label>
