@@ -484,6 +484,32 @@ def _get_shared_flashinfer_prefill_workspace(
     return workspace
 
 
+def _tq_private_plan_indptrs(plan_kwargs: dict[str, Any]) -> dict[str, Any]:
+    """[FORK][LANE EF2] Give FlashInfer plan() indptr sources nobody can overwrite (L134).
+
+    plan() copies qo/kv indptr host->device with non_blocking=True. Every TQ impl here
+    reuses ONE pinned scratch pair (_fi_single_qo/kv_indptr_cpu) and rewrites it for
+    the next request in the same _prefill_attention loop before the GPU has run the
+    queued copy (2026-10-01 14:40: continuation q=843/kv=40091 then first chunk
+    q=1087). The cached wrapper then keeps the second request's lengths on the device
+    under the first request's host schedule -> out-of-bounds q/k/v/out access on that
+    call and on every later cache hit (Xid 31). A fresh copy per plan is tracked by
+    PyTorch's caching host allocator until its DMA completes.
+    """
+    out = dict(plan_kwargs)
+    for name in ("qo_indptr", "kv_indptr"):
+        t = out.get(name)
+        if isinstance(t, torch.Tensor) and t.device.type == "cpu":
+            fresh = torch.empty(t.shape, dtype=t.dtype, pin_memory=t.is_pinned())
+            fresh.copy_(t)
+            out[name] = fresh
+    if plan_kwargs.get("kv_indptr") is not None and plan_kwargs.get(
+        "kv_indptr"
+    ) is plan_kwargs.get("qo_indptr"):
+        out["kv_indptr"] = out["qo_indptr"]
+    return out
+
+
 class TurboQuantAttentionBackend(AttentionBackend):
     """Attention backend using TurboQuant KV-cache compression."""
 
@@ -826,7 +852,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         if not _DEFAULT_TQ_FI_PLAN_CACHE:
             wrapper = self._get_flashinfer_prefill_wrapper(device)
             assert wrapper is not None
-            wrapper.plan(**plan_kwargs)
+            wrapper.plan(**_tq_private_plan_indptrs(plan_kwargs))
             return wrapper
 
         norm_device = _normalize_cuda_device(device)
@@ -880,7 +906,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 "NHD",
                 **wrapper_kwargs,
             )
-            wrapper.plan(**plan_kwargs)
+            wrapper.plan(**_tq_private_plan_indptrs(plan_kwargs))
             _TQ_FI_PREFILL_WRAPPERS[cache_key] = wrapper
         else:
             _TQ_FI_PREFILL_WRAPPERS.move_to_end(cache_key)
