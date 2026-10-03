@@ -601,3 +601,15 @@ class OfflineDrift(unittest.TestCase):
             st, lease = cli.open_window("K5", "K5", 600, 1)
         self.assertEqual(lease, "L1")
         self.assertEqual(sum(1 for c in calls if c[1] == "POST"), 3)
+
+
+class OwnUncached(unittest.TestCase):
+    def test_probe_then_anchor_then_model(self):
+        f = shim.own_uncached_tokens
+        self.assertEqual(f({"pm_credit_probe": 26000, "probe_prompt_tokens": 30000, "pm_credit_anchored": 1,
+                            "pm_anchor_age_s": 3.0}, 9999, 29000), (4000, "probe"))
+        self.assertEqual(f({"pm_credit_anchored": 21408, "pm_anchor_age_s": 3.0}, 9999, 29000), (7592, "anchor"))
+        self.assertEqual(f({"pm_credit_anchored": 0, "pm_anchor_age_s": None}, 9999, 29000), (9999, "model"))
+        with patch.object(shim, "anchored_credit", lambda chain, est, now=None: (17840, 5.0)):
+            self.assertEqual(f({}, 9999, 29000, pm_chain=[(b"k", 1)]), (11160, "anchor"))
+        self.assertEqual(f(None, None, None), (0, "model"))
