@@ -22,7 +22,18 @@ fi
 
 # 1) wait for health (the API takes minutes to come up after a cold start)
 t0=$(date +%s)
+# AU 2026-10-03: stop waiting the moment the engine process is gone. systemd keeps the unit "activating" while this
+# ExecStartPost hook runs, so a boot that died in 20 s used to hold the unit (and delay ExecStopPost + Restart=) for the
+# full cap: 10-03 03:01-03:30 four failed boots each took 7 min 16 s instead of ~25 s. MAINPID is set by systemd here.
+main_alive(){
+  local p="${MAINPID:-}"
+  [ -z "$p" ] && p=$(systemctl show -p MainPID --value vllm-qwen27b 2>/dev/null)
+  [ -z "$p" ] && return 0            # unknown: keep the old behaviour (bounded by CAP_SECS)
+  [ "$p" = "0" ] && return 1
+  kill -0 "$p" 2>/dev/null
+}
 until curl -sf -m 3 "$ENGINE/health" > /dev/null 2>&1; do
+  main_alive || { say "engine main process exited during boot; not waiting for health"; exit 0; }
   sleep 5
   [ $(( $(date +%s) - t0 )) -ge "$CAP_SECS" ] && { say "gave up waiting for health after ${CAP_SECS}s"; exit 0; }
 done
