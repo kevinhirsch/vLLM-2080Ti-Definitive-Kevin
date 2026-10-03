@@ -397,11 +397,17 @@ LOCAL_ONLY = 1 if os.environ.get("SHIM_LOCAL_ONLY", "0").lower() in ("1", "true"
 # biasing robot busywork away from 2x-priced remote. Interactive routing unchanged.
 PEAK_HOURS = os.environ.get("SHIM_PEAK_HOURS_UTC", "1-4,6-10")
 
-def is_peak():
+def is_peak(ts=None):
+    """Is `ts` (epoch seconds, default now) inside the provider's PEAK pricing window?
+    The schedule comes from the dated pricing table (remote-pricing.json: UTC windows, weekdays
+    only, Chinese public holidays off-peak -- see _pricing_is_peak); SHIM_PEAK_HOURS_UTC is only
+    the fallback when no table can be loaded."""
     try:
-        utc = time.gmtime()
-        # DeepSeek's peak window applies Monday-Friday only.  Weekend UTC hours
-        # that look like a peak window are billed at the off-peak price.
+        return _pricing_is_peak(ts)
+    except Exception:
+        pass
+    try:
+        utc = time.gmtime(ts)
         if utc.tm_wday >= 5:
             return False
         h = utc.tm_hour
@@ -1609,14 +1615,200 @@ _CFG.update({
 })
 
 
-def _remote_prices(model=None, *, peak=None):
-    """($/Mtok cache hit, cache miss, output) for a remote model."""
+# ---------------- dated pricing table (lane SL, 2026-10-02) ----------------
+# The price of a remote token is a FUNCTION OF (model, token type, time), read from a small
+# dated table -- remote-pricing.json beside this file, hot-reloaded when it changes -- not from
+# constants. Provenance (source_url, fetched) travels with the numbers; refresh with
+# remote_pricing_refresh.py (reports drift as a fact; --apply rewrites the file). If the file is
+# absent or invalid the embedded copy below (identical to the committed file; a test pins that)
+# is used and the status says so. Source: https://api-docs.deepseek.com/quick_start/pricing --
+# off-peak is half of peak; PEAK = 01:00-04:00 and 06:00-10:00 UTC, Monday-Friday, EXCLUDING
+# Chinese public holidays (those are off-peak all day). Legacy model names are billed at Flash.
+# 2026-10-02 was inside China's National Day holiday (Oct 1-7), so every hour of Kevin's export
+# carries the off-peak price even though 07:00-09:00 UTC on a Friday looks like peak.
+PRICING_FILE = os.environ.get("SHIM_PRICING_FILE") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "remote-pricing.json")
+PRICING_STALE_DAYS = int(os.environ.get("SHIM_PRICING_STALE_DAYS", "30"))
+_PRICE_TYPES = ("cache_hit", "cache_miss", "output")
+_PRICING_DEFAULT = {
+    "schema": 1,
+    "provider": "deepseek",
+    "unit": "usd_per_mtok",
+    "source_url": "https://api-docs.deepseek.com/quick_start/pricing",
+    "fetched": "2026-10-02",
+    "peak": {
+        "tz": "UTC",
+        "windows": [[1, 4], [6, 10]],
+        "weekdays": [0, 1, 2, 3, 4],
+        "off_peak_dates": [["2026-01-01", "2026-01-03"], ["2026-02-15", "2026-02-23"],
+                           ["2026-04-04", "2026-04-06"], ["2026-05-01", "2026-05-05"],
+                           ["2026-06-19", "2026-06-21"], ["2026-09-25", "2026-09-27"],
+                           ["2026-10-01", "2026-10-07"]],
+        "holidays_through": "2026-12-31",
+        "holiday_source": "https://www.china-briefing.com/news/china-2026-public-holiday-schedule/",
+        "note": "Chinese public holidays are off-peak all day (provider page, footnote 2). "
+                "Make-up working Saturdays/Sundays are treated as weekend (off-peak). "
+                "Dates after holidays_through are treated as ordinary weekdays (the dearer side).",
+    },
+    "models": {
+        "deepseek-flash": {
+            "aliases": ["deepseek-v4-flash", "deepseek-v4-flash-vision-exp"],
+            "off_peak": {"cache_hit": 0.003, "cache_miss": 0.15, "output": 0.6},
+            "peak": {"cache_hit": 0.006, "cache_miss": 0.3, "output": 1.2},
+        },
+        "deepseek-v4-pro": {
+            "aliases": [],
+            "off_peak": {"cache_hit": 0.022, "cache_miss": 0.66, "output": 1.98},
+            "peak": {"cache_hit": 0.044, "cache_miss": 1.32, "output": 3.96},
+        },
+    },
+}
+_PRICING_CACHE = {"checked": 0.0, "mtime": None, "table": None, "source": "embedded", "error": None}
+
+
+def _pricing_validate(raw):
+    """A raw table dict -> the normalised table, or ValueError naming the first problem."""
+    if not isinstance(raw, dict) or raw.get("schema") != 1:
+        raise ValueError("pricing table: schema must be 1")
+    pk = raw.get("peak")
+    if not isinstance(pk, dict):
+        raise ValueError("pricing table: peak section missing")
+    windows = []
+    for w in pk.get("windows") or []:
+        a, b = float(w[0]), float(w[1])
+        if not (0 <= a < b <= 24):
+            raise ValueError(f"pricing table: bad peak window {w}")
+        windows.append((a, b))
+    weekdays = {int(d) for d in pk.get("weekdays") or []}
+    if not weekdays <= set(range(7)):
+        raise ValueError("pricing table: weekdays must be 0..6 (Monday=0)")
+    off_dates = []
+    for pair in pk.get("off_peak_dates") or []:
+        lo = datetime.date.fromisoformat(pair[0]).toordinal()
+        hi = datetime.date.fromisoformat(pair[-1]).toordinal()
+        if hi < lo:
+            raise ValueError(f"pricing table: off-peak range reversed {pair}")
+        off_dates.append((lo, hi))
+    through = pk.get("holidays_through")
+    through = datetime.date.fromisoformat(through).toordinal() if through else None
+    models, alias = {}, {}
+    for name, m in (raw.get("models") or {}).items():
+        entry = {}
+        for period in ("off_peak", "peak"):
+            row = (m or {}).get(period)
+            if not isinstance(row, dict):
+                raise ValueError(f"pricing table: {name}.{period} missing")
+            vals = {}
+            for t in _PRICE_TYPES:
+                v = float(row[t])
+                if not (v >= 0) or v != v or v == float("inf"):
+                    raise ValueError(f"pricing table: {name}.{period}.{t} must be a finite price >= 0")
+                vals[t] = v
+            entry[period] = vals
+        models[str(name).lower()] = entry
+        alias[str(name).lower()] = str(name).lower()
+        for a in (m or {}).get("aliases") or []:
+            alias[str(a).lower()] = str(name).lower()
+    if not models:
+        raise ValueError("pricing table: no models")
+    return {"raw": raw, "windows": windows, "weekdays": weekdays, "off_dates": off_dates,
+            "holidays_through": through, "models": models, "alias": alias,
+            "fetched": raw.get("fetched"), "source_url": raw.get("source_url")}
+
+
+def _pricing_table(force=False):
+    """The live normalised pricing table. Re-stats the file at most every 30 s; a file that is
+    missing or invalid never breaks pricing (the embedded copy, or the last good file, is used)."""
+    c = _PRICING_CACHE
+    now = time.monotonic()
+    if c["table"] is not None and not force and now - c["checked"] < 30:
+        return c["table"]
+    c["checked"] = now
+    try:
+        st = os.stat(PRICING_FILE)
+        if c["table"] is not None and c["source"] == "file" and c["mtime"] == st.st_mtime_ns:
+            return c["table"]
+        with open(PRICING_FILE, encoding="utf-8") as fh:
+            table = _pricing_validate(json.load(fh))
+        c.update(table=table, mtime=st.st_mtime_ns, source="file", error=None)
+        log.info("pricing table loaded from %s (fetched %s)", PRICING_FILE, table["fetched"])
+    except FileNotFoundError:
+        if c["table"] is None or c["source"] == "file":
+            c.update(table=_pricing_validate(_PRICING_DEFAULT), mtime=None, source="embedded", error=None)
+    except Exception as exc:
+        c["error"] = f"{type(exc).__name__}: {exc}"[:200]
+        log.error("pricing table %s unusable (%s): keeping %s", PRICING_FILE, exc,
+                  "the last good file" if c["source"] == "file" else "the embedded table")
+        if c["table"] is None:
+            c.update(table=_pricing_validate(_PRICING_DEFAULT), mtime=None, source="embedded")
+    return c["table"]
+
+
+def _pricing_is_peak(ts=None):
+    t = _pricing_table()
+    g = time.gmtime(time.time() if ts is None else ts)
+    if g.tm_wday not in t["weekdays"]:
+        return False
+    day = datetime.date(g.tm_year, g.tm_mon, g.tm_mday).toordinal()
+    if any(lo <= day <= hi for lo, hi in t["off_dates"]):
+        return False
+    hour = g.tm_hour + g.tm_min / 60.0
+    return any(a <= hour < b for a, b in t["windows"])
+
+
+def remote_price(model, token_type, ts=None, *, peak=None):
+    """$/Mtok for (model, token type, time) from the dated table; None if the table does not
+    know the model. token_type: cache_hit | cache_miss | output. `peak` overrides the clock."""
+    if token_type not in _PRICE_TYPES:
+        raise ValueError(f"unknown token type {token_type!r}")
+    t = _pricing_table()
+    entry = t["models"].get(t["alias"].get(str(model or "").lower(), ""))
+    if entry is None:
+        return None
+    if peak is None:
+        peak = _pricing_is_peak(ts)
+    return entry["peak" if peak else "off_peak"][token_type]
+
+
+def pricing_status(now=None):
+    """Provenance + freshness of the live table (an input to Halo's reconciliation fact)."""
+    now = time.time() if now is None else now
+    t = _pricing_table()
+    today = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).date()
+    age = None
+    try:
+        age = (today - datetime.date.fromisoformat(str(t["fetched"]))).days
+    except Exception:
+        pass
+    beyond = bool(t["holidays_through"] and today.toordinal() > t["holidays_through"])
+    return {"source": _PRICING_CACHE["source"], "path": PRICING_FILE, "fetched": t["fetched"],
+            "source_url": t["source_url"], "age_days": age, "holidays_through":
+            datetime.date.fromordinal(t["holidays_through"]).isoformat() if t["holidays_through"] else None,
+            "period_now": "peak" if _pricing_is_peak(now) else "off_peak",
+            "models": sorted(t["models"]), "error": _PRICING_CACHE["error"],
+            "stale": bool(beyond or age is None or age > PRICING_STALE_DAYS),
+            "stale_reason": ("holiday calendar ended" if beyond else
+                             "table older than %d days" % PRICING_STALE_DAYS if (age is None or age > PRICING_STALE_DAYS)
+                             else None)}
+
+
+def _remote_prices(model=None, *, peak=None, when=None):
+    """($/Mtok cache hit, cache miss, output) for a remote model at a time. Precedence: an
+    operator override row in SHIM_REMOTE_PRICES_JSON, then the dated table, then the legacy knobs."""
+    model = model or REMOTE_MODEL
     try:
         row = (json.loads(REMOTE_PRICES_JSON) if REMOTE_PRICES_JSON else {}).get(str(model or "")) or {}
     except Exception:
         row = {}
     if peak is None:
-        peak = is_peak()
+        peak = is_peak() if when is None else is_peak(when)
+    if not row:
+        try:
+            got = tuple(remote_price(model, t, peak=peak) for t in _PRICE_TYPES)
+            if None not in got:
+                return got
+        except Exception as exc:
+            log.warning("pricing table lookup failed (%s): legacy price knobs used", exc)
     base = (float(row.get("cache_hit", REMOTE_PRICE_CACHE_HIT_PER_MTOK)),
             float(row.get("cache_miss", REMOTE_PRICE_CACHE_MISS_PER_MTOK)),
             float(row.get("output", REMOTE_PRICE_OUTPUT_PER_MTOK)))
@@ -1627,44 +1819,82 @@ def _remote_prices(model=None, *, peak=None):
             float(row.get("output_peak", REMOTE_PRICE_OUTPUT_PER_MTOK_PEAK if not row else base[2] * 2)))
 
 
-def _remote_cost_actual(model, cache_hit, cache_miss, outtok, *, peak=None):
-    hit_p, miss_p, out_p = _remote_prices(model, peak=peak)
+def _remote_hold_rates(model=None):
+    """($/Mtok cache-miss input, output) at the DEARER period -- the rates an upfront hold must
+    assume because nobody knows yet what the call will hit or when it will be billed."""
+    return (max(_remote_prices(model, peak=False)[1], _remote_prices(model, peak=True)[1]),
+            max(_remote_prices(model, peak=False)[2], _remote_prices(model, peak=True)[2]))
+
+
+def _remote_cost_actual(model, cache_hit, cache_miss, outtok, *, peak=None, when=None):
+    hit_p, miss_p, out_p = _remote_prices(model, peak=peak, when=when)
     return round((max(0, cache_hit or 0) / 1e6) * hit_p + (max(0, cache_miss or 0) / 1e6) * miss_p
                  + (max(0, outtok or 0) / 1e6) * out_p, 9)
 
 
+# Calibration for the one case that has no usage to read (a client that hung up, a cut stream):
+# the expected cache-hit share of a prompt, learned token-weighted from the last ~200 calls that
+# DID report usage. Below 50 observations nothing is assumed (all-miss, the dearer bound).
+_CACHE_RATIO = {"hit": 0.0, "miss": 0.0, "n": 0}
+CACHE_RATIO_DECAY = 0.995
+CACHE_RATIO_MIN_SAMPLES = 50
+
+
+def _cache_ratio_note(hit, miss):
+    """Fold one usage-bearing call into the rolling hit/miss prompt-token ratio."""
+    c = _CACHE_RATIO
+    c["hit"] = c["hit"] * CACHE_RATIO_DECAY + max(0, hit or 0)
+    c["miss"] = c["miss"] * CACHE_RATIO_DECAY + max(0, miss or 0)
+    c["n"] += 1
+
+
+def _cache_hit_share():
+    c = _CACHE_RATIO
+    tot = c["hit"] + c["miss"]
+    return (c["hit"] / tot) if (c["n"] >= CACHE_RATIO_MIN_SAMPLES and tot > 0) else 0.0
+
+
 def _request_remote_cost(info):
     """(usd, basis) for one finished remote request -- the ONE pricing function behind
-    settlement, the per-client dashboard and the telemetry. 'actual': the provider reported
-    cache hit/miss counts; 'usage': it reported only prompt_tokens (priced as cache misses);
-    'estimate': no usage at all (no-cache list estimate, an upper bound)."""
+    settlement, the per-client dashboard and the telemetry. Bases:
+      'actual'   the provider reported cache hit/miss counts (priced per type, at the time sent);
+      'usage'    it reported only prompt_tokens (priced as cache misses -- an upper bound);
+      'failed'   the call returned an HTTP error / never produced a completion: $0, the
+                 provider does not bill it (a 402 Insufficient Balance cost nothing);
+      'estimate' the call was answered or begun but no usage arrived (client hung up, stream
+                 cut): prompt split by the recently observed cache-hit share (all-miss until
+                 enough calls reported usage) + streamed chunks as output tokens.
+    Failure is decided by `remote_outcome` (set where the relay result is known) only when no
+    provider usage is present -- usage always wins."""
     out = info.get("outtok") if info.get("outtok") is not None else info.get("outtok_lb")
     model = info.get("remote_model") or REMOTE_MODEL
     prices = info.get("remote_prices")                 # a metered custom endpoint's own prices
     hit, miss = info.get("remote_cache_hit"), info.get("remote_cache_miss")
+    peak, when = info.get("remote_price_peak"), info.get("remote_sent_at")
 
     def priced(h, m):
         if prices:
             return round((max(0, h or 0) * prices[0] + max(0, m or 0) * prices[1]
                           + max(0, out or 0) * prices[2]) / 1e6, 9)
-        return _remote_cost_actual(model, h, m, out, peak=info.get("remote_price_peak"))
+        return _remote_cost_actual(model, h, m, out, peak=peak, when=when)
     if hit is not None and miss is not None:
         return priced(hit, miss), "actual"
     if info.get("ptok_exact") is not None:
         return priced(0, info.get("ptok_exact")), "usage"
-    if prices:
-        return priced(0, info.get("ptok") or 0), "estimate"
-    return _remote_cost_estimate(info.get("ptok") or 0, out), "estimate"
+    if info.get("remote_outcome") == "failed":
+        return 0.0, "failed"
+    ptok = int(info.get("ptok") or 0)
+    share = _cache_hit_share()                         # 0.0 until enough calls have reported usage
+    hit_est = int(ptok * share)
+    return priced(hit_est, ptok - hit_est), "estimate"
 
 
-def _remote_cost_estimate(ptok, outtok):
-    """est. remote cost = tokens x configurable $/Mtok, peak/off-peak aware (reuses the
-    EXISTING is_peak() rather than a second copy of the peak-hours logic)."""
+def _remote_cost_estimate(ptok, outtok, model=None, when=None):
+    """est. remote cost for an unmetered/unknown call: all-miss input + output at the table's
+    price for the time (the dearer-than-actual side; the real bill is mostly cache hits)."""
     if not ptok and not outtok:
         return 0.0
-    cin, cout = (REMOTE_COST_IN_PER_MTOK_PEAK, REMOTE_COST_OUT_PER_MTOK_PEAK) if is_peak() \
-        else (REMOTE_COST_IN_PER_MTOK, REMOTE_COST_OUT_PER_MTOK)
-    return round(((ptok or 0) / 1e6) * cin + ((outtok or 0) / 1e6) * cout, 6)
+    return _remote_cost_actual(model or REMOTE_MODEL, 0, ptok, outtok, when=when)
 
 
 # ---------------- remote spend authority (R2, 2026-09-25; v2 after Terra's 12:38 review) ----------------
@@ -1773,10 +2003,16 @@ def _spend_day_start(now, tz=None):
     return d.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
 
 
-def _spend_hold_estimate(ptok, maxtok):
-    """Price a supplied prompt-token upper bound and maximum output at peak rates."""
-    rin = max(REMOTE_COST_IN_PER_MTOK, REMOTE_COST_IN_PER_MTOK_PEAK)
-    rout = max(REMOTE_COST_OUT_PER_MTOK, REMOTE_COST_OUT_PER_MTOK_PEAK)
+def _spend_hold_estimate(ptok, maxtok, model=None):
+    """Upper bound for one paid call: the prompt-token bound at the dearer period's CACHE-MISS
+    price plus the maximum output at the dearer period's output price, from the dated table
+    (legacy knobs only when the table cannot price the model). Settlement replaces it with the
+    call's actual usage, so the hold only has to be an upper bound, never the charge."""
+    try:
+        rin, rout = _remote_hold_rates(model)
+    except Exception:
+        rin = max(REMOTE_COST_IN_PER_MTOK, REMOTE_COST_IN_PER_MTOK_PEAK)
+        rout = max(REMOTE_COST_OUT_PER_MTOK, REMOTE_COST_OUT_PER_MTOK_PEAK)
     out = maxtok if maxtok and maxtok > 0 else SPEND_DEFAULT_OUT_TOKENS
     return round((max(0, ptok or 0) / 1e6) * rin + (out / 1e6) * rout, 6)
 
@@ -1821,7 +2057,8 @@ def telemetry_remote_cost(start, end, telemetry_dir=None):
                     # endpoint is excluded. Rows since v6 count at any status (the provider
                     # bills errors that carried usage); pre-v6 rows keep the old status rule.
                     if "remote_sent" in r:
-                        counted = r.get("remote_sent") and r.get("cost_policy") != "free"
+                        counted = (r.get("remote_sent") and r.get("cost_policy") != "free"
+                                   and r.get("remote_outcome") != "failed")   # a failed call is never billed
                     else:
                         counted = status is None or int(status) < 400
                     if start <= t < end and r.get("route") == "remote" and counted:
@@ -2285,6 +2522,12 @@ class SpendLedger:
                 return False
             return (not self.enforcing()) or round(float(amount), 6) <= self._totals()["available"]
 
+    def held_amount(self, req_key):
+        """The amount currently held for a request (None if it holds nothing)."""
+        with self._lock:
+            h = self.state["holds"].get(req_key)
+            return None if h is None else float(h.get("amount") or 0.0)
+
     def settle(self, req_key, cost, meta=None):
         """Replace a request's hold with its priced cost, or charge an unheld remote request.
         Idempotent per request key. A failed write keeps the charge in memory (still counted)
@@ -2486,9 +2729,10 @@ def _stall_brake_not_applied(why, client):
     log.info("stalled-delivery brake not applied (%s, client=%s): remote is the only place this can be served", why, client)
 
 
-def _spend_hold_for(request, body, prices=None):
+def _spend_hold_for(request, body, prices=None, model=None):
     """Hold this paid request's upper-bound cost before forwarding. None = go ahead.
-    `prices` ($/Mtok hit, miss, out) for a metered custom endpoint; default provider otherwise."""
+    `prices` ($/Mtok hit, miss, out) for a metered custom endpoint; default provider otherwise
+    (`model` selects its row in the dated pricing table)."""
     info = _ACTIVE.get(id(request))
     key = (info or {}).get("spend_key") or ("anon-" + os.urandom(8).hex())
     try:
@@ -2501,7 +2745,7 @@ def _spend_hold_for(request, body, prices=None):
         out = maxtok if maxtok and maxtok > 0 else SPEND_DEFAULT_OUT_TOKENS
         amount = round((max(0, ptok or 0) * prices[1] + out * prices[2]) / 1e6, 6)   # no-cache bound
     else:
-        amount = _spend_hold_estimate(ptok, maxtok)
+        amount = _spend_hold_estimate(ptok, maxtok, model)
     ok, reason = _spend().hold(key, amount, rid=rid, client_ip=getattr(request, "remote", None),
                                meta=_spend_attribution_meta(info))
     if not ok:
@@ -2517,11 +2761,18 @@ def _spend_hold_for(request, body, prices=None):
 def _spend_settle(info, resp):
     """handle_completions' finally: charge what the provider bills, release the hold.
 
-    v6 (Terra 13:15): provider-reported usage is charged REGARDLESS of HTTP status. A request
-    that reached the provider (remote_sent) without trustworthy usage -- an error, a truncated
-    or lost stream, a client disconnect -- is charged its full held amount (conservative). A
-    request that was held but never sent (context rejection, refusal) is charged nothing. A
-    free-policy endpoint is never charged."""
+    The charge is the call's ACTUAL usage (SL lane, 2026-10-02), priced per token type at the
+    time it was sent:
+      * provider usage present (any HTTP status) -> actual (cache hit / miss / output);
+      * the call failed -- HTTP >= 400 (a 402 Insufficient Balance, 4xx, 5xx), a relay that died
+        before any completion, or a request that was held but never sent -> $0, hold released;
+      * the call was answered but no usage arrived (client hung up, stream cut) -> a bounded
+        estimate (prompt split by the recent cache-hit share + streamed chunks), never more than
+        the hold;
+      * the outcome is unknown (the handler itself was torn down mid-call) -> the full hold,
+        the one conservative case left.
+    A free-policy endpoint is never charged. The upfront hold is unchanged: it bounds what
+    in-flight calls can spend, then this replaces it with the real figure."""
     try:
         key = info.get("spend_key")
         if not key:
@@ -2532,27 +2783,60 @@ def _spend_settle(info, resp):
             return
         sent = bool(info.get("remote_sent"))
         cost, basis = _request_remote_cost(info) if sent else (0.0, None)
+        outcome = info.get("remote_outcome")
         if sent and basis in ("actual", "usage"):
-            charge = cost
+            charge, mbasis = cost, basis
+            if basis == "actual":
+                _cache_ratio_note(info.get("remote_cache_hit"), info.get("remote_cache_miss"))
+        elif sent and basis == "failed":
+            charge, mbasis = 0.0, "failed"
+        elif sent and basis == "estimate" and outcome == "ok":
+            charge, mbasis = cost, "aborted-estimate"
+            held = _spend().held_amount(key) if info.get("spend_held") else None
+            if held is not None:
+                charge = min(charge, held)
         elif sent and info.get("spend_held"):
-            charge = None                      # no trustworthy usage: the held amount
+            charge, mbasis = None, "held-fallback"     # outcome unknown: the held amount
         elif sent and info.get("route") == "remote":
-            charge = cost                      # unheld (pre-v6 path) estimate
+            charge, mbasis = cost, "estimated"         # unheld (pre-v6 path) estimate
         else:
-            charge = 0.0
+            charge, mbasis = 0.0, "unsent"
         if info.get("spend_held") or charge:
-            charged = _spend().settle(key, charge, meta=_spend_attribution_meta(
-                info, basis if sent and basis in ("actual", "usage") else
-                "held-fallback" if sent and info.get("spend_held") else
-                "estimated" if sent else "unsent"))
+            charged = _spend().settle(key, charge, meta=_spend_attribution_meta(info, mbasis))
             info["charged_usd"] = charged
     except Exception as exc:
         log.warning("spend settle failed (hold expires and is charged): %s", exc)
 
 
+RECONCILIATION_FACT_FILE = os.environ.get(
+    "SHIM_SPEND_RECONCILIATION_FILE", "/home/kevin/.local/share/vllm-qwen27b/spend-reconciliation.json")
+
+
+def _reconciliation_fact():
+    """The latest ledger-vs-provider drift fact (written by spend_reconcile.py --fact-out), as
+    a SUMMARY for Halo -- read-only, no hours. None until someone has run the reconciliation.
+    Nothing here changes the cap or the ledger."""
+    try:
+        with open(RECONCILIATION_FACT_FILE, encoding="utf-8") as fh:
+            f = json.load(fh)
+        keys = ("generated_at", "window", "provider_usd", "ledger_usd", "drift_usd", "ledger_over_provider",
+                "failed_calls_charged_usd", "hours_drifted", "verdict")
+        out = {k: f.get(k) for k in keys}
+        out["age_s"] = round(time.time() - float(f.get("generated_at") or 0))
+        return out
+    except Exception:
+        return None
+
+
 async def gateway_spend(request):
     """GET /gateway/spend: the one daily remote-spend total (read-only, unauthenticated)."""
-    return web.json_response(_spend().snapshot())
+    snap = _spend().snapshot()
+    snap["reconciliation"] = _reconciliation_fact()
+    try:
+        snap["pricing"] = pricing_status()
+    except Exception as exc:
+        snap["pricing"] = {"error": str(exc)[:120]}
+    return web.json_response(snap)
 
 
 async def _spend_body(request):
@@ -2740,6 +3024,7 @@ def _telemetry_note_request(info, resp=None):
             "remote_model": info.get("remote_model"), "remote_cache_hit": info.get("remote_cache_hit"),
             "cost_policy": info.get("cost_policy"), "remote_provider": info.get("remote_provider"),
             "remote_sent": bool(info.get("remote_sent")),
+            "remote_outcome": info.get("remote_outcome"), "remote_status": info.get("remote_status"),
             "remote_cache_miss": info.get("remote_cache_miss"),
             # gw-ttft-decomposition-telemetry: admission_wait duplicates `waited` under the
             # AC-named field so the JSONL is self-auditable against the card without a lookup
@@ -6144,6 +6429,14 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
     # has_tool_calls reduce to.
     _saw_content = [False]
     _saw_tool_call = [False]
+    _scan_tail = [b""]     # SL lane: the unterminated last SSE line, carried into the next chunk
+
+    def _scan_usage_stream(chunk):
+        """_scan_usage for a chunk stream: a usage trailer that straddles a network chunk
+        boundary used to be missed (the call was then settled without its real usage)."""
+        complete, _scan_tail[0] = _sse_split_tail(_scan_tail[0], chunk)
+        if complete:
+            _scan_usage(complete)
 
     def _scan_content_shape(data):
         _saw_content[0], _saw_tool_call[0] = _sse_content_shape(data, _saw_content[0], _saw_tool_call[0])
@@ -6186,6 +6479,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
     _scan_usage(buf)   # TELEMETRY: covers the (common, for short responses) case where the whole
                         # stream -- usage trailer included -- already arrived within the gate
     _scan_content_shape(buf)
+    _scan_tail[0] = bytes(buf[buf.rfind(b"\n") + 1:])[-(1 << 20):]   # partial last line -> next chunk
 
     if phase == "clean_end":
         # upstream finished before any 'meaningful' chunk — deliver as-is (short/empty response),
@@ -6249,7 +6543,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
                 break
             await resp.write(chunk)
             _chunk_ct[0] += 1
-            _scan_usage(chunk)
+            _scan_usage_stream(chunk)
             _scan_content_shape(chunk)
     except Exception as e:
         try:
@@ -6257,6 +6551,8 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
         except Exception:
             pass
     await _finish_stream_response(resp, request, session)
+    if _scan_tail[0]:
+        _scan_usage(_scan_tail[0])       # a final line the stream ended without a newline on
     _outkw = {"outtok_lb": _chunk_ct[0],
               "content_empty": not _saw_content[0], "has_tool_calls": _saw_tool_call[0]}
     if _exact_outtok[0] is not None:
@@ -6274,6 +6570,17 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
         _outkw.update(_remote_usage_kw(_exact_ptok[0], _exact_hit[0], _exact_miss[0]))
     _active_set(request, **_outkw)
     return "ok", resp
+
+
+def _sse_split_tail(tail, chunk, cap=1 << 20):
+    """(complete lines, unterminated tail) for a byte stream arriving in arbitrary chunks: the
+    tail is prepended to the next chunk, so an SSE line (the usage trailer above all) that a
+    network read split in two is still seen whole. The tail is bounded by `cap`."""
+    data = bytes(tail) + bytes(chunk)
+    nl = data.rfind(b"\n")
+    if nl < 0:
+        return b"", data[-cap:]
+    return data[:nl + 1], data[nl + 1:][-cap:]
 
 
 def _usage_cache_split(usage):
@@ -6463,7 +6770,8 @@ async def _forward_remote(request, path, body, streaming, endpoint=None, model=N
     _active_set(request, cost_policy=policy["policy"], remote_provider=policy.get("provider"),
                 remote_prices=policy.get("prices"))
     if policy["policy"] == "metered":
-        refused = _spend_hold_for(request, body, prices=policy.get("prices") if endpoint is not None else None)
+        refused = _spend_hold_for(request, body, prices=policy.get("prices") if endpoint is not None else None,
+                                  model=model)
         if refused is not None:
             return refused
     prepared, ctx = _prepare_provider_context(body, limit, max_output)
@@ -6479,13 +6787,22 @@ async def _forward_remote(request, path, body, streaming, endpoint=None, model=N
                 context_limit=limit, context_prompt_tokens=ctx.get("prompt_tokens"),
                 context_compacted=bool(ctx.get("compacted")),
                 context_omitted=int(ctx.get("omitted", 0) or 0))
-    _active_set(request, remote_model=model, remote_price_peak=is_peak())
+    _sent_at = time.time()
+    _active_set(request, remote_model=model, remote_sent_at=_sent_at, remote_price_peak=is_peak())
     relay_body = remap_for_remote(prepared, model, max_output)
     if streaming:
         relay_body = _with_stream_usage(relay_body)   # v6: settle needs the provider's usage
     _active_set(request, remote_sent=True)            # v6: from here the provider may bill
     kind, payload = await _relay(request, base, path, relay_body, key, streaming,
                                  provider_name=model)
+    # Settlement needs to know whether the provider produced a completion: a relay that failed
+    # before the client was committed, or an HTTP >= 400 answer (402 Insufficient Balance, 4xx,
+    # 5xx), is never billed. An ok answer that reaches settlement without usage (hung-up client,
+    # cut stream) is billed what it consumed, estimated.
+    _status = getattr(payload, "status", None) if kind == "ok" else (payload[0] if payload else None)
+    _active_set(request, remote_status=_status,
+                remote_outcome="failed" if (kind != "ok" or (isinstance(_status, int) and _status >= 400))
+                else "ok")
     if kind == "ok":
         _note_payload_outcome(request, payload, streaming)   # TELEMETRY: see DESIGN.md (c)
         if not streaming:
@@ -6510,6 +6827,8 @@ def _price_configured(model):
     if not model or model == REMOTE_MODEL:
         return True
     try:
+        # Deliberately NOT the dated table: serving a non-default model (e.g. the 13x dearer pro
+        # model) stays an explicit operator decision -- a SHIM_REMOTE_PRICES_JSON row.
         return str(model) in (json.loads(REMOTE_PRICES_JSON) if REMOTE_PRICES_JSON else {})
     except Exception:
         return False

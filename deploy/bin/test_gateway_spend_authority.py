@@ -417,10 +417,14 @@ class Seam(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snap["in_flight"], 0)
         self.assertAlmostEqual(snap["spent"], (90_000 * 0.003 + 10_000 * 0.15 + 500 * 0.6) / 1e6, places=9)
 
-    async def test_a_forwarded_request_without_usage_is_charged_its_hold(self):
+    async def test_a_forwarded_request_without_usage_is_charged_a_bounded_estimate_not_its_hold(self):
         resp = await shim.handle_completions(Request())      # the fake provider returns no usage
         self.assertEqual(resp.status, 200)
-        self.assertAlmostEqual(self.led.snapshot()["spent"], 0.0312, places=6)
+        # SL lane: an answered call with no usage trailer (hung-up client, cut stream) is billed
+        # what it consumed, estimated -- all-miss prompt, off the hold's worst-case output.
+        spent = self.led.snapshot()["spent"]
+        self.assertGreater(spent, 0.0)
+        self.assertLess(spent, 0.0312)
 
     async def test_reserve_requires_the_spend_credential_and_binds_owner_and_ip(self):
         self.assertEqual((await self._reserve(token=None))[0], 401)
@@ -644,7 +648,7 @@ class ThroughputGuard(unittest.IsolatedAsyncioTestCase):
         # This pins the SPEND seam (budget available -> the overflow is not blocked), so it runs
         # under the pre-L1 routing policy: with LOCAL_FIRST on, an idle local engine keeps the
         # big prompt local (covered in test_gateway_local_first.py).
-        with patch.object(shim, "_spend_hold_estimate", lambda p, m: 0.001), \
+        with patch.object(shim, "_spend_hold_estimate", lambda p, m, model=None: 0.001), \
                 patch.object(shim, "LOCAL_FIRST", False):
             resp = await shim.handle_completions(Request(model="qwen-local", max_tokens=1000))
         self.assertEqual((resp.status, self.calls), (200, ["remote"]))

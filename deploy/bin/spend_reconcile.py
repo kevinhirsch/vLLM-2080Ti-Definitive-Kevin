@@ -23,6 +23,18 @@ compare-and-set bound to the exact ledger revision it read, with nothing in flig
 telemetry flushed past the last settle; a conflict recomputes (v6). The admin token is read
 from a file, never from argv or the environment dump.
 The billing CSV is only read; nothing from it (user id, key prefix) is written anywhere.
+
+Lane SL (2026-10-02) -- per-hour LEDGER-vs-PROVIDER drift, as a FACT for Halo:
+
+    spend_reconcile.py --billing amount-*.csv --cost cost-*.csv --telemetry <dir> \
+        --start 2026-10-02T00:00:00-07:00 --end 2026-10-03T00:00:00-07:00 --fact-out spend-reconciliation.json
+
+compares, for EVERY hour of the window (hours the provider billed nothing included), what the
+provider billed (amount x price from the amount export, cross-checked against the cost export)
+with what the gateway CHARGED its ledger (telemetry charged_usd) and what the pricing replayed.
+The fact names the hours that drifted and why they can be told apart (failed calls charged,
+estimates, unpriced peak windows). It is a measurement only: this tool never changes the cap or
+the ledger -- correcting the ledger stays the separate, compare-and-set `--post` above.
 """
 from __future__ import annotations
 
@@ -81,7 +93,7 @@ def _counted(r: dict, provider: str) -> bool:
         return False
     if "remote_sent" in r:
         return bool(r.get("remote_sent")) and r.get("cost_policy") != "free" and \
-            (r.get("remote_provider") or provider) == provider
+            r.get("remote_outcome") != "failed" and (r.get("remote_provider") or provider) == provider
     status = r.get("status")
     return r.get("alias_kind") != "custom-remote" and (status is None or int(status) < 400)
 
@@ -142,6 +154,85 @@ def bill_prices(rows) -> tuple:
             p[r["type"]] = float(r["price"])
     return (p.get("input_cache_hit_tokens", 0.0), p.get("input_cache_miss_tokens", 0.0),
             p.get("output_tokens", 0.0))
+
+
+def read_cost(paths) -> dict:
+    """{hour start (epoch): usd} from the provider's cost export (summed over wallet types)."""
+    out = {}
+    for p in paths:
+        with open(p, encoding="utf-8-sig", newline="") as fh:
+            for r in csv.DictReader(fh):
+                t = _ts(r["start_time_iso"])
+                out[t] = out.get(t, 0.0) + float(r.get("cost") or 0)
+    return out
+
+
+def hourly_drift(billing_rows, cost_by_hour, tel_rows_all, start, end, provider="deepseek",
+                 hour_tolerance_usd=0.05, hour_tolerance_rel=0.10) -> dict:
+    """Per hour of [start, end): the provider's bill vs what the gateway charged its ledger.
+
+    `tel_rows_all` are ALL remote telemetry rows (failed ones included -- a failed call that
+    the ledger charged is exactly the drift to find). Provider hours come from the amount export
+    (amount x price); `cost_by_hour` (optional) is the cost export, cross-checked per hour."""
+    bill_hour = {}
+    for r in billing_rows:
+        kind = r.get("type")
+        if kind in TYPES:
+            h = _ts(r["start_time_iso"])
+            bill_hour[h] = bill_hour.get(h, 0.0) + float(r.get("amount") or 0) * float(r.get("price") or 0)
+    hours, h = [], start
+    while h < end:
+        nxt = h + 3600
+        rows = [t for t in tel_rows_all if h <= float(t.get("t") or 0) < nxt and t.get("route") == "remote"
+                and t.get("remote_sent") and t.get("cost_policy") != "free"
+                and (t.get("remote_provider") or provider) == provider]
+        ledger = sum(float(t.get("charged_usd") or 0.0) for t in rows)
+        failed = [t for t in rows if t.get("remote_outcome") == "failed" or int(t.get("status") or 0) >= 400]
+        failed_usd = sum(float(t.get("charged_usd") or 0.0) for t in failed)
+        prov = bill_hour.get(h, 0.0)
+        cost_csv = cost_by_hour.get(h) if cost_by_hour else None
+        drift = ledger - prov
+        hours.append({
+            "hour": datetime.datetime.fromtimestamp(h).astimezone().isoformat(timespec="minutes"),
+            "provider_usd": round(prov, 6),
+            "provider_cost_export_usd": None if cost_csv is None else round(cost_csv, 6),
+            "ledger_usd": round(ledger, 6), "drift_usd": round(drift, 6),
+            "drift_ratio": None if prov <= 0 else round(ledger / prov, 3),
+            "calls": len(rows), "failed_calls": len(failed), "failed_calls_charged_usd": round(failed_usd, 6),
+            "flag": ("drift" if abs(drift) > max(hour_tolerance_usd, hour_tolerance_rel * prov) else "ok"),
+        })
+        h = nxt
+    prov_total = sum(x["provider_usd"] for x in hours)
+    led_total = sum(x["ledger_usd"] for x in hours)
+    bad = [x for x in hours if x["flag"] == "drift"]
+    return {"hours": hours, "provider_usd": round(prov_total, 6), "ledger_usd": round(led_total, 6),
+            "drift_usd": round(led_total - prov_total, 6),
+            "drift_ratio": None if prov_total <= 0 else round(led_total / prov_total, 3),
+            "failed_calls_charged_usd": round(sum(x["failed_calls_charged_usd"] for x in hours), 6),
+            "hours_drifted": len(bad),
+            "worst_hours": sorted(bad, key=lambda x: -abs(x["drift_usd"]))[:6]}
+
+
+def drift_fact(drift: dict, window, pricing=None, now=None) -> dict:
+    """The fact Halo reads: a measurement with its own verdict. It asks for no cap change."""
+    over = drift["drift_ratio"]
+    return {"fact": "spend_ledger_vs_provider_drift", "generated_at": now or time.time(),
+            "window": list(window), "provider_usd": drift["provider_usd"], "ledger_usd": drift["ledger_usd"],
+            "drift_usd": drift["drift_usd"], "ledger_over_provider": over,
+            "failed_calls_charged_usd": drift["failed_calls_charged_usd"],
+            "hours_drifted": drift["hours_drifted"], "worst_hours": drift["worst_hours"],
+            "verdict": "ok" if not drift["hours_drifted"] else "drift",
+            "pricing": pricing, "hours": drift["hours"],
+            "note": "measurement only; the $25/day cap is unchanged and no ledger write is implied"}
+
+
+def write_fact(path: str, fact: dict) -> None:
+    tmp = f"{path}.tmp-{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(fact, fh, indent=2, sort_keys=True, default=str)
+        fh.write("\n")
+    os.chmod(tmp, 0o640)
+    os.replace(tmp, path)
 
 
 def reconcile(billing_rows, tel_rows, start, end, tolerance=0.02) -> dict:
@@ -222,6 +313,8 @@ def main(argv=None):
     ap.add_argument("--now", help="end of today's figure (default: now)")
     ap.add_argument("--tolerance", type=float, default=0.02)
     ap.add_argument("--provider", default="deepseek", help="the billed provider's identity in the telemetry")
+    ap.add_argument("--cost", nargs="*", default=[], help="the provider's cost export(s), cross-checked per hour")
+    ap.add_argument("--fact-out", help="write the per-hour ledger-vs-provider drift fact (JSON) here")
     ap.add_argument("--post", help="gateway base URL: replace today's spend with the best figure")
     ap.add_argument("--admin-token-file", default=os.path.expanduser("~/.local/share/vllm-qwen27b/admin.token"))
     a = ap.parse_args(argv)
@@ -232,6 +325,21 @@ def main(argv=None):
     result = reconcile(rows, tel, start, end, a.tolerance)
     result["best"] = best_figure(result["billing"], bill_prices(rows),
                                  [r for r in tel if end <= float(r.get("t") or 0) < now])
+    if a.fact_out:
+        all_rows = []
+        for path in sorted(glob.glob(os.path.join(a.telemetry, "requests-*.jsonl"))):
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        continue
+                    if start <= float(r.get("t") or 0) < end:
+                        all_rows.append(r)
+        drift = hourly_drift(rows, read_cost(a.cost) if a.cost else None, all_rows, start, end, a.provider)
+        fact = drift_fact(drift, (a.start, a.end))
+        write_fact(a.fact_out, fact)
+        result["drift"] = {k: v for k, v in fact.items() if k != "hours"}
     if a.post:
         def compute():
             t_now = time.time()
