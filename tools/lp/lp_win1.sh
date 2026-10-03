@@ -19,12 +19,14 @@ echo "LP W1 start $(date)  label=$LABEL only='${LP_ONLY:-}'"
 BOOT_TIMEOUT=900 ./boot2.sh ${LABEL}-small "VLLM_GPU_UTIL=0.45" "V02_MAXLEN=65536" || echo "small boot failed; benching anyway if VRAM allows"
 nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv,noheader
 for g in 0 1; do
-  LP_IN_WINDOW=1 CUDA_VISIBLE_DEVICES=$g PYTHONPATH=/home/kevin/Desktop/wt-lp:/home/kevin/Desktop/wt-integrate/tools/u2 timeout 900 $PY /home/kevin/Desktop/wt-lp/tools/lp/w4a8_bench.py \
-     --min-free-mib 3000 --cap-mib 2500 --iters 30 --sustain 25 --json $OUT/w4a8_bench_gpu$g.json > $OUT/w4a8_bench_gpu$g.log 2>&1
+  # GPU0: full shape x M matrix; GPU1 (the cooler, faster card): gate_up/down at prefill M only + sustain, to bound the window
+  if [ $g = 0 ]; then BA=(--Ms 16,64,256,1024,2048,3632); else BA=(--Ms 3632 --shapes gate_up,down); fi
+  LP_IN_WINDOW=1 CUDA_VISIBLE_DEVICES=$g PYTHONPATH=/home/kevin/Desktop/wt-lp:/home/kevin/Desktop/wt-integrate/tools/u2 timeout 600 $PY /home/kevin/Desktop/wt-lp/tools/lp/w4a8_bench.py \
+     "${BA[@]}" --min-free-mib 3000 --cap-mib 2500 --iters 20 --sustain 20 --json $OUT/w4a8_bench_gpu$g.json > $OUT/w4a8_bench_gpu$g.log 2>&1
   echo "bench gpu$g rc=$? :"; grep -E "PER-CHUNK|SUSTAIN|correctness" $OUT/w4a8_bench_gpu$g.log | cut -c1-200
 done
 # ---- Phase A2 (~5-10 min, small idle engine still up): full-model kernel-exact fidelity gate on GPU0 (K7's --device cuda mode)
-GPU_IN_WINDOW=1 CUDA_VISIBLE_DEVICES=0 timeout 900 $PY /home/kevin/Desktop/wt-lp/tools/lp/variant_gate.py --device cuda --gpu-need-mib 1500 \
+GPU_IN_WINDOW=1 CUDA_VISIBLE_DEVICES=0 timeout 600 $PY /home/kevin/Desktop/wt-lp/tools/lp/variant_gate.py --device cuda --gpu-need-mib 1500 \
    --variants w4a8e3,w4a8g,w4a8 --out $OUT/gate_gpu_win.json > $OUT/gate_gpu_win.log 2>&1; echo "gpu fidelity gate rc=$?"
 grep -E "^\[.*\] (w4a8e3|w4a8g|w4a8) \{" $OUT/gate_gpu_win.log | cut -c1-260
 # ---- Phase B: engine with int8 activations (from the wt-lp tree; everything else = the override that was live) ----
