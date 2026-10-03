@@ -104,8 +104,9 @@ def v_w4a8gd(n, x, info):
 
 
 def v_w4a8g(n, x, info):
-    if "wq8" not in info: info["wq8"] = int_scales(info)
-    return q_grp(x.half().float(), 8) @ info["wq8"].T
+    """kernel-exact LP_A8G: per-(row,128) int8 act scales, REAL fp16 weight group scales (no int16 rounding)."""
+    if "w16s" not in info: info["w16s"] = (info["qz"] * info["s"].half().float().unsqueeze(-1)).reshape(info["w"].shape)
+    return q_grp(x.half().float(), 8) @ info["w16s"].T
 
 
 def v_w4a8hd(n, x, info):

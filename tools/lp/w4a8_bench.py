@@ -28,6 +28,15 @@ from safetensors import safe_open
 torch.cuda.set_per_process_memory_fraction(a.cap_mib / (torch.cuda.get_device_properties(0).total_memory / 2**20))
 from _ctlayer import make_marlin_layer
 from vllm import _custom_ops as ops
+G8 = None
+if os.environ.get("LP_G8", "1") == "1":
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import lp_g8 as G8
+        G8.build()
+        print("LP_A8G extension loaded", flush=True)
+    except Exception as ex:  # keep the stock arms running
+        print("LP_A8G extension unavailable:", repr(ex)[:300], flush=True); G8 = None
 
 MD = "/home/kevin/Desktop/models/Qwen3.8-27B-HauhauCS-Aggressive-W4A16-twolven/model.safetensors"
 P = "model.language_model.layers"
@@ -73,6 +82,16 @@ def emulate(t, x, N, K):
     return xq @ w.T, xf @ w16.T
 
 
+def emulate_g(t, x, N, K):
+    """CPU emulation of the LP_A8G kernel: per-(row,128) int8 act, fp16 weight group scales."""
+    sh = torch.arange(8, dtype=torch.int32) * 4
+    q = ((t["weight_packed"].unsqueeze(-1) >> sh) & 15).reshape(N, K // 128, 128)
+    zp = ((t["weight_zero_point"].unsqueeze(1) >> sh.view(1, 8, 1)) & 15).reshape(N, -1)
+    w = ((q - zp.unsqueeze(-1)).float() * t["weight_scale"].half().float().unsqueeze(-1)).reshape(N, K)
+    xg = x.float().view(x.shape[0], -1, 128); sc = xg.abs().amax(-1, keepdim=True).clamp(min=1e-8) / 127
+    return (torch.clamp(torch.round(xg / sc), -127, 127) * sc).view(x.shape[0], K) @ w.T
+
+
 def timeit(fn):
     s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     s.record(); fn(); e.record(); e.synchronize(); return s.elapsed_time(e)
@@ -93,17 +112,30 @@ for name in a.shapes.split(","):
     finally:
         os.environ.pop("VLLM_MARLIN_INPUT_DTYPE", None)
     assert s8.kernel.config.act_type == torch.int8, "int8 act not engaged"
+    g8 = G8.G8Linear({k: v for k, v in t.items()}, N, K) if G8 is not None else None
     # correctness on 32 rows with outlier channels like post-norm activations
     xc = torch.randn(32, K) ; xc[:, :8] *= 20
     y8 = s8.apply_weights(l8, xc.half().cuda(), None).float().cpu(); y16 = s16.apply_weights(l16, xc.half().cuda(), None).float().cpu()
     e8, e16 = emulate(t, xc.half(), N, K)
     corr = {"rel_w4a8_vs_emul": ((y8 - e8).norm() / e8.norm()).item(), "rel_w4a16_vs_fp32": ((y16 - e16).norm() / e16.norm()).item(),
             "rel_w4a8_vs_w4a16_kernel": ((y8 - y16).norm() / y16.norm()).item()}
+    if g8 is not None:
+        yg = g8.forward(xc.half().cuda(), G8.quant_act_g128_triton).float().cpu(); eg = emulate_g(t, xc.half(), N, K)
+        corr["rel_w4a8g_vs_emul"] = ((yg - eg).norm() / eg.norm()).item()
+        corr["rel_w4a8g_vs_fp32"] = ((yg - e16).norm() / e16.norm()).item()
+        corr["rel_w4a8_vs_fp32"] = ((y8 - e16).norm() / e16.norm()).item()
+        for Mt in (1, 7, 65, 300):  # odd M: tail rows + M-split paths
+            xt = torch.randn(Mt, K) ; xt[:, :8] *= 20
+            yt = g8.forward(xt.half().cuda(), G8.quant_act_g128_triton).float().cpu(); et = emulate_g(t, xt.half(), N, K)
+            corr[f"rel_w4a8g_vs_emul_M{Mt}"] = ((yt - et).norm() / et.norm()).item()
     print(f"{name:9s} N={N} K={K} correctness {json.dumps({k: round(v, 5) for k, v in corr.items()})}", flush=True)
     for M in Ms:
         x = torch.randn(M, K, device="cuda", dtype=torch.float16); x[:, :8] *= 20
         fns = {"w4a16": lambda: s16.apply_weights(l16, x, None), "w4a8": lambda: s8.apply_weights(l8, x, None),
                "quant": lambda: ops.scaled_int8_quant(x, None, None, symmetric=True)}
+        if g8 is not None:
+            fns["w4a8g"] = lambda: g8.forward(x, G8.quant_act_g128_triton)
+            fns["quant_g"] = lambda: G8.quant_act_g128_triton(x)
         for fn in fns.values():
             for _ in range(a.warmup): fn()
         ts = {k: [] for k in fns}
@@ -116,17 +148,19 @@ for name in a.shapes.split(","):
             r[k] = {"med": statistics.median(ts[k]), "min": min(ts[k]), "p25": sorted(ts[k])[len(ts[k]) // 4]}
             r[k]["tflops_min"] = fl / r[k]["min"] / 1e9
         r["speedup_min"] = r["w4a16"]["min"] / r["w4a8"]["min"]; r["speedup_med"] = r["w4a16"]["med"] / r["w4a8"]["med"]
+        if "w4a8g" in r: r["speedup_g_min"] = r["w4a16"]["min"] / r["w4a8g"]["min"]
         rows.append(r)
         print(f"  M={M:5d} w4a16 {r['w4a16']['min']:7.3f}/{r['w4a16']['med']:7.3f} ms ({r['w4a16']['tflops_min']:5.1f} TF)  "
               f"w4a8 {r['w4a8']['min']:7.3f}/{r['w4a8']['med']:7.3f} ms ({r['w4a8']['tflops_min']:5.1f} TOPS)  quant {r['quant']['min']:.3f}  "
-              f"speedup min {r['speedup_min']:.2f}x med {r['speedup_med']:.2f}x", flush=True)
+              f"speedup min {r['speedup_min']:.2f}x med {r['speedup_med']:.2f}x" +
+              (f" | w4a8g {r['w4a8g']['min']:7.3f} ms ({r['w4a8g']['tflops_min']:5.1f}) x{r['speedup_g_min']:.2f} quant_g {r['quant_g']['min']:.3f}" if "w4a8g" in r else ""), flush=True)
         del x
-    del l16, l8; torch.cuda.empty_cache()
+    del l16, l8, g8; torch.cuda.empty_cache()
 tot = {}
 for r in rows:
     if r["M"] == max(Ms):
-        for k in ("w4a16", "w4a8"):
-            tot[k] = tot.get(k, 0) + r[k]["min"] * r["layers"]
+        for k in ("w4a16", "w4a8", "w4a8g"):
+            if k in r: tot[k] = tot.get(k, 0) + r[k]["min"] * r["layers"]
 print("PER-CHUNK linear time (min, ms, all layers, M=%d): %s  ratio %.2fx" % (max(Ms), {k: round(v, 1) for k, v in tot.items()}, tot["w4a16"] / tot["w4a8"]))
 sustain = {}
 if a.sustain > 0:
