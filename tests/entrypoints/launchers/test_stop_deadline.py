@@ -185,6 +185,9 @@ def test_workers_and_api_server_are_wired_to_the_deadline():
 
     assert "arm_exit_deadline(\"Worker\"" in inspect.getsource(WorkerProc.worker_main)
     assert "arm_exit_deadline(" in inspect.getsource(launcher.serve_http)
+    from vllm.entrypoints.launchers.api_server import entry
+
+    assert "arm_exit_deadline(" in inspect.getsource(entry.run_server)  # stop during boot
     assert "timeout_graceful_shutdown" in inspect.getsource(launcher.serve_http)
 
 

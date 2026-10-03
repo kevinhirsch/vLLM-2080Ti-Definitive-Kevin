@@ -19,6 +19,7 @@ from vllm.logger import init_logger
 from vllm.reasoning import ReasoningParserManager
 from vllm.tool_parsers import ToolParserManager
 from vllm.usage.usage_lib import UsageContext
+from vllm.utils.shutdown_deadline import arm_exit_deadline
 from vllm.utils.system_utils import decorate_logs
 
 from ..app import build_app
@@ -168,6 +169,9 @@ async def run_server(args, **uvicorn_kwargs) -> None:
     # Interrupt initialization if SIGTERM arrives before uvicorn installs its
     # own signal handlers. Once uvicorn is running it replaces this.
     def _interrupt_init(*_) -> None:
+        # L52: a stop during boot (engine/worker startup in flight) unwinds through the engine
+        # client's teardown, which can wait on workers that are mid-compile; bound it.
+        arm_exit_deadline("API server", envs.VLLM_API_SERVER_EXIT_DEADLINE_S)
         raise KeyboardInterrupt("terminated")
 
     signal.signal(signal.SIGTERM, _interrupt_init)
