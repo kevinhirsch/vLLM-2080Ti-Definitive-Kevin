@@ -83,6 +83,7 @@ class Scheduler(SchedulerInterface):
     # (bypassing __init__) keep working with the lane EF/EF2 hooks.
     progress_guard_enabled: bool = False
     short_first_enabled: bool = False
+    short_first_prefix_aware: bool = False
     prefill_share_enabled: bool = False
 
     def __init__(
@@ -497,6 +498,20 @@ class Scheduler(SchedulerInterface):
         )
         self._short_first_streak: int = 0
         self.num_short_first_yields: int = 0
+        # [FORK][LANE CR2] Judge a waiting request by what it would COMPUTE,
+        # not by its prompt length. A waiting request has num_computed_tokens
+        # == 0 until admission, so a 30K warm continuation with ~1K uncached
+        # tokens never counted as short and queued behind the cold prefill it
+        # could have overtaken in one step. When on, the yield decision probes
+        # the local prefix cache (read-only hash lookups, bounded by the same
+        # 16-request scan) and counts num_tokens - hit. Default off:
+        # VLLM_SCHED_SHORT_FIRST_PREFIX_AWARE=1 enables it.
+        self.short_first_prefix_aware: bool = (
+            self.short_first_enabled
+            and self.cache_config.enable_prefix_caching
+            and os.environ.get("VLLM_SCHED_SHORT_FIRST_PREFIX_AWARE", "0") == "1"
+        )
+        self.num_short_first_prefix_yields: int = 0
 
         # [FORK][LANE EF2] Prefill/decode time-slicing. VLLM_SCHED_PREFILL_SHARE=f
         # (0<f<1) gives a long prefill chunk at most fraction f of wall time
@@ -564,10 +579,21 @@ class Scheduler(SchedulerInterface):
                 seen += 1
                 if seen > 16:
                     return False
+                if r.status not in (RequestStatus.WAITING, RequestStatus.PREEMPTED):
+                    continue
+                if r.num_tokens - r.num_computed_tokens <= block:
+                    return True
                 if (
-                    r.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
-                    and r.num_tokens - r.num_computed_tokens <= block
+                    # getattr: unit tests drive this helper on bare namespaces
+                    getattr(self, "short_first_prefix_aware", False)
+                    and r.num_computed_tokens == 0
+                    and r.num_tokens
+                    - self.kv_cache_manager.probe_prefix_cache_hit(r)
+                    <= block
                 ):
+                    # [FORK][LANE CR2] warm continuation: short by its uncached
+                    # remainder (see __init__).
+                    self.num_short_first_prefix_yields += 1
                     return True
         return False
 
