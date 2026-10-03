@@ -11,9 +11,17 @@ L=/home/kevin/projects/lanes/k5; K5=/home/kevin/Desktop/wt-k5; I=/home/kevin/Des
 SD=/home/kevin/.local/share/vllm-qwen27b; O=$SD/v02.override.env
 mkdir -p $L/win $L/win/prof_base $L/win/prof_k5; rm -f $L/test_gdn_mtp.json $L/test_tq_batched.json; cp $O $L/win/override.saved; echo "k5 window start $(date)"; cat $L/win/override.saved
 XID0=$(sudo -n dmesg 2>/dev/null | grep -c -E 'Xid' || echo na)
+gpu_clean_wait() {  # wait up to 600 s for no non-engine GPU compute processes before a boot (the KV pool is sized at boot)
+  local t0=$(date +%s) f
+  while f=$(/home/kevin/projects/lanes/windows/gpu_foreign.sh); [ -n "$f" ]; do
+    [ $(( $(date +%s) - t0 )) -ge 600 ] && { echo "WARN foreign GPU procs at boot $1 (KV pool may shrink): $(echo "$f" | tr '\n' '|')"; return 1; }
+    sleep 10
+  done; return 0
+}
 boot() {  # boot LABEL EXTRA_LINES...   (override = saved trial override + extra export lines)
   local lab=$1; shift; cp $L/win/override.saved $O; for kv in "$@"; do echo "export $kv" >> $O; done
   for p in $(pgrep -f "[w]armup-after-start.sh"); do kill $p; done
+  gpu_clean_wait $lab
   python3 $SD/engine-actuator.py restart --by K5 --reason "K5 arm $lab" --no-drain --foreground > $L/win/boot_$lab.log 2>&1 &
   sleep 20; local t0=$(date +%s)
   until curl -s -m 2 -o /dev/null -w "%{http_code}" localhost:8001/health | grep -q 200; do
@@ -62,7 +70,7 @@ if [ "$KPASS" = "True" ]; then
   }
 else echo "SKIP K5 arm: kernel test failed"; fi
 # 4. restore
-echo "== restore $(date +%T)"; cp $L/win/override.saved $O
+echo "== restore $(date +%T)"; cp $L/win/override.saved $O; gpu_clean_wait restore
 python3 $SD/engine-actuator.py restart --by K5 --reason "K5 window restore" --no-drain --foreground > $L/win/boot_restore.log 2>&1 &
 sleep 20; t0=$(date +%s); until curl -s -m 2 -o /dev/null -w "%{http_code}" localhost:8001/health | grep -q 200; do [ $(( $(date +%s) - t0 )) -ge 900 ] && break; sleep 4; done
 cmp -s $O $L/win/override.saved && echo "override restored verbatim"
