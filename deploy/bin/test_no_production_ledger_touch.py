@@ -37,9 +37,27 @@ prod = json.loads(os.environ["RATCHET_PROD_PATHS"])
 hits = []
 EVENTS = {"open", "os.rename", "os.chmod", "os.remove", "os.mkdir", "os.utime", "os.truncate",
           "os.link", "os.symlink", "shutil.copyfile", "shutil.copymode", "shutil.move", "shutil.rmtree"}
+live = json.loads(os.environ.get("RATCHET_LIVE_WRITE_PATHS", "[]"))
+def _writes(event, args):
+    if event != "open":
+        return True
+    mode = args[1] if len(args) > 1 else "r"
+    flags = args[2] if len(args) > 2 else 0
+    if isinstance(mode, str) and any(c in mode for c in "wax+"):
+        return True
+    return isinstance(flags, int) and bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC))
 def hook(event, args):
     if event not in EVENTS:
         return
+    if live and _writes(event, args):
+        for a in args:
+            if isinstance(a, (str, bytes)) or hasattr(a, "__fspath__"):
+                try:
+                    p = os.fsdecode(a)
+                except Exception:
+                    continue
+                if any(p.startswith(x) for x in live):
+                    hits.append([event, p])
     for a in args:
         if isinstance(a, (str, bytes)) or hasattr(a, "__fspath__"):
             try:
@@ -60,6 +78,14 @@ result = unittest.TextTestRunner(stream=open(os.devnull, "w"), verbosity=0).run(
 print("RATCHET " + json.dumps({"hits": hits, "ran": result.testsRun,
                                "failures": len(result.failures) + len(result.errors)}))
 '''
+
+
+# Lane CFG 2026-10-03: the deployed gateway files change only through gateway_safe_publish. A suite run wrote the
+# live gateway_config_schema.py (a test redirected DASH_RUNTIME only, the schema install used the real RUNTIME), so
+# any WRITE to these paths by a test or tool is a hit too (reads are allowed).
+_LIVE = "/home/kevin/.local/share/vllm-qwen27b/"
+LIVE_GATEWAY_FILES = [_LIVE + n for n in ("keepalive-shim.py", "gateway_dashboard.html", "gateway_config_schema.py",
+                                          "shim.env", "gateway-aliases.json", "admin.token")]
 
 
 def production_paths():
@@ -89,7 +115,8 @@ class ProductionLedgerRatchet(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="ratchet-tmp-") as tmp:
             env = {k: v for k, v in os.environ.items() if not k.startswith("SHIM_SPEND")}
             env.update(TMPDIR=tmp, RATCHET_DIR=str(HERE), RATCHET_MODULES=json.dumps(tests),
-                       RATCHET_TOOLS=json.dumps(tools), RATCHET_PROD_PATHS=json.dumps(production_paths()))
+                       RATCHET_TOOLS=json.dumps(tools), RATCHET_PROD_PATHS=json.dumps(production_paths()),
+                       RATCHET_LIVE_WRITE_PATHS=json.dumps(LIVE_GATEWAY_FILES))
             out = subprocess.run([sys.executable, "-c", PROBE], cwd=str(HERE), env=env,
                                  capture_output=True, text=True, timeout=600)
             line = next((l for l in out.stdout.splitlines() if l.startswith("RATCHET ")), None)
