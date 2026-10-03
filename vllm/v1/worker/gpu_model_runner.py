@@ -3993,19 +3993,46 @@ class GPUModelRunner(
         num_tokens: int,
         num_reqs: int,
         force_uniform_decode: bool | None = None,
+        has_non_spec_rows: bool = False,
     ) -> bool:
         """
         Checks if it's a decode batch with same amount scheduled tokens
         across all requests.
+
+        ``has_non_spec_rows``: at least one request in the batch is NOT a
+        speculative-decode row (it carries no scheduled draft tokens: a prefill
+        or continuation chunk whose length merely equals 1 + num_spec_tokens).
+        Such a batch is shape-identical to a uniform spec-decode batch but must
+        not replay the FULL cudagraph captured for spec decode: the GDN
+        attention metadata of the live step has a different structure (e.g.
+        non-empty non_spec_token_indx), so replay either raises in
+        _refresh_captured_forward_context_tensors (CUDAGRAPH-REFRESH mismatch,
+        engine dead) or silently loses recurrent state (vllm-project/vllm#53051).
         """
+        if force_uniform_decode is not None:
+            return force_uniform_decode
         return (
-            (
-                (max_num_scheduled_tokens == uniform_decode_query_len)
-                and (num_tokens == max_num_scheduled_tokens * num_reqs)
-            )
-            if force_uniform_decode is None
-            else force_uniform_decode
+            (max_num_scheduled_tokens == uniform_decode_query_len)
+            and (num_tokens == max_num_scheduled_tokens * num_reqs)
+            and not has_non_spec_rows
         )
+
+    @staticmethod
+    def _batch_has_non_spec_rows(
+        spec_decode_metadata: "SpecDecodeMetadata | None",
+        num_decode_draft_tokens: np.ndarray,
+        num_reqs: int,
+        num_spec_tokens: int,
+    ) -> bool:
+        """True when some request of a uniform-length batch is not a spec-decode
+        row. ``num_decode_draft_tokens`` is the per-request mask built in
+        _prepare_inputs (-1 = not a decode-with-drafts row); with no spec
+        metadata at all no row carries drafts."""
+        if num_spec_tokens <= 0 or os.environ.get("VLLM_UNIFORM_DECODE_NONSPEC_GUARD", "1") == "0":
+            return False  # =0 restores the shape-only upstream behaviour (A/B + instant rollback of this guard)
+        if spec_decode_metadata is None:
+            return True
+        return bool((num_decode_draft_tokens[:num_reqs] < 0).any())
 
     def _allow_microbatching(
         self, num_reqs: int, num_scheduled_tokens_np: np.ndarray
@@ -4067,6 +4094,7 @@ class GPUModelRunner(
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
+        has_non_spec_rows: bool = False,
     ) -> tuple[
         CUDAGraphMode,
         BatchDescriptor,
@@ -4080,6 +4108,7 @@ class GPUModelRunner(
             num_tokens=num_tokens,
             num_reqs=num_reqs,
             force_uniform_decode=force_uniform_decode,
+            has_non_spec_rows=has_non_spec_rows,
         )
         # Encoder-decoder models only support CG for decoder_step > 0 (no enc_output
         # is present). Also, chunked-prefill is disabled, so batch are uniform.
@@ -4396,6 +4425,12 @@ class GPUModelRunner(
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 allow_microbatching=self._allow_microbatching(
                     num_reqs, num_scheduled_tokens_np
+                ),
+                has_non_spec_rows=self._batch_has_non_spec_rows(
+                    spec_decode_metadata,
+                    self.num_decode_draft_tokens.np,
+                    num_reqs,
+                    self.num_spec_tokens,
                 ),
             )
 
