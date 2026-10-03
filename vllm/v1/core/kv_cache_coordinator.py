@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import NamedTuple
@@ -919,6 +920,47 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         for manager in self.single_type_managers:
             manager.cache_hit_alignment_tokens = cache_hit_alignment_tokens
         self.verify_and_split_kv_cache_groups()
+        self._maybe_install_chain_index(kv_cache_config, hash_block_size)
+
+    def _maybe_install_chain_index(
+        self, kv_cache_config: KVCacheConfig, hash_block_size: int
+    ) -> None:
+        """Lane R2: chain-aware eviction ordering (opt-in, see hybrid_chain_index)."""
+        if os.environ.get("VLLM_R2_CHAIN_AWARE_EVICT", "0") != "1":
+            return
+        if self.independent_block_pools or not self.block_pool.enable_caching:
+            return
+        attn: set[int] = set()
+        snap: set[int] = set()
+        for gid, g in enumerate(kv_cache_config.kv_cache_groups):
+            spec = g.kv_cache_spec
+            if spec.block_size != hash_block_size:
+                return
+            if isinstance(spec, MambaSpec):
+                snap.add(gid)
+            elif isinstance(spec, FullAttentionSpec):
+                attn.add(gid)
+            else:
+                return
+        if not attn or not snap:
+            return
+        from vllm.v1.core.hybrid_chain_index import HybridChainIndex
+
+        self.block_pool.chain_index = HybridChainIndex(self.block_pool, attn, snap)
+        self.block_pool.chain_index.supersede = (
+            os.environ.get("VLLM_R2_SUPERSEDE", "0") == "1"
+        )
+        self.block_pool.chain_index.dry_run = (
+            os.environ.get("VLLM_R2_DRYRUN", "0") == "1"
+        )
+        self.block_pool.chain_index.supersede_grace_s = float(
+            os.environ.get("VLLM_R2_SUPERSEDE_GRACE_S", "90")
+        )
+        logger.info(
+            "R2 chain-aware prefix-cache eviction ON (attn groups %s, snapshot groups %s)",
+            sorted(attn),
+            sorted(snap),
+        )
 
     @property
     def _cache_hit_alignment_tokens(self) -> int:

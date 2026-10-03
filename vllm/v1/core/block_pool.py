@@ -200,6 +200,9 @@ class BlockPool:
         # Callbacks for blocks released with ``unpin_blocks`` whose contents
         # are still being read until the pool reuses them.
         self._reuse_watchers: dict[int, Callable[[KVCacheBlock], None]] = {}
+        # Optional chain-aware eviction ordering for hybrid models (Lane R2,
+        # VLLM_R2_CHAIN_AWARE_EVICT=1); installed by the hybrid coordinator.
+        self.chain_index = None
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -301,6 +304,14 @@ class BlockPool:
                 blk,
                 num_tokens=num_hash_tokens,
             )
+            if (
+                self.chain_index is not None
+                and kv_cache_group_id in self.chain_index.snap_gids
+            ):
+                self.chain_index.on_snapshot_cached(
+                    block_hash,
+                    tuple(block_hashes[: num_cached_blocks + i + 1]),
+                )
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
@@ -744,6 +755,8 @@ class BlockPool:
             return False
 
         self._emit_block_removed_events(evicted_hashes)
+        if self.chain_index is not None:
+            self.chain_index.on_evicted(evicted_hashes)
         return True
 
     def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
@@ -754,6 +767,8 @@ class BlockPool:
         Args:
             blocks: A list of blocks to touch.
         """
+        if self.chain_index is not None:
+            self.chain_index.on_touch(blocks)
         for block in blocks:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
@@ -785,7 +800,14 @@ class BlockPool:
                 continue
             block.ref_cnt -= 1
             if block.ref_cnt == 0 and not block.is_null:
-                if block.block_hash is None or not self.enable_caching:
+                if (
+                    block.block_hash is None
+                    or not self.enable_caching
+                    or (
+                        self.chain_index is not None
+                        and self.chain_index.evict_first(block)
+                    )
+                ):
                     # LIFO reuse of non-cached blocks for better GPU locality.
                     blocks_to_evict_first.append(block)
                 else:
@@ -847,6 +869,8 @@ class BlockPool:
         # Remove all hashes from all blocks.
         for block in self.blocks:
             block.reset_hash()
+        if self.chain_index is not None:
+            self.chain_index.clear()
 
         if self.metrics_collector:
             self.metrics_collector.reset()
