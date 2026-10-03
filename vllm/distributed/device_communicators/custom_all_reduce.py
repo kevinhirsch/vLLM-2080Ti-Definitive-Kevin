@@ -257,6 +257,12 @@ class CustomAllreduce:
             return
 
         self.disabled = False
+        logger.info_once(
+            "K3 custom allreduce max_size=%d bytes (%.1f MiB)",
+            max_size,
+            max_size / 2**20,
+            scope="global",
+        )
         # Buffers memory are owned by this Python class and passed to C++.
         # Metadata composes of two parts: metadata for synchronization and a
         # temporary buffer for storing intermediate allreduce results.
