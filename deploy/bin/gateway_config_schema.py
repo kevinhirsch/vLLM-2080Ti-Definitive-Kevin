@@ -374,10 +374,10 @@ def check_value(key: Key, raw: str):
         return True, problem, healed
     if t == "bool":
         if s == "":
-            return True, "empty boolean (readers disagree on its meaning; set 0 or 1)", None
+            return True, "empty boolean (the code default applies; set 0 or 1)", None
         c = canonical_bool(s)
         if c is None:
-            return True, "not a boolean: %r (readers treat it as true)" % s, None
+            return True, "not a boolean: %r (the code default applies)" % s, None
         return True, None, (c if c != s else None)
     if t == "enum":
         if s.lower() not in key.choices:
