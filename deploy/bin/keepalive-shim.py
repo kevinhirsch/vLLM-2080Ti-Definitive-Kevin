@@ -1435,6 +1435,143 @@ def local_first_decision(reason, *, background, units, reservation, est_computed
     return True, "capacity"
 
 
+# ---------------- QoL INTERACTIVE OVERFLOW (lane CFG, 2026-10-03) ----------------
+# Kevin, 2026-10-03: interactive overflow "should be based on quality of life". An INTERACTIVE request goes remote only
+# when the PREDICTED local time-to-first-token is long (> QOL_TTFT_S, counting what it already waited) AND the remote is
+# predicted to be meaningfully faster (by >= QOL_MIN_GAIN_S, from MEASURED remote TTFT in its prompt-size band). A request
+# about to start locally, or a small one that will be fast locally, never overflows just because it waited; one stuck
+# behind a monster prefill overflows at once instead of after a timer. Prediction = local_first_predicted_ttft() (class
+# queue wait + engine prefill backlog + own uncached prefill at the live prefill rate), with GW2's engine-anchored cache
+# credit for the request's own size when the chain has one (the cache-credit guess is the largest input error).
+#   SHIM_QOL_OVERFLOW=off     no effect (default)
+#                     shadow  decide and log (telemetry qol_* fields) next to what actually happened; routing unchanged
+#                     on      the decision governs interactive overflow for QOL_REASONS and the lane wait
+# Background traffic, planned-offline windows, local-down, size caps, pins, aliases and the spend authority are untouched.
+QOL_OVERFLOW = os.environ.get("SHIM_QOL_OVERFLOW", "off").strip().lower()
+QOL_TTFT_S = float(os.environ.get("SHIM_QOL_TTFT_S", "15"))
+QOL_MIN_GAIN_S = float(os.environ.get("SHIM_QOL_MIN_GAIN_S", "5"))
+QOL_REMOTE_QUANTILE = float(os.environ.get("SHIM_QOL_REMOTE_QUANTILE", "0.75"))
+QOL_REMOTE_MIN_SAMPLES = int(os.environ.get("SHIM_QOL_REMOTE_MIN_SAMPLES", "5"))
+QOL_REMOTE_WINDOW_S = float(os.environ.get("SHIM_QOL_REMOTE_WINDOW_S", "21600"))
+QOL_REASONS = os.environ.get("SHIM_QOL_REASONS", "perf,big-prompt,monster,predicted")
+QOL_BANDS = (8192, 32768, 65536, 131072)          # prompt-token band upper edges; the last band is open-ended
+_QOL_REMOTE = collections.deque(maxlen=4000)      # (t, prompt_tokens, ttft_s) of finished streamed remote requests
+_QOL_SEEDED = [False]
+_QOL_STATS = collections.Counter()
+_CFG.update({
+    "SHIM_QOL_OVERFLOW": ("QOL_OVERFLOW", lambda v: _qol_cast_mode(v)),
+    "SHIM_QOL_TTFT_S": ("QOL_TTFT_S", float),
+    "SHIM_QOL_MIN_GAIN_S": ("QOL_MIN_GAIN_S", float),
+    "SHIM_QOL_REASONS": ("QOL_REASONS", lambda v: ",".join(sorted({x.strip().lower() for x in str(v).split(",") if x.strip()}))),
+})
+
+
+def _qol_cast_mode(v):
+    v = str(v).strip().lower()
+    if v not in ("off", "shadow", "on"):
+        raise ValueError("qol_overflow must be off|shadow|on")
+    return v
+
+
+def qol_band(ptok):
+    for i, edge in enumerate(QOL_BANDS):
+        if (ptok or 0) <= edge:
+            return i
+    return len(QOL_BANDS)
+
+
+def qol_note_remote(ptok, ttft, now=None):
+    if isinstance(ttft, (int, float)) and ttft > 0 and ptok:
+        _QOL_REMOTE.append((now or time.time(), int(ptok), float(ttft)))
+
+
+def _qol_seed():
+    """Restore recent remote TTFT samples from the on-disk request log once (a restart must not blind the model)."""
+    if _QOL_SEEDED[0]:
+        return
+    _QOL_SEEDED[0] = True
+    try:
+        files = sorted(f for f in os.listdir(TELEMETRY_DIR) if f.startswith("requests-") and f.endswith(".jsonl"))[-2:]
+        cutoff = time.time() - QOL_REMOTE_WINDOW_S
+        rows = []
+        for f in files:
+            p = os.path.join(TELEMETRY_DIR, f)
+            with open(p, "rb") as fh:
+                size = os.path.getsize(p)
+                fh.seek(max(0, size - 16 * 1024 * 1024))
+                for line in fh.read().splitlines()[1:]:
+                    if b'"route": "remote"' not in line and b'"route":"remote"' not in line:
+                        continue
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    if r.get("t", 0) >= cutoff and r.get("ttft"):
+                        rows.append((r["t"], int(r.get("ptok_exact") or r.get("ptok") or 0), float(r["ttft"])))
+        for row in sorted(rows)[-_QOL_REMOTE.maxlen:]:
+            _QOL_REMOTE.append(row)
+    except Exception as e:
+        log.warning("qol: remote TTFT seed failed: %s", e)
+
+
+def qol_remote_ttft(ptok, now=None):
+    """(seconds, band, n): the QOL_REMOTE_QUANTILE of measured remote TTFT for this prompt-size band over the last
+    QOL_REMOTE_WINDOW_S. seconds is None with fewer than QOL_REMOTE_MIN_SAMPLES samples (no claim that remote is faster)."""
+    _qol_seed()
+    now = now or time.time()
+    b = qol_band(ptok)
+    v = sorted(s for t, p, s in _QOL_REMOTE if now - t <= QOL_REMOTE_WINDOW_S and qol_band(p) == b)
+    if len(v) < max(1, QOL_REMOTE_MIN_SAMPLES):
+        return None, b, len(v)
+    return v[min(len(v) - 1, int(QOL_REMOTE_QUANTILE * len(v)))], b, len(v)
+
+
+def qol_choice(local_remaining_s, waited_s, remote_s, ttft_target_s=None, min_gain_s=None):
+    """The pure QoL rule: ("remote"|"local"|"legacy", why). Remote only when the person's total wait for a local first
+    token would exceed the target AND the remote is predicted to answer at least min_gain sooner from now."""
+    target = QOL_TTFT_S if ttft_target_s is None else ttft_target_s
+    gain = QOL_MIN_GAIN_S if min_gain_s is None else min_gain_s
+    if local_remaining_s is None:
+        return "legacy", "no-local-prediction"
+    total = max(0.0, waited_s or 0.0) + max(0.0, local_remaining_s)
+    if total <= target:
+        return "local", "fast-local"
+    if remote_s is None:
+        return "legacy", "no-remote-samples"
+    if local_remaining_s - remote_s < gain:
+        return "local", "remote-not-faster"
+    return "remote", "remote-faster"
+
+
+def qol_decide(cls, est_computed, ptok, *, units=1, waited=0.0, pm_chain=None, now=None):
+    """Predict and decide for one interactive request. Never raises; returns a flat dict for telemetry."""
+    out = {"qol_mode": QOL_OVERFLOW}
+    try:
+        own_tok = est_computed
+        if pm_chain:
+            ac, _age = anchored_credit(pm_chain, ptok, now=now)
+            if ac:
+                own_tok = max(0, int(ptok or 0) - int(ac))
+                out["qol_anchored"] = int(ac)
+        pred, parts = local_first_predicted_ttft(cls if cls in FLOW_CLASSES else "kevin", own_tok, units=units, now=now)
+        remote, band, n = qol_remote_ttft(ptok, now=now)
+        would, why = qol_choice(pred, waited, remote)
+        out.update(qol_would=would, qol_why=why, qol_pred_local_s=None if pred is None else round(pred, 1),
+                   qol_pred_remote_s=None if remote is None else round(remote, 2), qol_band=band, qol_remote_n=n,
+                   qol_waited_s=round(waited or 0.0, 1), **{"qol_" + k: v for k, v in (parts or {}).items()})
+    except Exception as e:
+        out.update(qol_would="legacy", qol_why="error:%s" % type(e).__name__)
+    return out
+
+
+_QOL_FIELDS = ("qol_mode", "qol_would", "qol_why", "qol_at", "qol_legacy", "qol_pred_local_s", "qol_pred_remote_s",
+               "qol_band", "qol_remote_n", "qol_waited_s", "qol_queue_s", "qol_backlog_s", "qol_own_s", "qol_anchored")
+
+
+def qol_governs(reason):
+    return QOL_OVERFLOW in ("shadow", "on") and reason in {x.strip() for x in str(QOL_REASONS).split(",") if x.strip()}
+
+
 def _latest_decode_tps():
     """Use the most recent measured engine decode rate, with a conservative floor."""
     for sample in reversed(_TELEM_FAST):
@@ -3955,6 +4092,8 @@ def _telemetry_note_request(info, resp=None):
             c["tokens_out"] += outtok_lb; c["tokens_out_lb"] += outtok_lb
         c["wait_sum"] += waited; c["wait_n"] += 1
         ttft = info.get("ttft")
+        if ttft is not None and route == "remote" and (status is None or status < 400):
+            qol_note_remote(info.get("ptok_exact") or info.get("ptok") or info.get("est_tokens"), ttft, now)   # lane CFG QoL
         if ttft is not None:
             c["ttft_sum"] += ttft; c["ttft_n"] += 1
             if status is None or status < 400:
@@ -4076,6 +4215,7 @@ def _telemetry_note_request(info, resp=None):
                 "probe_ms": info.get("probe_ms"), "credit_source": info.get("credit_source"),
                 "pm_credit_model": info.get("pm_credit_model")}
                if (CREDIT_ANCHOR != "off" or CREDIT_PROBE != "off") else {}),
+            **({k: info.get(k) for k in _QOL_FIELDS} if QOL_OVERFLOW != "off" else {}),
             "flow_class": info.get("flow_class"), "flow_expected_wait": info.get("flow_expected_wait_s"),
             "flow_held": info.get("flow_held"), "flow_adjacent": info.get("flow_adjacent"),
             **({"chain_prev_route": info.get("chain_prev_route"), "chain_prev_age_s": info.get("chain_prev_age_s"),
@@ -8871,6 +9011,13 @@ async def _route_completions(request, _no_overflow=False):
         keep, why = local_first_decision(reason, background=background, units=units,
                                          reservation=_lf_res, est_computed=est_computed, cls=_early_cls,
                                          warm=_cr_warm)
+        if not background and qol_governs(reason):       # lane CFG: QoL interactive overflow (shadow logs, on decides)
+            _q = qol_decide(_early_cls, est_computed, ptok, units=units, pm_chain=_pm.get("chain"))
+            _q.update(qol_at="guard:" + reason, qol_legacy="local" if keep else "remote")
+            _active_set(request, **_q)
+            _QOL_STATS["%s:%s->%s" % (reason, _q["qol_legacy"], _q["qol_would"])] += 1
+            if QOL_OVERFLOW == "on" and _q["qol_would"] in ("local", "remote"):
+                keep, why = _q["qol_would"] == "local", "qol:" + _q["qol_why"]
         if keep:
             _local_first_kept[reason] += 1
             _lf_kept.append(reason)
@@ -9229,6 +9376,16 @@ async def _route_completions(request, _no_overflow=False):
         background, overflow_ok, is_peak(), LOCAL_WAIT, BG_WAIT, INTERACTIVE_NEVER_OVERFLOW)
     admitted = False
     t_admit0 = time.time()
+    # lane CFG QoL: an interactive request that may overflow is judged by its PREDICTED wait, not a timer.
+    _qol_live = (QOL_OVERFLOW in ("shadow", "on") and not background and overflow_ok and not alias_local_only
+                 and not local_pin)
+    _qol_broke, _qol_next = False, 0.0
+    if _qol_live:
+        _q = qol_decide(_early_cls, est_computed, ptok, units=units, pm_chain=_pm.get("chain"))
+        _q.update(qol_at="admission")
+        _active_set(request, **_q)
+        if QOL_OVERFLOW == "on":
+            deadline = t_admit0 + max(1.0, float(LOCAL_FIRST_FIRST_TOKEN_MAX))   # hard bound; the prediction decides first
     queued = False
     # The size-implied unit cost does not change while we wait (est_computed is fixed at arrival), so
     # compute it once rather than re-hashing the body on every 50 ms poll.
@@ -9312,6 +9469,14 @@ async def _route_completions(request, _no_overflow=False):
                 # Only the engine's prefill queue is full: background work is patient and has no
                 # reason to pay for remote because of it -- keep waiting (bounded) for it to drain.
                 deadline = max(deadline, t_admit0 + BG_WAIT_LOCAL)
+            if _qol_live and QOL_OVERFLOW == "on" and waited >= _qol_next:
+                _qol_next = waited + 1.0
+                _q = qol_decide(_early_cls, est_computed, ptok, units=units, waited=waited, pm_chain=_pm.get("chain"))
+                if _q.get("qol_would") == "remote":
+                    _q.update(qol_at="wait", qol_legacy=None)
+                    _active_set(request, **_q)
+                    _qol_broke = True
+                    break
             if time.time() >= deadline:
                 break
             if not queued:                       # first time we couldn't get a slot -> we're backlogged
@@ -9350,6 +9515,13 @@ async def _route_completions(request, _no_overflow=False):
             reason = "bg-yield"      # lanes exist but are reserved for interactive
         else:
             reason = "cap"
+        if _qol_broke:
+            reason = "qol"                # predicted local first token too late and remote measurably faster
+        elif _qol_live and not _local_offline() and _health["ok"]:
+            _q = qol_decide(_early_cls, est_computed, ptok, units=units, waited=waited, pm_chain=_pm.get("chain"))
+            _q.update(qol_at="wait-timeout", qol_legacy="remote")
+            _active_set(request, **_q)
+            _QOL_STATS["wait-timeout:remote->%s" % _q["qol_would"]] += 1
         where = f"remote({reason})" if overflow_ok and not alias_local_only else "local-only(wait-exhausted)"
         log.info("route %s units=%d inflight=%d/%d tok=%d/%d waited=%.1fs -> %s",
                  path, units, _inflight, effective_budget(), _inflight_tokens, token_budget(), waited, where)

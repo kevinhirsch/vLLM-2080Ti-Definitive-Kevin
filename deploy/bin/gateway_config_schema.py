@@ -270,6 +270,14 @@ _k("SHIM_EXPECTED_OUTPUT", "bool", "1", "Big-out rule uses the learned expected 
 _k("SHIM_EXPECTED_OUTPUT_QUANTILE", "float", "0.95", "Quantile of a signature's output history used as its expectation.", lo=0, hi=1, gname="EXPECTED_OUTPUT_QUANTILE", tunable=True, owner="LF")
 _k("SHIM_EXPECTED_OUTPUT_MIN_SAMPLES", "int", "20", "History required before the expectation is used.", gname="EXPECTED_OUTPUT_MIN_SAMPLES", tunable=True, owner="LF")
 _k("SHIM_EXPECTED_OUTPUT_HISTORY", "int", "200", "Output history kept per signature.", gname="EXPECTED_OUTPUT_HISTORY", owner="LF")
+# ---- QoL interactive overflow (lane CFG, Kevin 2026-10-03: "based on quality of life") ----
+_k("SHIM_QOL_OVERFLOW", "enum", "off", "Predictive interactive overflow: off | shadow (log only) | on (decides).", choices=("off", "shadow", "on"), gname="QOL_OVERFLOW", tunable=True, kill=True, owner="CFG")
+_k("SHIM_QOL_TTFT_S", "float", "15", "Interactive overflow only when the predicted local first token (incl. time waited) exceeds this.", unit="s", gname="QOL_TTFT_S", tunable=True, owner="CFG")
+_k("SHIM_QOL_MIN_GAIN_S", "float", "5", "...and the measured remote TTFT for its size band is at least this much sooner.", unit="s", gname="QOL_MIN_GAIN_S", tunable=True, owner="CFG")
+_k("SHIM_QOL_REMOTE_QUANTILE", "float", "0.75", "Quantile of measured remote TTFT per size band used as the remote prediction.", lo=0, hi=1, gname="QOL_REMOTE_QUANTILE", owner="CFG")
+_k("SHIM_QOL_REMOTE_MIN_SAMPLES", "int", "5", "Remote samples per band before QoL may claim remote is faster.", gname="QOL_REMOTE_MIN_SAMPLES", owner="CFG")
+_k("SHIM_QOL_REMOTE_WINDOW_S", "float", "21600", "Window of measured remote TTFT samples.", unit="s", gname="QOL_REMOTE_WINDOW_S", owner="CFG")
+_k("SHIM_QOL_REASONS", "list", "perf,big-prompt,monster,predicted", "Predictive overflow reasons QoL governs for interactive traffic (plus the lane wait).", gname="QOL_REASONS", tunable=True, owner="CFG")
 # ---- micro lane / probes ----
 _k("SHIM_MICRO_LEARN", "bool", "1", "Learn short-output signatures and admit them to the tiny lane.", gname="MICRO_LEARN", kill=True)
 _k("SHIM_MICRO_SIG_CHARS", "int", "32", "Prompt-head chars in a micro signature.", unit="chars", gname="MICRO_SIG_CHARS")
