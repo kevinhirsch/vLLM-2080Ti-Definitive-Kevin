@@ -1229,6 +1229,8 @@ def _drain_startup_recover():
                                  "duration_s": round(time.time() - float(last.get("t") or time.time()), 1), "reason": last.get("reason"),
                                  "by": last.get("by"), "ttl_s": last.get("ttl_s"), "active_at_open": last.get("active"),
                                  "refused": None, "note": "refused count unknown: the process that held the fence is gone"})
+    except FileNotFoundError:
+        pass                      # no ledger yet (first start, fresh dir): nothing to recover, not a failure
     except Exception as _e:
         _swallowed("_drain_startup_recover", _e)
 

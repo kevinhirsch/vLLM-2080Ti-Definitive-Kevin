@@ -159,6 +159,15 @@ class SwallowedExceptionsAreCounted(_Fresh):
         self.assertEqual(len([r for r in cm.output if "flood" in r]), 4)    # 1, 2, 4, 8
 
 
+class SwallowedCounterHasNoFirstStartNoise(_Fresh):
+    def test_missing_drain_ledger_is_not_counted(self):
+        m = self.m
+        m._SWALLOWED.clear()
+        m._DRAIN_LEDGER = self.tmp + "/no-such/drains.jsonl"
+        m._drain_startup_recover()
+        self.assertNotIn("_drain_startup_recover", m._SWALLOWED)
+
+
 class PerClientTablesAreBounded(_Fresh):
     """Class: dict keyed by a caller-chosen header with no eviction."""
 
