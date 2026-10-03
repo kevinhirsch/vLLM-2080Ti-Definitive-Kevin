@@ -70,13 +70,13 @@ struct Strides {
   int64_t mixed_row, a_row, b_row, z_row, state_slot, out_row;
 };
 
-// DT: dt_bias element type, NW: norm weight element type, S: state element type
-template <typename S, typename DT, typename NW, int HPK, bool SIGMOID>
+// S: state element type (fp16 or fp32); A_log, dt_bias and the norm weight arrive as fp32
+template <typename S, bool SIGMOID>
 __global__ __launch_bounds__(kThreads, 1) void gdn_mtp_sm75_kernel(
     const __half* __restrict__ mixed_qkv, const __half* __restrict__ a, const __half* __restrict__ b,
-    const float* __restrict__ a_log, const DT* __restrict__ dt_bias, const int* __restrict__ state_indices,
+    const float* __restrict__ a_log, const float* __restrict__ dt_bias, const int* __restrict__ state_indices,
     const int* __restrict__ cu_seqlens, const int* __restrict__ num_accepted, S* __restrict__ state,
-    const __half* __restrict__ z, const NW* __restrict__ norm_w, __half* __restrict__ out, int H, int HV,
+    const __half* __restrict__ z, const float* __restrict__ norm_w, __half* __restrict__ out, int H, int HV, int HPK,
     int width, int null_block_id, float scale, float eps, Strides st) {
   const int n = blockIdx.x;
   const int hv = blockIdx.y;
@@ -138,7 +138,7 @@ __global__ __launch_bounds__(kThreads, 1) void gdn_mtp_sm75_kernel(
       sk[t][d] = kv[i] * kn;
     }
     if (lane == 0) {
-      const float x = __half2float(a[(int64_t)(bos + t) * st.a_row + hv]) + ld1<DT>(dt_bias + hv);
+      const float x = __half2float(a[(int64_t)(bos + t) * st.a_row + hv]) + dt_bias[hv];
       const float sp = x <= 20.0f ? log1pf(expf(x)) : x;
       sdecay[t] = expf(-expf(a_log[hv]) * sp);
       sbeta[t] = sigmoidf_(__half2float(b[(int64_t)(bos + t) * st.b_row + hv]));
@@ -212,61 +212,214 @@ __global__ __launch_bounds__(kThreads, 1) void gdn_mtp_sm75_kernel(
       const int v = lane + i * 32;
       const float g = __half2float(z[(int64_t)(bos + t) * st.z_row + (int64_t)hv * kDimV + v]);
       const float act = SIGMOID ? sigmoidf_(g) : g * sigmoidf_(g);
-      const float y = ((ov[i] * rstd) * ld1<NW>(norm_w + v)) * act;
+      const float y = ((ov[i] * rstd) * norm_w[v]) * act;
       out[(int64_t)(bos + t) * st.out_row + (int64_t)hv * kDimV + v] = __float2half(y);
     }
   }
 }
 
-template <typename S, typename DT, typename NW, int HPK>
-void launch(bool sigmoid, dim3 grid, cudaStream_t s, const torch::Tensor& mixed, const torch::Tensor& a,
-            const torch::Tensor& b, const torch::Tensor& a_log, const torch::Tensor& dt_bias,
-            const torch::Tensor& sidx, const torch::Tensor& cu, const torch::Tensor& nacc, torch::Tensor& state,
-            const torch::Tensor& z, const torch::Tensor& nw, torch::Tensor& out, int H, int HV, int width,
-            int null_id, float scale, float eps, Strides st) {
-#define K5_ARGS                                                                                                     \
-  reinterpret_cast<const __half*>(mixed.data_ptr()), reinterpret_cast<const __half*>(a.data_ptr()),                \
-      reinterpret_cast<const __half*>(b.data_ptr()), a_log.data_ptr<float>(),                                      \
-      reinterpret_cast<const DT*>(dt_bias.data_ptr()), sidx.data_ptr<int>(), cu.data_ptr<int>(),                    \
-      nacc.data_ptr<int>(), reinterpret_cast<S*>(state.data_ptr()), reinterpret_cast<const __half*>(z.data_ptr()), \
-      reinterpret_cast<const NW*>(nw.data_ptr()), reinterpret_cast<__half*>(out.data_ptr()), H, HV, width,         \
-      null_id, scale, eps, st
-  if (sigmoid)
-    gdn_mtp_sm75_kernel<S, DT, NW, HPK, true><<<grid, kThreads, 0, s>>>(K5_ARGS);
-  else
-    gdn_mtp_sm75_kernel<S, DT, NW, HPK, false><<<grid, kThreads, 0, s>>>(K5_ARGS);
-#undef K5_ARGS
+// ---------------------------------------------------------------------------------------------------------------
+// v2 layout (reduction-light).  v1 gives every value row to a whole warp (32 lanes x 4 K-elements), so each row
+// dot product costs a 5-step shuffle and a thread does 8 rows x 2 dots x 5 = 80 shuffles per token; the recurrence
+// is instruction/reduction-bound, not memory-bound (K8 measured the stock Triton kernel the same way).  v2 gives each
+// row to an 8-lane group (16 K-elements per lane, interleaved as k = m*32 + seg*4 + i so shared-memory float4 reads
+// are conflict-free and each 8-lane group reads a contiguous 128 B / 64 B global segment): 2 rows x 2 dots x 3 =
+// 12 shuffles per thread per token, the same FMA count, the same register footprint.
+constexpr int kGrp = 8;                               // lanes per row
+constexpr int kRowsPerPass = kWarps * (32 / kGrp);    // 64
+constexpr int kRowsV2 = kDimV / kRowsPerPass;         // 2 rows per thread
+constexpr int kSegs = kDimK / (kGrp * 4);             // 4 float4 segments per row per lane
+
+template <typename S, bool SIGMOID>
+__global__ __launch_bounds__(kThreads, 1) void gdn_mtp_sm75_v2_kernel(
+    const __half* __restrict__ mixed_qkv, const __half* __restrict__ a, const __half* __restrict__ b,
+    const float* __restrict__ a_log, const float* __restrict__ dt_bias, const int* __restrict__ state_indices,
+    const int* __restrict__ cu_seqlens, const int* __restrict__ num_accepted, S* __restrict__ state,
+    const __half* __restrict__ z, const float* __restrict__ norm_w, __half* __restrict__ out, int H, int HV, int HPK,
+    int width, int null_block_id, float scale, float eps, Strides st) {
+  const int n = blockIdx.x;
+  const int hv = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int grp = lane >> 3;
+  const int seg = lane & 7;
+  const int bos = cu_seqlens[n];
+  const int T = cu_seqlens[n + 1] - bos;
+  if (T <= 0) return;
+
+  const int acc = num_accepted[n];
+  int src = -1;
+  if (acc >= 1 && acc <= width) src = state_indices[(int64_t)n * width + acc - 1];
+  if (src < 0 || src == null_block_id || T > kMaxTok) {
+    for (int i = tid; i < T * kDimV; i += kThreads) {
+      const int t = i / kDimV, v = i % kDimV;
+      out[(int64_t)(bos + t) * st.out_row + (int64_t)hv * kDimV + v] = __float2half(0.0f);
+    }
+    return;
+  }
+
+  const int kh = hv / HPK;
+  __shared__ __align__(16) float sq[kMaxTok][kDimK];
+  __shared__ __align__(16) float sk[kMaxTok][kDimK];
+  __shared__ float sv[kMaxTok][kDimV];
+  __shared__ float so[kMaxTok][kDimV];
+  __shared__ float sdecay[kMaxTok];
+  __shared__ float sbeta[kMaxTok];
+  __shared__ int sdst[kMaxTok];
+  __shared__ float skq[kMaxTok];
+
+  int rows[kRowsV2];
+#pragma unroll
+  for (int j = 0; j < kRowsV2; ++j) rows[j] = warp * (32 / kGrp) + grp + j * kRowsPerPass;
+  const S* src_state = state + (int64_t)src * st.state_slot + (int64_t)hv * kDimV * kDimK;
+  float h[kRowsV2][kSegs][4];
+#pragma unroll
+  for (int j = 0; j < kRowsV2; ++j)
+#pragma unroll
+    for (int m = 0; m < kSegs; ++m) ld4<S>(src_state + rows[j] * kDimK + m * 32 + seg * 4, h[j][m]);
+
+  if (warp < T) {
+    const int t = warp;
+    const int64_t mb = (int64_t)(bos + t) * st.mixed_row;
+    float qv[4], kv[4], qs = 0.f, ks = 0.f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int d = lane + i * 32;
+      qv[i] = __half2float(mixed_qkv[mb + kh * kDimK + d]);
+      kv[i] = __half2float(mixed_qkv[mb + (int64_t)H * kDimK + kh * kDimK + d]);
+      sv[t][d] = __half2float(mixed_qkv[mb + (int64_t)2 * H * kDimK + (int64_t)hv * kDimV + d]);
+      qs += qv[i] * qv[i];
+      ks += kv[i] * kv[i];
+    }
+    qs = warp_sum(qs);
+    ks = warp_sum(ks);
+    const float qn = rsqrtf(qs + 1e-6f) * scale;
+    const float kn = rsqrtf(ks + 1e-6f);
+    float kq = 0.f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int d = lane + i * 32;
+      sq[t][d] = qv[i] * qn;
+      sk[t][d] = kv[i] * kn;
+      kq += (qv[i] * qn) * (kv[i] * kn);
+    }
+    kq = warp_sum(kq);
+    if (lane == 0) {
+      skq[t] = kq;
+      const float x = __half2float(a[(int64_t)(bos + t) * st.a_row + hv]) + dt_bias[hv];
+      const float sp = x <= 20.0f ? log1pf(expf(x)) : x;
+      sdecay[t] = expf(-expf(a_log[hv]) * sp);
+      sbeta[t] = sigmoidf_(__half2float(b[(int64_t)(bos + t) * st.b_row + hv]));
+      const int d = t < width ? state_indices[(int64_t)n * width + t] : -1;
+      sdst[t] = (d >= 0 && d != null_block_id) ? d : -1;
+    }
+  }
+  __syncthreads();
+
+  for (int t = 0; t < T; ++t) {
+    float kk[kSegs][4], qq[kSegs][4];
+#pragma unroll
+    for (int m = 0; m < kSegs; ++m) {
+      const float4 k4 = *reinterpret_cast<const float4*>(&sk[t][m * 32 + seg * 4]);
+      const float4 q4 = *reinterpret_cast<const float4*>(&sq[t][m * 32 + seg * 4]);
+      kk[m][0] = k4.x; kk[m][1] = k4.y; kk[m][2] = k4.z; kk[m][3] = k4.w;
+      qq[m][0] = q4.x; qq[m][1] = q4.y; qq[m][2] = q4.z; qq[m][3] = q4.w;
+    }
+    // K8's single-pass form: both dot products against the OLD state (independent, no decay pass):
+    //   sk = h.k, sq = h.q;  d = beta * (v - dec*sk);  o = dec*sq + d*(k.q);  h' = dec*h + d*k
+    const float dec = sdecay[t], beta = sbeta[t], kq = skq[t];
+    float hk[kRowsV2], hq[kRowsV2];
+#pragma unroll
+    for (int j = 0; j < kRowsV2; ++j) {
+      float s0 = 0.f, s1 = 0.f;
+#pragma unroll
+      for (int m = 0; m < kSegs; ++m)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          s0 += h[j][m][i] * kk[m][i];
+          s1 += h[j][m][i] * qq[m][i];
+        }
+      hk[j] = s0;
+      hq[j] = s1;
+    }
+#pragma unroll
+    for (int o = kGrp / 2; o > 0; o >>= 1)
+#pragma unroll
+      for (int j = 0; j < kRowsV2; ++j) {
+        hk[j] += __shfl_xor_sync(0xffffffffu, hk[j], o);
+        hq[j] += __shfl_xor_sync(0xffffffffu, hq[j], o);
+      }
+#pragma unroll
+    for (int j = 0; j < kRowsV2; ++j) {
+      const float delta = (sv[t][rows[j]] - dec * hk[j]) * beta;
+      hq[j] = dec * hq[j] + delta * kq;
+#pragma unroll
+      for (int m = 0; m < kSegs; ++m)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) h[j][m][i] = dec * h[j][m][i] + kk[m][i] * delta;
+    }
+    if (seg == 0) {
+#pragma unroll
+      for (int j = 0; j < kRowsV2; ++j) so[t][rows[j]] = __half2float(__float2half(hq[j]));
+    }
+    const int dst = sdst[t];
+    if (dst >= 0) {
+      S* d = state + (int64_t)dst * st.state_slot + (int64_t)hv * kDimV * kDimK;
+#pragma unroll
+      for (int j = 0; j < kRowsV2; ++j)
+#pragma unroll
+        for (int m = 0; m < kSegs; ++m) st4<S>(d + rows[j] * kDimK + m * 32 + seg * 4, h[j][m]);
+    }
+  }
+  __syncthreads();
+
+  if (warp < T) {
+    const int t = warp;
+    float ov[4], ss = 0.f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      ov[i] = so[t][lane + i * 32];
+      ss += ov[i] * ov[i];
+    }
+    ss = warp_sum(ss);
+    const float rstd = rsqrtf(ss / (float)kDimV + eps);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int v = lane + i * 32;
+      const float g = __half2float(z[(int64_t)(bos + t) * st.z_row + (int64_t)hv * kDimV + v]);
+      const float act = SIGMOID ? sigmoidf_(g) : g * sigmoidf_(g);
+      const float y = ((ov[i] * rstd) * norm_w[v]) * act;
+      out[(int64_t)(bos + t) * st.out_row + (int64_t)hv * kDimV + v] = __float2half(y);
+    }
+  }
 }
 
-template <typename S, typename DT, typename NW>
-void dispatch_hpk(int hpk, bool sigmoid, dim3 grid, cudaStream_t s, const torch::Tensor& mixed,
-                  const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& a_log,
-                  const torch::Tensor& dt_bias, const torch::Tensor& sidx, const torch::Tensor& cu,
-                  const torch::Tensor& nacc, torch::Tensor& state, const torch::Tensor& z, const torch::Tensor& nw,
-                  torch::Tensor& out, int H, int HV, int width, int null_id, float scale, float eps, Strides st) {
-#define K5_CALL(N)                                                                                                \
-  launch<S, DT, NW, N>(sigmoid, grid, s, mixed, a, b, a_log, dt_bias, sidx, cu, nacc, state, z, nw, out, H, HV, \
-                       width, null_id, scale, eps, st)
-  switch (hpk) {
-    case 1: K5_CALL(1); break;
-    case 2: K5_CALL(2); break;
-    case 3: K5_CALL(3); break;
-    case 4: K5_CALL(4); break;
-    default: K5_CALL(8); break;
-  }
-#undef K5_CALL
+template <typename S, bool SIG>
+void launch_one(int variant, dim3 grid, cudaStream_t s, const __half* mixed, const __half* a, const __half* b,
+                const float* a_log, const float* dt_bias, const int* sidx, const int* cu, const int* nacc, S* state,
+                const __half* z, const float* nw, __half* out, int H, int HV, int hpk, int width, int null_id,
+                float scale, float eps, Strides st) {
+  if (variant == 1)
+    gdn_mtp_sm75_kernel<S, SIG><<<grid, kThreads, 0, s>>>(mixed, a, b, a_log, dt_bias, sidx, cu, nacc, state, z, nw,
+                                                         out, H, HV, hpk, width, null_id, scale, eps, st);
+  else
+    gdn_mtp_sm75_v2_kernel<S, SIG><<<grid, kThreads, 0, s>>>(mixed, a, b, a_log, dt_bias, sidx, cu, nacc, state, z,
+                                                            nw, out, H, HV, hpk, width, null_id, scale, eps, st);
 }
 
 }  // namespace
 
 // mixed_qkv [L, 2*H*128 + HV*128] fp16 (row stride free, channel stride 1); a, b [L, HV] fp16 (row stride free);
 // z [L, HV, 128] fp16 (row stride free, head rows contiguous); state [slots, HV, 128, 128] fp16|fp32;
-// out [L, HV, 128] fp16 (row stride free, head rows contiguous); state_indices [N, W] int32; cu_seqlens [N+1];
-// num_accepted [N] int32.  Only requests 0..N-1 are processed; rows outside their [bos, eos) are untouched.
+// out [L, HV, 128] fp16 (row stride free, head rows contiguous); A_log, dt_bias [HV] fp32; norm_w [128] fp32;
+// state_indices [N, W] int32; cu_seqlens [N+1]; num_accepted [N] int32.  Only requests 0..N-1 are processed;
+// rows outside their [bos, eos) are untouched.  variant: 1 = 32 lanes/row, 2 = 8 lanes/row single-pass.
 void gdn_mtp_sm75(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_log,
                   torch::Tensor dt_bias, torch::Tensor state_indices, torch::Tensor cu_seqlens,
                   torch::Tensor num_accepted, torch::Tensor state, torch::Tensor z, torch::Tensor norm_w,
-                  torch::Tensor out, double scale, double eps, int64_t null_block_id, bool sigmoid_gate) {
+                  torch::Tensor out, double scale, double eps, int64_t null_block_id, bool sigmoid_gate,
+                  int64_t variant) {
   TORCH_CHECK(mixed_qkv.is_cuda() && mixed_qkv.scalar_type() == at::kHalf && mixed_qkv.dim() == 2 &&
               mixed_qkv.stride(1) == 1, "mixed_qkv: CUDA fp16 [L, C], channel-contiguous");
   TORCH_CHECK(a.scalar_type() == at::kHalf && b.scalar_type() == at::kHalf && a.dim() == 2 && b.dim() == 2 &&
@@ -276,10 +429,9 @@ void gdn_mtp_sm75(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, tor
   TORCH_CHECK(out.scalar_type() == at::kHalf && out.dim() == 3 && out.size(2) == kDimV && out.stride(2) == 1 &&
               out.stride(1) == kDimV, "out: fp16 [L, HV, 128] with contiguous head rows");
   TORCH_CHECK(a_log.scalar_type() == at::kFloat && a_log.is_contiguous(), "A_log: fp32 contiguous");
-  TORCH_CHECK(dt_bias.is_contiguous() && (dt_bias.scalar_type() == at::kFloat || dt_bias.scalar_type() == at::kHalf),
-              "dt_bias: fp32|fp16 contiguous");
-  TORCH_CHECK(norm_w.is_contiguous() && norm_w.numel() == kDimV &&
-              (norm_w.scalar_type() == at::kFloat || norm_w.scalar_type() == at::kHalf), "norm_w: 128 fp32|fp16");
+  TORCH_CHECK(dt_bias.scalar_type() == at::kFloat && dt_bias.is_contiguous(), "dt_bias: fp32 contiguous");
+  TORCH_CHECK(norm_w.scalar_type() == at::kFloat && norm_w.is_contiguous() && norm_w.numel() == kDimV,
+              "norm_w: 128 fp32");
   TORCH_CHECK(state.dim() == 4 && state.size(2) == kDimV && state.size(3) == kDimK && state.stride(3) == 1 &&
               state.stride(2) == kDimK && state.stride(1) == kDimV * kDimK, "state: [slots, HV, 128, 128]");
   TORCH_CHECK(state.scalar_type() == at::kFloat || state.scalar_type() == at::kHalf, "state: fp32|fp16");
@@ -299,30 +451,29 @@ void gdn_mtp_sm75(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, tor
   TORCH_CHECK(kw > 0 && kw % (2 * kDimK) == 0, "mixed_qkv width inconsistent with state heads");
   const int H = kw / (2 * kDimK);
   TORCH_CHECK(HV % H == 0, "HV % H");
-  const int hpk = HV / H;
-  TORCH_CHECK(hpk == 1 || hpk == 2 || hpk == 3 || hpk == 4 || hpk == 8, "HV/H must be in {1,2,3,4,8}");
   TORCH_CHECK(a.size(1) == HV && b.size(1) == HV && z.size(1) == HV && out.size(1) == HV, "head count mismatch");
   if (N == 0) return;
   const Strides st{mixed_qkv.stride(0), a.stride(0), b.stride(0), z.stride(0), state.stride(0), out.stride(0)};
   const at::cuda::OptionalCUDAGuard guard(mixed_qkv.device());
   cudaStream_t s = at::cuda::getCurrentCUDAStream();
   const dim3 grid(N, HV);
-  const bool s32 = state.scalar_type() == at::kFloat;
-  const bool d32 = dt_bias.scalar_type() == at::kFloat;
-  const bool w32 = norm_w.scalar_type() == at::kFloat;
-  const float sc = (float)scale, ep = (float)eps;
-  const int nid = (int)null_block_id;
-#define K5_D(S, DT, NW)                                                                                          \
-  dispatch_hpk<S, DT, NW>(hpk, sigmoid_gate, grid, s, mixed_qkv, a, b, a_log, dt_bias, state_indices, cu_seqlens, \
-                          num_accepted, state, z, norm_w, out, H, HV, W, nid, sc, ep, st)
-  if (s32) {
-    if (d32) { if (w32) K5_D(float, float, float); else K5_D(float, float, __half); }
-    else     { if (w32) K5_D(float, __half, float); else K5_D(float, __half, __half); }
+  const auto* mp = reinterpret_cast<const __half*>(mixed_qkv.data_ptr());
+  const auto* ap = reinterpret_cast<const __half*>(a.data_ptr());
+  const auto* bp = reinterpret_cast<const __half*>(b.data_ptr());
+  const auto* zp = reinterpret_cast<const __half*>(z.data_ptr());
+  auto* op = reinterpret_cast<__half*>(out.data_ptr());
+  const int v = (int)variant;
+#define K5_L(S, SIG)                                                                                              \
+  launch_one<S, SIG>(v, grid, s, mp, ap, bp, a_log.data_ptr<float>(), dt_bias.data_ptr<float>(),                  \
+                     state_indices.data_ptr<int>(), cu_seqlens.data_ptr<int>(), num_accepted.data_ptr<int>(),      \
+                     reinterpret_cast<S*>(state.data_ptr()), zp, norm_w.data_ptr<float>(), op, H, HV, HV / H, W,   \
+                     (int)null_block_id, (float)scale, (float)eps, st)
+  if (state.scalar_type() == at::kFloat) {
+    if (sigmoid_gate) K5_L(float, true); else K5_L(float, false);
   } else {
-    if (d32) { if (w32) K5_D(__half, float, float); else K5_D(__half, float, __half); }
-    else     { if (w32) K5_D(__half, __half, float); else K5_D(__half, __half, __half); }
+    if (sigmoid_gate) K5_L(__half, true); else K5_L(__half, false);
   }
-#undef K5_D
+#undef K5_L
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

@@ -44,12 +44,13 @@ echo "== stop engine $(date +%T)"; sudo -n systemctl stop vllm-qwen27b; sleep 5
 nvidia-smi --query-gpu=index,memory.used --format=csv,noheader
 ( . $L/envbuild.sh; cd $K5 && CUDA_VISIBLE_DEVICES=1 VLLM_K5_GDN_BUILD_DIR=$L/ext PYTHONPATH=$K5 timeout 600 python tools/k5/test_gdn_mtp.py ) 2>&1 | grep -vE "^W1003|warn" | tail -20
 TEST_RC=${PIPESTATUS[0]}; KPASS=$(python3 -c "import json;print(json.load(open('$L/test_gdn_mtp.json'))['pass'])" 2>/dev/null || echo False)
-echo "kernel test pass=$KPASS"
+VAR=$(python3 -c "import json;b=json.load(open('$L/test_gdn_mtp.json'))['bench'];f=[r for r in b if r['state']=='float16'];print(1 if sum(r['k5v1_us'] for r in f)<sum(r['k5v2_us'] for r in f) else 2)" 2>/dev/null || echo 2)
+echo "kernel test pass=$KPASS variant=$VAR"
 # 2. BASE arm
 boot base "$(prof_extra $L/win/prof_base)" && measure base
 # 3. K5 arm (only if the kernel test passed)
 if [ "$KPASS" = "True" ]; then
-  boot k5 "$(prof_extra $L/win/prof_k5)" "V02_ROOT=$K5" "VLLM_K5_GDN_FUSED=1" "VLLM_K5_GDN_BUILD_DIR=$L/ext" && {
+  boot k5 "$(prof_extra $L/win/prof_k5)" "V02_ROOT=$K5" "VLLM_K5_GDN_FUSED=1" "VLLM_K5_GDN_VARIANT=$VAR" "VLLM_K5_GDN_BUILD_DIR=$L/ext" && {
     journalctl -u vllm-qwen27b --since '-15 min' --no-pager | grep -iE "k5|gdn_mtp" | tail -3
     measure k5
     echo "== k5 evalkit $(date +%T)"; (cd /home/kevin/Desktop/qwen38-evalkit && timeout 1500 python3 run_eval.py --tag k5-gdnfused --categories tool_call,code_exec,long_ctx 2>&1 | grep -E "passed=False|/60")

@@ -1282,6 +1282,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         """Lane K5: pure spec-decode batch on fp16/sm_75 -> conv1d update + ONE fused kernel
         (l2norm, gating, delta-rule state update per MTP position, RMSNormGated) + out_proj.
         Returns False (caller runs the stock path) for anything it does not cover."""
+        if getattr(self, "_k5_dt_bias", None) is None:
+            # fp32 copies made once, on the first (profiling) forward, before any CUDA-graph capture
+            self._k5_dt_bias = self.dt_bias.detach().float().contiguous()
+            self._k5_norm_w = self.norm.weight.detach().float().contiguous()
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):
             return False
@@ -1359,13 +1363,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             a[:n],
             b[:n],
             self.A_log,
-            self.dt_bias,
+            self._k5_dt_bias,
             sidx[:num_req],
             md.spec_query_start_loc[: num_req + 1],
             md.num_accepted_tokens[:num_req],
             ssm_state,
             z,
-            self.norm.weight,
+            self._k5_norm_w,
             core_attn_out[:n],
             self.head_k_dim**-0.5,
             self.norm.eps,

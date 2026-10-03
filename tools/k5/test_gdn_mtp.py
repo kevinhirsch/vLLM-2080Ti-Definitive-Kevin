@@ -40,7 +40,7 @@ def make(N, sdt, invalid_req=None):
     cu = torch.arange(0, T + 1, W, device=dev, dtype=torch.int32)
     nacc = torch.randint(1, W + 1, (N,), device=dev, dtype=torch.int32)
     w = (1 + 0.1 * torch.randn(V, device=dev)).half()
-    return dict(mixed=mixed, z=z, a=a, b=b, A_log=A_log, dt_bias=dt_bias, state=state, sidx=sidx, cu=cu, nacc=nacc,
+    return dict(dt_f32=dt_bias.float(), w_f32=w.float(), mixed=mixed, z=z, a=a, b=b, A_log=A_log, dt_bias=dt_bias, state=state, sidx=sidx, cu=cu, nacc=nacc,
                 w=w, T=T, N=N)
 
 
@@ -62,10 +62,10 @@ def stock(d, state):
     return y.view(T, HV, V)
 
 
-def fused(d, state):
+def fused(d, state, variant=2):
     out = torch.zeros(d["T"], HV, V, device=dev, dtype=torch.half)
-    ext.gdn_mtp(d["mixed"], d["a"], d["b"], d["A_log"], d["dt_bias"], d["sidx"], d["cu"], d["nacc"], state, d["z"],
-                d["w"], out, K ** -0.5, 1e-6, -1, False)
+    ext.gdn_mtp(d["mixed"], d["a"], d["b"], d["A_log"], d["dt_f32"], d["sidx"], d["cu"], d["nacc"], state, d["z"],
+                d["w_f32"], out, K ** -0.5, 1e-6, -1, False, variant)
     return out
 
 
@@ -98,33 +98,37 @@ ok = True
 for sdt in (torch.float16, torch.float32):
     for N, inv in ((1, None), (4, 2), (12, None), (16, 5)):
         d = make(N, sdt, inv)
-        s_ref, s_k5 = d["state"].clone(), d["state"].clone()
-        y_ref = stock(d, s_ref)
-        y_k5 = fused(d, s_k5)
-        torch.cuda.synchronize()
-        dy = (y_ref.float() - y_k5.float()).abs()
-        rel = (dy.max() / y_ref.float().abs().max().clamp_min(1e-6)).item()
-        ds = (s_ref.float() - s_k5.float()).abs().max().item()
-        smag = s_ref.float().abs().max().item()
-        nan = bool(torch.isnan(y_k5).any() or torch.isnan(s_k5.float()).any())
-        tol_y = 2e-2
-        tol_s = 2e-3 * smag + (1e-3 if sdt == torch.float16 else 1e-5)
-        good = (not nan) and rel < tol_y and ds < tol_s
-        if inv is not None:
-            good = good and float(y_k5[inv * W:(inv + 1) * W].abs().max()) == 0.0
-        ok &= good
-        row = dict(state=str(sdt).split(".")[-1], N=N, invalid_req=inv, out_maxabs=round(dy.max().item(), 5),
-                   out_rel=round(rel, 5), state_maxabs=round(ds, 6), state_absmax=round(smag, 4), nan=nan, pass_=good)
-        res["cases"].append(row)
-        print(row, flush=True)
+        for var in (1, 2):
+            s_ref, s_k5 = d["state"].clone(), d["state"].clone()
+            y_ref = stock(d, s_ref)
+            y_k5 = fused(d, s_k5, var)
+            torch.cuda.synchronize()
+            dy = (y_ref.float() - y_k5.float()).abs()
+            rel = (dy.max() / y_ref.float().abs().max().clamp_min(1e-6)).item()
+            ds = (s_ref.float() - s_k5.float()).abs().max().item()
+            smag = s_ref.float().abs().max().item()
+            nan = bool(torch.isnan(y_k5).any() or torch.isnan(s_k5.float()).any())
+            tol_y = 2e-2
+            tol_s = 2e-3 * smag + (1e-3 if sdt == torch.float16 else 1e-5)
+            good = (not nan) and rel < tol_y and ds < tol_s
+            if inv is not None:
+                good = good and float(y_k5[inv * W:(inv + 1) * W].abs().max()) == 0.0
+            ok &= good
+            row = dict(variant=var, state=str(sdt).split(".")[-1], N=N, invalid_req=inv,
+                       out_maxabs=round(dy.max().item(), 5), out_rel=round(rel, 5), state_maxabs=round(ds, 6),
+                       state_absmax=round(smag, 4), nan=nan, pass_=good)
+            res["cases"].append(row)
+            print(row, flush=True)
 for sdt in (torch.float16, torch.float32):
     for N in (1, 4, 12, 16):
         d = make(N, sdt)
         st = d["state"].clone()
         ts = graph_time(lambda: stock(d, st))
-        tk = graph_time(lambda: fused(d, st))
-        row = dict(state=str(sdt).split(".")[-1], N=N, stock_us=round(ts[2], 2), k5_us=round(tk[2], 2),
-                   speedup=round(ts[2] / tk[2], 2), saved_us_per_step_48_layers=round((ts[2] - tk[2]) * 48, 1))
+        t1 = graph_time(lambda: fused(d, st, 1))
+        tk = graph_time(lambda: fused(d, st, 2))
+        row = dict(state=str(sdt).split(".")[-1], N=N, stock_us=round(ts[2], 2), k5v1_us=round(t1[2], 2),
+                   k5v2_us=round(tk[2], 2), speedup_v2=round(ts[2] / tk[2], 2),
+                   saved_us_per_step_48_layers=round((ts[2] - tk[2]) * 48, 1))
         res["bench"].append(row)
         print(row, flush=True)
 res["pass"] = bool(ok)
