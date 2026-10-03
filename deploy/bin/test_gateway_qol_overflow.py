@@ -44,6 +44,20 @@ class Rule(unittest.TestCase):
                 patch.object(shim, "QOL_REMOTE_MIN_SAMPLES", 6):
             self.assertIsNone(shim.qol_remote_ttft(60_000, now=now)[0])
 
+    def test_remote_ttft_prefers_the_same_price_period(self):
+        now = time.time()
+        dq = collections.deque(maxlen=4000)
+        for i in range(6):
+            dq.append((now - 100 - i, 50_000, 20.0))     # "peak" samples: slow
+            dq.append((now - 200 - i, 50_000, 2.0))      # "off-peak" samples: fast
+        peak = lambda t=None: (t is None) or (now - 150 < t <= now)
+        with patch.object(shim, "_QOL_REMOTE", dq), patch.object(shim, "_QOL_SEEDED", [True]), \
+                patch.object(shim, "is_peak", peak), patch.object(shim, "QOL_REMOTE_MIN_SAMPLES", 5):
+            self.assertEqual(shim.qol_remote_ttft(50_000, now=now)[0], 20.0)   # now is peak: peak samples only
+        with patch.object(shim, "_QOL_REMOTE", dq), patch.object(shim, "_QOL_SEEDED", [True]), \
+                patch.object(shim, "is_peak", peak), patch.object(shim, "QOL_REMOTE_MIN_SAMPLES", 7):
+            self.assertEqual(shim.qol_remote_ttft(50_000, now=now)[2], 12)     # too few in-period: all hours
+
     def test_decide_prefers_the_engine_anchored_credit(self):
         seen = {}
 

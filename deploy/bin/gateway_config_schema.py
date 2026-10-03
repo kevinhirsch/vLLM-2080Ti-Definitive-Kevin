@@ -640,9 +640,13 @@ def effective(module_globals=None, environ=None, env_file=None, schema=SCHEMA, o
             differs = False
         p = persisted.get(name)
         pval = p[1] if p else None
-        restart_changes = None
-        if p is not None or in_env:
-            restart_changes = _norm(pval, key) != _norm(STARTUP["raw"].get(name, env_val), key) if (p is not None) else True
+        # Only the env file is known here: a key set in the environment but not in shim.env came from the unit's
+        # Environment= (SHIM_PORT) or a parent process, which a restart re-applies -- not a pending change.
+        restart_changes = False
+        if p is not None:
+            restart_changes = _norm(pval, key) != _norm(STARTUP["raw"].get(name, env_val), key)
+        elif in_env:
+            source = source + " (not in the env file: unit Environment= or parent)"
         row = dict(key=name, type=key.type, unit=key.unit, value=live, default=key.default if not key.computed_default else "(computed)",
                    source=source, differs_from_default=differs, persisted=pval, persisted_line=p[0] if p else None,
                    restart_would_change=bool(restart_changes), tunable=key.tunable, kill_switch=key.kill, money=key.money,

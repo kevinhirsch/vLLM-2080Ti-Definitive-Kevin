@@ -1588,11 +1588,19 @@ def _qol_seed():
 
 def qol_remote_ttft(ptok, now=None):
     """(seconds, band, n): the QOL_REMOTE_QUANTILE of measured remote TTFT for this prompt-size band over the last
-    QOL_REMOTE_WINDOW_S. seconds is None with fewer than QOL_REMOTE_MIN_SAMPLES samples (no claim that remote is faster)."""
+    QOL_REMOTE_WINDOW_S, from samples in the same provider price period (peak / off-peak hours: the provider's latency
+    follows its load) when that period alone has enough, else all hours. seconds is None with fewer than
+    QOL_REMOTE_MIN_SAMPLES samples (no claim that remote is faster)."""
     _qol_seed()
     now = now or time.time()
     b = qol_band(ptok)
-    v = sorted(s for t, p, s in _QOL_REMOTE if now - t <= QOL_REMOTE_WINDOW_S and qol_band(p) == b)
+    rows = [(t, s) for t, p, s in _QOL_REMOTE if now - t <= QOL_REMOTE_WINDOW_S and qol_band(p) == b]
+    try:
+        pk = is_peak(now)
+        same = sorted(s for t, s in rows if is_peak(t) == pk)
+    except Exception:
+        same = []
+    v = same if len(same) >= max(1, QOL_REMOTE_MIN_SAMPLES) else sorted(s for _, s in rows)
     if len(v) < max(1, QOL_REMOTE_MIN_SAMPLES):
         return None, b, len(v)
     return v[min(len(v) - 1, int(QOL_REMOTE_QUANTILE * len(v)))], b, len(v)
