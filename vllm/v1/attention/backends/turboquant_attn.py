@@ -66,6 +66,7 @@ from vllm.v1.attention.ops.flydsl_turboquant_decode import (
 )
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.ops import tq_gqa_cuda as _gqa_cuda
+from vllm.v1.attention.ops import k5_tq_batched as _k5_tq
 from vllm.v1.attention.ops.triton_turboquant_decode import (
     _fp8_format_code,
     _tq_full_dequant_kv,
@@ -1519,6 +1520,12 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         K/V. Pure and mixed MTP batches must use this same attention math to
         avoid changing verifier logits when a late prefill joins the batch.
         """
+        if _k5_tq.enabled():
+            batched = self._k5_spec_batched(
+                query, key, value, kv_cache, attn_metadata, Pi, centroids, PiT
+            )
+            if batched is not None:
+                return batched
         qsl_cpu = attn_metadata.query_start_loc_cpu
         qsl = (
             qsl_cpu.tolist()
@@ -1572,6 +1579,64 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             output[q_start:q_end] = out.to(query.dtype)
 
         return output
+
+    def _k5_spec_batched(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TurboQuantMetadata,
+        Pi: torch.Tensor,
+        centroids: torch.Tensor,
+        PiT: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Lane K5: the raw-current verifier attention for a uniform batch (every request has the same q_len) in
+        O(1) launches instead of ~18 per request.  Same kernels and per-sequence math as the loop below; returns
+        None (caller runs the loop) for anything else."""
+        qsl_cpu = attn_metadata.query_start_loc_cpu
+        if qsl_cpu is None:
+            return None
+        num_reqs = attn_metadata.seq_lens.shape[0]
+        qsl = qsl_cpu[: num_reqs + 1].tolist()
+        if num_reqs <= 0 or len(qsl) != num_reqs + 1 or qsl[0] != 0:
+            return None
+        ql = qsl[1] - qsl[0]
+        if ql <= 0 or ql > 16 or any(qsl[i + 1] - qsl[i] != ql for i in range(num_reqs)):
+            return None
+        rows = num_reqs * ql
+        _, hq, d = query.shape
+        hk = key.shape[1]
+        if (
+            query.shape[0] != rows
+            or key.shape[0] != rows
+            or hk <= 0
+            or hq % hk != 0
+            or query.dtype != torch.float16
+            or not _gqa_cuda.enabled()
+            or not _gqa_cuda.gqa_eligible(
+                Hq=hq, Hk=hk, D=d, mse_bits=self.tq_config.key_mse_bits,
+                value_quant_bits=self.tq_config.effective_value_quant_bits,
+                key_fp8=self.tq_config.key_fp8, key_packed_size=self.tq_config.key_packed_size,
+            )
+        ):
+            return None
+        cached = (attn_metadata.seq_lens[:num_reqs] - ql).clamp_min(0).to(torch.int32)
+        has_prefix = cached > 0
+        block_table = attn_metadata.block_table[:num_reqs]
+        safe_block_table = torch.where(has_prefix.view(num_reqs, 1), block_table, torch.zeros_like(block_table))
+        prefix_lse = torch.empty(rows, hq, dtype=torch.float32, device=query.device)
+        prefix_out = torch.empty_like(query)
+        _gqa_cuda.tq_gqa_decode_attention(
+            query, kv_cache, safe_block_table, cached, Pi, centroids, self.scale,
+            self.tq_config.norm_correction, q_per_seq=ql, num_splits=self.max_num_kv_splits, PiT=PiT,
+            output_buf=prefix_out, lse_buf=prefix_lse,
+        )
+        row_has = has_prefix.view(num_reqs, 1).expand(num_reqs, ql).reshape(rows)
+        prefix_out = torch.where(row_has.view(rows, 1, 1), prefix_out, torch.zeros_like(prefix_out))
+        prefix_lse = torch.where(row_has.view(rows, 1), prefix_lse, torch.full_like(prefix_lse, float("-inf")))
+        output = torch.empty_like(query)
+        return _k5_tq.merge_batched(query, key, value, prefix_out, prefix_lse, self.scale, ql, output)
 
     # ------------------------------------------------------------------ #
     #  Store K/V into combined cache (vectorized)                         #

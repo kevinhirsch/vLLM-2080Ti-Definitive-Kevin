@@ -3,13 +3,13 @@
 #   0. save the current override env (restored verbatim at the end, whatever happens)
 #   1. kernel correctness + microbench on GPU1 with the engine stopped (gate for step 3)
 #   2. BASE arm: current override + torch profiler config -> quick.py decode, profiles at 1/4/12 streams
-#   3. K5 arm: same + V02_ROOT=wt-k5 VLLM_K5_GDN_FUSED=1 -> quick.py, profiles 1/4/12, evalkit tool_call+code_exec+long_ctx, Xid/OOM counts
+#   3. K5 arm: same + V02_ROOT=wt-k5 VLLM_K5_GDN_FUSED=1 (+ VLLM_K5_TQ_BATCHED=1 if its test passed) -> quick.py, profiles 1/4/12, evalkit tool_call+code_exec+long_ctx, Xid/OOM counts
 #   4. restore the saved override + engine-actuator restart, health check
 # Run under: python3 /home/kevin/Desktop/wt-integrate/deploy/bin/gateway-offline.py run --reason "K5 GDN fused decode A/B" --by K5 --ttl 3000 --wait-s 90 -- bash /home/kevin/Desktop/wt-k5/tools/k5/k5_win.sh
 set -u
 L=/home/kevin/projects/lanes/k5; K5=/home/kevin/Desktop/wt-k5; I=/home/kevin/Desktop/wt-integrate
 SD=/home/kevin/.local/share/vllm-qwen27b; O=$SD/v02.override.env
-mkdir -p $L/win $L/win/prof_base $L/win/prof_k5; rm -f $L/test_gdn_mtp.json; cp $O $L/win/override.saved; echo "k5 window start $(date)"; cat $L/win/override.saved
+mkdir -p $L/win $L/win/prof_base $L/win/prof_k5; rm -f $L/test_gdn_mtp.json $L/test_tq_batched.json; cp $O $L/win/override.saved; echo "k5 window start $(date)"; cat $L/win/override.saved
 XID0=$(sudo -n dmesg 2>/dev/null | grep -c -E 'Xid' || echo na)
 boot() {  # boot LABEL EXTRA_LINES...   (override = saved trial override + extra export lines)
   local lab=$1; shift; cp $L/win/override.saved $O; for kv in "$@"; do echo "export $kv" >> $O; done
@@ -46,11 +46,15 @@ nvidia-smi --query-gpu=index,memory.used --format=csv,noheader
 TEST_RC=${PIPESTATUS[0]}; KPASS=$(python3 -c "import json;print(json.load(open('$L/test_gdn_mtp.json'))['pass'])" 2>/dev/null || echo False)
 VAR=$(python3 -c "import json;b=json.load(open('$L/test_gdn_mtp.json'))['bench'];f=[r for r in b if r['state']=='float16'];print(1 if sum(r['k5v1_us'] for r in f)<sum(r['k5v2_us'] for r in f) else 2)" 2>/dev/null || echo 2)
 echo "kernel test pass=$KPASS variant=$VAR"
+( . $L/envbuild.sh; cd $K5 && CUDA_VISIBLE_DEVICES=1 VLLM_TQ_GQA_CUDA=1 VLLM_TQ_GQA_BUILD_DIR=$K5/.deps/tq_gqa_build PYTHONPATH=$K5 timeout 600 python tools/k5/test_tq_batched.py ) 2>&1 | grep -vE "^W1003|warn" | tail -8
+TPASS=$(python3 -c "import json;print(json.load(open('$L/test_tq_batched.json'))['pass'])" 2>/dev/null || echo False)
+TQ_ON=0; [ "$TPASS" = "True" ] && TQ_ON=1
+echo "tq batched test pass=$TPASS -> VLLM_K5_TQ_BATCHED=$TQ_ON"
 # 2. BASE arm
 boot base "$(prof_extra $L/win/prof_base)" && measure base
 # 3. K5 arm (only if the kernel test passed)
 if [ "$KPASS" = "True" ]; then
-  boot k5 "$(prof_extra $L/win/prof_k5)" "V02_ROOT=$K5" "VLLM_K5_GDN_FUSED=1" "VLLM_K5_GDN_VARIANT=$VAR" "VLLM_K5_GDN_BUILD_DIR=$L/ext" && {
+  boot k5 "$(prof_extra $L/win/prof_k5)" "V02_ROOT=$K5" "VLLM_K5_GDN_FUSED=1" "VLLM_K5_GDN_VARIANT=$VAR" "VLLM_K5_TQ_BATCHED=$TQ_ON" "VLLM_K5_GDN_BUILD_DIR=$L/ext" && {
     journalctl -u vllm-qwen27b --since '-15 min' --no-pager | grep -iE "k5|gdn_mtp" | tail -3
     measure k5
     echo "== k5 evalkit $(date +%T)"; (cd /home/kevin/Desktop/qwen38-evalkit && timeout 1500 python3 run_eval.py --tag k5-gdnfused --categories tool_call,code_exec,long_ctx 2>&1 | grep -E "passed=False|/60")
