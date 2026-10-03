@@ -13,7 +13,7 @@ import sys
 
 import torch
 
-from k1_common import K1, flashinfer_run, gpu_guard, ref_attention, smi_free
+from k1_common import K1, flashinfer_run, gpu_guard, preflight, ref_attention, ref_attention_long, smi_free
 
 
 def rel(a, b):
@@ -46,13 +46,14 @@ def main():
         (2048, 9000, 6, 1, True, 8.0),
         (777, 3001, 6, 1, False, 1.0),
     ]
-    variants = [0, 1, 2, 3]
+    variants = [0, 1, 2, 3, 4, 5, 6, 7]
     pc_only = "--pc-only" in sys.argv
     if pc_only:
         cases = []
     results = []
     worst = {vv: [0.0, 0.0, 0.0] for vv in variants}
     for Tq, Tkv, Hq, Hk, causal, qm in cases:
+        preflight()
         g = torch.Generator(device=dev).manual_seed(Tq * 7 + Tkv)
         q = (torch.randn(Tq, Hq, 256, device=dev, generator=g) * qm).half()
         k = torch.randn(Tkv, Hk, 256, device=dev, generator=g).half()
@@ -118,10 +119,55 @@ def main():
     print("varlen:", json.dumps(vl), flush=True)
     del qs, ks, vs, o, lse, qkv, q, k, v, obuf, lse_ht, ref_o, ref_lse
     torch.cuda.empty_cache()
+    # segmented context (exact LSE merge in the kernel epilogue): pieces [0,a) [a,b) non-causal, [b, Tkv) causal last
+    seg = []
+    for Tq, Tkv, cuts, qm in ((1000, 9000, (3000, 6000), 4.0), (3632, 7300, (1856, 3712), 1.0), (64, 20000, (7136, 14272), 8.0)):
+        g = torch.Generator(device=dev).manual_seed(Tkv)
+        q = torch.randn(Tq, 6, 256, device=dev, generator=g, dtype=torch.half).mul_(qm)
+        k = torch.randn(Tkv, 1, 256, device=dev, generator=g, dtype=torch.half)
+        v = torch.randn(Tkv, 1, 256, device=dev, generator=g, dtype=torch.half)
+        ref_o, ref_lse = ref_attention(q, k, v, scale, True)
+        acc_o = torch.empty(Tq, 6, 256, device=dev)
+        acc_l = torch.empty(Tq, 6, device=dev)
+        out = torch.empty_like(q)
+        lse_o = torch.empty(Tq, 6, device=dev)
+        a, b = cuts
+        K1.fa75_prefill(q, k[:a], v[:a], scale=scale, causal=False, out=out, acc_o=acc_o, acc_lse=acc_l, acc_mode=1)
+        K1.fa75_prefill(q, k[a:b], v[a:b], scale=scale, causal=False, out=out, acc_o=acc_o, acc_lse=acc_l, acc_mode=2)
+        K1.fa75_prefill(q, k[b:], v[b:], scale=scale, causal=True, out=out, lse=lse_o, acc_o=acc_o, acc_lse=acc_l,
+                        acc_mode=3)
+        one = K1.fa75_prefill(q, k, v, scale=scale, causal=True)
+        r = dict(Tq=Tq, Tkv=Tkv, cuts=cuts, seg_vs_ref=rel(out, ref_o), seg_vs_single=rel(out, one),
+                 lse_err=(lse_o - ref_lse).abs().max().item(), finite=bool(torch.isfinite(out).all()))
+        seg.append(r)
+        print("segmented:", json.dumps(r), flush=True)
+        del q, k, v, ref_o, ref_lse, acc_o, acc_l, out, lse_o, one
+        torch.cuda.empty_cache()
+
+    # long context error growth (K9 saw fp32-P.V + TAU 8 drift to 9e-4 at 131K): real per-rank GQA-6, 128 rows
+    longc = []
+    for Tkv, qm in ((32768, 2.0), (131072, 2.0), (131072, 6.0)):
+        g = torch.Generator(device=dev).manual_seed(Tkv + int(qm))
+        q = torch.randn(128, 6, 256, device=dev, generator=g, dtype=torch.half).mul_(qm)
+        k = torch.randn(Tkv, 1, 256, device=dev, generator=g, dtype=torch.half)
+        v = torch.randn(Tkv, 1, 256, device=dev, generator=g, dtype=torch.half)
+        ref_o, ref_lse = ref_attention_long(q, k, v, scale, True)
+        r = dict(Tkv=Tkv, q_mult=qm)
+        for vv in (0, 2, 3, 7, 8, 9):
+            o, lse = K1.fa75_prefill(q, k, v, scale=scale, causal=True, return_lse=True, variant=vv)
+            r[f"v{vv}"] = (round(rel(o, ref_o)[0], 6), round((lse - ref_lse).abs().max().item(), 6))
+            del o, lse
+        longc.append(r)
+        print("long:", json.dumps(r), flush=True)
+        del q, k, v, ref_o, ref_lse
+        torch.cuda.empty_cache()
+
     print("WORST normwise rel err (vs_ref, vs_fi, lse_abs) per variant bn16:", json.dumps(worst))
-    ok = all(w[0] < 1e-3 and w[1] < 1e-3 and w[2] < 1e-3 for vv, w in worst.items() if vv in (0, 2))
+    ok = all(w[0] < 1e-3 and w[1] < 1e-3 and w[2] < 1e-3 for vv, w in worst.items())
+    ok = ok and all(x["seg_vs_ref"][0] < 1e-3 and x["lse_err"] < 1e-3 and x["finite"] for x in seg)
+    ok = ok and all(x[f"v{vv}"][0] < 1e-3 for x in longc for vv in (3, 7))
     ok = ok and strided["vs_ref"][0] < 1e-3 and strided["untouched"] and all(x["vs_ref"][0] < 1e-3 for x in vl)
-    print("GATE (fp32-PV variants 0/2, strided, varlen):", "PASS" if ok else "FAIL")
+    print("GATE (all variants, strided, varlen, segmented):", "PASS" if ok else "FAIL")
     print("smi:", smi_free())
     return 0 if ok else 1
 

@@ -817,6 +817,32 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
         alloc_len = round_up(
             max(1, model_config.max_model_len - 1), self.kv_cache_spec.block_size
         )
+        k1_rows = _k1fa.workspace_rows(
+            self.kv_cache_spec.block_size, scheduler_config.max_num_batched_tokens
+        )
+        if (
+            k1_rows
+            and k1_rows < alloc_len
+            and head_size == 256
+            and model_config.dtype == torch.float16
+            and getattr(self.kv_cache_spec, "sliding_window", None) is None
+        ):
+            # [FORK][LANE K1] segmented continuation: one piece of cached rows + the chunk, plus the fp32
+            # accumulator the kernel merges pieces into. Everything else goes to the KV cache pool.
+            cache_buf_shape = (k1_rows, num_kv_heads, head_size)
+            nb = scheduler_config.max_num_batched_tokens
+            current_workspace_manager().get_simultaneous(
+                (cache_buf_shape, torch.float16),
+                (cache_buf_shape, torch.float16),
+                ((nb, num_heads, head_size), torch.float32),
+                ((nb, num_heads), torch.float32),
+            )
+            logger.info_once(
+                "TurboQuant continuation workspace (K1 segmented): %d rows instead of %d",
+                k1_rows,
+                alloc_len,
+            )
+            return
         cache_buf_shape = (alloc_len, num_kv_heads, head_size)
         current_workspace_manager().get_simultaneous(
             (cache_buf_shape, torch.float16),
@@ -982,6 +1008,15 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # FlyDSL decode state. Auto-enabled on gfx950 when FlyDSL is available.
         self.sliding_window = sliding_window
         self.sinks = kwargs.get("sinks")
+        if _k1fa.enabled() and _k1fa.segment_rows(16) and (
+            self.sinks is not None or sliding_window is not None or head_size != 256
+        ):
+            # the builder sized the continuation workspace for the segmented K1 path; the fallback needs
+            # max_model_len rows and would hit the locked workspace mid-request
+            raise ValueError(
+                "VLLM_TQ_FA75_PREFILL=1 with segmentation needs head_size 256, no sinks, no sliding window; "
+                "set VLLM_TQ_FA75_SEGMENT_TOKENS=0 or VLLM_TQ_FA75_PREFILL=0"
+            )
         if _k1fa.enabled() and head_size == 256:
             # [FORK][LANE K1] build/load the JIT extension at init, never inside a request
             _k1fa._load()
@@ -2056,50 +2091,25 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             output=prefix_out,
         )
 
-    def _continuation_prefill(
+    def _tq_dequant_cached_rows(
         self,
         layer: Any,
-        query: torch.Tensor,  # (q_len, Hq, D)
-        key_chunk: torch.Tensor,  # (q_len, Hk, D)
-        val_chunk: torch.Tensor,  # (q_len, Hk, D)
-        kv_cache: torch.Tensor,  # (num_blocks, block_size, Hk, slot_size)
-        block_table: torch.Tensor,  # (1, max_num_blocks)
-        cached_len: int,
-        seq_len: int,
-        Pi: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,  # (1, num_blocks) - row 0 maps to the first block
+        alloc_len: int,  # rows to dequantise (whole blocks)
+        n_rot: int,  # leading rows that need the inverse key rotation (the cached ones)
+        k_rows: torch.Tensor,  # (>= alloc_len, Hk, D) fp16
+        v_rows: torch.Tensor,
         centroids: torch.Tensor,
-        flashinfer_wrapper: Any | None = None,
-        flashinfer_prefix_combine_wrappers: tuple[Any, Any] | None = None,
-    ) -> torch.Tensor:
-        """Handle continuation chunk by dequanting cached K/V from TQ cache.
-
-        Dequants previously cached K/V, concatenates with the current
-        chunk's raw K/V, then runs flash_attn with causal masking.
-        """
-        q_len, Hq, D = query.shape
-        Hk = key_chunk.shape[1]
-        device = query.device
+        D: int,
+        Hk: int,
+        device: torch.device,
+    ) -> None:
+        """Dequantise TQ cache rows [0, alloc_len) of ``block_table`` into (rows, Hk, D) fp16 buffers."""
         block_size = kv_cache.shape[1]
         BLOCK_D = triton.next_power_of_2(D)
-
         mse_bytes = self._mse_bytes
         val_data_bytes = self._val_data_bytes
-
-        # Dequant cached K/V from TQ cache.
-        # [FORK][LANE S3] The dequant kernel writes straight into the
-        # (rows, Hk, D) buffers that attention reads (strided output), the
-        # inverse key rotation is applied in place in bounded token chunks,
-        # and the buffers come from the WorkspaceManager (reserved at
-        # max_model_len and counted by memory profiling). The previous code
-        # also allocated k_flat, k_full and v_full per call, each
-        # cached_len*Hk*D*2 bytes (268 MB at 262K tokens, 537 MB at 524K) with
-        # ~0.3 GiB free, which OOM-killed the engine at long context.
-        alloc_len = math.ceil(cached_len / block_size) * block_size
-        rows = max(alloc_len, math.ceil(seq_len / block_size) * block_size)
-        k_rows, v_rows = current_workspace_manager().get_simultaneous(
-            ((rows, Hk, D), torch.float16),
-            ((rows, Hk, D), torch.float16),
-        )
         # Dequant layout view (1, Hk, rows, D) over the (rows, Hk, D) buffer.
         k_cached = k_rows.permute(1, 0, 2).unsqueeze(0)
         v_cached = v_rows.permute(1, 0, 2).unsqueeze(0)
@@ -2191,10 +2201,110 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # bounded chunks (temporary <= _TQ_CONT_ROT_CHUNK*Hk*D*2 bytes).
         if not self.tq_config.key_fp8:
             Pi_half = layer._tq_Pi_half
-            for c0 in range(0, cached_len, _TQ_CONT_ROT_CHUNK):
-                c1 = min(c0 + _TQ_CONT_ROT_CHUNK, cached_len)
+            for c0 in range(0, n_rot, _TQ_CONT_ROT_CHUNK):
+                c1 = min(c0 + _TQ_CONT_ROT_CHUNK, n_rot)
                 blk = k_rows[c0:c1]
                 blk.copy_((blk.reshape(-1, D) @ Pi_half).reshape(c1 - c0, Hk, D))
+
+    def _k1_segmented_continuation(
+        self,
+        layer: Any,
+        query: torch.Tensor,  # (q_len, Hq, D) fp16
+        key_chunk: torch.Tensor,  # (q_len, Hk, D)
+        val_chunk: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,  # (1, max_num_blocks)
+        cached_len: int,
+        centroids: torch.Tensor,
+        seg: int,  # cached rows per piece (whole blocks)
+    ) -> torch.Tensor:
+        """[FORK][LANE K1] Continuation prefill in pieces: dequantise <= seg cached rows at a time into the
+        workspace, attend non-causally (pieces before the last), merge exactly by LSE inside the kernel, and finish
+        with one causal call over [last cached piece | current chunk]. Same math as one call over the whole
+        context; the workspace is (seg + chunk) rows instead of max_model_len."""
+        q_len, Hq, D = query.shape
+        Hk = key_chunk.shape[1]
+        device = query.device
+        block_size = kv_cache.shape[1]
+        s_last = (cached_len // seg) * seg
+        n_c = cached_len - s_last
+        rows = seg + math.ceil(q_len / block_size) * block_size
+        k_rows, v_rows, acc_o, acc_lse = current_workspace_manager().get_simultaneous(
+            ((rows, Hk, D), torch.float16),
+            ((rows, Hk, D), torch.float16),
+            ((q_len, Hq, D), torch.float32),
+            ((q_len, Hq), torch.float32),
+        )
+        out = torch.empty_like(query)
+        for i, s0 in enumerate(range(0, s_last, seg)):
+            self._tq_dequant_cached_rows(
+                layer, kv_cache, block_table[:, s0 // block_size :], seg, seg, k_rows, v_rows, centroids, D, Hk, device
+            )
+            _k1fa.fa75_prefill(
+                query, k_rows[:seg], v_rows[:seg], scale=self.scale, causal=False, out=out,
+                acc_o=acc_o, acc_lse=acc_lse, acc_mode=1 if i == 0 else 2,
+            )
+        if n_c:
+            self._tq_dequant_cached_rows(
+                layer, kv_cache, block_table[:, s_last // block_size :],
+                math.ceil(n_c / block_size) * block_size, n_c, k_rows, v_rows, centroids, D, Hk, device,
+            )
+        k_rows[n_c : n_c + q_len] = key_chunk
+        v_rows[n_c : n_c + q_len] = val_chunk
+        return _k1fa.fa75_prefill(
+            query, k_rows[: n_c + q_len], v_rows[: n_c + q_len], scale=self.scale, causal=True, out=out,
+            acc_o=acc_o, acc_lse=acc_lse, acc_mode=3 if s_last else 0,
+        )
+
+    def _continuation_prefill(
+        self,
+        layer: Any,
+        query: torch.Tensor,  # (q_len, Hq, D)
+        key_chunk: torch.Tensor,  # (q_len, Hk, D)
+        val_chunk: torch.Tensor,  # (q_len, Hk, D)
+        kv_cache: torch.Tensor,  # (num_blocks, block_size, Hk, slot_size)
+        block_table: torch.Tensor,  # (1, max_num_blocks)
+        cached_len: int,
+        seq_len: int,
+        Pi: torch.Tensor,
+        centroids: torch.Tensor,
+        flashinfer_wrapper: Any | None = None,
+        flashinfer_prefix_combine_wrappers: tuple[Any, Any] | None = None,
+    ) -> torch.Tensor:
+        """Handle continuation chunk by dequanting cached K/V from TQ cache.
+
+        Dequants previously cached K/V, concatenates with the current
+        chunk's raw K/V, then runs flash_attn with causal masking.
+        """
+        q_len, Hq, D = query.shape
+        Hk = key_chunk.shape[1]
+        device = query.device
+        block_size = kv_cache.shape[1]
+
+        seg = _k1fa.segment_rows(block_size)
+        if seg and self._k1fa_ok(query, key_chunk):
+            return self._k1_segmented_continuation(
+                layer, query, key_chunk, val_chunk, kv_cache, block_table, cached_len, centroids, seg
+            )
+
+        # Dequant cached K/V from TQ cache.
+        # [FORK][LANE S3] The dequant kernel writes straight into the
+        # (rows, Hk, D) buffers that attention reads (strided output), the
+        # inverse key rotation is applied in place in bounded token chunks,
+        # and the buffers come from the WorkspaceManager (reserved at
+        # max_model_len and counted by memory profiling). The previous code
+        # also allocated k_flat, k_full and v_full per call, each
+        # cached_len*Hk*D*2 bytes (268 MB at 262K tokens, 537 MB at 524K) with
+        # ~0.3 GiB free, which OOM-killed the engine at long context.
+        alloc_len = math.ceil(cached_len / block_size) * block_size
+        rows = max(alloc_len, math.ceil(seq_len / block_size) * block_size)
+        k_rows, v_rows = current_workspace_manager().get_simultaneous(
+            ((rows, Hk, D), torch.float16),
+            ((rows, Hk, D), torch.float16),
+        )
+        self._tq_dequant_cached_rows(
+            layer, kv_cache, block_table, alloc_len, cached_len, k_rows, v_rows, centroids, D, Hk, device
+        )
 
         qdtype = query.dtype
         if qdtype == torch.float16:

@@ -19,20 +19,14 @@ MIN_FREE_MB = int(os.getenv("K1_MIN_FREE_MB", "420"))
 
 
 def preflight() -> None:
-    """No CUDA call before this: refuse while an engine window/boot runs or the engine is unhealthy."""
-    if not os.getenv("K1_IN_WINDOW"):
-        busy = subprocess.run(
-            ["pgrep", "-af", r"gateway-offline.py run|boot2?\.sh|engine-actuator.py restart|_win[A-Za-z0-9]*\.sh"],
-            capture_output=True, text=True).stdout.strip()
-        if busy:
-            raise SystemExit(f"K1 guard: engine window/boot in progress, not touching the GPU:\n{busy}")
-        import urllib.request
-        try:
-            ok = urllib.request.urlopen("http://127.0.0.1:8001/health", timeout=3).status == 200
-        except Exception:
-            ok = False
-        if not ok:
-            raise SystemExit("K1 guard: engine not healthy (booting or down); not touching the GPU")
+    """No CUDA call before this. The shared estate gate (~/projects/lanes/windows/gpuok.sh): no GPU-busy signal
+    (windows, boots), no planned offline, engine healthy, enough free VRAM on the physical GPU we will use."""
+    phys = (os.getenv("CUDA_VISIBLE_DEVICES") or "0").split(",")[0] or "0"
+    need = int(os.getenv("K1_CAP_MB", "260")) + 250  # tensors + CUDA context
+    gate = os.path.expanduser("~/projects/lanes/windows/gpuok.sh")
+    r = subprocess.run([gate, phys, str(need)], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise SystemExit(f"K1 guard (gpuok.sh {phys} {need}): stay off the GPU: {r.stdout.strip()} {r.stderr.strip()}")
 
 
 def gpu_guard(dev: int = 0) -> None:
@@ -109,3 +103,33 @@ def ref_attention(q, k, v, scale, causal, chunk_heads=1):
 
 if not os.getenv("K1_NO_PREFLIGHT"):
     preflight()
+
+
+def ref_attention_long(q, k, v, scale, causal, kc=16384):
+    """fp32 reference streaming over key chunks (online softmax): bounded memory at 128K+ keys."""
+    Tq, Hq, D = q.shape
+    Tkv, Hk, _ = k.shape
+    g = Hq // Hk
+    out = torch.empty(Tq, Hq, D, dtype=torch.float32, device=q.device)
+    lse = torch.empty(Tq, Hq, dtype=torch.float32, device=q.device)
+    rows = torch.arange(Tq, device=q.device)[:, None] + (Tkv - Tq)
+    for h in range(Hq):
+        qh = q[:, h].float()
+        m = torch.full((Tq,), float("-inf"), device=q.device)
+        l = torch.zeros(Tq, device=q.device)
+        acc = torch.zeros(Tq, D, device=q.device)
+        for c0 in range(0, Tkv, kc):
+            c1 = min(Tkv, c0 + kc)
+            s = (qh @ k[c0:c1, h // g].float().T) * scale
+            if causal:
+                s.masked_fill_(torch.arange(c0, c1, device=q.device)[None, :] > rows, float("-inf"))
+            mn = torch.maximum(m, s.max(-1).values)
+            a = torch.exp(m - mn)
+            p = torch.exp(s - mn[:, None])
+            l = l * a + p.sum(-1)
+            acc = acc * a[:, None] + p @ v[c0:c1, h // g].float()
+            m = mn
+            del s, p
+        out[:, h] = acc / l[:, None]
+        lse[:, h] = m + torch.log(l)
+    return out, lse
