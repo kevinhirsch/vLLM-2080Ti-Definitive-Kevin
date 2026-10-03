@@ -20,6 +20,7 @@ Modes
            serial vs K-chunk overlapped on a priority side stream
 """
 import argparse
+import datetime
 import json
 import os
 import subprocess
@@ -45,6 +46,7 @@ def worker(rank, args):
             rank=rank,
             distributed_init_method=f"file://{args.rdv}",
             local_rank=rank,
+            timeout=datetime.timedelta(seconds=90),
         )
         ps.initialize_model_parallel(2, 1)
     grp = ps.get_tp_group()
@@ -167,15 +169,38 @@ def main():
     ap.add_argument("--out", default="/tmp/k3_bench")
     ap.add_argument("--rdv", default=f"/tmp/k3_rdv_{os.getpid()}")
     ap.add_argument("--worker", type=int, default=-1)
+    ap.add_argument("--timeout", type=int, default=600, help="whole-run wall limit (s)")
     args = ap.parse_args()
     if args.worker >= 0:
         worker(args.worker, args)
         return
+    # pass the parent's rendezvous file explicitly: the worker's own default
+    # embeds ITS pid, so without this the two ranks never meet (hang).
+    base = [a for a in sys.argv[1:]]
+    for f in (args.rdv, f"{args.out}.rank0.json", f"{args.out}.rank1.json"):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
     ps = [
-        subprocess.Popen([sys.executable, __file__, "--worker", str(r)] + sys.argv[1:])
+        subprocess.Popen(
+            [sys.executable, __file__, "--worker", str(r), "--rdv", args.rdv] + base
+        )
         for r in (0, 1)
     ]
-    rc = [p.wait() for p in ps]
+    deadline = time.time() + args.timeout
+    rc = [None, None]
+    while None in rc and time.time() < deadline:
+        for i, p in enumerate(ps):
+            if rc[i] is None:
+                rc[i] = p.poll()
+        time.sleep(1)
+    for i, p in enumerate(ps):
+        if rc[i] is None:
+            print(f"TIMEOUT rank {i}: killing", flush=True)
+            p.kill()
+            rc[i] = 124
+    rc = [x or 0 for x in rc]
     for r in (0, 1):
         try:
             rows = json.load(open(f"{args.out}.rank{r}.json"))
