@@ -28,7 +28,7 @@ deploy/docs/engine-liveness-authority.md):
 The allow-list is DIAG below: a fixed map name -> env vars. Nothing else can be set through this tool. Every change is
 reversible (stage-diag --clear) and recorded. Flags only take effect at the next engine start.
 """
-import argparse, contextlib, fcntl, json, os, re, signal, subprocess, sys, time, urllib.request
+import argparse, contextlib, fcntl, json, os, re, signal, subprocess, sys, time, urllib.error, urllib.request
 from datetime import datetime
 
 _TERMINATION_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
@@ -245,6 +245,18 @@ def gateway_view():
     except Exception as e:  # noqa: BLE001
         out["stats_error"] = repr(e)
     return out
+
+
+def health_code(timeout=3):
+    """HTTP status of the engine's /health: 200 healthy, 503 = EngineDeadError (vLLM health.py: the engine core is dead while the
+    API process lives -- /v1/models keeps answering 200, so the wedge probes needed ~5 min to see it). None = no answer at all."""
+    try:
+        with urllib.request.urlopen(f"{ENGINE}/health", timeout=timeout) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def engine_healthy():
@@ -786,6 +798,8 @@ def _env_i(name, default):
 HOLD_MAX_TTL_S = _env_i("LIVENESS_HOLD_MAX_TTL_S", 8 * 3600)   # DFT's 16000 s fine-tune window fits; nothing holds forever
 BOOT_DEADLINE_S = _env_i("LIVENESS_BOOT_DEADLINE_S", 900)       # cold compile+capture ~4-5 min; window boot budgets use 900
 UNRESPONSIVE_S = _env_i("LIVENESS_UNRESPONSIVE_S", 180)         # API was up this boot, then stopped answering for this long
+DEAD_CORE_S = _env_i("LIVENESS_DEAD_CORE_S", 50)               # /health answered 503 = vLLM's EngineDeadError: the core is dead
+                                                                # behind a live API; two consecutive ticks confirm it
 DOWN_GRACE_S = _env_i("LIVENESS_DOWN_GRACE_S", 180)            # systemd relaunches crashes in 15 s; leave stop->start pairs room
 AUTO_MAX_PER_HOUR = _env_i("LIVENESS_AUTO_MAX_PER_HOUR", 2)     # the watchdog's long-standing rail, now for ALL automatic actions
 AUTO_MIN_GAP_S = _env_i("LIVENESS_AUTO_MIN_GAP_S", 600)         # base gap; doubles per consecutive failed action (backoff)
@@ -806,6 +820,7 @@ STATES = {
     "STOPPING":       {"kind": "active", "owner": "systemd (TimeoutStopSec, then SIGKILL)", "deadline_s": 120, "exits": ["DOWN", "BOOTING"]},
     "DOWN":           {"kind": "active", "owner": "liveness authority (start)", "deadline_s": DOWN_GRACE_S, "exits": ["BOOTING", "BREAKER_OPEN"]},
     "STUCK_BOOT":     {"kind": "active", "owner": "liveness authority (recover)", "deadline_s": 0, "exits": ["RECOVERING", "BREAKER_OPEN"]},
+    "DEAD_CORE":      {"kind": "active", "owner": "liveness authority (recover)", "deadline_s": 0, "exits": ["RECOVERING", "BREAKER_OPEN"]},
     "UNRESPONSIVE":   {"kind": "active", "owner": "liveness authority (recover)", "deadline_s": 0, "exits": ["RECOVERING", "BREAKER_OPEN"]},
     "RECOVERING":     {"kind": "active", "owner": "liveness authority (verifies its own action)", "deadline_s": VERIFY_S,
                        "exits": ["UP", "action failed -> backoff / BREAKER_OPEN"]},
@@ -1108,7 +1123,9 @@ def observe(now=None):
         job = json.load(open(JOB))
     except (OSError, ValueError):
         job = None
-    return {"now": now, "paused": os.path.exists(LPAUSE), "unit": _unit_facts(), "healthy": engine_healthy(),
+    healthy = engine_healthy()
+    return {"now": now, "paused": os.path.exists(LPAUSE), "unit": _unit_facts(), "healthy": healthy,
+            "health_code": 200 if healthy else health_code(),
             "planned_lock": _lock_held(), "job": job, "holds": active_holds(now), "offline": _gateway_offline(),
             "frontier_window_age_s": fq_age, "window_procs": [w for w in _window_procs() if w[1] < HOLD_MAX_TTL_S],
             "watchdog_failures": int(wd.get("consecutive_failures") or 0),
@@ -1189,6 +1206,13 @@ def classify(f, prev):
         return "DOWN", f"unit {st or 'unknown'} for {round(now - since)}s (result {u.get('Result')})", carry
     # process exists (active, or activating while the warm-up hook runs) but /health does not answer
     age = now - boot_t if boot_t else 0
+    if f.get("health_code") == 503:
+        # EF2 class gap: an explicit 503 is vLLM's EngineDeadError, not a slow boot or a busy engine. Confirm on a second tick.
+        dead_since = prev.get("dead_core_since") if prev.get("dead_core_since") and prev.get("state") in ("DEAD_CORE", "SUSPECT") else now
+        carry["dead_core_since"] = dead_since
+        if now - dead_since >= DEAD_CORE_S:
+            return "DEAD_CORE", f"/health answers 503 (EngineDeadError) for {round(now - dead_since)}s: engine core dead behind a live API", carry
+        return "SUSPECT", "/health answers 503 (EngineDeadError); confirming on the next tick", carry
     if carry["last_healthy"] and boot_t and carry["last_healthy"] >= boot_t:
         down_for = now - carry["last_healthy"]
         if down_for >= UNRESPONSIVE_S:
@@ -1362,7 +1386,7 @@ def tick(by="liveness-tick", act=True):
     if act and not f.get("paused"):
         if state == "DOWN" and f["now"] - float(carry.get("down_since") or f["now"]) >= DOWN_GRACE_S:
             result = _act("start", "down-unowned", by, reason, f)
-        elif state in ("STUCK_BOOT", "UNRESPONSIVE"):
+        elif state in ("STUCK_BOOT", "UNRESPONSIVE", "DEAD_CORE"):
             result = _act("recover", state.lower(), by, reason, f)
         if result and result.get("acted"):
             f.pop("_actions", None)

@@ -33,6 +33,7 @@ class Base(unittest.TestCase):
         self.events, self.sudo = [], []
         self.ledger = []
         self.windows = []
+        self.code = None
         self.needs = []
         paths = {"BASE": d, "HOLDS": f"{d}/holds.json", "HOLDS_LOCK": f"{d}/holds.lock", "LSTATE": f"{d}/state.json",
                  "LACTIONS": f"{d}/actions.jsonl", "LPAUSE": f"{d}/PAUSE", "WD_STATE": f"{d}/wd.json",
@@ -48,6 +49,7 @@ class Base(unittest.TestCase):
                          "ledger_rows": lambda limit=None, since=None: [r for r in self.ledger if not since or r["ts"] >= since],
                          "now_iso": lambda: "2027-01-15T00:00:00+00:00",
                          "_window_procs": lambda: list(self.windows),
+                         "health_code": lambda *a, **k: self.code,
                          "_raise_need": lambda st, r, f: (self.needs.append(st), "need-1")[1]}.items():
             p = patch.object(ea, name, fn)
             p.start()
@@ -220,6 +222,34 @@ class Exits(Base):
         m = json.load(open(os.path.join(ea.BASE, "liveness-recover.json")))
         self.assertEqual(m["cause"], "stuck_boot")
         self.assertFalse(os.path.exists(os.path.join(ea.BASE, "wedge-restart.json")))
+
+    def test_dead_core_behind_live_api_recovered_in_two_ticks(self):
+        """EF2 class gap: /health 503 = EngineDeadError while /v1/models stays 200 -- the wedge path needed ~5 min."""
+        ea.tick()
+        self.healthy, self.code = False, 503
+        self.now += 60
+        self.assertEqual(ea.tick()["state"], "SUSPECT")
+        self.assertEqual(self.sudo, [])
+        self.now += 60
+        out = ea.tick()
+        self.assertEqual(out["state"], "RECOVERING")
+        self.assertIn(["kill", "-s", "KILL", ea.UNIT], self.sudo)
+        self.assertEqual(json.load(open(os.path.join(ea.BASE, "liveness-recover.json")))["cause"], "dead_core")
+
+    def test_a_single_503_or_a_timeout_is_not_a_dead_core(self):
+        ea.tick()
+        self.healthy, self.code = False, 503
+        self.now += 60
+        ea.tick()
+        self.healthy, self.code = True, 200          # recovered on its own
+        self.now += 60
+        self.assertEqual(ea.tick()["state"], "UP")
+        self.healthy, self.code = False, None        # no answer at all: the slower UNRESPONSIVE path, not DEAD_CORE
+        self.now += 60
+        self.assertEqual(ea.tick()["state"], "SUSPECT")
+        self.now += 60
+        self.assertEqual(ea.tick()["state"], "SUSPECT")
+        self.assertEqual(self.sudo, [])
 
     def test_unresponsive_after_being_up_this_boot(self):
         ea.tick()                               # healthy: last_healthy recorded

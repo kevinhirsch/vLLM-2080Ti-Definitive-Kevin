@@ -50,6 +50,7 @@ The order is: who owns the engine first, then health.
 | STOPPING | active | systemd (TimeoutStopSec, then SIGKILL) | 120 s | DOWN, BOOTING |
 | DOWN | active | authority: `start` | 180 s grace | BOOTING (RECOVERING); BREAKER_OPEN |
 | STUCK_BOOT | active | authority: `recover` | 0 | RECOVERING; BREAKER_OPEN |
+| DEAD_CORE | active | authority: `recover` | 50 s (two ticks of /health 503 = vLLM EngineDeadError while /v1/models stays 200) | RECOVERING; BREAKER_OPEN |
 | UNRESPONSIVE | active | authority: `recover` | 0 | RECOVERING; BREAKER_OPEN |
 | RECOVERING | active | authority: verifies its own action | 960 s | UP (outcome ok); action failed → backoff or BREAKER_OPEN |
 | PLANNED | active | planned restart (`restart.lock` holder) | 2400 s | UP or BOOTING; holder died → job reconciled `abandoned` |
