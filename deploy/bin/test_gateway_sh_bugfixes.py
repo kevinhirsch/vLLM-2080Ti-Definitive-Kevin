@@ -277,3 +277,32 @@ class PerRequestEnvParseCannotKillRequests(unittest.TestCase):
             out = G.run_scenario(dict(req=dict(fields=dict(messages=G._msgs(60_000)))), 0)
         self.assertEqual(out["response"]["status"], 200, out["response"])
         self.assertEqual(len(out.get("flightrec") or []), 1)              # the default threshold (15000) applied
+
+
+class InputTokensAreMeasuredWhereCountedEstimatedElsewhere(_Fresh):
+    """L161: tokens_in summed the gateway's ESTIMATE (ptok) and the dashboard labelled it measured."""
+
+    def test_history_summary_splits_exact_and_estimate(self):
+        import json
+        import os
+        m = self.m
+        m.TELEMETRY_DIR = self.tmp + "/tel"
+        os.makedirs(m.TELEMETRY_DIR)
+        now = m.time.time()
+        rows = [dict(t=now - 5, client="a", route="local", ptok=900, ptok_exact=1000, outtok=10),
+                dict(t=now - 4, client="a", route="remote", ptok=500, ptok_exact=None, outtok=None, outtok_lb=7),
+                dict(t=now - 3, client="a", route="local", ptok=300)]                 # pre-GW2 row: no ptok_exact
+        with open(m._history_day_file(now), "w") as f:
+            f.write("".join(json.dumps(r) + "\n" for r in rows))
+        pc = m._history_summary_blocking(now - 60, 1)["per_client"]["a"]
+        self.assertEqual((pc["tokens_in_exact"], pc["tokens_in_est"], pc["tokens_in"]), (1000, 800, 1800))
+        self.assertEqual((pc["tokens_out_exact"], pc["tokens_out_lb"], pc["tokens_out"]), (10, 7, 17))
+
+    def test_process_rollup_splits_exact_and_estimate(self):
+        m = self.m
+        t0 = m.time.time()
+        m._telemetry_note_request({"name": "b", "route": "local", "t0": t0, "ptok": 90, "ptok_exact_local": 100})
+        m._telemetry_note_request({"name": "b", "route": "remote", "t0": t0, "ptok": 40, "ptok_exact": 45})
+        m._telemetry_note_request({"name": "b", "route": "rejected", "t0": t0, "ptok": 30})
+        c = m._PER_CLIENT["b"]
+        self.assertEqual((c["tokens_in_exact"], c["tokens_in_est"]), (145, 30))
