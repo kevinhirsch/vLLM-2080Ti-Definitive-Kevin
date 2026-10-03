@@ -528,6 +528,11 @@ _CFG = {
     "SHIM_LOCAL_FIRST_WAIT_WINDOW_SECS": ("LOCAL_FIRST_WAIT_WINDOW_SECS", float),
     "SHIM_LOCAL_FIRST_FIRST_TOKEN_MAX": ("LOCAL_FIRST_FIRST_TOKEN_MAX", float),
     "SHIM_LOCAL_FIRST_INTERACTIVE_TTFT_SECS": ("LOCAL_FIRST_INTERACTIVE_TTFT_SECS", float),
+    # LF (10-03): deadline-derived local-first + expected-output big-out rule (see the LF block below).
+    "SHIM_LOCAL_FIRST_DERIVE": ("LOCAL_FIRST_DERIVE", lambda v: str(v).lower() not in ("0", "false", "off", "")),
+    "SHIM_EXPECTED_OUTPUT":  ("EXPECTED_OUTPUT", lambda v: str(v).lower() not in ("0", "false", "off", "")),
+    "SHIM_EXPECTED_OUTPUT_QUANTILE": ("EXPECTED_OUTPUT_QUANTILE", float),
+    "SHIM_EXPECTED_OUTPUT_MIN_SAMPLES": ("EXPECTED_OUTPUT_MIN_SAMPLES", int),
 }
 # A single request whose est. (prompt + max_tokens) exceeds this will OOM local even at
 # budget=1 (context + generation peaks past this box's tiny free VRAM), so route it straight
@@ -658,6 +663,30 @@ LOCAL_FIRST_FIRST_TOKEN_MAX = float(os.environ.get("SHIM_LOCAL_FIRST_FIRST_TOKEN
 # PREFILL_TPS, scaled by concurrency -- exceeds this. 0 = off: the data above shows local does
 # not breach a 20s interactive ceiling, so it is off by default.
 LOCAL_FIRST_INTERACTIVE_TTFT_SECS = float(os.environ.get("SHIM_LOCAL_FIRST_INTERACTIVE_TTFT_SECS", "0"))
+# ---- LF (lane LF, 2026-10-03): "are we routing to remote what local could serve?" ----
+# MEASURED 10-02 23:21 -> 10-03 05:10 (11,879 requests): of 4,179 "discretionary" remote trips, 2,822 happened INSIDE
+# declared offline windows (the big-out/big-prompt guards sat before the _local_offline() check, so a window's
+# traffic wore a discretionary label), and in the 95 live minutes local prefill was already 94% busy.
+# What was left was decided by flat constants, not by the caller's patience:
+#   * big-out compared the REQUESTED ceiling (Halo sends max_tokens=16384 on every turn; its real outputs are p50 336 /
+#     p90 846 tokens) -> every Halo turn tripped it;
+#   * the heavy-prefill / queue-wait / monster tests used 15 s / 5 s / 30 s whatever the class and its deadline;
+#   * a remote-served turn never warms the local prefix model, so a patient caller was predicted "cold" forever and
+#     its cold prediction sent it remote again (self-fulfilling).
+# With LOCAL_FIRST_DERIVE (default on) a predictive reason keeps the request local while its PREDICTED time to first
+# token -- queue wait for its class + the uncached prefill already ahead in the engine + its own uncached prefill, all
+# at the live measured prefill rate -- fits the class's patience: kevin = FIRST_TOKEN_MAX (a person is waiting),
+# halo = LOCAL_FIRST_FIRST_TOKEN_MAX (no deadline), runner/background = their flow deadline; every budget is capped at
+# LOCAL_FIRST_FIRST_TOKEN_MAX, the first-token wait the local relay will actually grant. The flat
+# QUEUE_WAIT_SECS / HEAVY_* / MONSTER_PREFILL_SECS values remain the configured FALLBACK (derive off, or no measured
+# prefill rate yet). ROLLBACK: SHIM_LOCAL_FIRST_DERIVE=0 and SHIM_EXPECTED_OUTPUT=0 restore the previous rules.
+LOCAL_FIRST_DERIVE = os.environ.get("SHIM_LOCAL_FIRST_DERIVE", "1").lower() not in ("0", "false", "off", "")
+# big-out is decided on the output a caller ACTUALLY produces (this quantile of its recent completions) once there
+# are enough samples; the requested max_tokens stays the hard upper bound and the fallback.
+EXPECTED_OUTPUT = os.environ.get("SHIM_EXPECTED_OUTPUT", "1").lower() not in ("0", "false", "off", "")
+EXPECTED_OUTPUT_QUANTILE = float(os.environ.get("SHIM_EXPECTED_OUTPUT_QUANTILE", "0.95"))
+EXPECTED_OUTPUT_MIN_SAMPLES = int(os.environ.get("SHIM_EXPECTED_OUTPUT_MIN_SAMPLES", "20"))
+EXPECTED_OUTPUT_HISTORY = int(os.environ.get("SHIM_EXPECTED_OUTPUT_HISTORY", "200"))
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout,
                     format="%(asctime)s [gateway] %(levelname)s %(message)s")
@@ -1144,6 +1173,10 @@ def perf_breaker_active():
 _ADMISSION_WAITS = collections.deque(maxlen=512)       # (t, waited_s) per admission outcome
 _local_first_kept = collections.Counter()              # reason -> kept local
 _local_first_remote = collections.Counter()            # "reason:why" -> still sent remote
+# LF: client -> remote trips taken while its prefix was predicted (almost) entirely cold. A remote-served turn never warms the
+# local prefix model, so a caller that keeps going remote stays predicted cold; a rising count here is that loop (the fix is
+# capacity -- the derived budget keeps patient callers local whenever their first token fits -- or rewarm-prefix.py).
+_local_first_cold_remote = collections.Counter()
 
 
 def _note_admission_wait(waited, now=None):
@@ -1185,15 +1218,87 @@ def local_saturation(background, units, reservation, now=None):
     return why
 
 
-def local_first_decision(reason, *, background, units, reservation, est_computed=0, now=None):
+def local_first_budget_s(cls):
+    """Seconds this work class will wait for its FIRST TOKEN before remote is the better answer (lane LF).
+    kevin / halo = LOCAL_FIRST_FIRST_TOKEN_MAX (no deadline: they have priority in the flow queue, so the queue term is
+    small); runner / background = their flow deadline. Capped at LOCAL_FIRST_FIRST_TOKEN_MAX: the longest first-token
+    wait the local relay grants (first_token_timeout), so a request kept local is never one the relay would abort.
+    Kevin additionally never queues behind more than HEAVY_ADMIT_BACKLOG_SECS of prefill (see local_first_decision)."""
+    cap = max(1.0, float(LOCAL_FIRST_FIRST_TOKEN_MAX))
+    try:
+        d = float(_flow_deadlines().get(cls) or 0.0)
+    except Exception:
+        d = 0.0
+    return max(1.0, min(d if d > 0 else cap, cap))
+
+
+def big_prompt_limit(cls=None):
+    """The prompt size (tokens, same unit the big-prompt guard compares) above which the prefill alone cannot fit the
+    class's first-token patience at the live measured prefill rate. Derived (prefill rate x patience) when local-first
+    derivation is on and the engine is not under the crash-adaptive floor; otherwise the configured BIG_PROMPT. Never
+    lower than the configured BIG_PROMPT."""
+    if BIG_PROMPT <= 0:
+        return 0
+    if (not (LOCAL_FIRST and LOCAL_FIRST_DERIVE and "big-prompt" in LOCAL_FIRST_REASONS and cls in FLOW_CLASSES)
+            or _big_prompt_restore is not None):
+        return BIG_PROMPT
+    ptps = prefill_tps()
+    if ptps <= 0:
+        return BIG_PROMPT
+    return max(BIG_PROMPT, int(ptps * local_first_budget_s(cls)))
+
+
+def local_first_predicted_ttft(cls, est_computed, *, background=False, units=1, now=None):
+    """(ttft_s, parts): predicted seconds to first token if this request is kept local now. queue = the class's
+    expected wait to be admitted; backlog = uncached prefill already admitted to the engine that is still ahead
+    of it (after admission the engine backlog is at most the class ceiling); own = its own uncached prefill.
+    All at the live measured prefill rate. None when no prefill rate is known (callers use the flat fallbacks)."""
+    ptps = prefill_tps()
+    if ptps <= 0:
+        return None, {}
+    own = max(0, est_computed or 0) / ptps
+    backlog = _prefill_backlog_secs()
+    queue = None
+    if FLOW_MODE != "off":
+        try:
+            queue = float(flow_expected_wait(cls, own, units=max(1, units),
+                                             lane_limit=admission_lane_limit(background, effective_budget(), FG_RESERVED)))
+            ceil = _flow_ceils()[cls] * FLOW_BACKLOG_S
+            if ceil > 0:
+                backlog = min(backlog, ceil)
+        except Exception:
+            queue = None
+    if queue is None:
+        queue = recent_admission_wait(now)
+    return queue + backlog + own, {"queue_s": round(queue, 1), "backlog_s": round(backlog, 1), "own_s": round(own, 1)}
+
+
+def local_first_decision(reason, *, background, units, reservation, est_computed=0, now=None, cls=None):
     """(keep_local, why) for a capacity/latency-PREDICTIVE remote reason.
 
     keep_local=False means: route remote under `reason` exactly as before this policy
-    existed (policy off, reason not covered, local saturated, or the interactive ceiling)."""
+    existed (policy off, reason not covered, local saturated, or the interactive ceiling).
+    With `cls` (the work class) and LOCAL_FIRST_DERIVE the saturation test is the class's patience, not flat constants."""
     if not LOCAL_FIRST or reason not in LOCAL_FIRST_REASONS:
         return False, "policy-off"
     if not _health.get("ok", False):
         return False, "local-unhealthy"
+    if LOCAL_FIRST_DERIVE and cls in FLOW_CLASSES:
+        ttft, parts = local_first_predicted_ttft(cls, est_computed, background=background, units=units, now=now)
+        if ttft is not None:
+            sat = []
+            if not _memory_available(reservation):
+                sat.append("tokens")                       # a hard fact: the KV reservation does not fit
+            budget = local_first_budget_s(cls)
+            if ttft > budget:
+                sat.append("deadline")                     # it would not get a first token inside its class patience
+            elif cls == "kevin" and HEAVY_ADMIT_BACKLOG_SECS > 0 and parts["backlog_s"] > HEAVY_ADMIT_BACKLOG_SECS:
+                sat.append("prefill-backlog")              # a person is waiting: not behind more than the configured backlog bound
+            if sat:
+                return False, "saturated:" + "+".join(sat)
+            if LOCAL_FIRST_INTERACTIVE_TTFT_SECS > 0 and not background and parts["own_s"] > LOCAL_FIRST_INTERACTIVE_TTFT_SECS:
+                return False, "interactive-ttft"
+            return True, "capacity"
     if USE_COMPUTED_COST and reason == "monster":
         # Cache-aware mode: "monster" means a real uncached prefill is already chewing the engine's
         # chunk steps, and every younger request queues behind it (vLLM schedules in arrival order).
@@ -1232,6 +1337,73 @@ def _latest_decode_tps():
     # conservative warm-start value instead of the hard safety floor; otherwise every first
     # 4K-token request after a restart would be pessimistically classified as a 200s job.
     return max(DECODE_TPS_FLOOR, 60.0)
+
+
+_OUT_HIST = {}                      # client -> deque[(t, outtok)] of recent completed outputs, any route
+
+
+def note_output_tokens(client, outtok, t=None):
+    """Remember how long this client's completed answers really are (its max_tokens is only a ceiling)."""
+    try:
+        if not client or outtok is None or int(outtok) < 0:
+            return
+        h = _OUT_HIST.get(client)
+        if h is None:
+            h = _OUT_HIST[client] = collections.deque(maxlen=max(10, EXPECTED_OUTPUT_HISTORY))
+        h.append((time.time() if t is None else t, int(outtok)))
+        if len(_OUT_HIST) > 500:                       # bounded: drop the longest-idle client
+            _OUT_HIST.pop(min(_OUT_HIST, key=lambda k: _OUT_HIST[k][-1][0] if _OUT_HIST[k] else 0), None)
+    except Exception:
+        pass
+
+
+def expected_output_tokens(client, maxtok):
+    """(tokens, source). The output this caller is EXPECTED to produce: its recent EXPECTED_OUTPUT_QUANTILE completion
+    length, never above the requested max_tokens (the hard bound) and never inferred from fewer than
+    EXPECTED_OUTPUT_MIN_SAMPLES completions -- then the ceiling itself is used (the previous rule)."""
+    maxtok = int(maxtok or 0)
+    if not EXPECTED_OUTPUT or maxtok <= 0:
+        return maxtok, "ceiling"
+    h = _OUT_HIST.get(client)
+    if not h or len(h) < max(1, EXPECTED_OUTPUT_MIN_SAMPLES):
+        return maxtok, "ceiling"
+    vals = sorted(v for _, v in h)
+    q = vals[min(len(vals) - 1, int(len(vals) * min(0.999, max(0.5, EXPECTED_OUTPUT_QUANTILE))))]
+    return min(maxtok, max(1, q)), "history-p%d" % round(EXPECTED_OUTPUT_QUANTILE * 100)
+
+
+def output_history_restore_blocking(now=None, before=None, per_file_cap=16 * 1024 * 1024, per_client=None):
+    """Blocking (executor): rebuild the per-client output history from the last day of the request log so a gateway
+    restart does not forget how long Halo's answers are. Returns {client: [(t, outtok), ...]} oldest first."""
+    now = time.time() if now is None else now
+    before = now if before is None else before
+    per_client = per_client or max(10, EXPECTED_OUTPUT_HISTORY)
+    out = {}
+    for day_i in range(2):
+        for raw in _read_lines_reverse(_history_day_file(now - day_i * 86400), per_file_cap):
+            try:
+                rec = json.loads(raw)
+            except Exception:
+                continue
+            t, c, o = rec.get("t"), rec.get("client"), rec.get("outtok")
+            if not isinstance(t, (int, float)) or t >= before or t < now - 86400 or not c or o is None:
+                continue
+            st = rec.get("status")
+            if st is not None and st >= 400:
+                continue
+            lst = out.setdefault(c, [])
+            if len(lst) < per_client:
+                lst.append((t, int(o)))
+    return {c: sorted(v) for c, v in out.items()}
+
+
+def output_history_restore(data):
+    n = 0
+    for c, rows in (data or {}).items():
+        for t, o in rows:
+            note_output_tokens(c, o, t)
+            n += 1
+    return n
 
 
 def predicted_occupancy_seconds(ptok, maxtok, concurrency=1):
@@ -3032,6 +3204,8 @@ def _telemetry_note_request(info, resp=None):
         c["classes"][info.get("flow_class") or "?"] += 1          # Lane DB2: the real work class, per client
         if route in ("local", "remote"):
             c[route] += 1
+        if outtok is not None and (status is None or status < 400):
+            note_output_tokens(name, outtok, now)           # LF: what this client's answers really weigh
         if outtok is not None:
             c["tokens_out"] += outtok; c["tokens_out_exact"] += outtok
         elif outtok_lb is not None:
@@ -5680,7 +5854,13 @@ def first_token_timeout(body, concurrency=1, local=False):
         # 'held/local-failed' 503 after ~60 s this way while DeepSeek was empty by Kevin's choice.
         # Give local the long cap instead; a truly wedged engine is the engine watchdog's job.
         return max(cap, LOCAL_FIRST_FIRST_TOKEN_MAX, FIRST_TOKEN_BASE + (est / prefill_tps()) * factor)
-    return min(cap, FIRST_TOKEN_BASE + (est / prefill_tps()) * factor)
+    legacy = min(cap, FIRST_TOKEN_BASE + (est / prefill_tps()) * factor)
+    if local and LOCAL_FIRST and LOCAL_FIRST_DERIVE:
+        # LF: a request local-first kept local may sit behind the uncached prefill already in the engine's FIFO; that
+        # wait is expected, not a wedge. Own prompt + the backlog ahead at the measured rate, capped at the local-first cap.
+        expected = FIRST_TOKEN_BASE + (est + max(0, _inflight_computed)) / max(1.0, prefill_tps())
+        return max(legacy, min(LOCAL_FIRST_FIRST_TOKEN_MAX, expected))
+    return legacy
 
 
 def is_background(body, request):
@@ -7220,13 +7400,18 @@ async def _route_completions(request, _no_overflow=False):
 
     def _lf_keep(reason):
         keep, why = local_first_decision(reason, background=background, units=units,
-                                         reservation=_lf_res, est_computed=est_computed)
+                                         reservation=_lf_res, est_computed=est_computed, cls=_early_cls)
         if keep:
             _local_first_kept[reason] += 1
             _lf_kept.append(reason)
             log.info("route %s %s predicted but local has capacity -> local-first", path, reason)
         elif why != "policy-off":
             _local_first_remote[f"{reason}:{why}"] += 1
+            try:                                   # LF: cold-cache loop signal (remote turns never warm the local prefix)
+                if _pm["credit"] < 0.1 * max(1, ptok) and why.startswith("saturated"):
+                    _local_first_cold_remote[client] += 1
+            except Exception:
+                pass
         return keep
 
     if LOG_REQUESTS:
@@ -7327,22 +7512,8 @@ async def _route_completions(request, _no_overflow=False):
         record_event("remote", "size", request, units, 0, **ev)
         return await _overflow_forward()
 
-    # big-OUTPUT requests (e.g. Hermes max_tokens=65536): long generations that saturate this slow
-    # box and hang interactive clients -> straight to remote (DeepSeek serves them far faster).
-    if (overflow_ok and not local_pin and not alias_local_only and BIG_OUTPUT > 0 and maxtok >= BIG_OUTPUT
-            and not _lf_keep("big-out")):
-        log.info("route %s maxtok=%d >= %d -> remote(big-out)", path, maxtok, BIG_OUTPUT)
-        record_event("remote", "big-out", request, units, 0, **ev)
-        return await _overflow_forward()
-
-    # big-PROMPT requests (e.g. a pi session whose context has grown huge): can't prefill within the
-    # first-token cap on this slow box and would saturate/OOM local -> straight to remote up front.
-    if (overflow_ok and not local_pin and not alias_local_only and BIG_PROMPT > 0 and _cost_tokens >= BIG_PROMPT
-            and not _lf_keep("big-prompt")):
-        log.info("route %s ptok=%d cost_tokens=%d >= %d -> remote(big-prompt)", path, ptok, _cost_tokens, BIG_PROMPT)
-        record_event("remote", "big-prompt", request, units, 0, **ev)
-        return await _overflow_forward()
-
+    # LF: checked BEFORE the predictive guards below (it used to follow them), so a window's traffic is labelled
+    # local-offline and not big-out/big-prompt/monster: 2,822 of 4,179 "discretionary" remote trips on 10-02/03 were window traffic.
     # CF: PLANNED local-offline window (benchmark / engine upgrade): the remote valve carries the estate inside
     # the daily cap; callers that must stay local (pinned, estate-local) and everything when no remote can take
     # work are told to retry -- the engine is being worked on, so nothing is admitted to it.
@@ -7359,6 +7530,25 @@ async def _route_completions(request, _no_overflow=False):
         return web.json_response({"error": {"message": "local engine is offline for planned work (%s); retry after %ds" % (
             _OFFLINE["reason"], left), "type": "local_offline_window"}}, status=503,
             headers={"Retry-After": str(left), "X-Gateway-Offline": "active"})
+
+    # big-OUTPUT requests (e.g. Hermes max_tokens=65536): long generations that saturate this slow
+    # box and hang interactive clients -> straight to remote (DeepSeek serves them far faster).
+    # LF: judged on the output this caller is EXPECTED to produce (its recent p95 completion length), the requested
+    # max_tokens being only the ceiling -- Halo asks for 16384 on every turn and writes p90 846.
+    _expected_out, _expected_src = expected_output_tokens(client, maxtok)
+    if (overflow_ok and not local_pin and not alias_local_only and BIG_OUTPUT > 0 and _expected_out >= BIG_OUTPUT
+            and not _lf_keep("big-out")):
+        log.info("route %s maxtok=%d expected_out=%d (%s) >= %d -> remote(big-out)", path, maxtok, _expected_out, _expected_src, BIG_OUTPUT)
+        record_event("remote", "big-out", request, units, 0, **ev)
+        return await _overflow_forward()
+
+    # big-PROMPT requests (e.g. a pi session whose context has grown huge): can't prefill within the
+    # first-token cap on this slow box and would saturate/OOM local -> straight to remote up front.
+    if (overflow_ok and not local_pin and not alias_local_only and BIG_PROMPT > 0 and _cost_tokens >= big_prompt_limit(_early_cls)
+            and not _lf_keep("big-prompt")):
+        log.info("route %s ptok=%d cost_tokens=%d >= %d -> remote(big-prompt)", path, ptok, _cost_tokens, big_prompt_limit(_early_cls))
+        record_event("remote", "big-prompt", request, units, 0, **ev)
+        return await _overflow_forward()
 
     # local DOWN -> overflow immediately (waiting for a slot won't help a dead engine) --
     # UNLESS this is background traffic under BG_LOCAL_ONLY: hold it and poll for recovery
@@ -7422,7 +7612,7 @@ async def _route_completions(request, _no_overflow=False):
         record_event("remote", "perf", request, units, 0, **ev)
         return await _overflow_forward()
 
-    predicted = predicted_occupancy_seconds(_cost_tokens, maxtok, max(1, _inflight + 1))
+    predicted = predicted_occupancy_seconds(_cost_tokens, _expected_out, max(1, _inflight + 1))
     _active_set(request, predicted_occupancy_s=predicted)
     if (overflow_ok and not local_pin and not alias_local_only and predicted is not None
             and predicted >= PREDICTED_OCCUPANCY_SECS and not _lf_keep("predicted")):
@@ -7964,6 +8154,13 @@ async def gateway_stats(request):
         "local_first": {
             "enabled": bool(LOCAL_FIRST), "reasons": sorted(LOCAL_FIRST_REASONS),
             "queue_wait_secs": LOCAL_FIRST_QUEUE_WAIT_SECS,
+            "derive": bool(LOCAL_FIRST_DERIVE), "cold_remote_by_client": dict(_local_first_cold_remote),
+            "budgets_s": {c: local_first_budget_s(c) for c in FLOW_CLASSES},
+            "big_prompt_limit": {c: big_prompt_limit(c) for c in FLOW_CLASSES},
+            "expected_output": {"enabled": bool(EXPECTED_OUTPUT), "quantile": EXPECTED_OUTPUT_QUANTILE,
+                                "min_samples": EXPECTED_OUTPUT_MIN_SAMPLES,
+                                "clients": {c: {"n": len(h), "p": expected_output_tokens(c, 10 ** 9)[0]}
+                                            for c, h in list(_OUT_HIST.items())[:50]}},
             "recent_admission_wait": round(recent_admission_wait(), 2),
             "kept_local": dict(_local_first_kept), "still_remote": dict(_local_first_remote),
         },
@@ -10477,6 +10674,13 @@ async def _on_startup(app):
             log.info("routing ring restored: %d rows from the request log", flow_routes_restore(_rows))
         except Exception as e:                                   # never block startup on a history read
             log.warning("routing ring restore failed: %s", e)
+    try:                                                         # LF: per-client output history survives a restart
+        _now2 = time.time()
+        _oh = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: output_history_restore_blocking(_now2, _PROCESS_STARTED))
+        log.info("output history restored: %d completions for %d clients", output_history_restore(_oh), len(_oh))
+    except Exception as e:
+        log.warning("output history restore failed: %s", e)
     _spend()   # R2: load (and, for a mid-day ledger, import today's recorded spend) before serving
     app["saver"] = asyncio.create_task(_stats_saver())
     app["telemetry_sampler"] = asyncio.create_task(_telemetry_sampler())   # TELEMETRY

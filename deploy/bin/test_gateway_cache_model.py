@@ -346,6 +346,7 @@ class Routing(Base, unittest.IsolatedAsyncioTestCase):
                 LOCAL_FIRST=True,
                 LOCAL_FIRST_REASONS=frozenset({"big-prompt", "perf", "predicted", "big-out", "monster"}),
                 LOCAL_FIRST_QUEUE_WAIT_SECS=5.0, LOCAL_FIRST_WAIT_WINDOW_SECS=60.0,
+                LOCAL_FIRST_DERIVE=False, EXPECTED_OUTPUT=False,   # these tests pin the flat-constant policy
                 LOCAL_FIRST_FIRST_TOKEN_MAX=300.0, LOCAL_FIRST_INTERACTIVE_TTFT_SECS=0.0,
                 _inflight=0, _inflight_tokens=0, _inflight_reserved_tokens=0, _inflight_computed=0,
                 _waiting=0, _waiting_by_class={"interactive": 0, "background": 0},
