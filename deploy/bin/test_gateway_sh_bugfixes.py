@@ -108,3 +108,172 @@ class OutcomeAlwaysNamed(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _Fresh(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self._td = tempfile.TemporaryDirectory(prefix="gw-sh-fix-")
+        self.addCleanup(self._td.cleanup)
+        self.tmp = self._td.name
+        self.m = G._fresh_shim(self.tmp, 0)
+
+
+class SwallowedExceptionsAreCounted(_Fresh):
+    """Class: a broad `except Exception: pass` hid a failure that fires on every request."""
+
+    def test_unusable_spend_ledger_is_counted_not_silent(self):
+        m = self.m
+
+        def boom():
+            raise OSError("ledger unreadable")
+        m._spend = boom
+        self.assertFalse(m._spend_allows_overflow(1000, 100))        # still fails closed, as before
+        self.assertFalse(m._spend_allows_overflow(1000, 100))
+        self.assertEqual(m._SWALLOWED["_spend_allows_overflow"][0], 2)
+        self.assertIn("ledger unreadable", m._SWALLOWED["_spend_allows_overflow"][2])
+
+    def test_unreadable_outcome_alarm_brake_is_counted(self):
+        m = self.m
+        m.OUTCOME_ALARM_PATH = self.tmp + "/no-such-alarm.json"
+        self.assertFalse(m._automatic_remote_budget_allows(1000, 100))
+        self.assertEqual(m._SWALLOWED["_automatic_remote_budget_allows"][0], 1)
+
+    def test_endpoint_and_metrics_export_them(self):
+        m = self.m
+        m._swallowed("unit-site", ValueError("x"))
+        m._ROUTER_CRASHES["KeyError"] += 1
+        resp = G.asyncio.run(m.gateway_internal_errors(None))
+        body = G.json.loads(resp.body)
+        self.assertEqual(body["swallowed"]["unit-site"]["n"], 1)
+        self.assertEqual(body["router_crashes"], {"KeyError": 1})
+        text = G.asyncio.run(m.gateway_metrics(None)).text
+        self.assertIn('gateway_swallowed_errors_total{site="unit-site"} 1', text)
+        self.assertIn('gateway_router_crashes_total{type="KeyError"} 1', text)
+
+    def test_warning_is_rate_limited_to_powers_of_two(self):
+        m = self.m
+        with self.assertLogs("gateway-shim", level="WARNING") as cm:
+            for _ in range(9):
+                m._swallowed("flood", RuntimeError("again"))
+        self.assertEqual(len([r for r in cm.output if "flood" in r]), 4)    # 1, 2, 4, 8
+
+
+class PerClientTablesAreBounded(_Fresh):
+    """Class: dict keyed by a caller-chosen header with no eviction."""
+
+    def test_per_client_rollup_caps_distinct_names(self):
+        m = self.m
+        for i in range(m.CLIENT_KEYS_MAX + 100):
+            m._telemetry_note_request({"name": "churn-%d" % i, "route": "local", "t0": m.time.time()})
+        self.assertEqual(len(m._PER_CLIENT), m.CLIENT_KEYS_MAX + 1)
+        self.assertEqual(m._PER_CLIENT[m.CLIENT_OVERFLOW_KEY]["requests"], 100)
+        m._telemetry_note_request({"name": "churn-0", "route": "local", "t0": m.time.time()})
+        self.assertEqual(m._PER_CLIENT["churn-0"]["requests"], 2)          # known names keep their own row
+
+    def test_client_key_helper(self):
+        m = self.m
+        table = {("c%d" % i): 1 for i in range(m.CLIENT_KEYS_MAX)}
+        self.assertEqual(m._client_key(table, "c1"), "c1")
+        self.assertEqual(m._client_key(table, "new"), m.CLIENT_OVERFLOW_KEY)
+
+
+class TelemetryLogCountsAreTruthful(_Fresh):
+    """Class: a count presented as fact that was not (rows 'written' when the write failed; silent row loss)."""
+
+    def test_failed_write_is_not_counted_as_written(self):
+        m = self.m
+        blocker = self.tmp + "/not-a-dir"
+        open(blocker, "w").close()
+        m.TELEMETRY_DIR = blocker + "/telemetry"                         # makedirs/open fail
+        r = m._flush_jsonl_blocking([{"a": 1}, {"b": 2}], None, None, 0, False)
+        self.assertEqual((r["written"], r["dropped_io"]), (0, 2))
+        self.assertEqual(r["bytes"], 0)
+
+    def test_unserialisable_row_is_counted(self):
+        m = self.m
+        m.TELEMETRY_DIR = self.tmp + "/tel"
+        r = m._flush_jsonl_blocking([{"a": 1}, {"bad": object()}], None, None, 0, False)
+        self.assertEqual((r["written"], r["dropped_bad"], r["dropped_io"]), (1, 1, 0))
+
+    def test_flusher_error_counts_the_lost_batch(self):
+        m = self.m
+
+        async def run():
+            m._JSONL_PENDING[:] = [{"a": 1}, {"a": 2}, {"a": 3}]
+
+            def boom(*a, **k):
+                raise RuntimeError("executor gone")
+            m._flush_jsonl_blocking = boom
+            m.TELEMETRY_FLUSH_SECS = 0
+            task = G.asyncio.ensure_future(m._jsonl_flusher())
+            for _ in range(20):
+                await G.asyncio.sleep(0)
+                if m._JSONL_STATE["dropped_err"]:
+                    break
+            task.cancel()
+            try:
+                await task
+            except BaseException:
+                pass
+        G.asyncio.run(run())
+        self.assertEqual(self.m._JSONL_STATE["dropped_err"], 3)
+
+
+class OneBooleanVocabulary(unittest.TestCase):
+    """Class: inconsistent bool parsing (four spellings across 26 readers + 20 dashboard casts)."""
+
+    FLAGS = {  # global -> (env key, code default)
+        "BG_LOCAL_ONLY": ("SHIM_BG_LOCAL_ONLY", True), "THINK_GUARD": ("SHIM_THINK_GUARD", True),
+        "EMPTY_RETRY": ("SHIM_EMPTY_RETRY", True), "LOG_REQUESTS": ("SHIM_LOG_REQUESTS", True),
+        "LOCAL_FIRST": ("SHIM_LOCAL_FIRST", True), "CONTEXT_COMPACTION_ENABLED": ("SHIM_CONTEXT_COMPACTION", True),
+        "FLOW_RESTORE": ("SHIM_FLOW_RESTORE", True), "CHAIN_TELEMETRY": ("SHIM_CHAIN_TELEMETRY", False),
+        "FORCE_REMOTE": ("SHIM_FORCE_REMOTE", False), "LOCAL_ONLY": ("SHIM_LOCAL_ONLY", False),
+        "REMOTE_VISION": ("SHIM_REMOTE_VISION", False), "CRASH_ADAPTIVE": ("SHIM_CRASH_ADAPTIVE", False),
+    }
+
+    def _import_with(self, value, schema=True):
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="gw-sh-flag-") as td:
+            return G._fresh_shim(td, 0, extra_env={k: value for k, _ in self.FLAGS.values()})
+
+    def test_every_spelling_means_the_same_everywhere(self):
+        for value, want in (("off", False), ("no", False), ("False", False), (" FALSE ", False), ("0", False),
+                            ("on", True), ("yes", True), ("True", True), ("1", True)):
+            m = self._import_with(value)
+            for g, (k, _d) in self.FLAGS.items():
+                with self.subTest(value=value, flag=g):
+                    self.assertEqual(bool(getattr(m, g)), want)
+
+    def test_empty_or_junk_means_the_code_default(self):
+        for value in ("", "maybe", "2"):
+            m = self._import_with(value)
+            for g, (k, d) in self.FLAGS.items():
+                with self.subTest(value=value, flag=g):
+                    self.assertEqual(bool(getattr(m, g)), d)
+
+    def test_dashboard_cast_matches_and_refuses_junk(self):
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="gw-sh-flag-") as td:
+            m = G._fresh_shim(td, 0)
+            m._persist_config = lambda: None
+            self.assertEqual(m.apply_config({"bg_local_only": "off"}), ["bg_local_only"])
+            self.assertIs(m.BG_LOCAL_ONLY, False)                 # was True: "off" not in ("0","false","")
+            self.assertEqual(m.apply_config({"chain_telemetry": "yes"}), ["chain_telemetry"])
+            self.assertIs(m.CHAIN_TELEMETRY, True)
+            self.assertEqual(m.apply_config({"local_only": True}), ["local_only"])
+            self.assertEqual(m.LOCAL_ONLY, 1)
+            self.assertEqual(m.apply_config({"local_only": 0}), ["local_only"])
+            self.assertEqual(m.LOCAL_ONLY, 0)
+            self.assertEqual(m.apply_config({"bg_local_only": "maybe"}), [])   # refused, value unchanged
+            self.assertIs(m.BG_LOCAL_ONLY, False)
+
+
+class PerRequestEnvParseCannotKillRequests(unittest.TestCase):
+    def test_bad_flightrec_min_tok_serves_the_request(self):
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"SHIM_FLIGHTREC_MIN_TOK": "15k"}):
+            out = G.run_scenario(dict(req=dict(fields=dict(messages=G._msgs(60_000)))), 0)
+        self.assertEqual(out["response"]["status"], 200, out["response"])
+        self.assertEqual(len(out.get("flightrec") or []), 1)              # the default threshold (15000) applied

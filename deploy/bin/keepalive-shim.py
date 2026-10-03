@@ -144,6 +144,40 @@ def _load_cfg_schema():
 
 
 _cfgschema = _load_cfg_schema()
+
+
+# Lane SH (2026-10-03): ONE boolean reader. Before, 26 import-time readers and 19 dashboard casts used four different
+# spellings: `not in ("0","false","")` turned "off"/"no"/"False " ON, `in ("1","true","on")` turned "yes" OFF, and ""
+# meant ON for two keys but OFF for the rest. Vocabulary = the config schema's (fallback copy if it is absent);
+# an empty or unrecognised value means the code default (and is reported), never a silent guess.
+_FLAG_TRUE = frozenset(getattr(_cfgschema, "TRUE_TOKENS", None) or {"1", "true", "on", "yes", "y", "t"})
+_FLAG_FALSE = frozenset(getattr(_cfgschema, "FALSE_TOKENS", None) or {"0", "false", "off", "no", "n", "f"})
+
+
+def _flag_value(raw):
+    """True / False for a recognised spelling, None otherwise (None, "", junk)."""
+    if raw is None or isinstance(raw, bool):
+        return raw
+    s = str(raw).strip().lower()
+    return True if s in _FLAG_TRUE else (False if s in _FLAG_FALSE else None)
+
+
+def _env_flag(raw, default):
+    """Import-time boolean: wrap the literal read, `_env_flag(os.environ.get("SHIM_X", "1"), True)`."""
+    v = _flag_value(raw)
+    if v is None:
+        if raw is not None and str(raw).strip():
+            print("gateway-shim: not a boolean: %r -> code default %s" % (raw, bool(default)), file=sys.stderr)
+        return bool(default)
+    return v
+
+
+def _cfg_flag(v):
+    """Dashboard/API cast (apply_config): an unrecognised value is refused (logged, live value unchanged)."""
+    out = _flag_value(v)
+    if out is None:
+        raise ValueError("not a boolean: %r" % (v,))
+    return out
 PORT         = int(os.environ.get("SHIM_PORT", "8000"))
 LOCAL        = os.environ.get("SHIM_UPSTREAM", "http://127.0.0.1:8001").rstrip("/")
 # where live config edits (via the dashboard) are persisted so they survive a restart
@@ -158,7 +192,7 @@ REMOTE_MODEL = os.environ.get("SHIM_REMOTE_MODEL", "deepseek-v4-flash")
 LOCAL_CONTEXT_LIMIT = int(os.environ.get("SHIM_LOCAL_CONTEXT_LIMIT", "524288"))
 REMOTE_CONTEXT_LIMIT = int(os.environ.get("SHIM_REMOTE_CONTEXT_LIMIT", "128000"))
 CONTEXT_SAFETY_MARGIN = int(os.environ.get("SHIM_CONTEXT_SAFETY_MARGIN", "1024"))
-CONTEXT_COMPACTION_ENABLED = os.environ.get("SHIM_CONTEXT_COMPACTION", "1").lower() not in ("0", "false", "off")
+CONTEXT_COMPACTION_ENABLED = _env_flag(os.environ.get("SHIM_CONTEXT_COMPACTION", "1"), True)
 CONTEXT_COMPACTION_KEEP = int(os.environ.get("SHIM_CONTEXT_COMPACTION_KEEP", "12"))
 ALIASES_FILE = os.environ.get("SHIM_ALIASES_FILE", "/home/kevin/.local/share/vllm-qwen27b/gateway-aliases.json")
 BUDGET       = int(os.environ.get("SHIM_LOCAL_BUDGET", "2"))
@@ -173,7 +207,7 @@ SLOT_POLL    = float(os.environ.get("SHIM_SLOT_POLL_SECS", "0.05"))
 HEALTH_TTL   = 5
 CHARS_PER_TOK = 3.5
 # Exact tokenisation for routing decisions. See _tokenize_exact().
-EXACT_TOKENS      = os.environ.get("SHIM_EXACT_TOKENS", "1") not in ("0", "false", "")
+EXACT_TOKENS      = _env_flag(os.environ.get("SHIM_EXACT_TOKENS", "1"), True)
 MIN_CHARS_PER_TOK = float(os.environ.get("SHIM_MIN_CHARS_PER_TOK", "2.0"))
 TOKENIZE_TIMEOUT  = float(os.environ.get("SHIM_TOKENIZE_TIMEOUT", "5"))
 # Adaptive first-token deadline: base + est_prompt_tokens/prefill_rate. Big-context prefills
@@ -225,7 +259,7 @@ POOL_TOKENS = int(os.environ.get("SHIM_POOL_TOKENS", "754068"))
 # itself stable again: BIG_PROMPT_RESTORE_N consecutive LOCAL completions whose prompt size is
 # "big" relative to the (lowered) floor land cleanly. Master-switched off by default so there
 # is no behaviour change until Kevin opts in.
-CRASH_ADAPTIVE        = os.environ.get("SHIM_CRASH_ADAPTIVE", "0") not in ("0", "false", "")
+CRASH_ADAPTIVE        = _env_flag(os.environ.get("SHIM_CRASH_ADAPTIVE", "0"), False)
 BIG_PROMPT_RESTORE_N  = int(os.environ.get("SHIM_BIG_PROMPT_RESTORE_N", "5"))
 CRASH_ADAPTIVE_FLOOR  = 24000
 # A completion with ptok >= the CURRENT (possibly-floored) BIG_PROMPT never reaches local -- the
@@ -331,8 +365,8 @@ PREFIX_MODEL_MAX_NODES = int(os.environ.get("SHIM_PREFIX_MODEL_MAX_NODES", "6000
 #                          splitting them to remote under monster/prefill pressure.
 #  SHIM_PREFIX_CREDIT_UNIT=N  round the cost model's credit to N tokens instead of whole attention blocks
 #                          (set to the engine's --prefix-match-unit when it runs VLLM_GDN_TAIL_PUBLISH=copy).
-CHAIN_TELEMETRY = os.environ.get("SHIM_CHAIN_TELEMETRY", "0").lower() in ("1", "true", "on", "yes")
-WARM_PRIORITY = os.environ.get("SHIM_WARM_PRIORITY", "0").lower() in ("1", "true", "on", "yes")
+CHAIN_TELEMETRY = _env_flag(os.environ.get("SHIM_CHAIN_TELEMETRY", "0"), False)
+WARM_PRIORITY = _env_flag(os.environ.get("SHIM_WARM_PRIORITY", "0"), False)
 WARM_PRIORITY_MIN_CREDIT = int(os.environ.get("SHIM_WARM_PRIORITY_MIN_CREDIT", "4096"))
 WARM_PRIORITY_MAX_COMPUTED = int(os.environ.get("SHIM_WARM_PRIORITY_MAX_COMPUTED", "1700"))
 WARM_PRIORITY_VALUE = int(os.environ.get("SHIM_WARM_PRIORITY_VALUE", "-10"))
@@ -377,18 +411,18 @@ BG_WAIT     = float(os.environ.get("SHIM_BG_WAIT_SECS", "5"))
 # Legitimate SIZE-based remote routing (size/big-out/big-prompt/monster) is deliberately
 # untouched: those requests can't run local regardless of engine health, remote or not, and
 # interactive traffic's behavior is completely unchanged either way.
-BG_LOCAL_ONLY    = os.environ.get("SHIM_BG_LOCAL_ONLY", "1") not in ("0", "false", "")
+BG_LOCAL_ONLY    = _env_flag(os.environ.get("SHIM_BG_LOCAL_ONLY", "1"), True)
 BG_WAIT_LOCAL    = float(os.environ.get("SHIM_BG_WAIT_LOCAL_SECS", "120"))
 BG_REJECT_RETRY_SECS = int(os.environ.get("SHIM_BG_REJECT_RETRY_SECS", "300"))
 # Background turns don't need chain-of-thought: thinking mode makes a cron status report
 # generate 2-3K reasoning tokens and hold a local lane for minutes. Injecting
 # enable_thinking=false for LOCAL background requests cuts their lane-hold ~10x.
-BG_NO_THINK = os.environ.get("SHIM_BG_NO_THINK", "1") not in ("0", "false", "")
+BG_NO_THINK = _env_flag(os.environ.get("SHIM_BG_NO_THINK", "1"), True)
 # thinking-budget guard: below THINK_OFF_UNDER tokens disable thinking entirely, below
 # THINK_LOW_UNDER downgrade to reasoning_effort=low. Measured starvation point ~1315 tok.
-THINK_GUARD     = os.environ.get("SHIM_THINK_GUARD", "1") not in ("0", "false", "")
-EMPTY_RETRY     = os.environ.get("SHIM_EMPTY_RETRY", "1") not in ("0", "false", "")
-REP_GUARD       = os.environ.get("SHIM_REP_GUARD", "1") not in ("0", "false", "")
+THINK_GUARD     = _env_flag(os.environ.get("SHIM_THINK_GUARD", "1"), True)
+EMPTY_RETRY     = _env_flag(os.environ.get("SHIM_EMPTY_RETRY", "1"), True)
+REP_GUARD       = _env_flag(os.environ.get("SHIM_REP_GUARD", "1"), True)
 REP_MIN_PATTERN = int(os.environ.get("SHIM_REP_MIN_PATTERN", "8"))
 REP_MAX_PATTERN = int(os.environ.get("SHIM_REP_MAX_PATTERN", "64"))
 REP_MIN_COUNT   = int(os.environ.get("SHIM_REP_MIN_COUNT", "6"))
@@ -408,14 +442,14 @@ THINK_LOW_UNDER = int(os.environ.get("SHIM_THINK_LOW_UNDER", "1400"))
 # guidance, so this never touches them. Each param is applied only when the caller did NOT already
 # provide it -- an explicit caller value always wins. Disable with SHIM_NONTHINK_PROFILE=0; tune the
 # individual values via SHIM_NONTHINK_{PP,TOP_P,TEMP,TOP_K}.
-NONTHINK_PROFILE = os.environ.get("SHIM_NONTHINK_PROFILE", "1") not in ("0", "false", "")
+NONTHINK_PROFILE = _env_flag(os.environ.get("SHIM_NONTHINK_PROFILE", "1"), True)
 NONTHINK_PP      = float(os.environ.get("SHIM_NONTHINK_PP", "1.5"))
 NONTHINK_TOP_P   = float(os.environ.get("SHIM_NONTHINK_TOP_P", "0.80"))
 NONTHINK_TEMP    = float(os.environ.get("SHIM_NONTHINK_TEMP", "0.7"))
 NONTHINK_TOP_K   = int(os.environ.get("SHIM_NONTHINK_TOP_K", "20"))
 # MASTER SWITCH: 1 = FULL REMOTE (every completion -> DeepSeek; local engine untouched —
 # for maintenance/repro/debugging), 0 = normal local-first. Toggle live from the dashboard.
-FORCE_REMOTE = 1 if os.environ.get("SHIM_FORCE_REMOTE", "0").lower() in ("1", "true", "on") else 0
+FORCE_REMOTE = 1 if _env_flag(os.environ.get("SHIM_FORCE_REMOTE", "0"), False) else 0
 # A paid full-remote maintenance mode is a lease, not a permanent routing state.
 # An old persisted FORCE_REMOTE=1 without a lease is inert after an upgrade.
 FORCE_REMOTE_LEASE_S = 3600
@@ -433,7 +467,7 @@ def effective_force_remote():
 # Better than unsetting the remote credentials because it is reversible from the dashboard and
 # leaves the remote configured for the moment it is wanted again. It OUTRANKS FORCE_REMOTE: if
 # both are somehow set, local wins, because the mode that cannot spend money is the safe one.
-LOCAL_ONLY = 1 if os.environ.get("SHIM_LOCAL_ONLY", "0").lower() in ("1", "true", "on") else 0
+LOCAL_ONLY = 1 if _env_flag(os.environ.get("SHIM_LOCAL_ONLY", "0"), False) else 0
 # PEAK-AWARE overflow bias (2026-08-13, DeepSeek peak/off-peak pricing eff. Aug 16):
 # during remote-provider PEAK hours (UTC ranges like "1-4,6-10"), BACKGROUND requests
 # wait the full LOCAL_WAIT for a local lane instead of fast-overflowing at BG_WAIT —
@@ -484,10 +518,10 @@ _CFG = {
     "SHIM_LOCAL_CONTEXT_LIMIT": ("LOCAL_CONTEXT_LIMIT", int),
     "SHIM_REMOTE_CONTEXT_LIMIT": ("REMOTE_CONTEXT_LIMIT", int),
     "SHIM_CONTEXT_SAFETY_MARGIN": ("CONTEXT_SAFETY_MARGIN", int),
-    "SHIM_CONTEXT_COMPACTION": ("CONTEXT_COMPACTION_ENABLED", lambda v: str(v).lower() not in ("0", "false", "off")),
+    "SHIM_CONTEXT_COMPACTION": ("CONTEXT_COMPACTION_ENABLED", lambda v: _cfg_flag(v)),
     "SHIM_CONTEXT_COMPACTION_KEEP": ("CONTEXT_COMPACTION_KEEP", int),
-    "SHIM_FORCE_REMOTE":     ("FORCE_REMOTE", lambda v: 1 if str(v).lower() in ("1","true","on") else 0),
-    "SHIM_LOCAL_ONLY":       ("LOCAL_ONLY",   lambda v: 1 if str(v).lower() in ("1","true","on") else 0),
+    "SHIM_FORCE_REMOTE":     ("FORCE_REMOTE", lambda v: 1 if _cfg_flag(v) else 0),
+    "SHIM_LOCAL_ONLY":       ("LOCAL_ONLY",   lambda v: 1 if _cfg_flag(v) else 0),
     # local capacity
     "SHIM_LOCAL_BUDGET":     ("BUDGET",       int),
     "SHIM_LOCAL_WAIT_SECS":  ("LOCAL_WAIT",   float),
@@ -521,24 +555,24 @@ _CFG = {
     "SHIM_BG_XCLIENTS":      ("BG_XCLIENTS", lambda v: [m.lower() for m in _parse_seq(v, _CFG_SEP["SHIM_BG_XCLIENTS"])]),
     "SHIM_POOL_TOKENS":      ("POOL_TOKENS",      int),
     # live capacity model (lane GW, 2026-10-02) -- see the CAPACITY MODEL section
-    "SHIM_CAPACITY_LIVE":    ("CAPACITY_LIVE",    lambda v: str(v).lower() not in ("0", "false", "off", "")),
-    "SHIM_CONTEXT_LIVE":     ("CONTEXT_LIVE",     lambda v: str(v).lower() not in ("0", "false", "off", "")),
+    "SHIM_CAPACITY_LIVE":    ("CAPACITY_LIVE",    lambda v: _cfg_flag(v)),
+    "SHIM_CONTEXT_LIVE":     ("CONTEXT_LIVE",     lambda v: _cfg_flag(v)),
     "SHIM_MODELS_POLL_SECS": ("MODELS_POLL_S",    float),
     "SHIM_TOKEN_BUDGET_FRAC": ("TOKEN_BUDGET_FRAC", float),
     "SHIM_TOKEN_BUDGET_CEIL": ("TOKEN_BUDGET_CEIL", int),
     "SHIM_LOCAL_MODALITIES": ("LOCAL_MODALITIES", lambda v: ",".join(sorted({x.strip().lower() for x in str(v).split(",") if x.strip()})) or "text"),
-    "SHIM_REMOTE_VISION":    ("REMOTE_VISION", lambda v: 1 if str(v).lower() in ("1", "true", "on") else 0),
+    "SHIM_REMOTE_VISION":    ("REMOTE_VISION", lambda v: 1 if _cfg_flag(v) else 0),
     "SHIM_BG_WAIT_SECS":     ("BG_WAIT",          float),
     "SHIM_BG_MARKERS":       ("BG_MARKERS", lambda v: [m for m in str(v).split("|") if m]),
-    "SHIM_BG_LOCAL_ONLY":    ("BG_LOCAL_ONLY", lambda v: str(v).lower() not in ("0","false","")),
+    "SHIM_BG_LOCAL_ONLY":    ("BG_LOCAL_ONLY", lambda v: _cfg_flag(v)),
     "SHIM_BG_WAIT_LOCAL_SECS": ("BG_WAIT_LOCAL", float),
     "SHIM_BG_REJECT_RETRY_SECS": ("BG_REJECT_RETRY_SECS", int),
     "SHIM_PEAK_HOURS_UTC":   ("PEAK_HOURS",       str),
     # behaviour toggles
-    "SHIM_BG_NO_THINK":      ("BG_NO_THINK",  lambda v: str(v).lower() not in ("0","false","")),
-    "SHIM_THINK_GUARD":      ("THINK_GUARD",  lambda v: str(v).lower() not in ("0","false","")),
-    "SHIM_EMPTY_RETRY":      ("EMPTY_RETRY",  lambda v: str(v).lower() not in ("0","false","")),
-    "SHIM_REP_GUARD":        ("REP_GUARD",    lambda v: str(v).lower() not in ("0","false","")),
+    "SHIM_BG_NO_THINK":      ("BG_NO_THINK",  lambda v: _cfg_flag(v)),
+    "SHIM_THINK_GUARD":      ("THINK_GUARD",  lambda v: _cfg_flag(v)),
+    "SHIM_EMPTY_RETRY":      ("EMPTY_RETRY",  lambda v: _cfg_flag(v)),
+    "SHIM_REP_GUARD":        ("REP_GUARD",    lambda v: _cfg_flag(v)),
     "SHIM_REP_MIN_PATTERN":  ("REP_MIN_PATTERN", int),
     "SHIM_REP_MAX_PATTERN":  ("REP_MAX_PATTERN", int),
     "SHIM_REP_MIN_COUNT":    ("REP_MIN_COUNT", int),
@@ -550,16 +584,16 @@ _CFG = {
     "SHIM_THINK_OFF_UNDER":  ("THINK_OFF_UNDER", int),
     "SHIM_THINK_LOW_UNDER":  ("THINK_LOW_UNDER", int),
     "SHIM_NO_THINK_IPS":     ("NO_THINK_IPS", lambda v: set(_parse_seq(v, _CFG_SEP["SHIM_NO_THINK_IPS"]))),
-    "SHIM_LOG_REQUESTS":     ("LOG_REQUESTS", lambda v: str(v).lower() not in ("0","false","")),
+    "SHIM_LOG_REQUESTS":     ("LOG_REQUESTS", lambda v: _cfg_flag(v)),
     # non-thinking sampling profile (EXP-026)
-    "SHIM_NONTHINK_PROFILE": ("NONTHINK_PROFILE", lambda v: str(v).lower() not in ("0","false","")),
+    "SHIM_NONTHINK_PROFILE": ("NONTHINK_PROFILE", lambda v: _cfg_flag(v)),
     "SHIM_NONTHINK_PP":      ("NONTHINK_PP",    float),
     "SHIM_NONTHINK_TOP_P":   ("NONTHINK_TOP_P", float),
     "SHIM_NONTHINK_TEMP":    ("NONTHINK_TEMP",  float),
     "SHIM_NONTHINK_TOP_K":   ("NONTHINK_TOP_K", int),
     "SHIM_PREDICTED_OCCUPANCY_SECS": ("PREDICTED_OCCUPANCY_SECS", float),
     "SHIM_DECODE_TPS_FLOOR": ("DECODE_TPS_FLOOR", float),
-    "SHIM_PERF_BREAKER_ENABLED": ("PERF_BREAKER_ENABLED", lambda v: str(v).lower() not in ("0", "false", "")),
+    "SHIM_PERF_BREAKER_ENABLED": ("PERF_BREAKER_ENABLED", lambda v: _cfg_flag(v)),
     "SHIM_PERF_BREAKER_TTFT_P95_SECS": ("PERF_BREAKER_TTFT_P95_SECS", float),
     "SHIM_PERF_BREAKER_GPU_UTIL_PCT": ("PERF_BREAKER_GPU_UTIL_PCT", float),
     "SHIM_PERF_BREAKER_KV_PCT": ("PERF_BREAKER_KV_PCT", float),
@@ -567,8 +601,8 @@ _CFG = {
     "SHIM_PERF_BREAKER_HOLD_SECS": ("PERF_BREAKER_HOLD_SECS", float),
     "SHIM_STREAM_IDLE_TIMEOUT_SECS": ("STREAM_IDLE_TIMEOUT_SECS", float),
     # [GW2 / L100] Lane CR knobs, hot-reloadable so the warm-priority A/B can alternate arms without restarts
-    "SHIM_CHAIN_TELEMETRY": ("CHAIN_TELEMETRY", lambda v: str(v).lower() in ("1", "true", "on", "yes")),
-    "SHIM_WARM_PRIORITY": ("WARM_PRIORITY", lambda v: str(v).lower() in ("1", "true", "on", "yes")),
+    "SHIM_CHAIN_TELEMETRY": ("CHAIN_TELEMETRY", lambda v: _cfg_flag(v)),
+    "SHIM_WARM_PRIORITY": ("WARM_PRIORITY", lambda v: _cfg_flag(v)),
     "SHIM_WARM_PRIORITY_MIN_CREDIT": ("WARM_PRIORITY_MIN_CREDIT", int),
     "SHIM_WARM_PRIORITY_MAX_COMPUTED": ("WARM_PRIORITY_MAX_COMPUTED", int),
     "SHIM_REASONING_WATCHDOG": ("REASONING_WATCHDOG", lambda v: str(v).strip().lower()),
@@ -580,15 +614,15 @@ _CFG = {
     "SHIM_CREDIT_PROBE_TIMEOUT_S": ("CREDIT_PROBE_TIMEOUT_S", float),
     "SHIM_CREDIT_PROBE_MIN_TOKENS": ("CREDIT_PROBE_MIN_TOKENS", int),
     # LOCAL-FIRST (L1, 2026-09-25) -- see the block after STREAM_IDLE_TIMEOUT_SECS below.
-    "SHIM_LOCAL_FIRST":      ("LOCAL_FIRST", lambda v: str(v).lower() not in ("0", "false", "off", "")),
+    "SHIM_LOCAL_FIRST":      ("LOCAL_FIRST", lambda v: _cfg_flag(v)),
     "SHIM_LOCAL_FIRST_REASONS": ("LOCAL_FIRST_REASONS", lambda v: _parse_reason_set(v)),
     "SHIM_LOCAL_FIRST_QUEUE_WAIT_SECS": ("LOCAL_FIRST_QUEUE_WAIT_SECS", float),
     "SHIM_LOCAL_FIRST_WAIT_WINDOW_SECS": ("LOCAL_FIRST_WAIT_WINDOW_SECS", float),
     "SHIM_LOCAL_FIRST_FIRST_TOKEN_MAX": ("LOCAL_FIRST_FIRST_TOKEN_MAX", float),
     "SHIM_LOCAL_FIRST_INTERACTIVE_TTFT_SECS": ("LOCAL_FIRST_INTERACTIVE_TTFT_SECS", float),
     # LF (10-03): deadline-derived local-first + expected-output big-out rule (see the LF block below).
-    "SHIM_LOCAL_FIRST_DERIVE": ("LOCAL_FIRST_DERIVE", lambda v: str(v).lower() not in ("0", "false", "off", "")),
-    "SHIM_EXPECTED_OUTPUT":  ("EXPECTED_OUTPUT", lambda v: str(v).lower() not in ("0", "false", "off", "")),
+    "SHIM_LOCAL_FIRST_DERIVE": ("LOCAL_FIRST_DERIVE", lambda v: _cfg_flag(v)),
+    "SHIM_EXPECTED_OUTPUT":  ("EXPECTED_OUTPUT", lambda v: _cfg_flag(v)),
     "SHIM_EXPECTED_OUTPUT_QUANTILE": ("EXPECTED_OUTPUT_QUANTILE", float),
     "SHIM_EXPECTED_OUTPUT_MIN_SAMPLES": ("EXPECTED_OUTPUT_MIN_SAMPLES", int),
 }
@@ -607,11 +641,11 @@ TOKEN_BUDGET     = _parse_budget(os.environ.get("SHIM_TOKEN_BUDGET"))
 # CAPACITY MODEL (lane GW, 2026-10-02). The gateway's capacity numbers are FACTS OF THE RUNNING ENGINE, so they are read
 # from it (see the "CAPACITY MODEL" section: pool_info / token_budget_info / prefill_info) and the configured values
 # below are only fallbacks / optional overrides. SHIM_CAPACITY_LIVE=0 restores configured-only behaviour (kill switch).
-CAPACITY_LIVE = os.environ.get("SHIM_CAPACITY_LIVE", "1").lower() not in ("0", "false", "off", "")
+CAPACITY_LIVE = _env_flag(os.environ.get("SHIM_CAPACITY_LIVE", "1"), True)
 # The context window the gateway admits against (SHIM_LOCAL_CONTEXT_LIMIT, SHIM_MAX_LOCAL_TOKENS) is the engine's own
 # max_model_len, read from its /v1/models every MODELS_POLL_S (and at once after an engine restart); the configured values are
 # only the fallback until the engine has answered. SHIM_CONTEXT_LIVE=0 (or SHIM_CAPACITY_LIVE=0) = configured-only (kill switch).
-CONTEXT_LIVE = os.environ.get("SHIM_CONTEXT_LIVE", "1").lower() not in ("0", "false", "off", "")
+CONTEXT_LIVE = _env_flag(os.environ.get("SHIM_CONTEXT_LIVE", "1"), True)
 MODELS_POLL_S = float(os.environ.get("SHIM_MODELS_POLL_SECS", "30"))
 # The token budget as a fraction of the KV pool. CALIBRATION (the only hand-set capacity datum, with its provenance):
 # 500,000 reserved tokens was set 2026-08-12 from the breaking-point bench (4 x 170K = 680K held with 611 MB VRAM margin at
@@ -631,7 +665,7 @@ TOKEN_BUDGET_CEIL = int(os.environ.get("SHIM_TOKEN_BUDGET_CEIL", "680000"))
 # so the default is 0). A media request the local engine cannot take goes to the remote provider when it can take it and
 # the hard daily cap has room, otherwise it gets one clear 400 -- never the engine's bare error.
 LOCAL_MODALITIES = ",".join(sorted({x.strip().lower() for x in os.environ.get("SHIM_LOCAL_MODALITIES", "text").split(",") if x.strip()})) or "text"
-REMOTE_VISION = 1 if os.environ.get("SHIM_REMOTE_VISION", "0").lower() in ("1", "true", "on") else 0
+REMOTE_VISION = 1 if _env_flag(os.environ.get("SHIM_REMOTE_VISION", "0"), False) else 0
 _MEDIA_PART_TYPES = {"image_url": "image", "input_image": "image", "image": "image", "video_url": "video", "input_video": "video",
                      "video": "video", "input_audio": "audio", "audio_url": "audio", "audio": "audio"}
 DEFAULT_MAX_OUT  = int(os.environ.get("SHIM_DEFAULT_MAX_OUT", "8192"))
@@ -651,7 +685,7 @@ TINY_EXTRA_LANES  = int(os.environ.get("SHIM_TINY_EXTRA_LANES", "2"))
 # MICRO_LEARN lets the gateway LEARN that a (client, prompt-head) signature is short-output and admit it to the tiny
 # lane. Unlike static-tiny, a learned-tiny request that finds the tiny lanes full WAITS locally (never overflows to
 # paid remote). Kill switch: SHIM_MICRO_LEARN=0.
-MICRO_LEARN       = os.environ.get("SHIM_MICRO_LEARN", "1") not in ("0", "false", "")
+MICRO_LEARN       = _env_flag(os.environ.get("SHIM_MICRO_LEARN", "1"), True)
 MICRO_SIG_CHARS   = int(os.environ.get("SHIM_MICRO_SIG_CHARS", "32"))      # normalized prompt-head chars in a signature
 MICRO_MIN_SAMPLES = int(os.environ.get("SHIM_MICRO_MIN_SAMPLES", "6"))     # completions seen before a signature qualifies
 MICRO_HISTORY     = int(os.environ.get("SHIM_MICRO_HISTORY", "16"))        # most recent completions kept per signature
@@ -663,7 +697,7 @@ MICRO_MAX_SIGS    = 2000
 # 391 of 1558 probes in that week were billed to the paid remote. When the engine has produced real tokens within
 # PROBE_FRESH_S, the gateway answers the probe itself; every PROBE_REAL_EVERY-th probe still goes through for real
 # so end-to-end generation stays proven. Only local-capable aliases (never estate-remote). Kill: SHIM_PROBE_SYNTH=0.
-PROBE_SYNTH       = os.environ.get("SHIM_PROBE_SYNTH", "1") not in ("0", "false", "")
+PROBE_SYNTH       = _env_flag(os.environ.get("SHIM_PROBE_SYNTH", "1"), True)
 PROBE_FRESH_S     = float(os.environ.get("SHIM_PROBE_FRESH_S", "120"))
 PROBE_REAL_EVERY  = int(os.environ.get("SHIM_PROBE_REAL_EVERY", "12"))
 # --- concurrency-aware first-token deadline (2026-08-13) ---
@@ -677,18 +711,18 @@ FT_CONCURRENCY_SCALE = int(os.environ.get("SHIM_FT_CONCURRENCY_SCALE", "1"))
 # Log source (ip/UA), model, size and a short prompt preview for each completion, to attribute
 # traffic (which client fires the tiny bursts / the slow big prefills). Set SHIM_LOG_REQUESTS=0
 # to disable (e.g. for prompt privacy).
-LOG_REQUESTS      = os.environ.get("SHIM_LOG_REQUESTS", "1") not in ("0", "false", "")
+LOG_REQUESTS      = _env_flag(os.environ.get("SHIM_LOG_REQUESTS", "1"), True)
 LOG_PREVIEW_CHARS = int(os.environ.get("SHIM_LOG_PREVIEW_CHARS", "70"))
 # vLLM-only params that a remote OpenAI endpoint would reject — stripped on overflow.
 REMOTE_STRIP = ("chat_template_kwargs", "mamba_cache_mode", "guided_decoding_backend")
 # Force non-thinking on the DeepSeek failover (see remap_for_remote). Disable with SHIM_REMOTE_NO_THINK=0.
-REMOTE_NO_THINK = os.environ.get("SHIM_REMOTE_NO_THINK", "1") not in ("0", "false", "")
+REMOTE_NO_THINK = _env_flag(os.environ.get("SHIM_REMOTE_NO_THINK", "1"), True)
 
 # Congestion controls.  These guards run inside the gateway before local admission.  Callers
 # never select a provider; they may only express an optional route intent.
 PREDICTED_OCCUPANCY_SECS = float(os.environ.get("SHIM_PREDICTED_OCCUPANCY_SECS", "180"))
 DECODE_TPS_FLOOR = float(os.environ.get("SHIM_DECODE_TPS_FLOOR", "20"))
-PERF_BREAKER_ENABLED = os.environ.get("SHIM_PERF_BREAKER_ENABLED", "1") not in ("0", "false", "")
+PERF_BREAKER_ENABLED = _env_flag(os.environ.get("SHIM_PERF_BREAKER_ENABLED", "1"), True)
 PERF_BREAKER_TTFT_P95_SECS = float(os.environ.get("SHIM_PERF_BREAKER_TTFT_P95_SECS", "20"))
 PERF_BREAKER_GPU_UTIL_PCT = float(os.environ.get("SHIM_PERF_BREAKER_GPU_UTIL_PCT", "95"))
 PERF_BREAKER_KV_PCT = float(os.environ.get("SHIM_PERF_BREAKER_KV_PCT", "85"))
@@ -761,7 +795,7 @@ def _parse_reason_set(v):
     return frozenset(x.strip(_REPR_JUNK) for x in parts if x.strip(_REPR_JUNK))
 
 
-LOCAL_FIRST = os.environ.get("SHIM_LOCAL_FIRST", "1").lower() not in ("0", "false", "off", "")
+LOCAL_FIRST = _env_flag(os.environ.get("SHIM_LOCAL_FIRST", "1"), True)
 LOCAL_FIRST_REASONS = _parse_reason_set(os.environ.get(
     "SHIM_LOCAL_FIRST_REASONS", "big-prompt,perf,predicted,big-out,monster"))
 LOCAL_FIRST_QUEUE_WAIT_SECS = float(os.environ.get("SHIM_LOCAL_FIRST_QUEUE_WAIT_SECS", "5"))
@@ -792,10 +826,10 @@ LOCAL_FIRST_INTERACTIVE_TTFT_SECS = float(os.environ.get("SHIM_LOCAL_FIRST_INTER
 # LOCAL_FIRST_FIRST_TOKEN_MAX, the first-token wait the local relay will actually grant. The flat
 # QUEUE_WAIT_SECS / HEAVY_* / MONSTER_PREFILL_SECS values remain the configured FALLBACK (derive off, or no measured
 # prefill rate yet). ROLLBACK: SHIM_LOCAL_FIRST_DERIVE=0 and SHIM_EXPECTED_OUTPUT=0 restore the previous rules.
-LOCAL_FIRST_DERIVE = os.environ.get("SHIM_LOCAL_FIRST_DERIVE", "1").lower() not in ("0", "false", "off", "")
+LOCAL_FIRST_DERIVE = _env_flag(os.environ.get("SHIM_LOCAL_FIRST_DERIVE", "1"), True)
 # big-out is decided on the output a caller ACTUALLY produces (this quantile of its recent completions) once there
 # are enough samples; the requested max_tokens stays the hard upper bound and the fallback.
-EXPECTED_OUTPUT = os.environ.get("SHIM_EXPECTED_OUTPUT", "1").lower() not in ("0", "false", "off", "")
+EXPECTED_OUTPUT = _env_flag(os.environ.get("SHIM_EXPECTED_OUTPUT", "1"), True)
 EXPECTED_OUTPUT_QUANTILE = float(os.environ.get("SHIM_EXPECTED_OUTPUT_QUANTILE", "0.95"))
 EXPECTED_OUTPUT_MIN_SAMPLES = int(os.environ.get("SHIM_EXPECTED_OUTPUT_MIN_SAMPLES", "20"))
 EXPECTED_OUTPUT_HISTORY = int(os.environ.get("SHIM_EXPECTED_OUTPUT_HISTORY", "200"))
@@ -803,6 +837,27 @@ EXPECTED_OUTPUT_HISTORY = int(os.environ.get("SHIM_EXPECTED_OUTPUT_HISTORY", "20
 logging.basicConfig(level=logging.INFO, stream=sys.stdout,
                     format="%(asctime)s [gateway] %(levelname)s %(message)s")
 log = logging.getLogger("gateway-shim")
+
+# ---- lane SH (2026-10-03): swallowed exceptions are counted, never invisible ----
+# ~100 `except Exception: pass` blocks keep bookkeeping from breaking a request, which is right, but a handler that
+# fires on EVERY request (an unwritable ledger, an unreadable outcome alarm that silently keeps the stalled brake on,
+# a learning table that always raises) looked exactly like health. State/IO sites now call _swallowed(site, exc):
+# per-site count + last error, a warning on the 1st, 2nd, 4th, 8th... occurrence, exported at
+# /gateway/internal-errors and as gateway_swallowed_errors_total{site} on /metrics. Parse-tolerance sites
+# (untrusted request bodies, optional files, regex scrapes) stay silent on purpose.
+_SWALLOWED = {}                 # site -> [count, last_epoch, last_repr]; keys are fixed source sites (bounded)
+
+
+def _swallowed(site, exc):
+    rec = _SWALLOWED.get(site)
+    if rec is None:
+        rec = _SWALLOWED[site] = [0, 0.0, ""]
+    rec[0] += 1
+    rec[1] = time.time()
+    rec[2] = repr(exc)[:240]
+    n = rec[0]
+    if n & (n - 1) == 0:          # 1, 2, 4, 8, ...: loud at first, never a log flood
+        log.warning("swallowed exception #%d at %s: %s", n, site, rec[2])
 
 # Optional admin gate for mutating gateway endpoints (POST /gateway/config, POST
 # /gateway/models/local). Default OFF: loaded once at import. SHIM_ADMIN_TOKEN env
@@ -899,8 +954,8 @@ def _remote_dead_save():
         with open(tmp, "w") as fh:
             json.dump({"until": _remote_dead_until, "count": _remote_dead_count}, fh)
         os.replace(tmp, _REMOTE_DEAD_FILE)
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("_remote_dead_save", _e)
 
 
 _REMOTE_DEAD_PERSIST = False       # armed by _on_startup only: importing the module (tests) must never read or write live state
@@ -920,8 +975,8 @@ def _note_remote_status(base, status):
         elif status == 200 and str(base).rstrip("/") != str(LOCAL).rstrip("/") and _remote_dead_until:
             _remote_dead_until = 0.0
             _remote_dead_save()
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("_note_remote_status", _e)
 
 
 def remote_ok():
@@ -986,8 +1041,8 @@ def _drain_ledger_write(row):
         os.makedirs(os.path.dirname(_DRAIN_LEDGER), exist_ok=True)
         with open(_DRAIN_LEDGER, "a") as fh:
             fh.write(json.dumps(row, sort_keys=True) + "\n")
-    except Exception:       # never let bookkeeping affect admission
-        pass
+    except Exception as _e:       # never let bookkeeping affect admission
+        _swallowed("_drain_ledger_write", _e)
 
 
 def _drain_close_record(how, now=None):
@@ -1024,8 +1079,8 @@ def _drain_startup_recover():
                                  "duration_s": round(time.time() - float(last.get("t") or time.time()), 1), "reason": last.get("reason"),
                                  "by": last.get("by"), "ttl_s": last.get("ttl_s"), "active_at_open": last.get("active"),
                                  "refused": None, "note": "refused count unknown: the process that held the fence is gone"})
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("_drain_startup_recover", _e)
 
 
 def _draining(now=None):
@@ -1201,7 +1256,10 @@ _CFG.update({
 
 _JSONL_PENDING = []   # plain list; appended to only from the event loop (see _telemetry_log_enqueue)
 _JSONL_STATE = {"date": None, "path": None, "bytes": 0, "capped": False,
-                "written": 0, "dropped_cap": 0, "dropped_queue": 0, "last_err": None}
+                "written": 0, "dropped_cap": 0, "dropped_queue": 0, "last_err": None,
+                # lane SH: rows lost AFTER leaving the queue used to vanish uncounted (and a failed write still
+                # counted as written): unserialisable row / failed write / flusher error.
+                "dropped_bad": 0, "dropped_io": 0, "dropped_err": 0}
 _HISTORY_SUMMARY_CACHE = {"key": None, "at": 0.0, "data": None}
 
 # ---- rings: bounded by construction (deque maxlen), see DESIGN.md (e) ----
@@ -1214,6 +1272,20 @@ _PER_CLIENT = collections.defaultdict(lambda: {
     "requests": 0, "local": 0, "remote": 0, "tokens_out": 0, "tokens_out_exact": 0,
     "tokens_out_lb": 0, "wait_sum": 0.0, "wait_n": 0, "ttft_sum": 0.0, "ttft_n": 0,
     "errors": 0, "cost_est_usd": 0.0, "classes": collections.Counter()})
+# lane SH: keyed by the caller-supplied X-Client/X-Title (or IP), so a client that varies its header grew this table
+# -- and the per-client /metrics label set -- without bound. Past CLIENT_KEYS_MAX distinct names, new names share
+# one "(other)" row; existing rows keep counting.
+CLIENT_KEYS_MAX = 512
+CLIENT_OVERFLOW_KEY = "(other)"
+
+
+def _client_key(table, name):
+    """`name` if `table` already has it or still has room, else the shared overflow key."""
+    if name in table or len(table) < CLIENT_KEYS_MAX:
+        return name
+    return CLIENT_OVERFLOW_KEY
+
+
 _ERROR_FEED = collections.deque(maxlen=200)
 # gw-admission-computed-token-cost safety AC: a request whose actual computed tokens exceed
 # what predict_computed_tokens() would have charged it by > 2x, regardless of whether
@@ -1440,6 +1512,151 @@ def local_first_decision(reason, *, background, units, reservation, est_computed
     return True, "capacity"
 
 
+# ---------------- QoL INTERACTIVE OVERFLOW (lane CFG, 2026-10-03) ----------------
+# Kevin, 2026-10-03: interactive overflow "should be based on quality of life". An INTERACTIVE request goes remote only
+# when the PREDICTED local time-to-first-token is long (> QOL_TTFT_S, counting what it already waited) AND the remote is
+# predicted to be meaningfully faster (by >= QOL_MIN_GAIN_S, from MEASURED remote TTFT in its prompt-size band). A request
+# about to start locally, or a small one that will be fast locally, never overflows just because it waited; one stuck
+# behind a monster prefill overflows at once instead of after a timer. Prediction = local_first_predicted_ttft() (class
+# queue wait + engine prefill backlog + own uncached prefill at the live prefill rate), with GW2's engine-anchored cache
+# credit for the request's own size when the chain has one (the cache-credit guess is the largest input error).
+#   SHIM_QOL_OVERFLOW=off     no effect (default)
+#                     shadow  decide and log (telemetry qol_* fields) next to what actually happened; routing unchanged
+#                     on      the decision governs interactive overflow for QOL_REASONS and the lane wait
+# Background traffic, planned-offline windows, local-down, size caps, pins, aliases and the spend authority are untouched.
+QOL_OVERFLOW = os.environ.get("SHIM_QOL_OVERFLOW", "off").strip().lower()
+QOL_TTFT_S = float(os.environ.get("SHIM_QOL_TTFT_S", "15"))
+QOL_MIN_GAIN_S = float(os.environ.get("SHIM_QOL_MIN_GAIN_S", "5"))
+QOL_REMOTE_QUANTILE = float(os.environ.get("SHIM_QOL_REMOTE_QUANTILE", "0.75"))
+QOL_REMOTE_MIN_SAMPLES = int(os.environ.get("SHIM_QOL_REMOTE_MIN_SAMPLES", "5"))
+QOL_REMOTE_WINDOW_S = float(os.environ.get("SHIM_QOL_REMOTE_WINDOW_S", "21600"))
+QOL_REASONS = os.environ.get("SHIM_QOL_REASONS", "perf,big-prompt,monster,predicted")
+QOL_BANDS = (8192, 32768, 65536, 131072)          # prompt-token band upper edges; the last band is open-ended
+_QOL_REMOTE = collections.deque(maxlen=4000)      # (t, prompt_tokens, ttft_s) of finished streamed remote requests
+_QOL_SEEDED = [False]
+_QOL_STATS = collections.Counter()
+_CFG.update({
+    "SHIM_QOL_OVERFLOW": ("QOL_OVERFLOW", lambda v: _qol_cast_mode(v)),
+    "SHIM_QOL_TTFT_S": ("QOL_TTFT_S", float),
+    "SHIM_QOL_MIN_GAIN_S": ("QOL_MIN_GAIN_S", float),
+    "SHIM_QOL_REASONS": ("QOL_REASONS", lambda v: ",".join(sorted({x.strip().lower() for x in str(v).split(",") if x.strip()}))),
+})
+
+
+def _qol_cast_mode(v):
+    v = str(v).strip().lower()
+    if v not in ("off", "shadow", "on"):
+        raise ValueError("qol_overflow must be off|shadow|on")
+    return v
+
+
+def qol_band(ptok):
+    for i, edge in enumerate(QOL_BANDS):
+        if (ptok or 0) <= edge:
+            return i
+    return len(QOL_BANDS)
+
+
+def qol_note_remote(ptok, ttft, now=None):
+    if isinstance(ttft, (int, float)) and ttft > 0 and ptok:
+        _QOL_REMOTE.append((now or time.time(), int(ptok), float(ttft)))
+
+
+def _qol_seed():
+    """Restore recent remote TTFT samples from the on-disk request log once (a restart must not blind the model)."""
+    if _QOL_SEEDED[0]:
+        return
+    _QOL_SEEDED[0] = True
+    try:
+        files = sorted(f for f in os.listdir(TELEMETRY_DIR) if f.startswith("requests-") and f.endswith(".jsonl"))[-2:]
+        cutoff = time.time() - QOL_REMOTE_WINDOW_S
+        rows = []
+        for f in files:
+            p = os.path.join(TELEMETRY_DIR, f)
+            with open(p, "rb") as fh:
+                size = os.path.getsize(p)
+                fh.seek(max(0, size - 16 * 1024 * 1024))
+                for line in fh.read().splitlines()[1:]:
+                    if b'"route": "remote"' not in line and b'"route":"remote"' not in line:
+                        continue
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    if r.get("t", 0) >= cutoff and r.get("ttft"):
+                        rows.append((r["t"], int(r.get("ptok_exact") or r.get("ptok") or 0), float(r["ttft"])))
+        for row in sorted(rows)[-_QOL_REMOTE.maxlen:]:
+            _QOL_REMOTE.append(row)
+    except Exception as e:
+        log.warning("qol: remote TTFT seed failed: %s", e)
+
+
+def qol_remote_ttft(ptok, now=None):
+    """(seconds, band, n): the QOL_REMOTE_QUANTILE of measured remote TTFT for this prompt-size band over the last
+    QOL_REMOTE_WINDOW_S, from samples in the same provider price period (peak / off-peak hours: the provider's latency
+    follows its load) when that period alone has enough, else all hours. seconds is None with fewer than
+    QOL_REMOTE_MIN_SAMPLES samples (no claim that remote is faster)."""
+    _qol_seed()
+    now = now or time.time()
+    b = qol_band(ptok)
+    rows = [(t, s) for t, p, s in _QOL_REMOTE if now - t <= QOL_REMOTE_WINDOW_S and qol_band(p) == b]
+    try:
+        pk = is_peak(now)
+        same = sorted(s for t, s in rows if is_peak(t) == pk)
+    except Exception:
+        same = []
+    v = same if len(same) >= max(1, QOL_REMOTE_MIN_SAMPLES) else sorted(s for _, s in rows)
+    if len(v) < max(1, QOL_REMOTE_MIN_SAMPLES):
+        return None, b, len(v)
+    return v[min(len(v) - 1, int(QOL_REMOTE_QUANTILE * len(v)))], b, len(v)
+
+
+def qol_choice(local_remaining_s, waited_s, remote_s, ttft_target_s=None, min_gain_s=None):
+    """The pure QoL rule: ("remote"|"local"|"legacy", why). Remote only when the person's total wait for a local first
+    token would exceed the target AND the remote is predicted to answer at least min_gain sooner from now."""
+    target = QOL_TTFT_S if ttft_target_s is None else ttft_target_s
+    gain = QOL_MIN_GAIN_S if min_gain_s is None else min_gain_s
+    if local_remaining_s is None:
+        return "legacy", "no-local-prediction"
+    total = max(0.0, waited_s or 0.0) + max(0.0, local_remaining_s)
+    if total <= target:
+        return "local", "fast-local"
+    if remote_s is None:
+        return "legacy", "no-remote-samples"
+    if local_remaining_s - remote_s < gain:
+        return "local", "remote-not-faster"
+    return "remote", "remote-faster"
+
+
+def qol_decide(cls, est_computed, ptok, *, units=1, waited=0.0, pm_chain=None, now=None):
+    """Predict and decide for one interactive request. Never raises; returns a flat dict for telemetry."""
+    out = {"qol_mode": QOL_OVERFLOW}
+    try:
+        own_tok = est_computed
+        if pm_chain:
+            ac, _age = anchored_credit(pm_chain, ptok, now=now)
+            if ac:
+                own_tok = max(0, int(ptok or 0) - int(ac))
+                out["qol_anchored"] = int(ac)
+        pred, parts = local_first_predicted_ttft(cls if cls in FLOW_CLASSES else "kevin", own_tok, units=units, now=now)
+        remote, band, n = qol_remote_ttft(ptok, now=now)
+        would, why = qol_choice(pred, waited, remote)
+        out.update(qol_would=would, qol_why=why, qol_pred_local_s=None if pred is None else round(pred, 1),
+                   qol_pred_remote_s=None if remote is None else round(remote, 2), qol_band=band, qol_remote_n=n,
+                   qol_waited_s=round(waited or 0.0, 1), **{"qol_" + k: v for k, v in (parts or {}).items()})
+    except Exception as e:
+        out.update(qol_would="legacy", qol_why="error:%s" % type(e).__name__)
+    return out
+
+
+_QOL_FIELDS = ("qol_mode", "qol_would", "qol_why", "qol_at", "qol_legacy", "qol_pred_local_s", "qol_pred_remote_s",
+               "qol_band", "qol_remote_n", "qol_waited_s", "qol_queue_s", "qol_backlog_s", "qol_own_s", "qol_anchored")
+
+
+def qol_governs(reason):
+    return QOL_OVERFLOW in ("shadow", "on") and reason in {x.strip() for x in str(QOL_REASONS).split(",") if x.strip()}
+
+
 def _latest_decode_tps():
     """Use the most recent measured engine decode rate, with a conservative floor."""
     for sample in reversed(_TELEM_FAST):
@@ -1470,8 +1687,8 @@ def note_output_tokens(client, outtok, t=None):
         h.append((time.time() if t is None else t, int(outtok)))
         if len(_OUT_HIST) > 500:                       # bounded: drop the longest-idle client
             _OUT_HIST.pop(min(_OUT_HIST, key=lambda k: _OUT_HIST[k][-1][0] if _OUT_HIST[k] else 0), None)
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("note_output_tokens", _e)
 
 
 def expected_output_tokens(client, maxtok):
@@ -1557,8 +1774,8 @@ def micro_observe(client, text, outtok):
             _MICRO_HIST.move_to_end(sig)
         h.append(int(outtok))
         _MICRO_STATS["observed"] += 1
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("micro_observe", _e)
 
 
 def micro_predict(client, text, ptok):
@@ -2001,8 +2218,8 @@ def lat_note_request(now, route, ttft, duration, waited, outtok, flow_class=None
                 if v < 120:
                     itl = round(v, 5)
         _REQ_LAT.append((now, route, round(float(ttft), 4), itl, flow_class))
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("lat_note_request", _e)
 
 
 def _quantile(vals, q):
@@ -2870,7 +3087,7 @@ def _claim_spend_authority(path=SPEND_FILE):
 SPEND_CLIENTS_FILE = os.environ.get("SHIM_SPEND_CLIENTS_FILE",
                                     "/home/kevin/.local/share/vllm-qwen27b/spend-clients.json")
 SPEND_CAP_USD = float(os.environ.get("SHIM_SPEND_CAP_USD", "25.0"))
-SPEND_ENFORCE = os.environ.get("SHIM_SPEND_ENFORCE", "1").lower() not in ("0", "false", "off", "")
+SPEND_ENFORCE = _env_flag(os.environ.get("SHIM_SPEND_ENFORCE", "1"), True)
 SPEND_TZ = os.environ.get("SHIM_SPEND_TZ", "America/Phoenix")   # the estate host's day (SpendGuard's)
 SPEND_RESERVATION_TTL_MAX = int(os.environ.get("SHIM_SPEND_RESERVATION_TTL_MAX", str(4 * 3600)))
 SPEND_REQUEST_HOLD_TTL = int(os.environ.get("SHIM_SPEND_REQUEST_HOLD_TTL", "1800"))
@@ -2885,7 +3102,7 @@ SPEND_KEEP_SECS = 2 * 86400          # finalized/expired reservations kept for i
 _SPEND_RID = re.compile(r"^[0-9a-f]{32}$")
 _CFG.update({
     "SHIM_SPEND_CAP_USD": ("SPEND_CAP_USD", float),
-    "SHIM_SPEND_ENFORCE": ("SPEND_ENFORCE", lambda v: str(v).lower() not in ("0", "false", "off", "")),
+    "SHIM_SPEND_ENFORCE": ("SPEND_ENFORCE", lambda v: _cfg_flag(v)),
 })
 try:
     with open(os.path.abspath(__file__), "rb") as _fh:
@@ -3599,7 +3816,8 @@ def _spend_allows_overflow(ptok, maxtok):
     locally (queueing for a lane) instead of refusing it."""
     try:
         return _spend().can_hold(_spend_hold_estimate(ptok, maxtok))
-    except Exception:
+    except Exception as _e:
+        _swallowed("_spend_allows_overflow", _e)
         return False
 
 
@@ -3623,7 +3841,8 @@ def _automatic_remote_budget_allows(ptok, maxtok):
         spend = _spend().snapshot()
         exposure = sum(float(spend.get(k) or 0) for k in ("spent", "held", "reserved"))
         return exposure + _spend_hold_estimate(ptok, maxtok) <= STALLED_AUTO_OVERFLOW_CAP_USD
-    except Exception:
+    except Exception as _e:
+        _swallowed("_automatic_remote_budget_allows", _e)
         return False
 
 
@@ -3823,8 +4042,8 @@ def _note_payload_outcome(request, payload, stream):
                     kw["cached_actual"] = cached
                     kw["ptok_exact_local"] = int(u["prompt_tokens"])
         _active_set(request, **kw)
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("_note_payload_outcome", _e)
 
 
 _EST_ERR = collections.deque(maxlen=2000)    # [GW2] (client, est_tokens, exact, est_computed, computed_actual)
@@ -3943,7 +4162,7 @@ def _telemetry_note_request(info, resp=None):
         status = getattr(resp, "status", None)
         if status is None:
             status = info.get("http_status")
-        c = _PER_CLIENT[name]
+        c = _PER_CLIENT[_client_key(_PER_CLIENT, name)]
         c["requests"] += 1
         c["classes"][info.get("flow_class") or "?"] += 1          # Lane DB2: the real work class, per client
         if route in ("local", "remote"):
@@ -3960,6 +4179,8 @@ def _telemetry_note_request(info, resp=None):
             c["tokens_out"] += outtok_lb; c["tokens_out_lb"] += outtok_lb
         c["wait_sum"] += waited; c["wait_n"] += 1
         ttft = info.get("ttft")
+        if ttft is not None and route == "remote" and (status is None or status < 400):
+            qol_note_remote(info.get("ptok_exact") or info.get("ptok") or info.get("est_tokens"), ttft, now)   # lane CFG QoL
         if ttft is not None:
             c["ttft_sum"] += ttft; c["ttft_n"] += 1
             if status is None or status < 400:
@@ -4083,6 +4304,7 @@ def _telemetry_note_request(info, resp=None):
                 "probe_ms": info.get("probe_ms"), "credit_source": info.get("credit_source"),
                 "pm_credit_model": info.get("pm_credit_model")}
                if (CREDIT_ANCHOR != "off" or CREDIT_PROBE != "off") else {}),
+            **({k: info.get(k) for k in _QOL_FIELDS} if QOL_OVERFLOW != "off" else {}),
             "flow_class": info.get("flow_class"), "flow_expected_wait": info.get("flow_expected_wait_s"),
             "flow_held": info.get("flow_held"), "flow_adjacent": info.get("flow_adjacent"),
             **({"chain_prev_route": info.get("chain_prev_route"), "chain_prev_age_s": info.get("chain_prev_age_s"),
@@ -4151,15 +4373,17 @@ def _flush_jsonl_blocking(lines, cur_date, cur_path, cur_bytes, cur_capped):
             cur_capped = True
     if cur_capped:
         return {"date": cur_date, "path": cur_path, "bytes": cur_bytes, "capped": True,
-                "written": 0, "dropped_cap": len(lines), "rotated": rotated}
+                "written": 0, "dropped_cap": len(lines), "rotated": rotated, "dropped_bad": 0, "dropped_io": 0}
     max_bytes = int(TELEMETRY_JSONL_MAX_MB * 1024 * 1024)
-    written = dropped_cap = 0
+    written = dropped_cap = dropped_bad = dropped_io = 0
+    start_bytes = cur_bytes
     buf = []
     for rec in lines:
         try:
             s = json.dumps(rec, separators=(",", ":")) + "\n"
         except Exception:
-            continue   # one broken record must not lose the rest of the batch
+            dropped_bad += 1   # one broken record must not lose the rest of the batch (lane SH: but it is counted)
+            continue
         n = len(s.encode("utf-8"))
         if cur_bytes + n > max_bytes:
             cur_capped = True
@@ -4175,8 +4399,11 @@ def _flush_jsonl_blocking(lines, cur_date, cur_path, cur_bytes, cur_capped):
             os.chmod(cur_path, 0o600)   # previews can contain prompt text -- same as flightrec
         except OSError as e:
             log.warning("jsonl flush: write %s failed: %s", cur_path, e)
+            # lane SH: nothing was written -- do not report the batch as written or advance the day's size
+            dropped_io, written, cur_bytes = written, 0, start_bytes
     return {"date": cur_date, "path": cur_path, "bytes": cur_bytes, "capped": cur_capped,
-            "written": written, "dropped_cap": dropped_cap, "rotated": rotated}
+            "written": written, "dropped_cap": dropped_cap, "rotated": rotated,
+            "dropped_bad": dropped_bad, "dropped_io": dropped_io}
 
 
 def _telemetry_retention_sweep():
@@ -4226,14 +4453,17 @@ async def _jsonl_flusher():
             _JSONL_STATE["capped"] = result["capped"]
             _JSONL_STATE["written"] += result["written"]
             _JSONL_STATE["dropped_cap"] += result["dropped_cap"]
-            _JSONL_STATE["last_err"] = None
+            _JSONL_STATE["dropped_bad"] += result.get("dropped_bad", 0)
+            _JSONL_STATE["dropped_io"] += result.get("dropped_io", 0)
+            _JSONL_STATE["last_err"] = None if not result.get("dropped_io") else "write failed"
             if result.get("rotated"):
                 await loop.run_in_executor(None, _telemetry_retention_sweep)
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            log.warning("jsonl flusher: %s", e)
+            log.warning("jsonl flusher: %s (%d rows lost)", e, len(lines))
             _JSONL_STATE["last_err"] = str(e)
+            _JSONL_STATE["dropped_err"] += len(lines)      # lane SH: the batch left the queue; count its loss
 
 
 def _read_lines_reverse(path, max_bytes):
@@ -5253,8 +5483,8 @@ def flow_meter_update(fam, prev_fam, dt, running, waiting, hit_rate, gen_tok_s):
         ct0, pt0 = hsum(prev_fam, "vllm:request_prefill_kv_computed_tokens"), hsum(prev_fam, "vllm:request_prefill_time_seconds")
         if None not in (ct, pt, ct0, pt0) and pt >= pt0 and ct >= ct0 and (pt > pt0 or ct > ct0):
             _FLOW_PURE.append((time.time(), ct - ct0, pt - pt0))
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("flow_meter_update", _e)
 
 
 # ---- the mode, as a fact ----
@@ -5521,8 +5751,8 @@ def flow_note_cache(info):
         row[0] += 1
         row[1] += int(cached)
         row[2] += int(ptok)
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("flow_note_cache", _e)
 
 
 @_flow_failopen(None)
@@ -5699,14 +5929,14 @@ def flow_note_route(decision, reason, request):
         headroom = bool(_health.get("ok") and not _local_offline() and _inflight < effective_budget()
                         and flow_backlog_s() <= LIGHT_PREFILL_SECS)
         _FLOW_ROUTES.append((time.time(), decision, reason, info.get("flow_class"), headroom))
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("flow_note_route", _e)
 
 
 # Lane DB2: the routing ring is in memory, so every restart emptied the "24 h" window (live: 6,439 of the 17,568 requests
 # the on-disk log held). At startup the last 24 h are rebuilt from the request log. A restored row cannot know whether
 # local had headroom at the time, so its headroom flag is None (never counted as a defect) and it is reported as `restored`.
-FLOW_RESTORE = os.environ.get("SHIM_FLOW_RESTORE", "1").lower() not in ("0", "false", "off")
+FLOW_RESTORE = _env_flag(os.environ.get("SHIM_FLOW_RESTORE", "1"), True)
 _FLOW_RESTORED = {"from": None, "n": 0}
 
 
@@ -5771,8 +6001,8 @@ def flow_remote_use(now=None):
     try:
         snap = _spend().snapshot()
         spend = {k: snap.get(k) for k in ("spent", "held", "reserved", "cap", "remaining") if k in snap}
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("flow_remote_use", _e)
     return {"principle": "local-first: remote is a valve for abnormal spikes and planned local-offline windows, not the "
                          "normal path. gateway_chosen_remote counts routes the gateway chose (not forced/aliased/"
                          "local-down/offline); remote_while_local_had_headroom is the defect signal: remote used although "
@@ -6749,8 +6979,8 @@ def _pm_feedback(info):
             _PM_STATS["underpredict"] += 1
         else:
             _PM_STATS["accurate"] += 1
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("_pm_feedback", _e)
 
 
 def _pm_summary():
@@ -6993,8 +7223,8 @@ def _prepare_local_body(request, body, background):
                 try:
                     if request.get("cr_warm_priority"):
                         local_alias_body["priority"] = WARM_PRIORITY_VALUE     # [LANE CR] warm continuation
-                except Exception:
-                    pass
+                except Exception as _e:
+                    _swallowed("_prepare_local_body", _e)
             if halo_control:
                 # vLLM priority scheduling preempts bulk FCFS work for the one
                 # control decision that keeps the estate supervised. A bounded
@@ -7003,8 +7233,8 @@ def _prepare_local_body(request, body, background):
                 local_alias_body["max_tokens"] = min(
                     int(local_alias_body.get("max_tokens") or 1024), 1024)
             body = json.dumps(local_alias_body).encode()
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("_prepare_local_body", _e)
     prepared = repetition_guard(nonthinking_sampling_profile(thinking_budget_guard(bound_local_output(body))))
     prepared, repeat_n = repeated_tool_call_note(prepared)
     if repeat_n:
@@ -7891,8 +8121,8 @@ def _timeout_note(request, layer, deadline_s, base, body, **extra):
         os.makedirs(os.path.dirname(_TIMEOUT_LEDGER), exist_ok=True)
         with open(_TIMEOUT_LEDGER, "a") as fh:
             fh.write(json.dumps(row, sort_keys=True) + "\n")
-    except Exception:       # bookkeeping must never touch the request path
-        pass
+    except Exception as _e:       # bookkeeping must never touch the request path
+        _swallowed("_timeout_note", _e)
 
 
 class _ClientGone(Exception):
@@ -8437,6 +8667,18 @@ def classify_remote_response(payload):
     return out
 
 
+def _flightrec_min_tok():
+    """SHIM_FLIGHTREC_MIN_TOK, read per call (as before). Lane SH: a bad value used to raise inside the local
+    path's try/finally -> every request >= that size died as a bare 500 when the schema module was absent; it
+    now means the default (15000) and is counted."""
+    raw = os.environ.get("SHIM_FLIGHTREC_MIN_TOK", "15000")
+    try:
+        return int(raw)
+    except (TypeError, ValueError) as e:
+        _swallowed("_flightrec_min_tok", e)
+        return 15000
+
+
 def _flightrec_dir():
     """Resolve the flight-recorder directory. Configurable via SHIM_FLIGHTREC_DIR (added by
     the shim-remote-observability lane, 2026-09-05 -- the path was previously hardcoded inline
@@ -8518,7 +8760,7 @@ async def _note_remote_response(request, payload, body):
             log.warning("remote returned EMPTY content (finish_reason=%s, completion_tokens=%s)",
                         cls["finish_reason"], cls["completion_tokens"])
         ptok = _est_tokens(body)
-        min_tok = int(os.environ.get("SHIM_FLIGHTREC_MIN_TOK", "15000"))
+        min_tok = _flightrec_min_tok()
         if ptok >= min_tok or empty_no_tool:
             fr = _flightrec_dir()
             stem = f"{int(time.time())}_remote_{ptok}tok"
@@ -8981,6 +9223,13 @@ async def _route_completions(request, _no_overflow=False):
         keep, why = local_first_decision(reason, background=background, units=units,
                                          reservation=_lf_res, est_computed=est_computed, cls=_early_cls,
                                          warm=_cr_warm)
+        if not background and qol_governs(reason):       # lane CFG: QoL interactive overflow (shadow logs, on decides)
+            _q = qol_decide(_early_cls, est_computed, ptok, units=units, pm_chain=_pm.get("chain"))
+            _q.update(qol_at="guard:" + reason, qol_legacy="local" if keep else "remote")
+            _active_set(request, **_q)
+            _QOL_STATS["%s:%s->%s" % (reason, _q["qol_legacy"], _q["qol_would"])] += 1
+            if QOL_OVERFLOW == "on" and _q["qol_would"] in ("local", "remote"):
+                keep, why = _q["qol_would"] == "local", "qol:" + _q["qol_why"]
         if keep:
             _local_first_kept[reason] += 1
             _lf_kept.append(reason)
@@ -8989,7 +9238,7 @@ async def _route_completions(request, _no_overflow=False):
             _local_first_remote[f"{reason}:{why}"] += 1
             try:                                   # LF: cold-cache loop signal (remote turns never warm the local prefix)
                 if _pm["credit"] < 0.1 * max(1, ptok) and why.startswith("saturated"):
-                    _local_first_cold_remote[client] += 1
+                    _local_first_cold_remote[_client_key(_local_first_cold_remote, client)] += 1
             except Exception:
                 pass
         return keep
@@ -9339,6 +9588,16 @@ async def _route_completions(request, _no_overflow=False):
         background, overflow_ok, is_peak(), LOCAL_WAIT, BG_WAIT, INTERACTIVE_NEVER_OVERFLOW)
     admitted = False
     t_admit0 = time.time()
+    # lane CFG QoL: an interactive request that may overflow is judged by its PREDICTED wait, not a timer.
+    _qol_live = (QOL_OVERFLOW in ("shadow", "on") and not background and overflow_ok and not alias_local_only
+                 and not local_pin)
+    _qol_broke, _qol_next = False, 0.0
+    if _qol_live:
+        _q = qol_decide(_early_cls, est_computed, ptok, units=units, pm_chain=_pm.get("chain"))
+        _q.update(qol_at="admission")
+        _active_set(request, **_q)
+        if QOL_OVERFLOW == "on":
+            deadline = t_admit0 + max(1.0, float(LOCAL_FIRST_FIRST_TOKEN_MAX))   # hard bound; the prediction decides first
     queued = False
     # The size-implied unit cost does not change while we wait (est_computed is fixed at arrival), so
     # compute it once rather than re-hashing the body on every 50 ms poll.
@@ -9422,6 +9681,14 @@ async def _route_completions(request, _no_overflow=False):
                 # Only the engine's prefill queue is full: background work is patient and has no
                 # reason to pay for remote because of it -- keep waiting (bounded) for it to drain.
                 deadline = max(deadline, t_admit0 + BG_WAIT_LOCAL)
+            if _qol_live and QOL_OVERFLOW == "on" and waited >= _qol_next:
+                _qol_next = waited + 1.0
+                _q = qol_decide(_early_cls, est_computed, ptok, units=units, waited=waited, pm_chain=_pm.get("chain"))
+                if _q.get("qol_would") == "remote":
+                    _q.update(qol_at="wait", qol_legacy=None)
+                    _active_set(request, **_q)
+                    _qol_broke = True
+                    break
             if time.time() >= deadline:
                 break
             if not queued:                       # first time we couldn't get a slot -> we're backlogged
@@ -9460,6 +9727,13 @@ async def _route_completions(request, _no_overflow=False):
             reason = "bg-yield"      # lanes exist but are reserved for interactive
         else:
             reason = "cap"
+        if _qol_broke:
+            reason = "qol"                # predicted local first token too late and remote measurably faster
+        elif _qol_live and not _local_offline() and _health["ok"]:
+            _q = qol_decide(_early_cls, est_computed, ptok, units=units, waited=waited, pm_chain=_pm.get("chain"))
+            _q.update(qol_at="wait-timeout", qol_legacy="remote")
+            _active_set(request, **_q)
+            _QOL_STATS["wait-timeout:remote->%s" % _q["qol_would"]] += 1
         where = f"remote({reason})" if overflow_ok and not alias_local_only else "local-only(wait-exhausted)"
         log.info("route %s units=%d inflight=%d/%d tok=%d/%d waited=%.1fs -> %s",
                  path, units, _inflight, effective_budget(), _inflight_tokens, token_budget(), waited, where)
@@ -9482,7 +9756,7 @@ async def _route_completions(request, _no_overflow=False):
     # Directory made configurable (SHIM_FLIGHTREC_DIR, default unchanged) by the
     # shim-remote-observability lane, 2026-09-05 -- see _flightrec_dir()'s docstring.
     try:
-        if ptok >= int(os.environ.get("SHIM_FLIGHTREC_MIN_TOK", "15000")):
+        if ptok >= _flightrec_min_tok():
             try:
                 fr = _flightrec_dir()
                 fn = f"{fr}/{int(time.time())}_{ptok}tok.json"
@@ -9828,6 +10102,19 @@ def _prom_line(name, value, labels=None):
     return f"{name} {value}"
 
 
+async def gateway_internal_errors(request):
+    """Lane SH: every suppressed exception (per source site: count, last time, last error) and every router crash
+    since start. Read-only; empty objects mean nothing has been swallowed."""
+    now = time.time()
+    return web.json_response({
+        "swallowed": {site: {"n": r[0], "last_t": round(r[1], 1), "last_age_s": round(now - r[1], 1), "last": r[2]}
+                      for site, r in sorted(_SWALLOWED.items())},
+        "router_crashes": dict(_ROUTER_CRASHES),
+        "telemetry_log": {k: _JSONL_STATE.get(k) for k in ("written", "dropped_queue", "dropped_cap", "dropped_bad",
+                                                            "dropped_io", "dropped_err", "last_err")},
+    })
+
+
 async def gateway_metrics(request):
     """One scrape target for both layers: this gateway's own counters/gauges, hand-formatted
     (deliberately not the prometheus_client library -- see the TELEMETRY module docstring far
@@ -9930,6 +10217,17 @@ async def gateway_metrics(request):
         L.append("# TYPE gateway_client_cost_est_usd_total counter")
         for name, c in _PER_CLIENT.items():
             L.append(_prom_line("gateway_client_cost_est_usd_total", round(c["cost_est_usd"], 6), {"client": name}))
+
+    if _SWALLOWED:                                    # lane SH: hidden failures are scrapeable
+        L.append("# HELP gateway_swallowed_errors_total Exceptions caught and suppressed at a state/IO site.")
+        L.append("# TYPE gateway_swallowed_errors_total counter")
+        for site, rec in sorted(_SWALLOWED.items()):
+            L.append(_prom_line("gateway_swallowed_errors_total", rec[0], {"site": site}))
+    if _ROUTER_CRASHES:
+        L.append("# HELP gateway_router_crashes_total Unhandled router exceptions answered with a JSON 500.")
+        L.append("# TYPE gateway_router_crashes_total counter")
+        for typ, n in sorted(_ROUTER_CRASHES.items()):
+            L.append(_prom_line("gateway_router_crashes_total", n, {"type": typ}))
 
     if _ENGINE_METRICS["ok"]:
         L.append(f"# engine metrics passthrough: last good scrape {round(time.time() - _ENGINE_METRICS['at'], 1)}s ago")
@@ -12355,6 +12653,7 @@ def make_app():
     app.router.add_post("/gateway/models/local", gateway_models_local)
     app.router.add_get("/gateway/config", gateway_config)
     app.router.add_get("/gateway/config/effective", gateway_config_effective)   # lane CFG: typed effective config
+    app.router.add_get("/gateway/internal-errors", gateway_internal_errors)    # lane SH: swallowed exceptions
     app.router.add_get("/gateway/spend", gateway_spend)                        # R2 spend authority
     app.router.add_post("/gateway/spend/reserve", gateway_spend_reserve)
     app.router.add_post("/gateway/spend/finalize", gateway_spend_finalize)
