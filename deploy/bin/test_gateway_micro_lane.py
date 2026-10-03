@@ -119,6 +119,24 @@ class ProbeDecision(unittest.TestCase):
         with patch.object(shim, "PROBE_SYNTH", False):
             self.assertFalse(self.d()[0])
 
+    def test_every_resolve_alias_kind_is_decided_correctly(self):
+        # Pin the decision to what _resolve_alias really returns for each model name (SH golden-test finding: the
+        # first cut only accepted builtin-local, so model=estate -- most of Halo's probes -- still hit the engine).
+        local = {"estate": "default", "estate-local": "builtin-local", "qwen-local": "native"}
+        remote = {"estate-remote": "builtin-remote", "estate-remote-pro": "builtin-remote"}
+        for model, kind in {**local, **remote}.items():
+            self.assertEqual(shim._resolve_alias(model)["kind"], kind, model)
+        with patch.dict(shim._ALIASES, {"my-ds": {"enabled": True, "base": "https://x.invalid"},
+                                        "off-one": {"enabled": False}}):
+            self.assertEqual(shim._resolve_alias("my-ds")["kind"], "custom-remote")
+            self.assertEqual(shim._resolve_alias("off-one")["kind"], "disabled")
+        for model, kind in local.items():
+            shim._PROBE_SEEN = 0
+            self.assertTrue(self.d(alias_kind=shim._resolve_alias(model)["kind"])[0], model)
+        for model, kind in {**remote, "my-ds": "custom-remote", "off-one": "disabled"}.items():
+            shim._PROBE_SEEN = 0
+            self.assertFalse(self.d(alias_kind=kind)[0], model)
+
     def test_response_shapes(self):
         r = shim.probe_synth_response(pbody(PROBE), "pong", False)
         j = json.loads(r.body)
@@ -178,6 +196,12 @@ class Routing(lf.RoutingBase):
         self.assertEqual(r.headers["X-Shim-Synth"], "probe")
         self.assertEqual(self.calls, [])
         self.assertEqual(self.events, [])                          # no slot, no engine, no remote
+
+    async def test_probe_is_answered_for_default_and_native_models_too(self):
+        for model in ("estate", "qwen-local"):
+            r = await self.route(model=model, messages=[{"role": "user", "content": PONG_CTX}])
+            self.assertEqual(r.headers["X-Shim-Synth"], "probe", model)
+        self.assertEqual(self.calls, [])
 
     async def test_probe_goes_through_for_real_when_the_engine_is_stale_or_alias_is_remote(self):
         with patch.object(shim, "_LAST_LOCAL_OK", time.time() - 3600):

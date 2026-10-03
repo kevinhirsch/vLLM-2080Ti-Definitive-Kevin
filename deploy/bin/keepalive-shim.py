@@ -1583,6 +1583,9 @@ def micro_history_restore(rows):
     return len(rows or [])
 
 
+# _resolve_alias kinds a local engine can answer: "default" (model=estate, local-first), "builtin-local" (estate-local) and
+# "native" (any other model name the engine serves). builtin-remote / custom-remote / disabled must exercise THEIR path.
+PROBE_SYNTH_ALIAS_KINDS = frozenset({None, "", "default", "builtin-local", "native"})
 _PROBE_RE = re.compile(r"^\s*reply with (?:the )?(?:single|one|only the) word:?\s*[\"'`]?([A-Za-z0-9_-]{1,24})[\"'`]?(?=\s|$)", re.I)
 # What Hermes/the front door append to the probe: injected live state, truncated plugin output, the clock line.
 _PROBE_CONTEXT_MARKERS = ("##", "[plugin hook", "(awareness", "now (")
@@ -1619,7 +1622,7 @@ def probe_synth_decision(word, alias_kind, local_ok_age_s, health_ok, offline_or
     global _PROBE_SEEN
     if not PROBE_SYNTH or not word:
         return False, "off"
-    if alias_kind not in (None, "", "builtin-local"):
+    if alias_kind not in PROBE_SYNTH_ALIAS_KINDS:
         return False, "alias-%s" % alias_kind            # an estate-remote / custom probe must exercise ITS provider
     if offline_or_forced:
         return False, "window"
