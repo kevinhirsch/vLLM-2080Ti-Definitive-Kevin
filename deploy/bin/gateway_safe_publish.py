@@ -226,40 +226,113 @@ def _restore_dashboard(state: dict) -> None:
 # its own directory at startup and runs unvalidated without it). Paths derive from SOURCE/RUNTIME at call time so a
 # test that redirects those never touches the production directory.
 CONFIG_SCHEMA_NAME = "gateway_config_schema.py"
+# Lane SH (2026-10-03): the manifest of Python modules that ship beside the shim. The shim loads each one from its
+# own directory at STARTUP (spec_from_file_location; the live dir is never put on sys.path), so -- unlike the
+# dashboard, which is read per request -- a changed module only takes effect through the drained restart: a
+# module-only change is a full publish, never the no-restart "current" path. (filename, result key). A module absent
+# from the source tree is "absent" (not an error); a first install is removed again on rollback.
+GATEWAY_MODULES = (
+    (CONFIG_SCHEMA_NAME, "config_schema"),
+)
+
+
+def _module_names() -> list[str]:
+    return [name for name, _ in GATEWAY_MODULES]
+
+
+def _module_sources() -> dict:
+    """{filename: bytes} of every manifest module present in the source tree (beside SOURCE, read at call time)."""
+    out = {}
+    for name in _module_names():
+        src = SOURCE.with_name(name)
+        if src.is_file():
+            out[name] = src.read_bytes()
+    return out
+
+
+def _modules_current(sources: dict) -> bool:
+    """True when every shipped module is byte-identical at its live path (RUNTIME's directory)."""
+    for name, data in sources.items():
+        dst = RUNTIME.with_name(name)
+        if not dst.is_file() or dst.read_bytes() != data:
+            return False
+    return True
+
+
+def _modules_loaded_match(token: str, sources: dict) -> bool:
+    """Lane SH: the restarted gateway reports (GET /gateway/modules) the sha256 of every module it executed; each
+    shipped module must be loaded with exactly the published bytes. A gateway without the endpoint can only be one
+    that predates the manifest, i.e. one shipping no code modules: then only the optional schema may be unverified."""
+    try:
+        got = (_http("/gateway/modules", token=token).get("modules") or {})
+    except Exception:
+        got = None
+    for name, data in sources.items():
+        rec = (got or {}).get(name)
+        if got is None and name == CONFIG_SCHEMA_NAME:
+            continue
+        if not rec or not rec.get("loaded") or rec.get("sha256") != _sha(data):
+            return False
+    return True
 
 
 def _install_gateway_files(dash: bytes) -> dict:
-    """Every file that ships beside the shim (dashboard + config schema), for _publish only. Lane CFG 2026-10-03: the
-    schema install used to ride inside _install_dashboard(), so a test that redirected only DASH_RUNTIME wrote the
-    LIVE gateway_config_schema.py. _install_dashboard() is dashboard-only again; only the publish path ships both."""
-    return {**_install_dashboard(dash), **_install_config_schema()}
+    """Every file that ships beside the shim (dashboard + the GATEWAY_MODULES manifest), for _publish only. Lane CFG
+    2026-10-03: the schema install used to ride inside _install_dashboard(), so a test that redirected only
+    DASH_RUNTIME wrote the LIVE gateway_config_schema.py. _install_dashboard() is dashboard-only again; only the
+    publish path ships both."""
+    return {**_install_dashboard(dash), **_install_modules()}
 
 
 def _restore_gateway_files(state: dict) -> None:
-    _restore_config_schema(state)
+    _restore_modules(state)
     _restore_dashboard(state)
 
 
+def _install_modules() -> dict:
+    out = {"modules": {}}
+    for name, key in GATEWAY_MODULES:
+        src, dst = SOURCE.with_name(name), RUNTIME.with_name(name)
+        if not src.is_file():
+            out[key] = "absent"
+            out["modules"][name] = {"status": "absent", "changed": False}
+            continue
+        new = src.read_bytes()
+        old = dst.read_bytes() if dst.is_file() else None
+        if old == new:
+            out[key] = "current"
+            out["modules"][name] = {"status": "current", "changed": False}
+            continue
+        _atomic_write(dst, new, 0o644)
+        out[key] = "installed"
+        out["modules"][name] = {"status": "installed", "changed": True, "previous": old}
+    return out
+
+
+def _restore_modules(state: dict) -> None:
+    for name, rec in (state.get("modules") or {}).items():
+        if not rec.get("changed"):
+            continue
+        dst = RUNTIME.with_name(name)
+        if rec.get("previous") is None:
+            dst.unlink(missing_ok=True)
+        else:
+            _atomic_write(dst, rec["previous"], 0o644)
+
+
 def _install_config_schema() -> dict:
-    src, dst = SOURCE.with_name(CONFIG_SCHEMA_NAME), RUNTIME.with_name(CONFIG_SCHEMA_NAME)
-    if not src.is_file():
-        return {"config_schema": "absent", "schema_changed": False}
-    new = src.read_bytes()
-    old = dst.read_bytes() if dst.is_file() else None
-    if old == new:
-        return {"config_schema": "current", "schema_changed": False}
-    _atomic_write(dst, new, 0o644)
-    return {"config_schema": "installed", "schema_previous": old, "schema_changed": True}
+    """Back-compat single-module entry point (the schema is now one row of GATEWAY_MODULES)."""
+    st = _install_modules()
+    rec = st["modules"].get(CONFIG_SCHEMA_NAME, {})
+    out = {"config_schema": st.get("config_schema", "absent"), "schema_changed": bool(rec.get("changed"))}
+    if rec.get("changed"):
+        out["schema_previous"] = rec.get("previous")
+    return out
 
 
 def _restore_config_schema(state: dict) -> None:
-    if not state.get("schema_changed"):
-        return
-    dst = RUNTIME.with_name(CONFIG_SCHEMA_NAME)
-    if state.get("schema_previous") is None:
-        dst.unlink(missing_ok=True)
-    else:
-        _atomic_write(dst, state["schema_previous"], 0o644)
+    if state.get("schema_changed"):
+        _restore_modules({"modules": {CONFIG_SCHEMA_NAME: {"changed": True, "previous": state.get("schema_previous")}}})
 
 
 # LV 2026-10-03: "is a Halo run live?" is the incident SUPERVISOR's question, answered by its lease-backed occupancy, not by this
@@ -548,15 +621,17 @@ def _publish(timeout_s: float, halo_wait_s: float) -> dict:
     dash_committed = subprocess.check_output(["git", "show", "HEAD:deploy/bin/gateway_dashboard.html"], cwd=REPO)
     if dash != dash_committed:
         raise RuntimeError("dashboard source differs from committed HEAD")
-    schema_src = SOURCE.with_name(CONFIG_SCHEMA_NAME)
-    if schema_src.is_file() and schema_src.read_bytes() != subprocess.check_output(
-            ["git", "show", "HEAD:deploy/bin/" + CONFIG_SCHEMA_NAME], cwd=REPO):
-        raise RuntimeError("config schema source differs from committed HEAD")
+    modules = _module_sources()
+    for name, data in modules.items():
+        if data != subprocess.check_output(["git", "show", "HEAD:deploy/bin/" + name], cwd=REPO):
+            raise RuntimeError(f"{name} source differs from committed HEAD")
     if not RUNTIME.is_file():
         raise RuntimeError("live gateway file is missing")
     previous = RUNTIME.read_bytes()
-    if previous == source:
-        # Same gateway code: the page alone may still be new. It is read per request, so no drain or restart is needed.
+    if previous == source and _modules_current(modules):
+        # Same gateway code AND the same startup-loaded modules: the page alone may still be new. It is read per
+        # request, so no drain or restart is needed. (Lane SH: a module-only change used to take this path -- the
+        # new module sat on disk unloaded until some later restart paired it with whatever shim was live then.)
         state = _install_gateway_files(dash)
         return {"status": "current", "sha256": _sha(source), "dashboard": state["dashboard"], "dashboard_sha256": _sha(dash),
                 "config_schema": state.get("config_schema")}
@@ -616,7 +691,8 @@ def _publish(timeout_s: float, halo_wait_s: float) -> dict:
                 new_spend = _http("/gateway/spend", token=token)
                 if (health.get("http_status") == 200 and new_spend.get("gateway_sha256") == _sha(source)
                         and new_spend.get("enforce") and new_spend.get("durable")
-                        and new_spend.get("attribution_gap_usd", 0) == 0):
+                        and new_spend.get("attribution_gap_usd", 0) == 0
+                        and _modules_loaded_match(token, modules)):
                     return {"status": "published", "sha256": _sha(source), "dashboard": dash_state["dashboard"] if "dashboard" in dash_state else "current",
                             "dashboard_sha256": _sha(dash), "backup": str(backup), "spent": new_spend.get("spent"),
                             "config_schema": dash_state.get("config_schema")}
