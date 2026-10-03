@@ -297,6 +297,24 @@ PREFIX_CACHE_MAX_CLIENTS = 200   # (legacy one-deep model bound; the model below
 PREFIX_ALIGN_TOKENS = int(os.environ.get("SHIM_PREFIX_ALIGN_TOKENS", "3568"))
 PREFIX_MODEL_TTL_SECS = float(os.environ.get("SHIM_PREFIX_MODEL_TTL_SECS", "900"))
 PREFIX_MODEL_MAX_NODES = int(os.environ.get("SHIM_PREFIX_MODEL_MAX_NODES", "60000"))
+# [LANE CR 2026-10-03] Lost tool-loop continuations. All default OFF.
+#  SHIM_CHAIN_TELEMETRY=1  log, per request, the route that last served this conversation's deepest known
+#                          message prefix (chain_prev_route/_age_s) and the unshaved matched prefix
+#                          (pm_match_tok): the exact "previous turn went remote" (cause b) signal.
+#  SHIM_WARM_PRIORITY=1    a warm continuation (credit >= MIN_CREDIT, predicted uncached <= MAX_COMPUTED)
+#                          is sent to vLLM with priority WARM_PRIORITY_VALUE (scheduling-policy priority) so it
+#                          is admitted ahead of cold prefills (its remainder fits the step budget a running
+#                          cold chunk leaves), and local-first judges it on queue + own prefill, not on the
+#                          cold backlog it no longer waits behind. Keeps warm chains local instead of
+#                          splitting them to remote under monster/prefill pressure.
+#  SHIM_PREFIX_CREDIT_UNIT=N  round the cost model's credit to N tokens instead of whole attention blocks
+#                          (set to the engine's --prefix-match-unit when it runs VLLM_GDN_TAIL_PUBLISH=copy).
+CHAIN_TELEMETRY = os.environ.get("SHIM_CHAIN_TELEMETRY", "0").lower() in ("1", "true", "on", "yes")
+WARM_PRIORITY = os.environ.get("SHIM_WARM_PRIORITY", "0").lower() in ("1", "true", "on", "yes")
+WARM_PRIORITY_MIN_CREDIT = int(os.environ.get("SHIM_WARM_PRIORITY_MIN_CREDIT", "4096"))
+WARM_PRIORITY_MAX_COMPUTED = int(os.environ.get("SHIM_WARM_PRIORITY_MAX_COMPUTED", "1700"))
+WARM_PRIORITY_VALUE = int(os.environ.get("SHIM_WARM_PRIORITY_VALUE", "-10"))
+PREFIX_CREDIT_UNIT = int(os.environ.get("SHIM_PREFIX_CREDIT_UNIT", "0"))
 # Prefill is the engine's scarce resource (one cold 50K prompt = ~45s of chunk steps that every
 # younger request waits behind). These express the guards in SECONDS OF PREFILL at PREFILL_TPS
 # (so they follow the measured rate instead of a hard-coded token count):
@@ -1295,7 +1313,7 @@ def local_first_predicted_ttft(cls, est_computed, *, background=False, units=1, 
     return queue + backlog + own, {"queue_s": round(queue, 1), "backlog_s": round(backlog, 1), "own_s": round(own, 1)}
 
 
-def local_first_decision(reason, *, background, units, reservation, est_computed=0, now=None, cls=None):
+def local_first_decision(reason, *, background, units, reservation, est_computed=0, now=None, cls=None, warm=False):
     """(keep_local, why) for a capacity/latency-PREDICTIVE remote reason.
 
     keep_local=False means: route remote under `reason` exactly as before this policy
@@ -1307,6 +1325,11 @@ def local_first_decision(reason, *, background, units, reservation, est_computed
         return False, "local-unhealthy"
     if LOCAL_FIRST_DERIVE and cls in FLOW_CLASSES:
         ttft, parts = local_first_predicted_ttft(cls, est_computed, background=background, units=units, now=now)
+        if ttft is not None and warm and WARM_PRIORITY:
+            # [LANE CR] a warm continuation is sent with engine priority and its uncached remainder fits the step
+            # budget a running cold chunk leaves, so it does not wait behind the cold backlog.
+            ttft = ttft - parts.get("backlog_s", 0.0)
+            parts = dict(parts, backlog_s=0.0)
         if ttft is not None:
             sat = []
             if not _memory_available(reservation):
@@ -3792,6 +3815,11 @@ def _telemetry_note_request(info, resp=None):
                         name, est_computed, computed_actual, computed_actual / max(1, est_computed))
             _MISESTIMATE_FEED.appendleft({"t": round(now, 1), "client": name,
                                           "est_computed": est_computed, "computed_actual": computed_actual})
+        if CHAIN_TELEMETRY or WARM_PRIORITY:
+            try:
+                _chain_route_note((_PM_INFLIGHT.get(info.get("pm_ref")) or {}).get("chain") or [], route, now)
+            except Exception:
+                pass
         _pm_feedback(info)        # LS lane: grade + self-correct the cache-aware cost model
         # (e) append-only JSONL request log -- see DESIGN.md (e) / REPORT.md. Never write on the
         # request path: this only appends a small dict to a bounded in-memory list;
@@ -3861,6 +3889,9 @@ def _telemetry_note_request(info, resp=None):
             "pm_credit": info.get("pm_credit"), "pm_age_s": info.get("pm_age_s"),
             "flow_class": info.get("flow_class"), "flow_expected_wait": info.get("flow_expected_wait_s"),
             "flow_held": info.get("flow_held"), "flow_adjacent": info.get("flow_adjacent"),
+            **({"chain_prev_route": info.get("chain_prev_route"), "chain_prev_age_s": info.get("chain_prev_age_s"),
+                "pm_match_tok": info.get("pm_match_tok"), "warm_priority": bool(info.get("warm_priority"))}
+               if (CHAIN_TELEMETRY or WARM_PRIORITY) else {}),
         })
     except Exception as e:
         log.warning("telemetry note_request: %s", e)
@@ -6163,6 +6194,37 @@ _PM_PAIRS = collections.deque(maxlen=500)  # (predicted_credit, actual_cached, p
 _PM_INFLIGHT = {}                          # id(request) -> prediction dict (chain etc.) until the request ends
 
 
+_CHAIN_ROUTE = collections.OrderedDict()   # [LANE CR] full-chain key of a finished request -> [route, t]
+
+
+def _chain_route_lookup(chain, now=None):
+    """(route, age_s, depth) of the deepest message prefix of `chain` that a finished request was served
+    on, within the prefix-model TTL; (None, None, -1) when this conversation has no known predecessor."""
+    now = time.time() if now is None else now
+    for i in range(len(chain) - 1, -1, -1):
+        node = _CHAIN_ROUTE.get(chain[i][0])
+        if node is not None and now - node[1] <= PREFIX_MODEL_TTL_SECS:
+            return node[0], now - node[1], i
+    return None, None, -1
+
+
+def _chain_route_note(chain, route, now=None):
+    """Remember which route served this request's whole conversation (its deepest chain node)."""
+    if not chain or route not in ("local", "remote"):
+        return
+    k = chain[-1][0]
+    _CHAIN_ROUTE[k] = [route, time.time() if now is None else now]
+    _CHAIN_ROUTE.move_to_end(k)
+    while len(_CHAIN_ROUTE) > max(1000, PREFIX_MODEL_MAX_NODES):
+        _CHAIN_ROUTE.popitem(last=False)
+
+
+def warm_continuation(pm):
+    """[LANE CR] True when the cost model says this request is a warm continuation of a local chain."""
+    return (WARM_PRIORITY and int(pm.get("credit") or 0) >= WARM_PRIORITY_MIN_CREDIT
+            and int(pm.get("computed") or 0) <= WARM_PRIORITY_MAX_COMPUTED)
+
+
 def _pm_chain(body):
     """[(chain_key, cumulative_serialized_chars)] -- one entry per message boundary of the request,
     plus the grand total. The root folds in everything that changes the rendered PREFIX before the
@@ -6218,9 +6280,10 @@ def _pm_predict(body, est_tokens, now=None):
         # estimate: pad it by the fixed margin plus 3%, shave it by how well past predictions held
         # up against the engine's own cached_tokens, then round DOWN to whole attention blocks.
         matched = chain[best][1] / total * est
-        a = max(1, prefix_align_tokens())
+        a = max(1, PREFIX_CREDIT_UNIT if PREFIX_CREDIT_UNIT > 0 else prefix_align_tokens())
         credit = (int(max(0.0, (matched - PREFIX_HIT_MARGIN_TOKENS - 0.03 * matched) * _pm_trust())) // a) * a
     return {"computed": max(1, est - credit), "credit": credit, "best": best,
+            "matched": int(chain[best][1] / total * est) if best >= 0 and total > 0 else 0,
             "age": age, "chain": chain, "total": total, "est": est}
 
 
@@ -6548,6 +6611,12 @@ def _prepare_local_body(request, body, background):
         if alias["kind"] in ("default", "builtin-local"):
             local_alias_body = json.loads(body)
             local_alias_body["model"] = _local_model_name()
+            if WARM_PRIORITY and not halo_control and "priority" not in local_alias_body:
+                try:
+                    if request.get("cr_warm_priority"):
+                        local_alias_body["priority"] = WARM_PRIORITY_VALUE     # [LANE CR] warm continuation
+                except Exception:
+                    pass
             if halo_control:
                 # vLLM priority scheduling preempts bulk FCFS work for the one
                 # control decision that keeps the estate supervised. A bounded
@@ -7902,6 +7971,17 @@ async def _route_completions(request, _no_overflow=False):
     _PM_INFLIGHT[id(request)] = _pm
     _active_set(request, est_tokens=ptok, est_computed=est_computed, pm_credit=_pm["credit"],
                 pm_age_s=None if _pm["age"] is None else round(_pm["age"], 1), pm_ref=id(request))
+    if CHAIN_TELEMETRY or WARM_PRIORITY:
+        try:
+            _cr_route, _cr_age, _ = _chain_route_lookup(_pm["chain"])
+            _active_set(request, chain_prev_route=_cr_route,
+                        chain_prev_age_s=None if _cr_age is None else round(_cr_age, 1), pm_match_tok=_pm.get("matched"))
+        except Exception:
+            pass
+    _cr_warm = warm_continuation(_pm)
+    if _cr_warm:
+        request["cr_warm_priority"] = True
+        _active_set(request, warm_priority=True)
     _prefix_cache_observe(client, body, ptok)
     # What the routing guards below treat as this request's "size": the predicted UNCACHED prefill
     # when the cache-aware cost model is on, else the raw prompt (previous behaviour, byte for byte).
@@ -7981,7 +8061,8 @@ async def _route_completions(request, _no_overflow=False):
 
     def _lf_keep(reason):
         keep, why = local_first_decision(reason, background=background, units=units,
-                                         reservation=_lf_res, est_computed=est_computed, cls=_early_cls)
+                                         reservation=_lf_res, est_computed=est_computed, cls=_early_cls,
+                                         warm=_cr_warm)
         if keep:
             _local_first_kept[reason] += 1
             _lf_kept.append(reason)
