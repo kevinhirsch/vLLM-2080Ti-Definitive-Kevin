@@ -10,6 +10,7 @@ set -u
 L=/home/kevin/projects/lanes/k5; K5=/home/kevin/Desktop/wt-k5; I=/home/kevin/Desktop/wt-integrate
 SD=/home/kevin/.local/share/vllm-qwen27b; O=$SD/v02.override.env
 mkdir -p $L/win $L/win/prof_base $L/win/prof_k5; rm -f $L/test_gdn_mtp.json $L/test_tq_batched.json; cp $O $L/win/override.saved; echo "k5 window start $(date)"; cat $L/win/override.saved
+WD0=$(systemctl is-active vllm-qwen27b-watchdog.timer); echo "watchdog timer at start: $WD0"
 XID0=$(sudo -n dmesg 2>/dev/null | grep -c -E 'Xid' || echo na)
 gpu_clean_wait() {  # wait up to 600 s for no non-engine GPU compute processes before a boot (the KV pool is sized at boot)
   local t0=$(date +%s) f
@@ -48,7 +49,8 @@ measure() {  # measure LABEL
   done
 }
 # 1. kernel test with the engine stopped
-echo "== stop engine $(date +%T)"; sudo -n systemctl stop vllm-qwen27b; sleep 5
+echo "== stop engine $(date +%T)"; [ "$WD0" = active ] && sudo -n systemctl stop vllm-qwen27b-watchdog.timer  # its Wants= would restart a stopped engine within a minute
+sudo -n systemctl stop vllm-qwen27b; sleep 5
 nvidia-smi --query-gpu=index,memory.used --format=csv,noheader
 ( . $L/envbuild.sh; cd $K5 && CUDA_VISIBLE_DEVICES=1 VLLM_K5_GDN_BUILD_DIR=$L/ext PYTHONPATH=$K5 timeout 600 python tools/k5/test_gdn_mtp.py ) 2>&1 | grep -vE "^W1003|warn" | tail -20
 TEST_RC=${PIPESTATUS[0]}; KPASS=$(python3 -c "import json;print(json.load(open('$L/test_gdn_mtp.json'))['pass'])" 2>/dev/null || echo False)
@@ -74,4 +76,5 @@ echo "== restore $(date +%T)"; cp $L/win/override.saved $O; gpu_clean_wait resto
 python3 $SD/engine-actuator.py restart --by K5 --reason "K5 window restore" --no-drain --foreground > $L/win/boot_restore.log 2>&1 &
 sleep 20; t0=$(date +%s); until curl -s -m 2 -o /dev/null -w "%{http_code}" localhost:8001/health | grep -q 200; do [ $(( $(date +%s) - t0 )) -ge 900 ] && break; sleep 4; done
 cmp -s $O $L/win/override.saved && echo "override restored verbatim"
+[ "$WD0" = active ] && sudo -n systemctl start vllm-qwen27b-watchdog.timer; echo "watchdog timer now: $(systemctl is-active vllm-qwen27b-watchdog.timer)"
 echo "restored health $(curl -s -m3 -o /dev/null -w '%{http_code}' localhost:8001/health) Xid before=$XID0 after=$(sudo -n dmesg 2>/dev/null | grep -c -E 'Xid' || echo na) $(date)"
