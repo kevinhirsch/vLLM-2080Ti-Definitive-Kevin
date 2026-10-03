@@ -89,8 +89,20 @@ def http(path, method="GET", payload=None):
         return {"error": e.read().decode()[:300], "http": e.code}
 
 
+OFFLINE_REFUSED_PUBLISH = "publish-in-flight"    # the gateway's 409 code while a gateway publish (drain fence) is in flight
+PUBLISH_WAIT_S = float(os.environ.get("GATEWAY_OFFLINE_PUBLISH_WAIT_S", "1800"))
+
+
 def open_window(reason, by, ttl, wait_s, mode="open"):
     d = http("/gateway/offline", "POST", {"ttl_s": ttl, "reason": reason, "by": by})
+    t_pub = time.time()
+    # GW2 2026-10-03: a window opened during a gateway publish was dropped by the publish's restart. The gateway now
+    # refuses to open one while its drain fence is up; wait for the publish (bounded) instead of failing the window.
+    while (not d.get("lease") and d.get("http") == 409 and OFFLINE_REFUSED_PUBLISH in str(d.get("error"))
+           and time.time() - t_pub < PUBLISH_WAIT_S):
+        print("gateway publish in flight: waiting to open the offline window", file=sys.stderr, flush=True)
+        time.sleep(15)
+        d = http("/gateway/offline", "POST", {"ttl_s": ttl, "reason": reason, "by": by})
     if not d.get("lease"):
         return d, None
     # L77: persist at once (not after the wait) and close the window if this process is interrupted while waiting, so a

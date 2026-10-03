@@ -103,10 +103,14 @@ class FakeGateway:
     def __init__(self):
         self.lease = None
         self.events = []
+        self.offline = False          # GW2: a planned offline window the publisher must not restart inside
 
     def __call__(self, path, method="GET", payload=None, token=""):
         if path == "/health":
             return {"http_status": 200}
+        if path == "/gateway/offline":
+            return {"offline": self.offline, "reason": "K5 A/B" if self.offline else None,
+                    "by": "K5" if self.offline else None, "remaining_s": 900 if self.offline else 0}
         if path == "/gateway/spend":
             return {"enforce": True, "durable": True, "cap": 25.0, "in_flight": 0}
         assert path == "/gateway/drain", path
@@ -203,6 +207,28 @@ class TerminationReleasesEverything(unittest.TestCase):
         self.assertEqual(self.gw.events, ["open", "delete"])
         self.assert_nothing_held()
 
+    def test_refuses_to_start_inside_a_planned_offline_window(self):
+        """GW2 2026-10-03: a 09:11 publish restarted the gateway inside K5's engine window and dropped the window."""
+        self.gw.offline = True
+        with patch.object(pub, "_wait_halo_quiet"), patch.object(pub, "_wait_empty"):
+            with self.assertRaisesRegex(RuntimeError, "planned offline window open .* at start"):
+                pub.publish(10, 10)
+        self.assertEqual(self.gw.events, [])                  # never even opened the fence
+        self.assertEqual(pub.RUNTIME.read_text(), "old gateway\n")
+        self.assert_nothing_held()
+
+    def test_aborts_before_restart_when_a_window_opens_mid_drain(self):
+        def drained(token, timeout_s):
+            self.gw.offline = True                             # K5 opened its window while the publisher waited
+        with patch.object(pub, "_wait_halo_quiet"), patch.object(pub, "_wait_empty", drained), \
+                patch.object(pub, "_run") as run:
+            with self.assertRaisesRegex(RuntimeError, "at restart"):
+                pub.publish(10, 10)
+        self.assertNotIn(("sudo", "-n", "systemctl", "restart", pub.SERVICE), [c.args for c in run.call_args_list])
+        self.assertEqual(pub.RUNTIME.read_text(), "old gateway\n")
+        self.assertEqual(self.gw.events, ["open", "delete"])
+        self.assert_nothing_held()
+
     def test_signal_after_install_does_not_start_a_rollback_but_releases_leases(self):
         def restart_then_killed(*args):
             if args[:3] == ("sudo", "-n", "systemctl") and args[3] == "restart":
@@ -233,6 +259,7 @@ class TerminationReleasesEverything(unittest.TestCase):
             lease = {{"v": None}}
             def http(path, method="GET", payload=None, token=""):
                 if path == "/health": return {{"http_status": 200}}
+                if path == "/gateway/offline": return {{"offline": False}}
                 if path == "/gateway/spend": return {{"enforce": True, "durable": True, "cap": 25.0}}
                 if method == "POST": lease["v"] = "L"; return {{"lease": "L"}}
                 if method == "DELETE":

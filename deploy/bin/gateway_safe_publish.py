@@ -301,6 +301,19 @@ def halo_run_live(row: dict, now: float | None = None) -> bool:
     return status in HALO_OPEN_STATES and bool(run_status) and run_status not in HALO_TERMINAL_RUN_STATUSES
 
 
+def _refuse_if_offline_window(token: str, phase: str) -> None:
+    """GW2 2026-10-03: never restart the gateway inside a planned offline window. At 09:06 a K5 engine window opened while
+    a publish waited for Halo; the restart dropped the window (it lived only in gateway memory) while the engine was
+    stopped. The gateway now persists windows and refuses to OPEN one while the drain fence is up; this closes the gap
+    before the fence (start) and between fence and restart (restart). An unreadable status refuses too."""
+    st = _http("/gateway/offline", token=token)
+    if st.get("http_status") not in (None, 200) or "offline" not in st:
+        raise RuntimeError(f"planned-offline status unreadable before {phase}: {str(st)[:200]}")
+    if st.get("offline"):
+        raise RuntimeError(f"planned offline window open ({st.get('reason')!r} by {st.get('by')!r}, "
+                           f"{st.get('remaining_s')} s left): publish refused at {phase}")
+
+
 def _halo_active_runs() -> list[str]:
     """Do not restart the gateway between turns of an active Halo repair."""
     if not HALO_INCIDENTS.is_dir():
@@ -556,6 +569,7 @@ def _publish(timeout_s: float, halo_wait_s: float) -> dict:
     drain_before = _http("/gateway/drain", token=token)
     if drain_before.get("draining") and not _reap_orphan_drain(token):
         raise RuntimeError("another publisher already holds the drain lease")
+    _refuse_if_offline_window(token, "start")
 
     halo_pause = None
     live_hold = None
@@ -591,6 +605,7 @@ def _publish(timeout_s: float, halo_wait_s: float) -> dict:
             active = _halo_active_runs()
             if active:
                 raise RuntimeError(f"Halo became active during gateway drain: {active[:6]}")
+            _refuse_if_offline_window(token, "restart")    # one opened during the Halo wait, before the fence went up
             dash_state = _install_gateway_files(dash)  # before the restart: the new shim finds its page at once
             _atomic_write(RUNTIME, source)
             installed = True
