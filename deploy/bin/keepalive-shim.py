@@ -7304,7 +7304,7 @@ class _SSEShape:
     reasoning had streamed before the first real output (content or tool call). Never raises."""
 
     __slots__ = ("tail", "finish", "tools", "reasoning_chars", "content_chars", "reasoning_at_output",
-                 "args_chars", "overflow")
+                 "args_chars", "overflow", "content_nonblank")
 
     def __init__(self):
         self.tail = b""
@@ -7315,6 +7315,7 @@ class _SSEShape:
         self.reasoning_at_output = None
         self.args_chars = 0
         self.overflow = False
+        self.content_nonblank = False
 
     @property
     def saw_output(self):
@@ -7368,6 +7369,7 @@ class _SSEShape:
                 if c:
                     self.content_chars += len(c)
                     if str(c).strip():
+                        self.content_nonblank = True
                         self._output()
                 for tc in d.get("tool_calls") or []:
                     self._output()
@@ -7495,6 +7497,12 @@ def tool_args_check(calls, schemas):
 def _shape_kw(shape, body, local):
     """_active_set kwargs for a finished stream's _SSEShape (L94 + L95 telemetry)."""
     kw = {"reasoning_chars": shape.reasoning_chars, "reasoning_chars_at_output": shape.reasoning_at_output}
+    # Same class as L94: _sse_content_shape skips any SSE line split across network chunks, so it can MISS the
+    # only content/tool line of a response and report a false empty. The lossless scan corrects false negatives only.
+    if shape.content_nonblank:
+        kw["content_empty"] = False
+    if shape.tools:
+        kw["has_tool_calls"] = True
     if local and shape.finish is not None:
         kw["finish_reason"] = shape.finish
     if shape.tools:
