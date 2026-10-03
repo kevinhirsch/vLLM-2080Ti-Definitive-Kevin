@@ -586,6 +586,28 @@ DEFAULT_MAX_OUT  = int(os.environ.get("SHIM_DEFAULT_MAX_OUT", "8192"))
 # (a tiny call on DeepSeek is near-free + fast) rather than waiting.
 TINY_TOKENS       = int(os.environ.get("SHIM_TINY_TOKENS", "1500"))
 TINY_EXTRA_LANES  = int(os.environ.get("SHIM_TINY_EXTRA_LANES", "2"))
+# --- MICRO fast lane v2 (lane K4, 2026-10-03) ---
+# Measured on 7 days of gateway telemetry (40.8k local completions): the static is_tiny() rule (prompt + max_tokens
+# <= TINY_TOKENS) catches 5.2% of requests, but a further ~10% finish in <=64 output tokens and queue in the full
+# lanes because their max_tokens is unset or large (research-service fact-checks, Halo pong probes, JSON triage).
+# MICRO_LEARN lets the gateway LEARN that a (client, prompt-head) signature is short-output and admit it to the tiny
+# lane. Unlike static-tiny, a learned-tiny request that finds the tiny lanes full WAITS locally (never overflows to
+# paid remote). Kill switch: SHIM_MICRO_LEARN=0.
+MICRO_LEARN       = os.environ.get("SHIM_MICRO_LEARN", "1") not in ("0", "false", "")
+MICRO_SIG_CHARS   = int(os.environ.get("SHIM_MICRO_SIG_CHARS", "32"))      # normalized prompt-head chars in a signature
+MICRO_MIN_SAMPLES = int(os.environ.get("SHIM_MICRO_MIN_SAMPLES", "6"))     # completions seen before a signature qualifies
+MICRO_HISTORY     = int(os.environ.get("SHIM_MICRO_HISTORY", "16"))        # most recent completions kept per signature
+MICRO_MAX_OUT     = int(os.environ.get("SHIM_MICRO_MAX_OUT", "96"))        # EVERY recent completion must be <= this
+MICRO_MAX_PROMPT  = int(os.environ.get("SHIM_MICRO_MAX_PROMPT", "6000"))   # prompts larger than this are never micro
+MICRO_MAX_SIGS    = 2000
+# --- PROBE synth (lane K4): Halo's front-door "Reply with the single word: pong" liveness probe fires every ~5 min,
+# carries 3-35k tokens of injected session context (2.9% of all uncached prefill in a week, 0.8% of requests) and
+# 391 of 1558 probes in that week were billed to the paid remote. When the engine has produced real tokens within
+# PROBE_FRESH_S, the gateway answers the probe itself; every PROBE_REAL_EVERY-th probe still goes through for real
+# so end-to-end generation stays proven. Only local-capable aliases (never estate-remote). Kill: SHIM_PROBE_SYNTH=0.
+PROBE_SYNTH       = os.environ.get("SHIM_PROBE_SYNTH", "1") not in ("0", "false", "")
+PROBE_FRESH_S     = float(os.environ.get("SHIM_PROBE_FRESH_S", "120"))
+PROBE_REAL_EVERY  = int(os.environ.get("SHIM_PROBE_REAL_EVERY", "12"))
 # --- concurrency-aware first-token deadline (2026-08-13) ---
 # Prefill compute is SHARED across concurrent requests on this box, so a big request queued behind
 # N others emits its first token only after ~N prefills complete. Scaling the wedge-detection
@@ -1404,6 +1426,162 @@ def output_history_restore(data):
             note_output_tokens(c, o, t)
             n += 1
     return n
+
+
+# ---- MICRO fast lane v2 + PROBE synth (lane K4, 2026-10-03) ----
+_MICRO_HIST = collections.OrderedDict()   # (client, signature) -> deque[outtok] of recent completed local answers
+_MICRO_STATS = {"admitted": 0, "observed": 0, "probe_synth": 0, "probe_real": 0}
+_LAST_LOCAL_OK = 0.0                      # last time the local engine really produced tokens for someone
+_PROBE_SEEN = 0
+
+
+def _micro_sig(client, text):
+    """(client, normalized prompt head). Digits fold to '#', whitespace collapses: ids, counts and timestamps in a
+    prompt head must not split one logical call type into endless one-sample signatures."""
+    t = re.sub(r"\s+", " ", re.sub(r"\d+", "#", (text or "").lower())).strip()
+    return (client or "?", t[:max(8, MICRO_SIG_CHARS)])
+
+
+def _note_local_ok(now):
+    global _LAST_LOCAL_OK
+    _LAST_LOCAL_OK = now
+
+
+def micro_observe(client, text, outtok):
+    """Record one completed LOCAL answer for its signature. Never raises."""
+    try:
+        if not MICRO_LEARN or not text or outtok is None or int(outtok) < 0:
+            return
+        sig = _micro_sig(client, text)
+        h = _MICRO_HIST.get(sig)
+        if h is None:
+            h = _MICRO_HIST[sig] = collections.deque(maxlen=max(2, MICRO_HISTORY))
+            while len(_MICRO_HIST) > MICRO_MAX_SIGS:
+                _MICRO_HIST.popitem(last=False)
+        else:
+            _MICRO_HIST.move_to_end(sig)
+        h.append(int(outtok))
+        _MICRO_STATS["observed"] += 1
+    except Exception:
+        pass
+
+
+def micro_predict(client, text, ptok):
+    """True when this signature has repeatedly produced short answers (every one of the last MICRO_HISTORY, at least
+    MICRO_MIN_SAMPLES of them, <= MICRO_MAX_OUT) and the prompt is modest. One long answer in the window disqualifies."""
+    try:
+        if not MICRO_LEARN or not text or ptok > MICRO_MAX_PROMPT:
+            return False
+        h = _MICRO_HIST.get(_micro_sig(client, text))
+        return bool(h) and len(h) >= MICRO_MIN_SAMPLES and max(h) <= MICRO_MAX_OUT
+    except Exception:
+        return False
+
+
+def micro_history_restore_blocking(now=None, before=None, per_file_cap=16 * 1024 * 1024):
+    """Blocking (executor): rebuild the signature history from the last day of the request log so a restart does not
+    forget which call types are short. Returns [(client, preview, outtok), ...] oldest first (local completions only)."""
+    now = time.time() if now is None else now
+    before = now if before is None else before
+    rows = []
+    for day_i in range(2):
+        for raw in _read_lines_reverse(_history_day_file(now - day_i * 86400), per_file_cap):
+            try:
+                rec = json.loads(raw)
+            except Exception:
+                continue
+            t, c, o = rec.get("t"), rec.get("client"), rec.get("outtok")
+            if not isinstance(t, (int, float)) or t >= before or t < now - 86400 or not c or o is None:
+                continue
+            if rec.get("route") not in ("local", "held") or (rec.get("status") or 200) >= 400 or not rec.get("preview"):
+                continue
+            rows.append((t, c, rec["preview"], int(o)))
+    rows.sort()
+    return [(c, p, o) for _, c, p, o in rows]
+
+
+def micro_history_restore(rows):
+    for c, p, o in rows or []:
+        micro_observe(c, p, o)
+    return len(rows or [])
+
+
+_PROBE_RE = re.compile(r"^\s*reply with (?:the )?(?:single|one|only the) word:?\s*[\"'`]?([A-Za-z0-9_-]{1,24})[\"'`]?(?=\s|$)", re.I)
+# What Hermes/the front door append to the probe: injected live state, truncated plugin output, the clock line.
+_PROBE_CONTEXT_MARKERS = ("##", "[plugin hook", "(awareness", "now (")
+
+
+def probe_word(body):
+    """The word a trivial liveness probe asks for, or None. Matches only when the LAST user message is the probe
+    sentence followed by nothing, or by recognised injected-context markers -- never "pong, then explain ...". """
+    try:
+        msgs = json.loads(body).get("messages") or []
+        for m in reversed(msgs):
+            if (m or {}).get("role") != "user":
+                continue
+            c = m.get("content")
+            if isinstance(c, list):
+                c = " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type", "text") == "text")
+            if not isinstance(c, str):
+                return None
+            mt = _PROBE_RE.match(c)
+            if not mt:
+                return None
+            rest = c[mt.end():].strip().lower()
+            if rest and not rest.startswith(_PROBE_CONTEXT_MARKERS):
+                return None
+            return mt.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def probe_synth_decision(word, alias_kind, local_ok_age_s, health_ok, offline_or_forced):
+    """(serve_synthetic, why). Pure so it is testable. The probe asks "is the front door alive and generating?":
+    real engine output within PROBE_FRESH_S answers that without spending a slot, a prefill or paid remote tokens."""
+    global _PROBE_SEEN
+    if not PROBE_SYNTH or not word:
+        return False, "off"
+    if alias_kind not in (None, "", "builtin-local"):
+        return False, "alias-%s" % alias_kind            # an estate-remote / custom probe must exercise ITS provider
+    if offline_or_forced:
+        return False, "window"
+    if not health_ok:
+        return False, "unhealthy"
+    if local_ok_age_s > PROBE_FRESH_S:
+        return False, "stale"
+    _PROBE_SEEN += 1
+    if PROBE_REAL_EVERY > 0 and _PROBE_SEEN % PROBE_REAL_EVERY == 0:
+        _MICRO_STATS["probe_real"] += 1
+        return False, "sampled-real"
+    return True, "fresh"
+
+
+def probe_synth_response(body, word, streaming):
+    """OpenAI-shaped answer for the synthetic probe. Marked X-Shim-Synth so nothing can mistake it for generation."""
+    try:
+        model = str(json.loads(body).get("model") or "estate")
+    except Exception:
+        model = "estate"
+    rid, created = "chatcmpl-synth-%s" % os.urandom(6).hex(), int(time.time())
+    usage = {"prompt_tokens": 0, "completion_tokens": 1, "total_tokens": 1}
+    hdr = {"X-Shim-Synth": "probe"}
+    if not streaming:
+        return web.json_response({
+            "id": rid, "object": "chat.completion", "created": created, "model": model,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": word}, "finish_reason": "stop"}],
+            "usage": usage}, headers=hdr)
+
+    def chunk(delta, finish=None, u=None):
+        d = {"id": rid, "object": "chat.completion.chunk", "created": created, "model": model,
+             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+        if u:
+            d["usage"] = u
+        return "data: " + json.dumps(d) + "\n\n"
+    payload = (chunk({"role": "assistant", "content": ""}) + chunk({"content": word})
+               + chunk({}, "stop", usage) + "data: [DONE]\n\n")
+    return web.Response(body=payload.encode(), content_type="text/event-stream",
+                        headers={**hdr, "Cache-Control": "no-cache"})
 
 
 def predicted_occupancy_seconds(ptok, maxtok, concurrency=1):
@@ -3584,6 +3762,10 @@ def _telemetry_note_request(info, resp=None):
             c[route] += 1
         if outtok is not None and (status is None or status < 400):
             note_output_tokens(name, outtok, now)           # LF: what this client's answers really weigh
+            if route in ("local", "held"):
+                micro_observe(name, info.get("preview"), outtok)   # K4: which call types are short
+        if route in ("local", "held") and (status is None or status < 400) and (outtok or outtok_lb):
+            _note_local_ok(now)                             # K4: proof the engine is really generating
         if outtok is not None:
             c["tokens_out"] += outtok; c["tokens_out_exact"] += outtok
         elif outtok_lb is not None:
@@ -7684,6 +7866,14 @@ async def _route_completions(request, _no_overflow=False):
         maxtok = 0
     ev = dict(ptok=ptok, maxtok=maxtok, stream=streaming)
     tiny = is_tiny(body)
+    # K4 micro lane v2: a call type that has repeatedly answered in <= MICRO_MAX_OUT tokens gets the tiny lane even when
+    # its max_tokens is unset/large. It never takes the paid tiny-fast overflow (see the tiny branch below).
+    tiny_learned = False
+    if not tiny and MICRO_LEARN:
+        tiny_learned = micro_predict(client, _preview(body), ptok)
+        if tiny_learned:
+            tiny = True
+            _active_set(request, tiny=True, micro="learned")
     background = is_background(body, request)
     halo_control = _halo_control_request(request, body)
     # Lane DB2: record the work class on the live request BEFORE any routing decision, so every route -- remote, alias,
@@ -7722,6 +7912,19 @@ async def _route_completions(request, _no_overflow=False):
     alias_force_remote = alias_kind == "builtin-remote"
     custom_endpoint = alias.get("endpoint") if alias_kind == "custom-remote" else None
     _active_set(request, alias=alias.get("name"), alias_kind=alias_kind)
+    # K4 PROBE synth: a trivial "Reply with the single word: X" liveness probe is answered here while the engine has
+    # demonstrably produced tokens for real traffic in the last PROBE_FRESH_S (see probe_synth_decision).
+    if PROBE_SYNTH and not _no_overflow:
+        _pw = probe_word(body)
+        if _pw:
+            _ok, _why = probe_synth_decision(_pw, alias_kind, time.time() - _LAST_LOCAL_OK, bool(_health["ok"]),
+                                             bool(_local_offline() or (remote_ok() and effective_force_remote())))
+            if _ok:
+                _MICRO_STATS["probe_synth"] += 1
+                _active_set(request, route="synth", reason="probe", phase="done", synth=True)
+                log.info("route %s PROBE %r answered by the gateway (engine fresh)", path, _pw)
+                return probe_synth_response(body, _pw, streaming)
+            log.info("route %s PROBE %r goes through for real (%s)", path, _pw, _why)
     # R2 v5 THROUGHPUT GUARD (Kevin, 2026-09-25): the daily remote cap is hard, but an OVERFLOW
     # -- a remote trip the GATEWAY chose (size, big-prompt, big-out, local-down, monster, perf,
     # predicted, tiny-fast, admission timeout) -- must never die of it. When the cap has no room
@@ -8095,7 +8298,9 @@ async def _route_completions(request, _no_overflow=False):
                 if kind == "ok":
                     _note_payload_outcome(request, payload, streaming)   # TELEMETRY
                     record_event("held" if bg_held_reason else "local",
-                                 bg_held_reason or "tiny", request, units, 0, **ev)
+                                 bg_held_reason or ("tiny-learned" if tiny_learned else "tiny"), request, units, 0, **ev)
+                    if tiny_learned:
+                        _MICRO_STATS["admitted"] += 1
                     return payload
                 status, text, oom = payload
                 if oom:
@@ -8115,7 +8320,7 @@ async def _route_completions(request, _no_overflow=False):
                 return await _overflow_forward(reentry=False)
             finally:
                 release_local()
-        elif overflow_ok and not alias_local_only:
+        elif overflow_ok and not alias_local_only and not tiny_learned:
             log.info("route %s TINY inflight=%d/%d full -> remote(tiny-fast)",
                      path, _inflight, tiny_limit)
             record_event("remote", "tiny-fast" if _memory_available(reservation, halo_control=halo_control) else "tokens", request, units, 0, **ev)
@@ -8495,6 +8700,10 @@ async def gateway_stats(request):
         "budget": effective_budget(), "configured_budget": BUDGET,
         "inflight": _inflight, "peak_inflight": _stats["peak_inflight"],
         "waiting": _waiting, "peak_waiting": _stats["peak_waiting"],
+        # K4 micro lane v2 + probe synth: what the learned tiny lane and the liveness-probe shortcut did since start.
+        "micro_lane": {"learn": MICRO_LEARN, "signatures": len(_MICRO_HIST), "qualifying": sum(
+            1 for h in _MICRO_HIST.values() if len(h) >= MICRO_MIN_SAMPLES and max(h) <= MICRO_MAX_OUT),
+            "probe_synth_enabled": PROBE_SYNTH, **_MICRO_STATS},
         # gw-queue-position-header (2026-09-11): per-class queue depth, so "am I personally
         # waiting" is answerable at a glance instead of one aggregate number that background
         # traffic can dominate. Deliberately NOT paired with a fake per-class wait estimate --
@@ -11060,6 +11269,13 @@ async def _on_startup(app):
         log.info("output history restored: %d completions for %d clients", output_history_restore(_oh), len(_oh))
     except Exception as e:
         log.warning("output history restore failed: %s", e)
+    try:                                                         # K4: which call types are short survives a restart
+        _now3 = time.time()
+        _mh = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: micro_history_restore_blocking(_now3, _PROCESS_STARTED))
+        log.info("micro-lane history restored: %d completions -> %d signatures", micro_history_restore(_mh), len(_MICRO_HIST))
+    except Exception as e:
+        log.warning("micro-lane history restore failed: %s", e)
     _spend()   # R2: load (and, for a mid-day ledger, import today's recorded spend) before serving
     app["saver"] = asyncio.create_task(_stats_saver())
     await _hw_seed_slow()                                                  # Lane TL: refill the slow ring from disk
