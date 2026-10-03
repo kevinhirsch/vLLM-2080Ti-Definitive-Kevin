@@ -6219,8 +6219,13 @@ def _est_tokens(body):
         j = json.loads(body)
     except Exception:
         return 0
+    if not isinstance(j, dict):
+        return 0                 # lane SH: a JSON array/string body used to raise here -> bare 500, no telemetry
     chars = 0
-    for m in (j.get("messages") or []):
+    msgs = j.get("messages")
+    for m in (msgs if isinstance(msgs, list) else []):
+        if not isinstance(m, dict):
+            continue
         c = m.get("content")
         if isinstance(c, str):
             chars += len(c)
@@ -6861,7 +6866,11 @@ def is_background(body, request):
         msgs = json.loads(body).get("messages") or []
     except Exception:
         return False
+    if not isinstance(msgs, list):
+        return False
     for m in (msgs[:2] + msgs[-1:]):
+        if not isinstance(m, dict):
+            continue
         c = m.get("content")
         if isinstance(c, str) and any(k in c[:500] for k in BG_MARKERS):
             return True
@@ -7727,6 +7736,10 @@ def _nonstream_shape_kw(data, body, local):
 async def _prepare_stream_response(resp, request, initial, session):
     """A disconnected caller must not strand the upstream ClientSession."""
     try:
+        try:
+            request["gw_stream_prepared"] = True     # lane SH: _router_crash_response must not answer twice
+        except Exception:
+            pass
         await resp.prepare(request)
         if initial:
             await resp.write(initial)
@@ -8563,22 +8576,101 @@ async def handle_completions(request):
         maxtok = int(j.get("max_tokens") or 0)
     except Exception:
         maxtok = 0
+    # lane SH: a body the router cannot read is still registered (so telemetry sees its 400), but the classifiers
+    # below read an empty object instead of crashing on it.
+    _bad = _body_shape_error(body)
+    _cb = b"{}" if _bad else body
     info.update({"ep": request.path.rsplit("/", 1)[-1], "model": str(j.get("model") or "")[:40],
-                 "ptok": _est_tokens(body), "maxtok": maxtok, "stream": wants_stream(body),
+                 "ptok": _est_tokens(_cb), "maxtok": maxtok, "stream": wants_stream(_cb),
                  "t0": time.time(), "phase": "routing", "route": None, "reason": None,
-                 "preview": _preview(body)[:100], "bg": is_background(body, request), "tiny": is_tiny(body),
+                 "preview": _preview(_cb)[:100], "bg": is_background(_cb, request), "tiny": is_tiny(_cb),
                  "spend_key": os.urandom(16).hex(), **_request_identity(request, body)})
     _ACTIVE[id(request)] = info
     _resp = None
     try:
-        _resp = await _route_completions(request)
+        if _bad:
+            _active_set(request, route="rejected", reason="bad-body")
+            _resp = web.json_response({"error": {"message": _bad, "type": "invalid_request_error",
+                                                 "code": "invalid_body"}}, status=400)
+            return _resp
+        try:
+            _resp = await _route_completions(request)
+        except Exception as e:                     # noqa: BLE001 -- lane SH: see _router_crash_response
+            _resp = _router_crash_response(request, e)
         return _resp
     finally:
         _info = _ACTIVE.pop(id(request), None)
         if _info is not None:
+            _note_unrouted_outcome(_info, _resp)     # lane SH: an early-return refusal still names its outcome
             _spend_settle(_info, _resp)             # R2: price what went remote, release its hold
             _telemetry_note_request(_info, _resp)   # TELEMETRY: per-client rollups + error feed
             _PM_INFLIGHT.pop(id(request), None)     # cost-model side table: never outlive the request
+
+
+# ---- lane SH (2026-10-03): every request gets the gateway's own answer, and every answer names its outcome ----
+# Before: (a) a body that parses as JSON but is not an object (or whose messages are not a list of objects) raised
+# inside handle_completions -> aiohttp's bare 500, which never reached telemetry (row status None, not in the error
+# feed); (b) any other exception escaping the router did the same; (c) early-return refusals (alias disabled,
+# estate-local while local is down, cap exhausted while local is down, no remote for an over-budget reservation,
+# context errors, cost-policy refusals) logged route "?" with no reason.
+_ROUTER_CRASHES = collections.Counter()      # exception type -> count (bounded: exception classes)
+
+
+def _body_shape_error(body):
+    """The reason a completion body cannot be routed, or None. Only shapes the router itself would crash on are
+    refused; a body that is not JSON at all keeps its existing 400 from the body preparation below."""
+    try:
+        j = json.loads(body)
+    except Exception:
+        return None
+    if not isinstance(j, dict):
+        return "request body must be a JSON object, got %s" % type(j).__name__
+    msgs = j.get("messages")
+    if msgs is not None and not isinstance(msgs, list):
+        return "messages must be a list of message objects, got %s" % type(msgs).__name__
+    if isinstance(msgs, list) and any(not isinstance(m, dict) for m in msgs):
+        return "every item of messages must be a message object"
+    return None
+
+
+def _router_crash_response(request, exc):
+    """An unhandled router exception becomes a counted, logged, telemetry-visible JSON 500. A stream that was
+    already committed to the client cannot be answered twice: re-raise (aiohttp closes it) after recording."""
+    if isinstance(exc, (ConnectionResetError, BrokenPipeError)):
+        _active_set(request, client_disconnected=True)   # the caller hung up: nothing to answer, not a gateway bug
+        raise exc
+    name = type(exc).__name__
+    _ROUTER_CRASHES[name] += 1
+    log.exception("router crashed (%s) on %s: %s", name, getattr(request, "path", "?"), exc)
+    _active_set(request, route="error", reason="gateway-exception:" + name, phase="done")
+    try:
+        committed = bool(request.get("gw_stream_prepared"))
+    except Exception:
+        committed = False
+    if committed:
+        raise exc
+    return web.json_response({"error": {"message": "gateway internal error (%s); the request was not served" % name,
+                                        "type": "gateway_internal_error"}}, status=500)
+
+
+def _note_unrouted_outcome(info, resp):
+    """A response returned before any route was recorded gets route "rejected" and a reason taken from the error
+    it carries (its type or code, else http-<status>), so telemetry and the error feed never show route "?"."""
+    if info.get("route") not in (None, "", "?"):
+        return
+    status = getattr(resp, "status", None)
+    reason = None
+    try:
+        err = json.loads(getattr(resp, "body", b"") or b"{}").get("error")
+        if isinstance(err, dict):
+            reason = err.get("code") or err.get("type")
+    except Exception:
+        reason = None
+    if resp is None:                                  # cancelled / aborted before any response existed
+        info["route"], info["reason"] = "aborted", info.get("reason") or "no-response"
+        return
+    info["route"] = "rejected" if status is None or status >= 400 else "?"
+    info["reason"] = info.get("reason") or reason or "http-%s" % status
 
 
 def _write_flightrec(fr, fn, body):
