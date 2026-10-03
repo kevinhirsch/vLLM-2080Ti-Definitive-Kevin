@@ -5819,6 +5819,48 @@ def _flow_refusal_response(r):
 # FENCE (/gateway/drain) stays for the instant of a gateway code swap only.
 _OFFLINE = {"until": 0.0, "lease": None, "reason": None, "by": None, "t0": None, "ttl_s": None, "refused": 0}
 OFFLINE_MAX_TTL_S = 3600
+# [GW2 2026-10-03] A planned offline window must survive a gateway restart. It used to live only in _OFFLINE, so the
+# 09:11 gateway publish dropped K5's window mid-benchmark: the engine was stopped, the gateway believed it was not in a
+# window, and only the local health check kept work off the engine. The window (lease included, so its owner can still
+# extend or close it) is written on every open/extend/close/expiry and restored at startup while it has time left.
+OFFLINE_REFUSED_PUBLISH = "publish-in-flight"     # 409 code gateway-offline.py and gateway_safe_publish.py key on
+OFFLINE_STATE_FILE = os.environ.get("SHIM_OFFLINE_STATE_FILE") or os.path.join(os.path.dirname(STATS_FILE), "offline-window.json")
+
+
+def _offline_persist():
+    """Atomically record the current window (or its absence). Never raises: a failed write must not fail an open."""
+    try:
+        row = {k: _OFFLINE.get(k) for k in ("until", "lease", "reason", "by", "t0", "ttl_s", "refused")}
+        tmp = OFFLINE_STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(row, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, OFFLINE_STATE_FILE)
+    except Exception as e:
+        log.warning("offline window persist failed: %s", e)
+
+
+def _offline_restore(now=None):
+    """Startup: re-open a persisted window that has not expired (same lease, same until). Returns True if restored."""
+    now = time.time() if now is None else now
+    try:
+        with open(OFFLINE_STATE_FILE) as f:
+            row = json.load(f)
+    except (OSError, ValueError):
+        return False
+    try:
+        until = float(row.get("until") or 0)
+    except (TypeError, ValueError):
+        return False
+    if not row.get("lease") or until <= now or until - now > OFFLINE_MAX_TTL_S:
+        return False
+    _OFFLINE.update(until=until, lease=str(row["lease"]), reason=row.get("reason"), by=row.get("by"),
+                    t0=row.get("t0") or now, ttl_s=row.get("ttl_s"), refused=int(row.get("refused") or 0))
+    _flow_event({"event": "offline-restore", "t": round(now, 3), "reason": _OFFLINE["reason"], "by": _OFFLINE["by"],
+                 "remaining_s": round(until - now)})
+    log.warning("planned offline window restored after restart: %s by %s, %ds left", _OFFLINE["reason"],
+                _OFFLINE["by"], until - now)
+    return True
 
 
 def _local_offline(now=None):
@@ -5847,6 +5889,7 @@ def _offline_reap(now=None):
                      "t0": round(_OFFLINE["t0"], 3), "reason": _OFFLINE["reason"], "by": _OFFLINE["by"],
                      "refused": _OFFLINE["refused"]})
         _OFFLINE.update(t0=None, lease=None, reason=None, by=None, ttl_s=None, refused=0)
+        _offline_persist()
         flow_note_mode(now)
 
 
@@ -5880,6 +5923,7 @@ async def gateway_offline(request):
         _flow_event({"event": "offline-close", "how": "delete", "t": round(now, 3), "t0": round(_OFFLINE["t0"] or now, 3),
                      "reason": _OFFLINE["reason"], "by": _OFFLINE["by"], "refused": _OFFLINE["refused"]})
         _OFFLINE.update(until=0.0, t0=None, lease=None, reason=None, by=None, ttl_s=None, refused=0)
+        _offline_persist()
         flow_note_mode(now)
         return web.json_response(_offline_status())
     try:
@@ -5888,14 +5932,21 @@ async def gateway_offline(request):
             raise ValueError
     except (ValueError, TypeError):
         return web.json_response({"error": "ttl_s must be 30..%d seconds" % OFFLINE_MAX_TTL_S}, status=400)
+    if _draining() and not (body.get("lease") and body.get("lease") == _OFFLINE["lease"]):
+        # [GW2] a gateway publish is in flight: its restart would race this window (09:06 K5 vs GW2 publish). Opening
+        # waits for the publish; gateway-offline.py retries on this marker. Extending an existing window stays allowed.
+        return web.json_response({"error": "gateway publish in flight", "code": OFFLINE_REFUSED_PUBLISH,
+                                  "retry_after_s": 15}, status=409, headers={"Retry-After": "15"})
     if _local_offline(now):
         if body.get("lease") and body.get("lease") == _OFFLINE["lease"]:           # extend
             _OFFLINE["until"] = now + ttl
+            _offline_persist()
             return web.json_response({**_offline_status(), "lease": _OFFLINE["lease"]})
         return web.json_response({"error": "another offline window is open", **_offline_status()}, status=409)
     by = str(body.get("by") or request.headers.get("X-Client") or request.headers.get("User-Agent") or "?")[:80]
     reason = str(body.get("reason") or "planned local work")[:120]
     _OFFLINE.update(until=now + ttl, lease=os.urandom(16).hex(), reason=reason, by=by, t0=now, ttl_s=ttl, refused=0)
+    _offline_persist()
     _flow_event({"event": "offline-open", "t": round(now, 3), "reason": reason, "by": by, "ttl_s": ttl,
                  "local_active": _offline_status()["local_active"]})
     flow_note_mode(now)
@@ -12449,6 +12500,7 @@ $('form').onsubmit=async e=>{e.preventDefault();const d={name:$('name').value,ba
 async def _on_startup(app):
     global _REMOTE_DEAD_PERSIST
     _drain_startup_recover()
+    _offline_restore()                  # [GW2] a planned offline window survives a gateway restart
     _REMOTE_DEAD_PERSIST = True
     _remote_dead_load()
     _load_stats()

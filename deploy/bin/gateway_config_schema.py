@@ -231,6 +231,7 @@ _k("SHIM_THINK_BUDGET_MAX", "int", "4096", "Thinking budget ceiling.", unit="tok
 _k("SHIM_THINK_OFF_UNDER", "int", "600", "max_tokens under this disables thinking.", unit="tokens", gname="THINK_OFF_UNDER", tunable=True)
 _k("SHIM_THINK_LOW_UNDER", "int", "1400", "max_tokens under this uses a low thinking budget.", unit="tokens", gname="THINK_LOW_UNDER", tunable=True)
 _k("SHIM_CREDIT_ANCHOR", "enum", "off", "Engine-anchored prefix-cache credit (shadow = log pm_credit_anchored only; live = route on it when the probe has no answer).", choices=("off", "shadow", "live"), gname="CREDIT_ANCHOR", tunable=True, kill=True, owner="GW2")
+_k("SHIM_OFFLINE_STATE_FILE", "path", None, "Where an open planned-offline window is persisted so it survives a gateway restart (default: offline-window.json beside SHIM_STATS_FILE).", gname="OFFLINE_STATE_FILE", restart=True, computed_default=True, owner="GW2")
 _k("SHIM_CREDIT_PROBE", "enum", "off", "Engine-reported prefix-cache credit via /v1/fork/prefix_cache_probe (shadow = log pm_credit_probe; live = route on it).", choices=("off", "shadow", "live"), gname="CREDIT_PROBE", tunable=True, kill=True, owner="GW2")
 _k("SHIM_CREDIT_PROBE_TIMEOUT_S", "float", "0.3", "Longest the router waits for the engine's cache probe before falling back.", unit="s", gname="CREDIT_PROBE_TIMEOUT_S", tunable=True, owner="GW2")
 _k("SHIM_CREDIT_PROBE_MIN_TOKENS", "int", "4096", "Only probe prompts at least this large (smaller ones cannot cross a prefill threshold).", unit="tokens", gname="CREDIT_PROBE_MIN_TOKENS", tunable=True, owner="GW2")
