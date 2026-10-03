@@ -189,8 +189,10 @@ class ThinkBudgetExplicit(unittest.TestCase):
 
     def test_knobs_are_hot_reloadable(self):
         for k in ("SHIM_REASONING_WATCHDOG", "SHIM_REASONING_BUDGET_TOKENS", "SHIM_THINK_BUDGET_EXPLICIT",
-                  "SHIM_REASONING_CHARS_PER_TOKEN"):
+                  "SHIM_REASONING_CHARS_PER_TOKEN", "SHIM_CHAIN_TELEMETRY", "SHIM_WARM_PRIORITY"):
             self.assertIn(k, shim._CFG)
+        self.assertIs(shim._CFG["SHIM_WARM_PRIORITY"][1]("0"), False)
+        self.assertIs(shim._CFG["SHIM_WARM_PRIORITY"][1]("1"), True)
 
 
 class Watchdog(unittest.IsolatedAsyncioTestCase):

@@ -539,6 +539,11 @@ _CFG = {
     "SHIM_PERF_BREAKER_MIN_SAMPLES": ("PERF_BREAKER_MIN_SAMPLES", int),
     "SHIM_PERF_BREAKER_HOLD_SECS": ("PERF_BREAKER_HOLD_SECS", float),
     "SHIM_STREAM_IDLE_TIMEOUT_SECS": ("STREAM_IDLE_TIMEOUT_SECS", float),
+    # [GW2 / L100] Lane CR knobs, hot-reloadable so the warm-priority A/B can alternate arms without restarts
+    "SHIM_CHAIN_TELEMETRY": ("CHAIN_TELEMETRY", lambda v: str(v).lower() in ("1", "true", "on", "yes")),
+    "SHIM_WARM_PRIORITY": ("WARM_PRIORITY", lambda v: str(v).lower() in ("1", "true", "on", "yes")),
+    "SHIM_WARM_PRIORITY_MIN_CREDIT": ("WARM_PRIORITY_MIN_CREDIT", int),
+    "SHIM_WARM_PRIORITY_MAX_COMPUTED": ("WARM_PRIORITY_MAX_COMPUTED", int),
     "SHIM_REASONING_WATCHDOG": ("REASONING_WATCHDOG", lambda v: str(v).strip().lower()),
     "SHIM_REASONING_BUDGET_TOKENS": ("REASONING_BUDGET_TOKENS", int),
     "SHIM_REASONING_CHARS_PER_TOKEN": ("REASONING_CHARS_PER_TOKEN", float),
