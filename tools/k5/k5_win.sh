@@ -26,8 +26,10 @@ boot() {  # boot LABEL EXTRA_LINES...   (override = saved trial override + extra
   python3 $SD/engine-actuator.py restart --by K5 --reason "K5 arm $lab" --no-drain --foreground > $L/win/boot_$lab.log 2>&1 &
   sleep 20; local t0=$(date +%s)
   until curl -s -m 2 -o /dev/null -w "%{http_code}" localhost:8001/health | grep -q 200; do
+    # the actuator refused (quiesce hold, lease lost, ...): never keep going, never boot a later arm
+    grep -qiE '"refused"|refus' $L/win/boot_$lab.log 2>/dev/null && { echo "BOOT REFUSED $lab: $(head -c 300 $L/win/boot_$lab.log)"; ABORT=1; return 1; }
     for p in $(pgrep -f "[w]armup-after-start.sh"); do kill $p; done
-    [ $(( $(date +%s) - t0 )) -ge 900 ] && { echo "BOOT FAILED $lab"; journalctl -u vllm-qwen27b --since "-10 min" --no-pager | grep -iE "error|Traceback|assert" | tail -8 | cut -c1-250; return 1; }
+    [ $(( $(date +%s) - t0 )) -ge 900 ] && { ABORT=1; echo "BOOT FAILED $lab"; journalctl -u vllm-qwen27b --since "-10 min" --no-pager | grep -iE "error|Traceback|assert" | tail -8 | cut -c1-250; return 1; }
     sleep 4
   done
   for p in $(pgrep -f "[w]armup-after-start.sh"); do kill $p; done
@@ -61,9 +63,11 @@ TPASS=$(python3 -c "import json;print(json.load(open('$L/test_tq_batched.json'))
 TQ_ON=0; [ "$TPASS" = "True" ] && TQ_ON=1
 echo "tq batched test pass=$TPASS -> VLLM_K5_TQ_BATCHED=$TQ_ON"
 # 2. BASE arm
+ABORT=0
 boot base "$(prof_extra $L/win/prof_base)" && measure base
 # 3. K5 arm (only if the kernel test passed)
-if [ "$KPASS" = "True" ]; then
+if [ "$ABORT" = 1 ]; then echo "SKIP K5 arm: a boot failed or was refused -> straight to restore"
+elif [ "$KPASS" = "True" ]; then
   boot k5 "$(prof_extra $L/win/prof_k5)" "V02_ROOT=$K5" "VLLM_K5_GDN_FUSED=1" "VLLM_K5_GDN_VARIANT=$VAR" "VLLM_K5_TQ_BATCHED=$TQ_ON" "VLLM_K5_GDN_BUILD_DIR=$L/ext" && {
     journalctl -u vllm-qwen27b --since '-15 min' --no-pager | grep -iE "k5|gdn_mtp" | tail -3
     measure k5
