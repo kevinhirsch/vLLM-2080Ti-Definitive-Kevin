@@ -109,7 +109,7 @@ it, and wt-integrate's working tree is never edited.
 
 0. **Before the window (done 2026-10-03):** the release `bf46537a45-20261003T1501` was built from integrate HEAD and verified. If integrate HEAD has moved by window time, the framework builds a fresh release from the new HEAD before it opens the gateway window (`release: {tree_head: wt-integrate}`). The tree must be clean.
 1. **preconditions:** the release verifies, its sha equals wt-integrate HEAD, and the tree is clean.
-2. **deploy-serve:** install the new serve scripts, the attributing collector and `unitrun.py` into `~/.local/share/vllm-qwen27b/`. These are snapshot files, put back verbatim on any failure. With no `current` pointer they boot wt-integrate exactly as before.
+2. **deploy-serve** (it also carries L123, `--disable-uvicorn-access-log` by default, into BOTH arms, so the identity gate still compares like with like): install the new serve scripts, the attributing collector and `unitrun.py` into `~/.local/share/vllm-qwen27b/`. These are snapshot files, put back verbatim on any failure. With no `current` pointer they boot wt-integrate exactly as before.
 3. **base-boot** (legacy tree, fresh boot, GPU gate) → **base-root** check → **base-probe:** quick.py, greedy probe, evalkit tool_call.
 4. **rel-boot** (the release) → **rel-verify-running:** the engine's cwd is the release, and `verify` still passes after the boot, so nothing was rebuilt → **rel-probe** (same probes).
 5. **tree-unchanged**, then **identity-gate** (`release_ab_probe.py compare`): the KV pools are equal, the greedy outputs are byte-identical on every prompt the base reproduced, decode is not slower, and evalkit is not worse.

@@ -102,6 +102,10 @@ ARGS=(
   --enable-auto-tool-choice
   --additional-config '{"gdn_prefill_backend":"flashqla_legacy"}'
 )
+# RT/L123 (2026-10-03): uvicorn's per-request INFO access lines (POST /tokenize, GET /metrics, POST /v1/...) were 69.9% of
+# syslog bytes (~140 MB/day, the same again in the 1 GB journal = ~7 days of other history lost). The gateway keeps its own
+# per-request telemetry. V02_ACCESS_LOG=1 in v02.override.env turns them back on.
+if [ "${V02_ACCESS_LOG:-0}" != "1" ]; then ARGS+=( --disable-uvicorn-access-log ); fi
 # Optional upstream #243 SSD prefix-KV persistence (experimental, opt-in): V02_SSD_KV_DIR=/path V02_SSD_KV_CPU_BYTES=N
 if [ -n "${V02_SSD_KV_DIR:-}" ]; then
   export PYTHONHASHSEED=0

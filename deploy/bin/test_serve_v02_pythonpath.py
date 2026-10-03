@@ -85,3 +85,11 @@ def test_venv_is_invoked_through_the_root_path_not_resolved(tmp_path):
     out, err = run("serve-hauhaucs-v02.sh", tmp_path, f"export V02_ROOT={lane}\n")
     assert f"venv={lane}/.venv -> {real}/.venv" in err
     assert out["PWD"] == str(lane)
+
+
+def test_uvicorn_access_log_off_by_default_and_reenabled_by_override(tmp_path):
+    root = fake_root(tmp_path / "lane")
+    out, _ = run("serve-hauhaucs-v02.sh", tmp_path, f"export V02_ROOT={root}\n")
+    assert "--disable-uvicorn-access-log" in out["ARGS"]
+    out, _ = run("serve-hauhaucs-v02.sh", tmp_path, f"export V02_ROOT={root}\nexport V02_ACCESS_LOG=1\n")
+    assert "--disable-uvicorn-access-log" not in out["ARGS"]
