@@ -20,6 +20,7 @@ Every other component either reads that state or asks the authority to act.
 | # | Path | Trigger | Own cooldown / limit | Fired (24 h) | After LV |
 |---|------|---------|----------------------|--------------|----------|
 | 1 | `vllm-watchdog.sh`, run by `vllm-qwen27b-watchdog.timer` every 60 s | generation wedge: models 200, 5 failed gen probes (2 with a kernel Xid), engine counters flat | 1800 s cooldown, 2 per hour (its own state file) | 3 wedge kills (SIGKILL, then `systemctl restart`), 840 OK / 112 failed probes | Detects only. A wedge goes to `engine-actuator.py recover --cause wedge`. The old rails remain only as a fallback for when the actuator is missing or crashes. |
+| 1b | `vllm-qwen27b-watchdog.service` **`Wants=vllm-qwen27b.service`** (found by WQ after the 08:52 deploy) | every timer firing (60 s) | none | it started a stopped engine every minute, before `vllm-watchdog.sh` could see a hold and defer, so a hold could not keep its engine down | **Removed** from the repo unit (`After=` stays), so `install.sh` ships it fixed. Root block for the host below. `test_liveness_units.py` fails if any unit pulls the engine in. |
 | 2 | systemd `Restart=always`, `RestartSec=15`, `StartLimitIntervalSec=0` (drop-ins `restart-always.conf`, `no-start-limit.conf`) | any exit | 15 s pacing, no limit | ~20 auto-restarts; crash loops of 6 and 10 boots (22:11, 01:19) | Unchanged: it is the process supervisor. The authority reads it (`SubState=auto-restart` = BOOTING) and detects CRASH_LOOP from the fault ledger. |
 | 3 | `engine-actuator.py restart` (Halo `engine_restart` MCP, lanes, windowctl) | discretionary, with a stated reason | one at a time (`restart.lock`), drain or offline window first | 77 planned restarts (S4 25, claude-up 22, claude-s2 14, S3 6, DFT 3, Halo 2, …) | Same, plus it is refused while someone else holds the engine or a release is in flight. The holder passes `--hold <lease>`. |
 | 4 | Window scripts (frontier-queue `done/*.sh`, `projects/lanes/*/window.sh`, `tools/s4_v3_window.sh`) | a window runs | none. They stop the watchdog timer and restore it in a trap. | 8 direct stops; DFT's trap skipped the timer re-arm when the engine was healthy, so the timer stayed stopped 4.5 h | Take a TTL-bounded **hold** (`hold run … -- cmd`). Never stop the timer. Legacy windows are recognised as implicit holds (process pattern, frontier `RUNNING` flag), each with a bound. |
@@ -91,6 +92,20 @@ engine-actuator.py restart --hold L ...         # the holder restarts its own en
 - There is at most one hold per kind.
 - TTL is 60 s to 8 h. Every hold expires by itself. `run` holds and `--owner-pid` holds are void the moment their owner dies (pid and start-time check).
 - `hold run` releases in `finally` and then starts the engine at once if it is DOWN. This is the windows' old "always a healthy engine at exit" contract, now in one place.
+- `hold run` exports its lease to the child as `ENGINE_HOLD_LEASE` (and `ENGINE_HOLD_LEASE_KIND`). `restart` reads `--hold` from that variable by default. A legacy window script that calls `engine-actuator.py restart` with no `--hold` therefore keeps working when it is wrapped in `hold run`. An explicit `--hold` wins over the variable.
+
+### Explicit and implicit holds: one rule
+
+| | Defers automatic actions (tick start/recover, watchdog probes, `recover`) | Refuses someone else's planned `restart` | Listed in |
+|---|---|---|---|
+| **Explicit** (`hold acquire` / `hold run`; kinds engine, quiesce) | yes (engine kind) | yes, unless the caller passes the lease (`--hold` or `ENGINE_HOLD_LEASE`) | `active_holds()`, `hold status` → `holds` |
+| **Implicit**: gateway offline window (OFFLINE_WINDOW), frontier `RUNNING` flag (≤ 3 h), legacy `*window.sh` / `*_driver.sh` process (≤ 8 h of runtime) | yes | **no** | `implicit_holds()`, `hold status` → `implicit_holds`, `liveness-state.json` → `implicit_holds` |
+
+Why implicit holds never refuse a planned restart: their owner *is* the restart caller, for example a `gateway-offline.py run` window or a legacy window script restarting its own engine. They name no lease that a caller could present.
+
+A planned restart inside an open offline window **rides that window** (strategy `existing-offline-window`). It opens no window of its own, releases nothing, and never falls back to the drain fence. Before LV it fell back to the drain fence, which refuses all admission and is meant only for gateway code swaps.
+
+`implicit_holds()` and `classify()` use the same ordering (offline window, then frontier flag, then window process), and a test pins it.
 
 ## 5. The drain-disturbance class (gateway publish, GW2 08:01)
 
@@ -133,7 +148,7 @@ Deploy is a plain file copy to `~/.local/share/vllm-qwen27b/`, with the old copi
 - `vllm-stop.sh` and `vllm-restart.sh`;
 - `watchdog/estate-watchdog.sh`.
 
-No unit change and no engine restart are needed. The next timer tick runs the authority.
+The one unit change is that `vllm-qwen27b-watchdog.service` drops `Wants=vllm-qwen27b.service`. That needs root and a daemon-reload, but no engine restart. Without it, holds cannot keep a stopped engine down. The next timer tick runs the authority.
 
 Kill switch: `touch ~/.local/share/vllm-qwen27b/LIVENESS_PAUSE`. The authority then publishes state only, and the watchdog defers.
 
