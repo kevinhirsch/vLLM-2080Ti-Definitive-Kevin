@@ -112,7 +112,7 @@ DEFAULT_WATCH_TIMERS = ["vllm-qwen27b-watchdog.timer"]
 VAR_RE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 STEP_KINDS = ("run", "script", "boot", "engine", "sleep")
 WATCHDOG_TIMER = "vllm-qwen27b-watchdog.timer"   # its service Wants= the engine: a tick STARTS a stopped engine
-CODE_FILES = ("windowctl.py", "unitrun.py", "gpuguard.py", "release.py", "release_ab_probe.py", "gateway-offline.py")
+CODE_FILES = ("windowctl.py", "unitrun.py", "gpuguard.py", "release.py", "release_ab_probe.py", "gateway-offline.py", "mini_yaml.py")
 BUILTINS = ("RESULTS", "WINDOW", "LANE", "STEP", "PROD_ROOT")
 
 
@@ -326,8 +326,12 @@ def find_conflicts(patterns, proc="/proc"):
 def load_spec(path):
     text = open(path).read()
     if path.endswith((".yaml", ".yml")):
-        import yaml
-        spec = yaml.safe_load(text)
+        # always the dependency-free subset parser (the test gate has no PyYAML; specs must parse the same everywhere)
+        import mini_yaml
+        try:
+            spec = mini_yaml.load(text)
+        except mini_yaml.MiniYAMLError as e:
+            raise SpecError(f"{path}: {e}")
     else:
         spec = json.loads(text)
     if not isinstance(spec, dict):
