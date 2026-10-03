@@ -1,0 +1,106 @@
+# Lane LP (L93/L115) window: W4A8 / W8X / LP_PIPE microbenches with the engine STOPPED, GPU full-model fidelity gate,
+# then base vs LP arm on the live config. Port of tools/lp/lp_win1.sh to the window framework (deploy/bin/windowctl.py).
+#   validate:  python3 /home/kevin/Desktop/vLLM-2080Ti-Definitive/deploy/bin/windowctl.py validate /home/kevin/Desktop/wt-lp/tools/lp/lp-w4a8.yaml
+#   run (WQ):  python3 /home/kevin/Desktop/vLLM-2080Ti-Definitive/deploy/bin/windowctl.py submit /home/kevin/Desktop/wt-lp/tools/lp/lp-w4a8.yaml --wait
+# LP arm = RELEASE of lp/turing-int8 @ 771ebe18c4 (= integrate 7004df6ae8 + 11 LP commits; csrc untouched, new code is
+# python/Triton + csrc_lp JIT used only by the benches). Arm env: W8X (VLLM_LP_W8X=1: prefill M>=2048 gate_up + GDN in_proj on
+# CUTLASS int8 from a just-in-time int8 expansion of the Marlin W4; decode unchanged) if the bench shows it exact and >=1.10x,
+# else stock W4A8 per-token int8 minus down_proj. Benches run from the wt-lp tree (own .deps; no prod JIT dir is touched).
+lane: lp
+window: lp-w4a8
+reason: "LP W4A8/W8X/LP_PIPE microbench + W8X A/B"
+by: LP
+results: /home/kevin/projects/lanes/lp/win
+max_s: 4200
+ttl_s: 1800
+wait_s: 90
+spend_pause_usd: 20
+gpu_gate_wait_s: 300
+conflicts: [trial_guard.sh]
+pause_timers: [vllm-qwen27b-watchdog.timer]
+on_new_xid: abort
+vars:
+  LP: /home/kevin/Desktop/wt-lp
+  PY: /home/kevin/Desktop/wt-integrate/.venv/bin/python
+  U2: /home/kevin/Desktop/wt-integrate/tools/u2
+  I: /home/kevin/Desktop/wt-integrate
+  S2: /home/kevin/projects/lanes/s2-speed
+  EVALKIT: /home/kevin/Desktop/qwen38-evalkit
+  ENVB: "export PATH=/home/kevin/.local/share/shim-gcc15:/home/kevin/Desktop/wt-integrate/.venv/bin:/usr/local/cuda-13/bin:$PATH CUDA_HOME=/usr/local/cuda-13 CC=/usr/bin/gcc-15 CXX=/usr/bin/g++-15"
+steps:
+  # 1. engine stopped: both GPUs free for the kernel benches (~15 min)
+  - name: stop-engine
+    engine: stop
+  - name: bench
+    timeout_s: 1200
+    on_fail: continue
+    run: |
+      {{ENVB}}; cd {{LP}}
+      LP_IN_WINDOW=1 CUDA_VISIBLE_DEVICES=0 PYTHONPATH={{LP}}:{{U2}} timeout 900 {{PY}} tools/lp/w4a8_bench.py --Ms 16,64,256,1024,2048,3632 \
+         --min-free-mib 3000 --cap-mib 4000 --iters 20 --sustain 20 --json {{RESULTS}}/w4a8_bench_gpu0.json > {{RESULTS}}/w4a8_bench_gpu0.log 2>&1 &
+      LP_IN_WINDOW=1 CUDA_VISIBLE_DEVICES=1 PYTHONPATH={{LP}}:{{U2}} timeout 900 {{PY}} tools/lp/w4a8_bench.py --Ms 3632 --shapes gate_up,down,gdn_qkvz \
+         --min-free-mib 3000 --cap-mib 4000 --iters 20 --sustain 20 --json {{RESULTS}}/w4a8_bench_gpu1.json > {{RESULTS}}/w4a8_bench_gpu1.log 2>&1 &
+      wait; grep -hE "PER-CHUNK|SUSTAIN|exact|M= 3632" {{RESULTS}}/w4a8_bench_gpu*.log | cut -c1-260
+    outputs: ["{{RESULTS}}/w4a8_bench_gpu0.json"]
+  - name: pipe-and-fidelity
+    timeout_s: 900
+    on_fail: continue
+    run: |
+      {{ENVB}}; cd {{LP}}
+      LP_IN_WINDOW=1 CUDA_VISIBLE_DEVICES=0 PYTHONPATH={{LP}}:{{U2}} timeout 600 {{PY}} tools/lp/pipe_bench.py --json {{RESULTS}}/pipe_bench_gpu0.json > {{RESULTS}}/pipe_bench_gpu0.log 2>&1 &
+      GPU_IN_WINDOW=1 CUDA_VISIBLE_DEVICES=1 timeout 780 {{PY}} tools/lp/variant_gate.py --device cuda --gpu-need-mib 1500 \
+         --variants w8x,w4a8e3,w4a8g,w4a8 --out {{RESULTS}}/gate_gpu.json > {{RESULTS}}/gate_gpu.log 2>&1 &
+      wait; grep -E "M= *(64|3632)" {{RESULTS}}/pipe_bench_gpu0.log | cut -c1-230; grep -E "\] (w8x|w4a8e3|w4a8g|w4a8) \{" {{RESULTS}}/gate_gpu.log | cut -c1-260
+  - name: choose
+    timeout_s: 60
+    on_fail: continue
+    run: "true"
+    capture:
+      W8X_OK:
+        cmd: "python3 {{LP}}/tools/lp/choose_w8x.py {{RESULTS}}"
+        default: "False"
+
+  # 2. BASE arm on the live config
+  - name: base-boot
+    boot:
+      default: true
+      label: base
+      timeout_s: 1200
+  - name: base-measure
+    timeout_s: 1200
+    on_fail: continue
+    run: |
+      cd {{S2}}; export ESTATE_FR={{S2}}/fr
+      python3 {{LP}}/tools/lp/cold_prefill.py 3 {{RESULTS}}/b1_base.json
+      python3 {{I}}/tools/s2-bench/quick.py 2>&1 | tail -1 | tee {{RESULTS}}/quick_base.json
+      ./w11.sh lpbase 3 "12:0" >/dev/null 2>&1; python3 analyze_cliff.py lpbase | cut -c1-160 | tee {{RESULTS}}/estate_base.txt
+
+  # 3. LP arm (release of the LP branch): W8X if it qualified, else stock W4A8 minus down_proj
+  - name: lp-boot-w8x
+    when: "{{W8X_OK}} == True"
+    boot:
+      release: {sha: 771ebe18c4, label: lp}
+      label: lpw8x
+      env: {VLLM_LP_W8X: "1", VLLM_LP_W8X_MIN_M: "2048"}
+      timeout_s: 1500
+  - name: lp-boot-a8nd
+    when: "{{W8X_OK}} == False"
+    boot:
+      release: {sha: 771ebe18c4, label: lp}
+      label: lpa8nd
+      env: {VLLM_MARLIN_INPUT_DTYPE: "int8", VLLM_LP_INT8_ONLY: "gate_up_proj|linear_attn|self_attn"}
+      timeout_s: 1500
+  - name: lp-measure
+    timeout_s: 2400
+    on_fail: continue
+    run: |
+      cd {{S2}}; export ESTATE_FR={{S2}}/fr
+      journalctl -u vllm-qwen27b --since '-20 min' --no-pager | grep -E "GPU KV cache size|Model loading took|LP|w8x|int8" | tail -5 | cut -c1-200
+      python3 {{LP}}/tools/lp/cold_prefill.py 3 {{RESULTS}}/b1_lp.json
+      python3 {{I}}/tools/s2-bench/quick.py 2>&1 | tail -1 | tee {{RESULTS}}/quick_lp.json
+      python3 det.py {{RESULTS}}/det_lp.json; python3 det.py --cmp det_s4_stack_ref.json {{RESULTS}}/det_lp.json | tail -2 | tee {{RESULTS}}/det_cmp.txt
+      ./w11.sh lplp 3 "12:0" >/dev/null 2>&1; python3 analyze_cliff.py lplp | cut -c1-160 | tee {{RESULTS}}/estate_lp.txt
+      (cd {{EVALKIT}} && python3 run_eval.py --tag lp-arm --categories tool_call,code_exec,long_ctx 2>&1 | tee {{RESULTS}}/evalkit_lp.out | grep -E "passed=False|/60|passed,")
+      python3 {{I}}/tools/up-bench/needle_long.py --tokens 262000 --depth 0.5 2>&1 | tail -1 | cut -c1-200 | tee {{RESULTS}}/needle_lp.txt
+      n=$(journalctl -u vllm-qwen27b --since '-40 min' --no-pager | grep -cE 'Traceback|CUDA error|illegal memory' || true); echo "lp errors in journal: $n" | tee {{RESULTS}}/lp_errors.txt
+# 4. restore: the framework (override verbatim + restart + health + expected KV pool + timers + .so + lease), always.
