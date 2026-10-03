@@ -79,7 +79,25 @@ def gdn_mtp(
     null_block_id: int,
     sigmoid_gate: bool,
     variant: int | None = None,
+    sr_seed: torch.Tensor | None = None,
+    sr_salt: int = 0,
 ) -> None:
     _load().gdn_mtp(mixed_qkv, a, b, A_log, dt_bias, state_indices, cu_seqlens, num_accepted, state, z,
                     norm_weight, out, float(scale), float(eps), int(null_block_id), bool(sigmoid_gate),
-                    int(_VARIANT if variant is None else variant))
+                    int(_VARIANT if variant is None else variant), sr_seed, int(sr_salt) & 0xFFFFFFFF)
+
+
+def sr_seed_for(state_dtype: torch.dtype, device: torch.device) -> torch.Tensor | None:
+    """Lane S4's shared per-step SR seed buffer when VLLM_GDN_SR=1 and the state is fp16, else None (round-to-nearest,
+    bit-identical to the non-SR kernel).  The buffer and its per-step bump live in S4's sr_convert module.  Call it
+    once, outside CUDA-graph capture (it may allocate)."""
+    if os.getenv("VLLM_GDN_SR", "0") != "1" or state_dtype != torch.float16:
+        return None
+    try:
+        from vllm.third_party.flash_linear_attention.ops.sr_convert import get_sr_seed
+    except ImportError:
+        import logging
+
+        logging.getLogger(__name__).warning("VLLM_GDN_SR=1 but sr_convert.get_sr_seed is not available; K5 GDN uses RNE")
+        return None
+    return get_sr_seed(device)

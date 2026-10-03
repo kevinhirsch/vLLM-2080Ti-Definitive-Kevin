@@ -62,10 +62,10 @@ def stock(d, state):
     return y.view(T, HV, V)
 
 
-def fused(d, state, variant=2):
+def fused(d, state, variant=2, sr_seed=None, sr_salt=0):
     out = torch.zeros(d["T"], HV, V, device=dev, dtype=torch.half)
     ext.gdn_mtp(d["mixed"], d["a"], d["b"], d["A_log"], d["dt_f32"], d["sidx"], d["cu"], d["nacc"], state, d["z"],
-                d["w_f32"], out, K ** -0.5, 1e-6, -1, False, variant)
+                d["w_f32"], out, K ** -0.5, 1e-6, -1, False, variant, sr_seed, sr_salt)
     return out
 
 
@@ -131,6 +131,36 @@ for sdt in (torch.float16, torch.float32):
                    saved_us_per_step_48_layers=round((ts[2] - tk[2]) * 48, 1))
         res["bench"].append(row)
         print(row, flush=True)
+# stochastic rounding of fp16 state stores (lane S4 request; VLLM_GDN_SR): unbiasedness vs an fp32-state reference
+d = make(4, torch.float32)
+init16 = d["state"].half()
+dst = d["sidx"].flatten().long()
+d16 = dict(d)
+s_rne = init16.clone()
+d16["state"] = s_rne
+d["state"] = init16.float()  # make the fp32 run start from the fp16-rounded state
+st32 = d["state"].clone()
+fused(d, st32, 2)
+ref = st32[dst]
+fused(d16, s_rne, 2)
+acc = torch.zeros_like(ref)
+K_SEEDS = 64
+for i in range(K_SEEDS):
+    s_sr = init16.clone()
+    seed = torch.tensor([1234 + 7919 * i], dtype=torch.int32, device=dev)
+    fused(d16, s_sr, 2, seed, 0xABCD)
+    acc += s_sr[dst].float()
+torch.cuda.synchronize()
+mean_sr = acc / K_SEEDS
+e_rne = (s_rne[dst].float() - ref).abs().mean().item()
+e_sr_mean = (mean_sr - ref).abs().mean().item()
+s_one = init16.clone(); fused(d16, s_one, 2, torch.tensor([99], dtype=torch.int32, device=dev), 0xABCD)
+e_sr_single = (s_one[dst].float() - ref).abs().mean().item()
+sr_ok = e_sr_mean < 0.5 * e_rne and not bool(torch.isnan(mean_sr).any())
+res["sr"] = dict(rne_mean_abs_err=e_rne, sr_single_mean_abs_err=e_sr_single, sr_avg64_mean_abs_err=e_sr_mean,
+                 ratio=round(e_sr_mean / max(e_rne, 1e-30), 3), pass_=sr_ok)
+print("SR", res["sr"], flush=True)
+res["sr_pass"] = bool(sr_ok)
 res["pass"] = bool(ok)
 out = os.environ.get("K5_OUT", "/home/kevin/projects/lanes/k5/test_gdn_mtp.json")
 json.dump(res, open(out, "w"), indent=1)

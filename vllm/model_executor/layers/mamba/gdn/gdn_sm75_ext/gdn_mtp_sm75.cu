@@ -19,6 +19,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp16.h>
 #include <stdint.h>
+#include <type_traits>
 
 namespace {
 
@@ -52,6 +53,40 @@ template <> __device__ __forceinline__ void st4<float>(float* p, const float* v)
 template <> __device__ __forceinline__ void st4<__half>(__half* p, const float* v) {
   __half2 a = __floats2half2_rn(v[0], v[1]);
   __half2 b = __floats2half2_rn(v[2], v[3]);
+  uint2 u;
+  u.x = *reinterpret_cast<uint32_t*>(&a);
+  u.y = *reinterpret_cast<uint32_t*>(&b);
+  *reinterpret_cast<uint2*>(p) = u;
+}
+
+// Stochastic rounding fp32 -> fp16 (lane S4's exactly-unbiased scheme, sr_convert.py, ported to CUDA; sm_75 has no
+// cvt.rs).  Normal range: add 13 random low bits to |x| and clear them (E[y] = x); fp16-subnormal range: fixed 2^-24 grid
+// floor(|x| * 2^24 + u); inf/nan pass through; clamp at 65504.
+__device__ __forceinline__ uint32_t k5_hash(uint32_t x) {  // lowbias32 integer hash
+  x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+  return x;
+}
+__device__ __forceinline__ __half k5_sr_half(float x, uint32_t r) {
+  const uint32_t bits = __float_as_uint(x);
+  const uint32_t mag = bits & 0x7FFFFFFFu;
+  if (mag >= 0x7F800000u) return __float2half_rn(x);
+  float y;
+  if (mag >= 0x38800000u) {
+    y = __uint_as_float((mag + (r & 0x1FFFu)) & 0x7FFFE000u);
+  } else {
+    const float u = (float)(r & 0xFFFFFFu) * (1.0f / 16777216.0f);
+    y = floorf(__uint_as_float(mag) * 16777216.0f + u) * (1.0f / 16777216.0f);
+  }
+  y = fminf(y, 65504.0f);
+  if (bits >> 31) y = -y;
+  return __float2half_rn(y);  // exact: y is representable in fp16
+}
+__device__ __forceinline__ void st4_sr(__half* p, const float* v, uint32_t key) {
+  const __half h0 = k5_sr_half(v[0], k5_hash(key));
+  const __half h1 = k5_sr_half(v[1], k5_hash(key + 1u));
+  const __half h2 = k5_sr_half(v[2], k5_hash(key + 2u));
+  const __half h3 = k5_sr_half(v[3], k5_hash(key + 3u));
+  __half2 a = __halves2half2(h0, h1), b = __halves2half2(h2, h3);
   uint2 u;
   u.x = *reinterpret_cast<uint32_t*>(&a);
   u.y = *reinterpret_cast<uint32_t*>(&b);
@@ -230,13 +265,14 @@ constexpr int kRowsPerPass = kWarps * (32 / kGrp);    // 64
 constexpr int kRowsV2 = kDimV / kRowsPerPass;         // 2 rows per thread
 constexpr int kSegs = kDimK / (kGrp * 4);             // 4 float4 segments per row per lane
 
-template <typename S, bool SIGMOID>
+template <typename S, bool SIGMOID, bool SR>
 __global__ __launch_bounds__(kThreads, 1) void gdn_mtp_sm75_v2_kernel(
     const __half* __restrict__ mixed_qkv, const __half* __restrict__ a, const __half* __restrict__ b,
     const float* __restrict__ a_log, const float* __restrict__ dt_bias, const int* __restrict__ state_indices,
     const int* __restrict__ cu_seqlens, const int* __restrict__ num_accepted, S* __restrict__ state,
     const __half* __restrict__ z, const float* __restrict__ norm_w, __half* __restrict__ out, int H, int HV, int HPK,
-    int width, int null_block_id, float scale, float eps, Strides st) {
+    int width, int null_block_id, float scale, float eps, Strides st, const int* __restrict__ sr_seed,
+    uint32_t sr_salt) {
   const int n = blockIdx.x;
   const int hv = blockIdx.y;
   const int tid = threadIdx.x;
@@ -260,6 +296,8 @@ __global__ __launch_bounds__(kThreads, 1) void gdn_mtp_sm75_v2_kernel(
   }
 
   const int kh = hv / HPK;
+  uint32_t seed = 0u;
+  if constexpr (SR) seed = (uint32_t)__ldg(sr_seed);
   __shared__ __align__(16) float sq[kMaxTok][kDimK];
   __shared__ __align__(16) float sk[kMaxTok][kDimK];
   __shared__ float sv[kMaxTok][kDimV];
@@ -369,7 +407,17 @@ __global__ __launch_bounds__(kThreads, 1) void gdn_mtp_sm75_v2_kernel(
 #pragma unroll
       for (int j = 0; j < kRowsV2; ++j)
 #pragma unroll
-        for (int m = 0; m < kSegs; ++m) st4<S>(d + rows[j] * kDimK + m * 32 + seg * 4, h[j][m]);
+        for (int m = 0; m < kSegs; ++m) {
+          if constexpr (SR) {
+            // key: per-step seed (device buffer, graph-safe), per-layer salt, unique element id (request, token, head, v, k)
+            const uint32_t elem = ((((uint32_t)n * kMaxTok + (uint32_t)t) * (uint32_t)HV + (uint32_t)hv) * kDimV +
+                                   (uint32_t)rows[j]) * kDimK + (uint32_t)(m * 32 + seg * 4);
+            st4_sr(reinterpret_cast<__half*>(d) + rows[j] * kDimK + m * 32 + seg * 4, h[j][m],
+                   k5_hash(seed ^ sr_salt) ^ (elem * 0x9E3779B1u));
+          } else {
+            st4<S>(d + rows[j] * kDimK + m * 32 + seg * 4, h[j][m]);
+          }
+        }
     }
   }
   __syncthreads();
@@ -399,13 +447,22 @@ template <typename S, bool SIG>
 void launch_one(int variant, dim3 grid, cudaStream_t s, const __half* mixed, const __half* a, const __half* b,
                 const float* a_log, const float* dt_bias, const int* sidx, const int* cu, const int* nacc, S* state,
                 const __half* z, const float* nw, __half* out, int H, int HV, int hpk, int width, int null_id,
-                float scale, float eps, Strides st) {
+                float scale, float eps, Strides st, const int* sr_seed, uint32_t sr_salt) {
+  if constexpr (std::is_same<S, __half>::value) {
+    if (sr_seed != nullptr) {  // stochastic-rounding state stores exist only in the v2 layout
+      gdn_mtp_sm75_v2_kernel<S, SIG, true><<<grid, kThreads, 0, s>>>(mixed, a, b, a_log, dt_bias, sidx, cu, nacc, state,
+                                                                    z, nw, out, H, HV, hpk, width, null_id, scale, eps,
+                                                                    st, sr_seed, sr_salt);
+      return;
+    }
+  }
   if (variant == 1)
     gdn_mtp_sm75_kernel<S, SIG><<<grid, kThreads, 0, s>>>(mixed, a, b, a_log, dt_bias, sidx, cu, nacc, state, z, nw,
                                                          out, H, HV, hpk, width, null_id, scale, eps, st);
   else
-    gdn_mtp_sm75_v2_kernel<S, SIG><<<grid, kThreads, 0, s>>>(mixed, a, b, a_log, dt_bias, sidx, cu, nacc, state, z,
-                                                            nw, out, H, HV, hpk, width, null_id, scale, eps, st);
+    gdn_mtp_sm75_v2_kernel<S, SIG, false><<<grid, kThreads, 0, s>>>(mixed, a, b, a_log, dt_bias, sidx, cu, nacc, state,
+                                                                   z, nw, out, H, HV, hpk, width, null_id, scale, eps,
+                                                                   st, nullptr, 0u);
 }
 
 }  // namespace
@@ -419,7 +476,7 @@ void gdn_mtp_sm75(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, tor
                   torch::Tensor dt_bias, torch::Tensor state_indices, torch::Tensor cu_seqlens,
                   torch::Tensor num_accepted, torch::Tensor state, torch::Tensor z, torch::Tensor norm_w,
                   torch::Tensor out, double scale, double eps, int64_t null_block_id, bool sigmoid_gate,
-                  int64_t variant) {
+                  int64_t variant, c10::optional<torch::Tensor> sr_seed, int64_t sr_salt) {
   TORCH_CHECK(mixed_qkv.is_cuda() && mixed_qkv.scalar_type() == at::kHalf && mixed_qkv.dim() == 2 &&
               mixed_qkv.stride(1) == 1, "mixed_qkv: CUDA fp16 [L, C], channel-contiguous");
   TORCH_CHECK(a.scalar_type() == at::kHalf && b.scalar_type() == at::kHalf && a.dim() == 2 && b.dim() == 2 &&
@@ -463,11 +520,18 @@ void gdn_mtp_sm75(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, tor
   const auto* zp = reinterpret_cast<const __half*>(z.data_ptr());
   auto* op = reinterpret_cast<__half*>(out.data_ptr());
   const int v = (int)variant;
+  const int* srp = nullptr;
+  if (sr_seed.has_value() && sr_seed->defined()) {
+    TORCH_CHECK(sr_seed->is_cuda() && sr_seed->scalar_type() == at::kInt && sr_seed->numel() >= 1,
+                "sr_seed: CUDA int32 [1] (lane S4 get_sr_seed)");
+    TORCH_CHECK(state.scalar_type() == at::kHalf, "stochastic rounding applies to an fp16 state only");
+    srp = sr_seed->data_ptr<int>();
+  }
 #define K5_L(S, SIG)                                                                                              \
   launch_one<S, SIG>(v, grid, s, mp, ap, bp, a_log.data_ptr<float>(), dt_bias.data_ptr<float>(),                  \
                      state_indices.data_ptr<int>(), cu_seqlens.data_ptr<int>(), num_accepted.data_ptr<int>(),      \
                      reinterpret_cast<S*>(state.data_ptr()), zp, norm_w.data_ptr<float>(), op, H, HV, HV / H, W,   \
-                     (int)null_block_id, (float)scale, (float)eps, st)
+                     (int)null_block_id, (float)scale, (float)eps, st, srp, (uint32_t)sr_salt)
   if (state.scalar_type() == at::kFloat) {
     if (sigmoid_gate) K5_L(float, true); else K5_L(float, false);
   } else {

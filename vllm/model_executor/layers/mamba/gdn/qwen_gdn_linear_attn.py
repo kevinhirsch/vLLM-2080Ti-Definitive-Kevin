@@ -4,6 +4,7 @@
 
 import importlib.util
 import os
+import zlib
 from pathlib import Path
 from types import ModuleType
 from typing import Literal
@@ -1286,6 +1287,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # fp32 copies made once, on the first (profiling) forward, before any CUDA-graph capture
             self._k5_dt_bias = self.dt_bias.detach().float().contiguous()
             self._k5_norm_w = self.norm.weight.detach().float().contiguous()
+            self._k5_sr_salt = zlib.crc32(self.prefix.encode())
+            self._k5_sr_seed = _k5_gdn.sr_seed_for(self.get_state_dtype()[1], self.A_log.device)
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):
             return False
@@ -1375,6 +1378,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.norm.eps,
             PAD_SLOT_ID,
             self.norm.activation == "sigmoid",
+            sr_seed=self._k5_sr_seed if ssm_state.dtype == torch.float16 else None,
+            sr_salt=self._k5_sr_salt,
         )
         projected_output, _ = self.out_proj(core_attn_out.flatten(-2))
         output.copy_(projected_output)
