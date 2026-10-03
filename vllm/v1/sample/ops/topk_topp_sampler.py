@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -523,7 +525,49 @@ def flashinfer_sample(
             logits, k, p, deterministic=True
         )
 
-    return next_token_ids.view(-1)
+    next_token_ids = next_token_ids.view(-1)
+    if _SENTINEL_GUARD:
+        next_token_ids = guard_sampling_sentinel(next_token_ids, logits)
+    return next_token_ids
+
+
+# [FORK][LANE EF2] FlashInfer's sampling kernels return the vocab size (an id one
+# past the last token) when a row cannot be sampled (NaN or fully masked probs).
+# 2026-10-02 legacy: 58 such rows (raw=[248320,-1,-1,-1]) at the first spec step
+# after a prefill emptied the row, skipped the scheduler's draft rollback and
+# drifted num_computed_tokens (L135; the 10-01 17:03 engine death). On a non-spec
+# row the sentinel would enter the sequence silently as an out-of-vocab token.
+# VLLM_SAMPLER_SENTINEL_GUARD=1: replace any id outside [0, vocab) with the row's
+# NaN-safe argmax (on device, no host sync) and count it; the count is logged
+# (rate limited) at most every _SENTINEL_LOG_EVERY calls, the only host read.
+_SENTINEL_GUARD = os.environ.get("VLLM_SAMPLER_SENTINEL_GUARD", "0") == "1"
+_SENTINEL_LOG_EVERY = 256
+_sentinel_state: dict = {"calls": 0, "count": None, "logged": 0}
+
+
+def guard_sampling_sentinel(
+    next_token_ids: torch.Tensor, logits: torch.Tensor
+) -> torch.Tensor:
+    vocab = logits.shape[-1]
+    bad = (next_token_ids < 0) | (next_token_ids >= vocab)
+    clean = torch.nan_to_num(logits, nan=float("-inf"))
+    fallback = clean.argmax(dim=-1).to(next_token_ids.dtype)
+    fixed = torch.where(bad, fallback, next_token_ids)
+    st = _sentinel_state
+    n = bad.sum()
+    st["count"] = n if st["count"] is None else st["count"] + n
+    st["calls"] += 1
+    if st["calls"] % _SENTINEL_LOG_EVERY == 0:
+        total = int(st["count"].item())
+        if total > st["logged"]:
+            logger.error(
+                "SAMPLER-SENTINEL %d sampled id(s) outside [0, %d) replaced by the "
+                "NaN-safe argmax (rows had NaN or fully masked logits; L135)",
+                total - st["logged"],
+                vocab,
+            )
+            st["logged"] = total
+    return fixed
 
 
 def _to_tensor_scalar_tuple(x):
