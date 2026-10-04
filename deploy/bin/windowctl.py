@@ -971,6 +971,8 @@ class Window:
         dur, poll = float(cfg.get("duration_s", 1800)), float(cfg.get("poll_s", 15))
         margin, min_fail = float(cfg.get("fail_margin", 0.02)), int(cfg.get("min_fail_n", 3))
         if self.dry:
+            self.vars.setdefault("T_LIVE_START", "0")
+            self.vars.setdefault("T_LIVE_END", "0")
             return {"rc": 0, "dry": True}
         lam = live_metrics_mod()
         t_start = float(self.t0)
