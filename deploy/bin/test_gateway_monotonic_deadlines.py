@@ -60,6 +60,13 @@ class WallClockStep(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(shim.effective_budget(), 1)             # two-hour wall step: still backing off
             self.assertLessEqual(shim._backoff_until - time.monotonic(), 120)
 
+    def test_ttft_is_a_monotonic_difference(self):
+        src = open(shim.__file__).read()
+        i = src.index("async def _relay(")
+        body = src[i:i + 60000]
+        self.assertIn("t_relay_start = time.monotonic()", body)
+        self.assertIn("_t_first[0] = time.monotonic()", body)
+
     def test_tokenize_failure_backoff_is_a_duration(self):
         src = open(shim.__file__).read()
         i = src.index("def _tokenize_exact")

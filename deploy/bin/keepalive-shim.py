@@ -8467,7 +8467,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
             committed (so the caller may fail over) — including a streaming upstream that
             dies during prefill before producing any token (the FIRST-TOKEN GATE).
     """
-    t_relay_start = time.time()   # TELEMETRY: TTFT reference point -- see DESIGN.md (c)
+    t_relay_start = time.monotonic()   # TELEMETRY: TTFT reference point -- see DESIGN.md (c)
     session = aiohttp.ClientSession()
 
     def _route_receipt():
@@ -8675,7 +8675,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
             buf.extend(chunk)
             _chunk_ct[0] += 1
             if _t_first[0] is None:
-                _t_first[0] = time.time()
+                _t_first[0] = time.monotonic()
             if (_looks_meaningful(buf.decode("utf-8", "replace"))
                     or len(buf) >= FIRST_GATE_MAX_BYTES or _chunk_ct[0] >= FIRST_GATE_MAX_CHUNKS):
                 return "commit"
