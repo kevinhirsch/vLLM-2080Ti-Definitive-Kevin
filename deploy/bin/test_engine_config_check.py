@@ -148,6 +148,25 @@ class CheckTests(Fixture):
         self.assertIn("clobbered", note)
 
 
+class RenderTests(Fixture):
+    def test_a_dry_run_never_waits_on_the_boot_gpu_gate(self):
+        """BS3/L117: the serve scripts source gpu-boot-gate.sh, which waits up to V02_GPU_WAIT_S (+ V02_GPU_ROGUE_WAIT_S) for the GPUs to be
+        free. The checker's dry run executes that shell logic while the LIVE engine is on the GPUs, so every `check` timed out
+        ('dry run timed out') and degraded into ~50 bogus 'extra-in-engine' errors. A render must switch the gate off, and the switch
+        must not leak into the compared environment."""
+        script = self.d / "serve-gated.sh"
+        script.write_text("#!/usr/bin/env bash\nset -euo pipefail\n"
+                          'if [ "${V02_GPU_WAIT_S:-90}" -gt 0 ] || [ "${V02_GPU_ROGUE_WAIT_S:-120}" -gt 0 ]; then sleep 60; fi\n'
+                          "export VLLM_REAL_KNOB=5\nexec python -m x\n")
+        r = E.render(script, {"PATH": os.environ["PATH"]}, str(self.d), timeout=8)
+        self.assertNotIn("error", r, r)
+        envs = [e for _, e in r["steps"]]
+        self.assertEqual(envs[-1]["VLLM_REAL_KNOB"], "5")
+        for e in envs:
+            self.assertNotIn("V02_GPU_WAIT_S", e)
+            self.assertNotIn("V02_GPU_ROGUE_WAIT_S", e)
+
+
 class WhereisTests(Fixture):
     def test_whereis_reports_production_chain_and_lookalikes(self):
         c = self.chain()

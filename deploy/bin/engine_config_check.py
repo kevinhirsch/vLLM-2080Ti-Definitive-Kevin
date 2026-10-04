@@ -230,6 +230,9 @@ __cfg_n=0
 '''
 
 
+_RENDER_ONLY = ("V02_GPU_WAIT_S", "V02_GPU_ROGUE_WAIT_S")      # set by render() itself; never part of the compared configuration
+
+
 def render(script: Path, base_env: dict, workdir: str, timeout=30):
     """Run the serve script's shell logic with its final exec replaced by a dump. Returns dict(steps=[(label, env)],
     argv=[...]) or dict(error=...). Refuses scripts with process-control commands."""
@@ -266,6 +269,10 @@ def render(script: Path, base_env: dict, workdir: str, timeout=30):
         rs = Path(td) / "render.sh"
         rs.write_text("\n".join(out) + "\n")
         env = dict(base_env)
+        # BS3/L117: the serve scripts source gpu-boot-gate.sh, which polls nvidia-smi for up to V02_GPU_WAIT_S (+ V02_GPU_ROGUE_WAIT_S) until the
+        # GPUs are free. A render runs while the live engine OWNS the GPUs, so the gate must be off here (it timed every check out).
+        env["V02_GPU_WAIT_S"] = "0"
+        env["V02_GPU_ROGUE_WAIT_S"] = "0"
         env["__CFG_DIR"] = td
         env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
         try:
@@ -286,6 +293,9 @@ def render(script: Path, base_env: dict, workdir: str, timeout=30):
                     k, v = item.split(b"=", 1)
                     e[k.decode(errors="replace")] = v.decode(errors="replace")
             e.pop("__CFG_DIR", None)
+            for k in _RENDER_ONLY:
+                if k not in base_env:
+                    e.pop(k, None)
             for k in [k for k in e if k.startswith("__cfg")]:
                 e.pop(k)
             steps.append((label, e))
