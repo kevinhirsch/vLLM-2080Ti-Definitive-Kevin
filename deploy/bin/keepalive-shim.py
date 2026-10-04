@@ -128,13 +128,39 @@ def _fmt_seq(value, sep):
 # loud warning), booleans are canonicalised to 1/0 (a dashboard-persisted "False" used to come back as ON after a
 # restart), and shim.env duplicates / unknown keys are logged. Fail safe: if the module is missing or raises, the
 # gateway runs exactly as before. Effective values: GET /gateway/config/effective.
+# Lane SH (2026-10-03): every module that ships beside this file (gateway_safe_publish.GATEWAY_MODULES) is loaded
+# through _load_gateway_module(): from THIS file's directory by path (the live dir is never put on sys.path -- it
+# holds many stray .py files), executing exactly the bytes it hashed, so GET /gateway/modules can prove which code
+# the running process loaded and the publisher can verify it after a restart.
+_GATEWAY_MODULES_LOADED = {}      # filename -> {"sha256", "loaded", "required", "error"}; one row per manifest file
+
+
+def _load_gateway_module(fname, modname, required=True):
+    import importlib.util as _ilu
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), fname)
+    rec = _GATEWAY_MODULES_LOADED[fname] = {"sha256": None, "loaded": False, "required": bool(required), "error": None}
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+        rec["sha256"] = hashlib.sha256(data).hexdigest()
+        spec = _ilu.spec_from_file_location(modname, path)
+        mod = _ilu.module_from_spec(spec)
+        sys.modules[modname] = mod          # dataclasses/typing resolve their module by name during exec
+        exec(compile(data, path, "exec"), mod.__dict__)
+        rec["loaded"] = True
+        return mod
+    except Exception as e:
+        rec["error"] = repr(e)[:240]
+        if required:
+            raise RuntimeError("gateway module %s could not be loaded from %s: %r" % (fname, path, e)) from e
+        return None
+
+
 def _load_cfg_schema():
     try:
-        import importlib.util as _ilu
-        _p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gateway_config_schema.py")
-        _spec = _ilu.spec_from_file_location("gateway_config_schema", _p)
-        _mod = _ilu.module_from_spec(_spec)
-        _spec.loader.exec_module(_mod)
+        _mod = _load_gateway_module("gateway_config_schema.py", "gateway_config_schema", required=False)
+        if _mod is None:
+            raise RuntimeError(_GATEWAY_MODULES_LOADED["gateway_config_schema.py"]["error"])
         _mod.sanitize_environ(os.environ, env_file=os.environ.get(
             "SHIM_ENV_FILE", "/home/kevin/.local/share/vllm-qwen27b/shim.env"))
         return _mod
@@ -1210,6 +1236,8 @@ def _drain_startup_recover():
                                  "duration_s": round(time.time() - float(last.get("t") or time.time()), 1), "reason": last.get("reason"),
                                  "by": last.get("by"), "ttl_s": last.get("ttl_s"), "active_at_open": last.get("active"),
                                  "refused": None, "note": "refused count unknown: the process that held the fence is gone"})
+    except FileNotFoundError:
+        pass                      # no ledger yet (first start, fresh dir): nothing to recover, not a failure
     except Exception as _e:
         _swallowed("_drain_startup_recover", _e)
 
@@ -4408,13 +4436,13 @@ def _telemetry_note_request(info, resp=None):
         if (CREDIT_ANCHOR != "off" or CREDIT_PROBE != "off") and route in ("local", "held") and info.get("ptok_exact_local"):
             try:
                 _anchor_note((_PM_INFLIGHT.get(info.get("pm_ref")) or {}).get("chain") or [], info["ptok_exact_local"], now)
-            except Exception:
-                pass
+            except Exception as _e:
+                _swallowed("telemetry:anchor_note", _e)
         if CHAIN_TELEMETRY or WARM_PRIORITY:
             try:
                 _chain_route_note((_PM_INFLIGHT.get(info.get("pm_ref")) or {}).get("chain") or [], route, now)
-            except Exception:
-                pass
+            except Exception as _e:
+                _swallowed("telemetry:chain_route_note", _e)
         _pm_feedback(info)        # LS lane: grade + self-correct the cache-aware cost model
         _shape_stats_note(route, status, info)
         _est_err_note(route, name, info)
@@ -4964,6 +4992,37 @@ def _history_summary_blocking(since_ts, max_files, hard_line_cap=500000):
 # existing functions, edited in place to plug into it -------------------------------------
 
 
+def _retract_route_event(request):
+    """Lane SH (L163): undo the counters, ring entries and routing row of this request's last record_event(). Used when
+    a spend-refused overflow re-enters the router and is served locally: before, the one request was counted twice
+    (once 'remote <reason>' although nothing was paid, once 'local')."""
+    try:
+        rec = request.get("gw_last_route_event")
+        request["gw_last_route_event"] = None
+    except Exception:
+        return
+    if not rec:
+        return
+    decision, reason, ev, row, waited = rec
+    _stats["total"] -= 1
+    key = {"local": "local", "held": "held", "rejected-bg": "rejected_bg", "gone": "client_gone"}.get(decision, "remote")
+    _stats[key] = _stats.get(key, 0) - 1
+    if key == "remote":
+        _remote_reasons[reason] -= 1
+        if _remote_reasons[reason] <= 0:
+            del _remote_reasons[reason]
+    if waited and waited > 0:
+        _stats["waited_total"] -= waited
+        _stats["waited_n"] -= 1
+    for ring, item in ((_events, ev), (_FLOW_ROUTES, row)):
+        if item is None:
+            continue
+        for k, x in enumerate(ring):
+            if x is item:
+                del ring[k]
+                break
+
+
 def record_event(decision, reason, request, units, waited, ptok=0, maxtok=0, stream=False):
     # route values: "local" / "remote" (unchanged), plus two BG-LOCAL-ONLY additions --
     # "held" (a background request that waited out a local-availability event and was served
@@ -4996,7 +5055,7 @@ def record_event(decision, reason, request, units, waited, ptok=0, maxtok=0, str
         _stats["waited_total"] += waited
         _stats["waited_n"] += 1
     _stats["peak_inflight"] = max(_stats["peak_inflight"], _inflight)
-    flow_note_route(decision, final_reason, request)
+    _route_row = flow_note_route(decision, final_reason, request)
     # TELEMETRY: pull whatever _relay()/_forward_remote()/the local-success branches have
     # already stashed on this request's live-registry entry (ttft/outtok are None for the
     # "record-before-forward" remote branches -- see DESIGN.md (c) for exactly why, and where
@@ -5004,7 +5063,7 @@ def record_event(decision, reason, request, units, waited, ptok=0, maxtok=0, str
     # _ACTIVE entry but read later, in handle_completions' finally, after the request finishes).
     _rinfo = _ACTIVE.get(id(request)) or {}
     _outtok, _outtok_lb = _rinfo.get("outtok"), _rinfo.get("outtok_lb")
-    _events.appendleft({"t": round(time.time(), 1), "d": decision, "r": final_reason,
+    _ev = ({"t": round(time.time(), 1), "d": decision, "r": final_reason,
                         "client": _client_label(request), "units": units,
                         "waited": round(waited or 0, 1),
                         "ep": request.path.rsplit("/", 1)[-1],
@@ -5016,6 +5075,11 @@ def record_event(decision, reason, request, units, waited, ptok=0, maxtok=0, str
                         "ttft": _rinfo.get("ttft"), "outtok": _outtok, "outtok_lb": _outtok_lb,
                         "cost_est": (_remote_cost_estimate(ptok, _outtok if _outtok is not None else _outtok_lb)
                                      if decision == "remote" else 0.0)})
+    _events.appendleft(_ev)
+    try:                       # lane SH (L163): what this request counted, so a re-entry can take it back
+        request["gw_last_route_event"] = (decision, reason, _ev, _route_row, waited)
+    except Exception:
+        pass
 
 def _gpu_stats():
     now = time.time()
@@ -6208,7 +6272,9 @@ def flow_note_route(decision, reason, request):
         info = _ACTIVE.get(id(request)) or {}
         headroom = bool(_health.get("ok") and not _local_offline() and _inflight < effective_budget()
                         and flow_backlog_s() <= LIGHT_PREFILL_SECS)
-        _FLOW_ROUTES.append((time.time(), decision, reason, info.get("flow_class"), headroom))
+        row = (time.time(), decision, reason, info.get("flow_class"), headroom)
+        _FLOW_ROUTES.append(row)
+        return row
     except Exception as _e:
         _swallowed("flow_note_route", _e)
 
@@ -9478,8 +9544,8 @@ async def _route_completions(request, _no_overflow=False):
     # (it used to be set only on the local admission path: 407 of 410 remote requests showed class "?").
     try:
         _active_set(request, flow_class=flow_class_of(request, body, background, halo_control))
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallowed("route:flow_class", _e)
     # gw-admission-computed-token-cost: predicted UNCONDITIONALLY (not gated on
     # USE_COMPUTED_COST, which only decides whether admission COST uses this number) so the
     # card's own accuracy gate has real predicted-vs-actual data to grade from the moment this
@@ -9495,8 +9561,8 @@ async def _route_completions(request, _no_overflow=False):
     if CREDIT_ANCHOR != "off" or CREDIT_PROBE != "off":
         try:
             await _credit_sources(request, _pm, _pm_body, ptok)     # [GW2 / L105] engine-reported credit
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallowed("route:credit_sources", _e)
     est_computed = _pm["computed"]
     units = estimate_units(body, client=client, computed=est_computed)
     # The chain holds raw digests (not JSON-serialisable), so it lives in a side table keyed by the
@@ -9509,8 +9575,8 @@ async def _route_completions(request, _no_overflow=False):
             _cr_route, _cr_age, _ = _chain_route_lookup(_pm["chain"])
             _active_set(request, chain_prev_route=_cr_route,
                         chain_prev_age_s=None if _cr_age is None else round(_cr_age, 1), pm_match_tok=_pm.get("matched"))
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallowed("route:chain_route_lookup", _e)
     _cr_warm = warm_continuation(_pm)
     if _cr_warm:
         request["cr_warm_priority"] = True
@@ -9575,6 +9641,7 @@ async def _route_completions(request, _no_overflow=False):
         if resp is not None and getattr(resp, "headers", {}).get("X-Gateway-Spend-Refused"):
             if reentry:
                 log.info("route %s overflow refused by the spend authority -> local", path)
+                _retract_route_event(request)        # L163: the remote event is replaced by the local one
                 return await _route_completions(request, _no_overflow=True)
             return _cap_exhausted_unavailable("local failed and the daily remote cap is exhausted")
         return resp
@@ -9621,8 +9688,8 @@ async def _route_completions(request, _no_overflow=False):
             try:                                   # LF: cold-cache loop signal (remote turns never warm the local prefix)
                 if _pm["credit"] < 0.1 * max(1, ptok) and why.startswith("saturated"):
                     _local_first_cold_remote[_client_key(_local_first_cold_remote, client)] += 1
-            except Exception:
-                pass
+            except Exception as _e:
+                _swallowed("route:lf_cold_remote", _e)
         return keep
 
     if LOG_REQUESTS:
@@ -10508,6 +10575,12 @@ def _prom_line(name, value, labels=None):
         lbl = ",".join(f'{k}="{_prom_escape(v)}"' for k, v in labels.items())
         return f"{name}{{{lbl}}} {value}"
     return f"{name} {value}"
+
+
+async def gateway_modules(request):
+    """Lane SH: which code this process is running -- its own file's sha256 and every module it loaded beside itself
+    (sha256 of the exact bytes executed). gateway_safe_publish verifies these against the sources after a restart."""
+    return web.json_response({"gateway_sha256": GATEWAY_SHA256, "modules": _GATEWAY_MODULES_LOADED})
 
 
 async def gateway_internal_errors(request):
@@ -13067,6 +13140,7 @@ def make_app():
     app.router.add_get("/gateway/config", gateway_config)
     app.router.add_get("/gateway/config/effective", gateway_config_effective)   # lane CFG: typed effective config
     app.router.add_get("/gateway/internal-errors", gateway_internal_errors)    # lane SH: swallowed exceptions
+    app.router.add_get("/gateway/modules", gateway_modules)                    # lane SH: loaded code (publish readback)
     app.router.add_get("/gateway/spend", gateway_spend)                        # R2 spend authority
     app.router.add_post("/gateway/spend/reserve", gateway_spend_reserve)
     app.router.add_post("/gateway/spend/finalize", gateway_spend_finalize)
