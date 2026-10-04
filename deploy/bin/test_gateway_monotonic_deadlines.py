@@ -65,5 +65,65 @@ class WallClockStep(unittest.IsolatedAsyncioTestCase):
         self.assertIn("_tok_fail_until = time.monotonic() + 60", body)
 
 
+class DecisionClocks(unittest.IsolatedAsyncioTestCase):
+    """L164 round 2: the remaining in-memory DECISION deadlines (OOM backoff, perf-breaker hold, health TTL, admission wait)."""
+
+    def test_oom_backoff_survives_a_forward_wall_step_and_ends_on_real_time(self):
+        with patch.object(shim, "OOM_BACKOFF", 120), patch.object(shim, "_pm_reset", lambda *a, **k: None), \
+                patch.object(shim, "BUDGET", 4):
+            shim._backoff_until, shim._backoff_mono_until = 0.0, 0.0
+            try:
+                shim.trigger_backoff("test")
+            except Exception:
+                pass
+            self.assertEqual(shim.effective_budget(), 1)
+            with patch.object(shim.time, "time", stepping_clock(3600 * 5)):     # NTP jumps 5 h forward mid-backoff
+                self.assertEqual(shim.effective_budget(), 1)                   # wall deadline: back to BUDGET at once (full lanes into a crashed engine)
+            with patch.object(shim.time, "monotonic", lambda r=time.monotonic: r() + 121):
+                self.assertEqual(shim.effective_budget(), 4)                  # real elapsed time still ends it
+
+    def test_perf_breaker_hold_is_monotonic(self):
+        with patch.object(shim, "PERF_BREAKER_ENABLED", True), patch.dict(shim._PERF_STATE, {"until": time.monotonic() + 60}):
+            self.assertTrue(shim.perf_breaker_active())
+            with patch.object(shim.time, "time", stepping_clock(3600 * 5)):
+                self.assertTrue(shim.perf_breaker_active())
+            with patch.object(shim.time, "time", stepping_clock(-3600 * 5)):
+                self.assertTrue(shim.perf_breaker_active())
+        with patch.object(shim, "PERF_BREAKER_ENABLED", True), patch.dict(shim._PERF_STATE, {"until": time.monotonic() - 1}):
+            self.assertFalse(shim.perf_breaker_active())
+
+    async def test_health_ttl_is_a_duration(self):
+        with patch.dict(shim._health, {"ok": True, "at": time.monotonic()}), patch.object(shim, "HEALTH_TTL", 5.0), \
+                patch.object(shim, "LOCAL", "http://127.0.0.1:9"):             # a probe would find nothing: a cache hit is the only True
+            with patch.object(shim.time, "time", stepping_clock(3600 * 5)):
+                self.assertTrue(await shim.local_healthy())                    # served from the cache, no probe of :8001
+
+    def test_wall_deadline_converts_once_to_the_monotonic_scale(self):
+        m0 = time.monotonic()
+        d = shim._wall_to_mono(time.time() + 30)
+        self.assertAlmostEqual(d - m0, 30, delta=1.0)
+        with patch.object(shim.time, "time", stepping_clock(3600)):             # after adoption a wall step cannot move it
+            self.assertAlmostEqual(d - time.monotonic(), 30, delta=1.0)
+
+    def test_decision_functions_never_read_the_wall_clock(self):
+        """Ratchet: these functions decide something from a duration; time.time() must not appear in them."""
+        import ast
+        tree = ast.parse(open(shim.__file__).read())
+        banned = {"effective_budget", "perf_breaker_active", "_wall_to_mono_never"}
+        found = {}
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef) and n.name in banned:
+                found[n.name] = [c.lineno for c in ast.walk(n) if isinstance(c, ast.Call) and ast.unparse(c.func) == "time.time"]
+        self.assertEqual({k: v for k, v in found.items() if v}, {})
+
+    def test_admission_wait_and_service_time_use_monotonic(self):
+        src = open(shim.__file__).read()
+        self.assertIn("deadline = time.monotonic() + admission_wait_seconds(", src)
+        self.assertIn("t_admit0 = time.monotonic()", src)
+        self.assertIn("if time.monotonic() >= deadline:", src)
+        self.assertIn("claimed_at = time.monotonic()", src)
+        self.assertIn("_wall_to_mono(flow_t.deadline_at - flow_t.cost_s)", src)
+
+
 if __name__ == "__main__":
     unittest.main()

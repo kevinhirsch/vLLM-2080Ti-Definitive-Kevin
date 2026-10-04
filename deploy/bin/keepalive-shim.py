@@ -968,8 +968,18 @@ _waiting_by_class = {"interactive": 0, "background": 0}
 # next user message, not by exactly 1). Bounded by PREFIX_CACHE_MAX_CLIENTS (FIFO eviction) so an
 # attacker or a runaway number of distinct X-Client values can't grow this without bound.
 _prefix_seen = {}
-_backoff_until = 0.0
-_health = {"ok": False, "at": 0.0}
+_backoff_until = 0.0          # wall epoch: DISPLAY only (status, metrics, sampler). The decision reads _backoff_mono_until (L164).
+_backoff_mono_until = 0.0
+_health = {"ok": False, "at": 0.0}     # "at" is a time.monotonic() stamp (L164): a TTL is a duration
+
+
+# L164 CLOCK RULE (one place to read it). time.time() is for TIMESTAMPS: anything written to disk, logged, sent to a client, shown on a
+# dashboard, or compared with a value that outlives this process (persisted windows, leases, client-declared deadlines).
+# time.monotonic() is for DURATIONS and in-memory DEADLINES: a TTL, a backoff, a hold, an admission wait, a service time. An NTP step
+# turns a wall-clock deadline into an instant timeout (forward) or a wait that never ends (backward). _wall_to_mono() converts a wall
+# epoch deadline (e.g. a client-declared one) into the monotonic scale once, at the moment it is adopted.
+def _wall_to_mono(wall_epoch):
+    return time.monotonic() + (float(wall_epoch) - time.time())
 REMOTE_ENABLED = bool(REMOTE_BASE and REMOTE_KEY)
 
 
@@ -1519,7 +1529,7 @@ def _update_perf_breaker(sample):
         _PERF_STATE["good_streak"] = 0
         _PERF_STATE["reason"] = ",".join(reasons)
         if _PERF_STATE["bad_streak"] >= max(1, PERF_BREAKER_MIN_SAMPLES):
-            _PERF_STATE["until"] = max(_PERF_STATE["until"], time.time() + PERF_BREAKER_HOLD_SECS)
+            _PERF_STATE["until"] = max(_PERF_STATE["until"], time.monotonic() + PERF_BREAKER_HOLD_SECS)   # L164: monotonic hold
     else:
         _PERF_STATE["good_streak"] += 1
         _PERF_STATE["bad_streak"] = 0
@@ -1529,7 +1539,7 @@ def _update_perf_breaker(sample):
 
 
 def perf_breaker_active():
-    return bool(PERF_BREAKER_ENABLED and time.time() < _PERF_STATE.get("until", 0.0))
+    return bool(PERF_BREAKER_ENABLED and time.monotonic() < _PERF_STATE.get("until", 0.0))
 
 
 # ---- LOCAL-FIRST state + decision (see the LOCAL_FIRST config block) ----
@@ -5380,8 +5390,8 @@ def _flow_failopen(default):
             except Exception as e:          # noqa: BLE001
                 _FLOW_ERR["n"] += 1
                 _FLOW_STATS["failopen_" + fn.__name__] += 1
-                if time.time() - _FLOW_ERR["last"] > 60:
-                    _FLOW_ERR["last"] = time.time()
+                if time.monotonic() - _FLOW_ERR["last"] > 60:
+                    _FLOW_ERR["last"] = time.monotonic()
                     log.exception("flow hook %s failed (%d so far); serving with legacy admission: %s", fn.__name__, _FLOW_ERR["n"], e)
                 return default
         wrapper.__name__ = fn.__name__
@@ -6756,12 +6766,13 @@ def _persist_config():
 
 
 def effective_budget():
-    return 1 if time.time() < _backoff_until else BUDGET
+    return 1 if time.monotonic() < _backoff_mono_until else BUDGET
 
 
 def trigger_backoff(reason):
-    global _backoff_until
+    global _backoff_until, _backoff_mono_until
     _backoff_until = time.time() + OOM_BACKOFF
+    _backoff_mono_until = time.monotonic() + OOM_BACKOFF
     log.warning("LOCAL backoff -> budget=1 for %ss (%s)", OOM_BACKOFF, reason)
     _pm_reset("local fault: " + str(reason)[:60])
     # CRASH-ADAPTIVE big_prompt guard: trigger_backoff() only fires on a real detected local
@@ -8124,7 +8135,8 @@ def remap_for_remote(body, remote_model=None, remote_max_output=None):
 
 async def local_healthy():
     now = time.time()
-    if now - _health["at"] < HEALTH_TTL:
+    mono = time.monotonic()            # L164: the TTL is a duration
+    if _health["at"] > 0 and mono - _health["at"] < HEALTH_TTL:
         return _health["ok"]
     ok = False
     foreign = 0
@@ -8165,7 +8177,7 @@ async def local_healthy():
     if ok and not _health.get("ok", False) and _health.get("at", 0.0) > 0:
         _pm_reset("engine back after being down")      # its prefix cache did not survive the outage
         _capacity_engine_changed(now, "engine back after being down")
-    _health.update(ok=ok, at=now, foreign=foreign, foreign_tokens=foreign_tokens, foreign_heavy=foreign_heavy)
+    _health.update(ok=ok, at=mono, foreign=foreign, foreign_tokens=foreign_tokens, foreign_heavy=foreign_heavy)
     return ok
 
 
@@ -10143,7 +10155,7 @@ async def _route_completions(request, _no_overflow=False):
     def claim_local():
         nonlocal reserved, claimed_at
         global _inflight, _inflight_tokens, _inflight_reserved_tokens, _inflight_computed
-        claimed_at = time.time()
+        claimed_at = time.monotonic()      # L164: a service time is a duration
         _flow_bump()
         _inflight += units
         _inflight_tokens += ptok
@@ -10164,7 +10176,7 @@ async def _route_completions(request, _no_overflow=False):
             _inflight_reserved_tokens -= reservation
             _inflight_computed = max(0, _inflight_computed - _pm.pop("backlog_held", 0))
             reserved = False
-            flow_note_service(flow_cls, time.time() - claimed_at)
+            flow_note_service(flow_cls, time.monotonic() - claimed_at)
             flow_prefill_done(id(request))
             _flow_bump()
 
@@ -10231,10 +10243,10 @@ async def _route_completions(request, _no_overflow=False):
     lane_limit = admission_lane_limit(background, effective_budget(), FG_RESERVED,
                                       halo_control=halo_control,
                                       tiny_extra_lanes=TINY_EXTRA_LANES)
-    deadline = time.time() + admission_wait_seconds(
+    deadline = time.monotonic() + admission_wait_seconds(     # L164: the whole admission wait is on the monotonic scale
         background, overflow_ok, is_peak(), LOCAL_WAIT, BG_WAIT, INTERACTIVE_NEVER_OVERFLOW)
     admitted = False
-    t_admit0 = time.time()
+    t_admit0 = time.monotonic()
     # lane CFG QoL: an interactive request that may overflow is judged by its PREDICTED wait, not a timer.
     _qol_live = (QOL_OVERFLOW in ("shadow", "on") and not background and overflow_ok and not alias_local_only
                  and not local_pin)
@@ -10269,7 +10281,7 @@ async def _route_completions(request, _no_overflow=False):
         # The flow class (not the legacy is_background() test, which does not know the overseer-* clients) owns the wait
         # bound of robot work whenever remote is a possible valve.
         if overflow_ok and not alias_local_only:
-            deadline = min(flow_t.deadline_at - flow_t.cost_s, t_admit0 + BG_WAIT_LOCAL)
+            deadline = min(_wall_to_mono(flow_t.deadline_at - flow_t.cost_s), t_admit0 + BG_WAIT_LOCAL)   # deadline_at is a client-declared wall epoch
     if FLOW_MODE != "off":
         _refusal = flow_admission_check(flow_t, bool(overflow_ok and not alias_local_only))
         _active_set(request, flow_expected_wait_s=flow_t.expected_wait_s)
@@ -10336,7 +10348,7 @@ async def _route_completions(request, _no_overflow=False):
                     _active_set(request, **_q)
                     _qol_broke = True
                     break
-            if time.time() >= deadline:
+            if time.monotonic() >= deadline:
                 break
             if not queued:                       # first time we couldn't get a slot -> we're backlogged
                 queued = True
@@ -10609,7 +10621,7 @@ async def h_catchall(request):
 
 
 async def gateway_stats(request):
-    up = _health["ok"] if (time.time() - _health["at"] < HEALTH_TTL) else await local_healthy()
+    up = _health["ok"] if (_health["at"] > 0 and time.monotonic() - _health["at"] < HEALTH_TTL) else await local_healthy()
     total = _stats["total"] or 1
     return web.json_response({
         "uptime": int(time.time() - _stats["started"]),
