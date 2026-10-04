@@ -177,6 +177,12 @@ class Holds(Base):
 
 
 class LegacyWindows(Base):
+    def setUp(self):
+        super().setUp()
+        p = patch.object(ea, "IMPLICIT_WINDOW_PROC_HOLD", 1)       # the pre-L153 stop-gap, switched back on for these old-behaviour tests
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_window_process_is_a_bounded_implicit_hold(self):
         self.windows = [(904804, 600, "bash /home/kevin/Desktop/wt-k3/tools/k3/window.sh /home/kevin/projects/lanes/k3")]
         self.healthy = False
@@ -192,6 +198,31 @@ class LegacyWindows(Base):
             self.assertTrue(ea.WINDOW_PROC_RE.match(ok), ok)
         for no in ("tail -f /x/window.sh", "grep window.sh", "bash -c 'echo window.sh'", "python3 windowctl.py"):
             self.assertFalse(ea.WINDOW_PROC_RE.match(no), no)
+
+
+class WindowProcessHoldIsOffByDefault(Base):
+    """L153 (BS3): every window script takes a real hold now (window_guard.sh); the process-pattern implicit hold is retired."""
+    def test_default_is_off(self):
+        self.assertEqual(ea.IMPLICIT_WINDOW_PROC_HOLD, 0)
+
+    def test_a_running_window_script_no_longer_holds_the_engine_and_is_listed(self):
+        self.windows = [(904804, 600, "bash /home/kevin/projects/lanes/dft/window.sh")]
+        self.healthy = False
+        self.unit.update(ActiveState="inactive", InactiveEnterTimestamp=self.now - 3000)
+        out = ea.tick()
+        self.assertEqual(out["state"], "RECOVERING")                      # the authority's normal DOWN exit
+        self.assertEqual(self.sudo[-1], ["start", "--no-block", ea.UNIT])
+        self.assertEqual(out["legacy_window_procs"][0]["pid"], 904804)
+        self.assertIn("window_guard", out["legacy_window_procs_note"])
+
+    def test_a_guarded_window_still_holds_through_the_explicit_hold(self):
+        self.windows = [(904804, 600, "bash /home/kevin/projects/lanes/dft/window.sh")]
+        json.dump([{"kind": "engine", "by": "DFT", "reason": "window", "lease": "L", "acquired": self.now - 60, "until": self.now + 600}],
+                  open(ea.HOLDS, "w"))
+        self.healthy = False
+        self.unit.update(ActiveState="inactive", InactiveEnterTimestamp=self.now - 3000)
+        self.assertEqual(ea.tick()["state"], "HELD")
+        self.assertEqual(self.sudo, [])
 
 
 class Exits(Base):
@@ -489,6 +520,9 @@ class ImplicitHoldsOneRule(Base):
             self.assertEqual(ea.do_restart(args), 0)
 
     def test_order_matches_classify(self):
+        p = patch.object(ea, "IMPLICIT_WINDOW_PROC_HOLD", 1)
+        p.start()
+        self.addCleanup(p.stop)
         self.offline = {"offline": True, "by": "K3", "reason": "r", "remaining_s": 10}
         self.windows = [(1, 5, "bash x/window.sh")]
         f = ea.observe()

@@ -817,6 +817,12 @@ def _env_i(name, default):
     except ValueError:
         return default
 
+#: L153 (BS3 2026-10-04): the process-pattern IMPLICIT hold (a running `*_window.sh` / `window.sh` / `*_driver.sh` counted as an engine hold, <= 8 h) was the
+#: stop-gap for window scripts that neither held nor were guarded. Every lane/repo window script now takes a real hold through window_guard.sh
+#: (tools/l153_guard_window_scripts.py; test_window_guard.LaneScriptsAreGuarded is the ratchet), so the pattern is OFF by default: a script that stops the engine
+#: without a hold gets the authority's normal DOWN exit after DOWN_GRACE_S, and is listed in liveness-state.json `legacy_window_procs` so the cause is visible.
+#: LIVENESS_IMPLICIT_WINDOW_PROC_HOLD=1 restores the old behaviour.
+IMPLICIT_WINDOW_PROC_HOLD = _env_i("LIVENESS_IMPLICIT_WINDOW_PROC_HOLD", 0)
 HOLD_MAX_TTL_S = _env_i("LIVENESS_HOLD_MAX_TTL_S", 8 * 3600)   # DFT's 16000 s fine-tune window fits; nothing holds forever
 BOOT_DEADLINE_S = _env_i("LIVENESS_BOOT_DEADLINE_S", 900)       # cold compile+capture ~4-5 min; window boot budgets use 900
 UNRESPONSIVE_S = _env_i("LIVENESS_UNRESPONSIVE_S", 180)         # API was up this boot, then stopped answering for this long
@@ -1046,6 +1052,15 @@ def _window_procs():
         if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit() and WINDOW_PROC_RE.match(parts[2]):
             out.append((int(parts[0]), int(parts[1]), parts[2][:160]))
     return out
+
+
+def _seen_window_procs():
+    return [w for w in _window_procs() if w[1] < HOLD_MAX_TTL_S]
+
+
+def _live_window_procs():
+    """The window processes that count as an implicit engine hold: none unless LIVENESS_IMPLICIT_WINDOW_PROC_HOLD=1 (see the knob)."""
+    return _seen_window_procs() if IMPLICIT_WINDOW_PROC_HOLD else []
 
 
 def _gateway_offline():
@@ -1285,7 +1300,8 @@ def observe(now=None):
     return {"now": now, "paused": os.path.exists(LPAUSE), "unit": _unit_facts(), "healthy": healthy,
             "health_code": 200 if healthy else health_code(),
             "planned_lock": _lock_held(), "job": job, "holds": active_holds(now), "offline": _gateway_offline(),
-            "frontier_window_age_s": fq_age, "window_procs": [w for w in _window_procs() if w[1] < HOLD_MAX_TTL_S],
+            "frontier_window_age_s": fq_age, "window_procs": _live_window_procs(),
+            "legacy_window_procs": [] if IMPLICIT_WINDOW_PROC_HOLD else _seen_window_procs(),
             "watchdog_failures": int(wd.get("consecutive_failures") or 0),
             "faults": _recent_faults(now), "fault_times": _recent_fault_times(now), "gate": gate(now)}
 
@@ -1446,6 +1462,9 @@ def _publish_state(state, reason, carry, f, extra=None):
            "healthy": f["healthy"], "holds": [{k: h.get(k) for k in ("kind", "by", "reason", "until", "mode")} for h in f.get("holds") or []],
            "implicit_holds": implicit_holds(f),
            "gate": f.get("gate"), "faults_window": f.get("faults_window"), "last_action": (_actions_cached(f) or [None])[-1]}
+    if f.get("legacy_window_procs"):
+        out["legacy_window_procs"] = [{"pid": w[0], "elapsed_s": w[1], "cmd": w[2]} for w in f["legacy_window_procs"]]
+        out["legacy_window_procs_note"] = "informational: a running window script is no longer an engine hold (L153); it must take one via window_guard.sh"
     if extra:
         out.update(extra)
     tmp = LSTATE + ".tmp"

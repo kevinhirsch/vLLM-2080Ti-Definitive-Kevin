@@ -100,11 +100,13 @@ engine-actuator.py restart --hold L ...         # the holder restarts its own en
 | | Defers automatic actions (tick start/recover, watchdog probes, `recover`) | Refuses someone else's planned `restart` | Listed in |
 |---|---|---|---|
 | **Explicit** (`hold acquire` / `hold run`; kinds engine, quiesce) | yes (engine kind) | yes, unless the caller passes the lease (`--hold` or `ENGINE_HOLD_LEASE`) | `active_holds()`, `hold status` → `holds` |
-| **Implicit**: gateway offline window (OFFLINE_WINDOW), frontier `RUNNING` flag (≤ 3 h), legacy `*window.sh` / `*_driver.sh` process (≤ 8 h of runtime) | yes | **no** | `implicit_holds()`, `hold status` → `implicit_holds`, `liveness-state.json` → `implicit_holds` |
+| **Implicit**: gateway offline window (OFFLINE_WINDOW), frontier `RUNNING` flag (≤ 3 h), legacy `*window.sh` / `*_driver.sh` process (≤ 8 h of runtime; **retired by default since L153**, see below) | yes | **no** | `implicit_holds()`, `hold status` → `implicit_holds`, `liveness-state.json` → `implicit_holds` |
 
 Why implicit holds never refuse a planned restart: their owner *is* the restart caller, for example a `gateway-offline.py run` window or a legacy window script restarting its own engine. They name no lease that a caller could present.
 
 A planned restart inside an open offline window **rides that window** (strategy `existing-offline-window`). It opens no window of its own, releases nothing, and never falls back to the drain fence. Before LV it fell back to the drain fence, which refuses all admission and is meant only for gateway code swaps.
+
+**L153 (BS3 2026-10-04): the process-pattern implicit hold is OFF by default** (`LIVENESS_IMPLICIT_WINDOW_PROC_HOLD=1` restores it). All 28 lane-private window scripts that stopped the watchdog timer were moved onto `window_guard.sh` with `tools/l153_guard_window_scripts.py` (originals under `~/projects/lanes/_l153-archive/`), the repo's two were migrated in `d232e7a7a2`, and `test_window_guard.py::LaneScriptsAreGuarded` fails if a lane script stops or starts the timer again. A window script that stops the engine without a hold now gets the normal DOWN exit after `DOWN_GRACE_S`; `liveness-state.json` lists it under `legacy_window_procs`.
 
 `implicit_holds()` and `classify()` use the same ordering (offline window, then frontier flag, then window process), and a test pins it.
 
