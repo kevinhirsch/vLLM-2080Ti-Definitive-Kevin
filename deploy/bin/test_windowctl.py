@@ -196,7 +196,7 @@ def test_the_ported_k5_spec_validates():
     names = [x["name"] for x in s["steps"]]
     assert names[:3] == ["clean", "stop-engine", "gdn-test"] and "k5-boot" in names
     k5 = next(x for x in s["steps"] if x["name"] == "k5-boot")
-    assert k5["boot"]["release"]["sha"].startswith("6235bb4956")     # the lane arm is a release, not the tree
+    assert k5["boot"]["release"]["sha"].startswith("40b3467c1d")     # the lane arm is a release, not the tree
     assert "trial_guard.sh" in s["conflicts"] and "vllm-qwen27b-watchdog.timer" in wc.pause_timers_of(s)
     tq = next(x for x in s["steps"] if x["name"] == "tq-test")
     assert s["vars"]["K5"] == "/home/kevin/Desktop/wt-k5"
@@ -538,6 +538,7 @@ def test_script_steps_run_from_a_read_only_snapshot(world, tmp_path):
 
 def test_submit_runs_the_window_from_a_code_snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(unitrun, "STATE_DIR", str(tmp_path / "units"))
+    monkeypatch.setattr(wc, "OVERRIDE", str(tmp_path / "v02.override.env"))
     seen = {}
     monkeypatch.setattr(wc.subprocess, "run", lambda argv, **k: seen.setdefault("argv", argv) and type("R", (), {"returncode": 0})())
     p = tmp_path / "s.json"
@@ -687,3 +688,15 @@ def test_L180_drop_only_removes_its_own_marker(world):
     assert wc.drop_planned_marker(mine) is False and os.path.exists(wc.PLANNED)
     json.dump(mine, open(wc.PLANNED, "w"))
     assert wc.drop_planned_marker(mine) is True and not os.path.exists(wc.PLANNED)
+
+
+def test_live_tools_refuse_mutations_from_a_test_run():
+    """PYTEST_CURRENT_TEST is inherited by every child: the live actuator / gateway-offline / windowctl / release refuse."""
+    import subprocess as sp
+    env = dict(os.environ, PYTEST_CURRENT_TEST="x", LIVE_GUARD_OFF="1")
+    for argv in ([sys.executable, os.path.join(HERE, "engine-actuator.py"), "restart", "--reason", "from a test run", "--by", "t"],
+                 [sys.executable, os.path.join(HERE, "gateway-offline.py"), "open", "--reason", "t", "--by", "t"],
+                 [sys.executable, os.path.join(HERE, "windowctl.py"), "deadman", "--state", "/nonexistent"],
+                 [sys.executable, os.path.join(HERE, "release.py"), "rollback", "--reason", "from a test run"]):
+        r = sp.run(argv, capture_output=True, text=True, env=env, timeout=60)
+        assert r.returncode in (2, 4) and "test run" in (r.stdout + r.stderr), (argv[1], r.stdout, r.stderr)

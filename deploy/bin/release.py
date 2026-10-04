@@ -864,6 +864,10 @@ def main(argv=None) -> int:
     p = sp.add_parser("rm")
     p.add_argument("id")
     a = ap.parse_args(argv)
+    if a.cmd in ("activate", "rollback", "rm", "build") and os.environ.get("PYTEST_CURRENT_TEST") \
+            and os.path.realpath(ROOT) == os.path.realpath(f"{__import__('pwd').getpwuid(os.getuid()).pw_dir}/.local/share/vllm-releases"):
+        print(json.dumps({"error": f"release {a.cmd} on the LIVE release root from a test run (PYTEST_CURRENT_TEST set)"}), file=sys.stderr)
+        return 4
     try:
         if a.cmd == "build":
             m = build(a.sha, label=a.label, from_tree=a.from_tree, jit=not a.no_jit, seed_caches=not a.no_seed_caches,

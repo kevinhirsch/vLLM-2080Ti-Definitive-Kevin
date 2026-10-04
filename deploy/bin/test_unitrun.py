@@ -156,3 +156,13 @@ def test_cli_run_uses_the_callers_cwd_for_relative_paths(state, tmp_path, monkey
     job = "cwd" + uuid.uuid4().hex[:6]
     rc = unitrun.main(["run", "--lane", "rltest", "--job", job, "--out", "o.log", "--", "cat", "rel.txt"])
     assert rc == 0 and (tmp_path / "o.log").read_text().strip() == "found"
+
+
+@needs_systemd
+def test_live_shell_dollar_signs_reach_bash_unexpanded(state, tmp_path):
+    out = tmp_path / "o.log"
+    res = unitrun.run("rltest", "dl" + uuid.uuid4().hex[:6], ["bash", "-c", "x=7; echo pid=$$ x=$x"], timeout_s=20, out=str(out),
+                      env={"x": "systemd-would-substitute-this"})
+    assert res["rc"] == 0
+    txt = out.read_text()
+    assert "x=7" in txt and "pid=$" not in txt.replace("pid=$$", "") and txt.split("pid=")[1].split()[0].isdigit()

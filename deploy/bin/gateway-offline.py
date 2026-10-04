@@ -75,6 +75,9 @@ def drop_lease(lease=None):
 
 
 def http(path, method="GET", payload=None):
+    # RL 2026-10-03: a process started from a pytest run must never open/close the REAL gateway's offline window
+    if method != "GET" and os.environ.get("PYTEST_CURRENT_TEST") and GATEWAY.rstrip("/") in ("http://127.0.0.1:8000", "http://localhost:8000"):
+        return {"error": f"refused: {method} {path} against the LIVE gateway from a test run (PYTEST_CURRENT_TEST set)", "http": 403}
     tok = ""
     try:
         tok = open(TOKEN_FILE).read().strip()
