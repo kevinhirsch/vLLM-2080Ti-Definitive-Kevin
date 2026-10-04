@@ -518,7 +518,7 @@ def main():
         recovered = liveness_action_row(a.liveness_action)
     if a.wedge and a.at:
         wedge = {"by": "watchdog", "wedge": True, "backfilled": True}
-    if a.pre_kill and not wedge:
+    if a.pre_kill and not wedge and not recovered:
         wedge = {"by": "watchdog", "wedge": True}
     if wedge:
         sig, detail = wedge_signature(sig, detail)
@@ -560,7 +560,7 @@ def main():
     if a.reconciled:
         row["reconciled"] = True
     if a.pre_kill:
-        row["recorded_by"] = "watchdog-pre-kill"
+        row["recorded_by"] = "liveness-pre-kill" if recovered else "watchdog-pre-kill"
     if wedge:
         row["wedge"] = {k: wedge.get(k) for k in ("by", "consecutive_failures", "ts")}
     if recovered:

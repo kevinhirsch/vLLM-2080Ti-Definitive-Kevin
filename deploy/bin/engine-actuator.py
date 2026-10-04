@@ -1525,6 +1525,12 @@ def _act(action, cause, by, evidence, f, dry_run=False):
                         json.dump({"ts": now_iso(), "id": aid, "cause": cause, "by": by, "evidence": evidence}, fh)
                 except OSError:
                     pass
+                # BS3: record the death BEFORE the kill, for every cause (the wedge path always did). `systemctl kill -s KILL` kills the WHOLE cgroup
+                # (--kill-whom=all, cgroup.kill) and that also kills the unit's ExecStopPost collector, which therefore never ran for the 4 medic
+                # recovers of 10-03 19:55 .. 10-04 06:07 (confirmed on a transient user unit: test_stop_post_race.py). The collector reads the
+                # marker just written and files a FAULT with the cause; its dedupe marker makes a later ExecStopPost skip.
+                steps.append(("pre-kill", subprocess.run([sys.executable, f"{BASE}/engine-fault-collector.py", "--pre-kill"],
+                                                         capture_output=True, text=True, timeout=60).returncode))
             steps.append(("reset-failed", _sudo(["reset-failed", UNIT])))
             # a confirmed wedge / stuck boot has never honoured SIGTERM (2026-09-02, 09-05): kill the control group up front
             steps.append(("kill", _sudo(["kill", "-s", "KILL", UNIT])))
