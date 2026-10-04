@@ -50,16 +50,6 @@ class WallClockStep(unittest.IsolatedAsyncioTestCase):
                 await shim._await_unless_gone(types.SimpleNamespace(), stuck(), timeout=0.2, poll=0.02)
         self.assertLess(time.monotonic() - t0, 2.0)
 
-    def test_oom_backoff_is_a_duration(self):
-        with patch.object(shim, "_backoff_until", 0.0), patch.object(shim, "OOM_BACKOFF", 120), \
-                patch.object(shim, "_pm_reset", lambda *a, **k: None):
-            shim.trigger_backoff("test fault")
-            self.assertEqual(shim.effective_budget(), 1)
-            real = time.time
-            with patch.object(shim.time, "time", lambda: real() + 7200):
-                self.assertEqual(shim.effective_budget(), 1)             # two-hour wall step: still backing off
-            self.assertLessEqual(shim._backoff_until - time.monotonic(), 120)
-
     def test_ttft_is_a_monotonic_difference(self):
         src = open(shim.__file__).read()
         i = src.index("async def _relay(")

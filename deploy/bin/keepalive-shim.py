@@ -2420,7 +2420,7 @@ async def _take_sample():
         "gateway": {"ttft60_p50": _l60.get("ttft_p50"), "ttft60_p95": _l60.get("ttft_p95"),
                     "itl60_p50": _l60.get("itl_p50"), "itl60_p95": _l60.get("itl_p95"), "lat60_n": _l60.get("n"),
                     "inflight": _inflight, "budget": effective_budget(), "waiting": _waiting,
-                    "backoff_s": max(0, int(_backoff_until - time.monotonic())),
+                    "backoff_s": max(0, int(_backoff_until - time.time())),
                     "local_healthy": _health.get("ok", False),
                     "remote_share_pct": _remote_share_delta(),
                     "perf_breaker": perf_breaker_active(),
@@ -6608,12 +6608,12 @@ def _persist_config():
 
 
 def effective_budget():
-    return 1 if time.monotonic() < _backoff_until else BUDGET
+    return 1 if time.time() < _backoff_until else BUDGET
 
 
 def trigger_backoff(reason):
     global _backoff_until
-    _backoff_until = time.monotonic() + OOM_BACKOFF        # [L164] in-memory deadline: monotonic, immune to a wall-clock step
+    _backoff_until = time.time() + OOM_BACKOFF
     log.warning("LOCAL backoff -> budget=1 for %ss (%s)", OOM_BACKOFF, reason)
     _pm_reset("local fault: " + str(reason)[:60])
     # CRASH-ADAPTIVE big_prompt guard: trigger_backoff() only fires on a real detected local
@@ -10320,7 +10320,7 @@ async def gateway_stats(request):
             False, effective_budget(), FG_RESERVED, halo_control=True,
             tiny_extra_lanes=TINY_EXTRA_LANES),
         "halo_control_token_reserve": _halo_control_token_reserve(),
-        "backoff": max(0, int(_backoff_until - time.monotonic())),
+        "backoff": max(0, int(_backoff_until - time.time())),
         "remote_model": REMOTE_MODEL, "remote_enabled": REMOTE_ENABLED,
         "local_only": bool(LOCAL_ONLY), "mode": routing_mode(),
         "local_wait": LOCAL_WAIT,
@@ -10464,7 +10464,7 @@ async def gateway_metrics(request):
     emit("gateway_inflight_tokens", "Sum of estimated prompt tokens across in-flight local requests.",
          "gauge", _inflight_tokens)
     emit("gateway_backoff_seconds", "Seconds remaining in an OOM-triggered budget=1 backoff.",
-         "gauge", max(0, int(_backoff_until - time.monotonic())))
+         "gauge", max(0, int(_backoff_until - time.time())))
 
     L.append("# HELP gateway_requests_total Completed requests by route.")
     L.append("# TYPE gateway_requests_total counter")
