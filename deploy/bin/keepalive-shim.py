@@ -642,6 +642,11 @@ _CFG = {
     "SHIM_REASONING_BUDGET_TOKENS": ("REASONING_BUDGET_TOKENS", int),
     "SHIM_REASONING_CHARS_PER_TOKEN": ("REASONING_CHARS_PER_TOKEN", float),
     "SHIM_THINK_BUDGET_EXPLICIT": ("THINK_BUDGET_EXPLICIT", int),
+    "SHIM_REMOTE_CONCURRENCY_LEARN": ("REMOTE_CONCURRENCY_LEARN", lambda v: _cfg_flag(v)),
+    "SHIM_REMOTE_CONCURRENCY_CAP": ("REMOTE_CONCURRENCY_CAP", int),
+    "SHIM_REMOTE_CONCURRENCY_TTL_S": ("REMOTE_CONCURRENCY_TTL_S", float),
+    "SHIM_REMOTE_CONCURRENCY_QUEUE_WAIT_S": ("REMOTE_CONCURRENCY_QUEUE_WAIT_S", float),
+    "SHIM_REMOTE_CONCURRENCY_RETRIES": ("REMOTE_CONCURRENCY_RETRIES", int),
     "SHIM_CREDIT_ANCHOR": ("CREDIT_ANCHOR", lambda v: str(v).strip().lower()),
     "SHIM_CREDIT_PROBE": ("CREDIT_PROBE", lambda v: str(v).strip().lower()),
     "SHIM_CREDIT_PROBE_TIMEOUT_S": ("CREDIT_PROBE_TIMEOUT_S", float),
@@ -778,6 +783,20 @@ REASONING_WATCHDOG = os.environ.get("SHIM_REASONING_WATCHDOG", "off").strip().lo
 REASONING_BUDGET_TOKENS = int(os.environ.get("SHIM_REASONING_BUDGET_TOKENS", "8192"))
 REASONING_CHARS_PER_TOKEN = float(os.environ.get("SHIM_REASONING_CHARS_PER_TOKEN", "4.0"))
 THINK_BUDGET_EXPLICIT = int(os.environ.get("SHIM_THINK_BUDGET_EXPLICIT", "0"))
+# [A6 2026-10-04] REMOTE CONCURRENCY GATE. DeepSeek answers 429 "Your current concurrency is C, which exceeds your concurrency limit
+# of N based on your remaining balance" (N follows the balance and moves). Before this the gateway passed that 429 to the client.
+# The gate learns the cap from the refusal, queues the request for a slot (nothing was billed: the provider refused it before
+# generating) and re-sends it; a client sees a slower answer, not an error.
+#  SHIM_REMOTE_CONCURRENCY_LEARN=1     learn the cap from 429s (0 = old behaviour: pass the 429 through)
+#  SHIM_REMOTE_CONCURRENCY_CAP=N       static cap per provider (0 = none until learned)
+#  SHIM_REMOTE_CONCURRENCY_TTL_S       a learned cap is forgotten after this long, so a topped-up balance is noticed
+#  SHIM_REMOTE_CONCURRENCY_QUEUE_WAIT_S  longest a request queues for a slot before its 429 is passed through
+#  SHIM_REMOTE_CONCURRENCY_RETRIES     re-sends of one request after a concurrency 429
+REMOTE_CONCURRENCY_LEARN = os.environ.get("SHIM_REMOTE_CONCURRENCY_LEARN", "1").strip().lower() not in ("0", "false", "off", "no", "")
+REMOTE_CONCURRENCY_CAP = int(os.environ.get("SHIM_REMOTE_CONCURRENCY_CAP", "0"))
+REMOTE_CONCURRENCY_TTL_S = float(os.environ.get("SHIM_REMOTE_CONCURRENCY_TTL_S", "900"))
+REMOTE_CONCURRENCY_QUEUE_WAIT_S = float(os.environ.get("SHIM_REMOTE_CONCURRENCY_QUEUE_WAIT_S", "180"))
+REMOTE_CONCURRENCY_RETRIES = int(os.environ.get("SHIM_REMOTE_CONCURRENCY_RETRIES", "4"))
 # [LANE GW2 2026-10-03] Engine-anchored cache credit, SHADOW only. The cost model's credit is a guess (matched chars /
 # total chars x the ESTIMATED prompt, shaved by trust, block-rounded); measured over 7,687 local rows it under-credits by
 # up to 14.3K tokens at p05 and over-credits by 3.6K at p95, and that error -- not the prompt-size estimate -- drives the
@@ -5826,7 +5845,7 @@ def flow_mode_now():
         why.append("local engine unhealthy")
     return {"planned_offline": offline, "mode": mode, "local_up": local_up, "remote_configured": remote_cfg, "remote_usable": remote_usable,
             "remote_dead_for_s": dead_s, "remote_budget_ok": budget_ok, "forced_remote": forced,
-            "full_local_flag": bool(LOCAL_ONLY), "why": why, **remote_balance_facts()}
+            "full_local_flag": bool(LOCAL_ONLY), "why": why, "remote_concurrency": remote_concurrency_facts(), **remote_balance_facts()}
 
 
 def flow_note_mode(now=None):
@@ -9216,6 +9235,162 @@ async def _note_remote_response(request, payload, body):
         log.warning("remote response note: %s", e)
 
 
+# ---- [A6 2026-10-04] remote concurrency gate: learn the provider's concurrency cap from its 429, queue instead of failing ----
+_RC_429 = re.compile(r"concurrency", re.I)
+_RC_LIMIT = re.compile(r"concurrency limit of\s+(\d+)", re.I)
+_RC_CURRENT = re.compile(r"current concurrency is\s+(\d+)", re.I)
+_RC = {}                       # provider base -> state
+_RC_STATS = collections.Counter()
+
+
+def _rc_state(provider):
+    st = _RC.get(provider)
+    if st is None:
+        st = _RC[provider] = {"inflight": 0, "waiters": collections.deque(), "learned": None, "learned_until": 0.0,
+                              "learned_at": None, "last_429": None}
+    return st
+
+
+def _rc_cap(st, now=None):
+    """The slots this provider currently allows us: the tighter of the static knob and an unexpired learned cap; None = no cap."""
+    now = time.monotonic() if now is None else now
+    caps = []
+    if REMOTE_CONCURRENCY_CAP > 0:
+        caps.append(REMOTE_CONCURRENCY_CAP)
+    if st["learned"] is not None and now < st["learned_until"]:
+        caps.append(st["learned"])
+    return max(1, min(caps)) if caps else None
+
+
+def _rc_wake(st):
+    """Hand free slots to queued requests, oldest first (FIFO: a retried request does not jump the line it already waited in)."""
+    cap = _rc_cap(st)
+    while st["waiters"] and (cap is None or st["inflight"] < cap):
+        fut = st["waiters"].popleft()
+        if fut.done():                  # cancelled while queued
+            continue
+        st["inflight"] += 1
+        fut.set_result(True)
+
+
+async def _rc_acquire(provider, wait_s):
+    """A slot on `provider`, or False when none came free within wait_s. A client hang-up cancels the wait."""
+    st = _rc_state(provider)
+    cap = _rc_cap(st)
+    if (cap is None or st["inflight"] < cap) and not st["waiters"]:
+        st["inflight"] += 1
+        return True
+    fut = asyncio.get_running_loop().create_future()
+    st["waiters"].append(fut)
+    _RC_STATS["queued"] += 1
+    try:
+        await asyncio.wait_for(asyncio.shield(fut), timeout=max(0.0, wait_s))
+        return True
+    except asyncio.TimeoutError:
+        if fut.done() and not fut.cancelled():      # the slot was handed over in the same instant: take it
+            return True
+        fut.cancel()
+        _RC_STATS["queue_timeouts"] += 1
+        return False
+    except BaseException:
+        if fut.done() and not fut.cancelled() and fut.result():
+            _rc_release(provider)                    # we were handed a slot but are being torn down: give it back
+        else:
+            fut.cancel()
+        raise
+
+
+def _rc_release(provider):
+    st = _rc_state(provider)
+    st["inflight"] = max(0, st["inflight"] - 1)
+    _rc_wake(st)
+
+
+def _rc_learn(provider, text):
+    """Fold one concurrency 429 into the cap. The provider names its limit N and the concurrency C it saw (this request
+    included); a request refused at C (even when C == N, the live case: 'current concurrency is 5 ... limit of 5') proves
+    fewer than C are allowed, so the cap is min(C, N) - 1. Returns the new cap or None when the text names no number."""
+    st = _rc_state(provider)
+    m_l, m_c = _RC_LIMIT.search(text or ""), _RC_CURRENT.search(text or "")
+    nums = [int(m.group(1)) for m in (m_l, m_c) if m]
+    if not nums:
+        return None
+    cap = max(1, min(nums) - 1)
+    now = time.monotonic()
+    st["learned"] = cap if st["learned"] is None or now >= st["learned_until"] else min(cap, st["learned"])
+    st["learned_until"] = now + REMOTE_CONCURRENCY_TTL_S
+    st["learned_at"], st["last_429"] = time.time(), (text or "")[:200]
+    _RC_STATS["learned"] += 1
+    return st["learned"]
+
+
+def _rc_is_concurrency_429(kind, payload):
+    if kind != "ok" or getattr(payload, "status", None) != 429:
+        return None
+    body = getattr(payload, "body", None)
+    if not isinstance(body, (bytes, bytearray)):
+        return None
+    text = bytes(body).decode("utf-8", "replace")
+    return text if _RC_429.search(text) else None
+
+
+def remote_concurrency_facts():
+    out = {}
+    for prov, st in _RC.items():
+        out[prov] = {"inflight": st["inflight"], "queued": len(st["waiters"]), "cap": _rc_cap(st),
+                     "learned": st["learned"], "learned_ttl_left_s": max(0, round(st["learned_until"] - time.monotonic())) if st["learned"] else 0,
+                     "last_429": st["last_429"]}
+    return {"providers": out, "stats": dict(_RC_STATS), "learn": bool(REMOTE_CONCURRENCY_LEARN),
+            "static_cap": REMOTE_CONCURRENCY_CAP}
+
+
+async def _relay_gated(request, base, path, relay_body, key, streaming, provider_name=None):
+    """_relay for a PAID remote call, behind the provider's concurrency gate. A concurrency 429 is not shown to the client: the
+    cap is learned, the request waits for a slot and is re-sent (the provider refused it before generating, so nothing was
+    billed and the spend hold stays valid). After REMOTE_CONCURRENCY_RETRIES re-sends or REMOTE_CONCURRENCY_QUEUE_WAIT_S of
+    queueing the last 429 is passed through unchanged."""
+    if not REMOTE_CONCURRENCY_LEARN and REMOTE_CONCURRENCY_CAP <= 0:
+        return await _relay(request, base, path, relay_body, key, streaming, provider_name=provider_name)
+    provider = str(base).rstrip("/")
+    t_end = time.monotonic() + max(0.0, REMOTE_CONCURRENCY_QUEUE_WAIT_S)
+    waited, attempts = 0.0, 0
+    while True:
+        t0 = time.monotonic()
+        try:
+            got = await _await_unless_gone(request, _rc_acquire(provider, max(0.0, t_end - t0)))
+        except _ClientGone:
+            return "ok", _gone_response(request)
+        waited += time.monotonic() - t0
+        if not got:
+            _RC_STATS["passed_429"] += 1
+            _active_set(request, remote_queue_wait_s=round(waited, 2), remote_429_retries=attempts)
+            return "ok", web.json_response(
+                {"error": {"message": f"remote provider concurrency limit; queued {round(waited)}s without a free slot",
+                           "type": "rate_limit_error", "code": "remote_concurrency_queue_timeout"}},
+                status=429, headers={"Retry-After": "30"})
+        try:
+            inflight_now = _rc_state(provider)["inflight"]
+            kind, payload = await _relay(request, base, path, relay_body, key, streaming, provider_name=provider_name)
+        finally:
+            _rc_release(provider)
+        text = _rc_is_concurrency_429(kind, payload)
+        if text is None or not REMOTE_CONCURRENCY_LEARN:
+            if waited > 0.05:
+                _active_set(request, remote_queue_wait_s=round(waited, 2), remote_429_retries=attempts)
+            return kind, payload
+        cap = _rc_learn(provider, text)
+        if cap is None:
+            # the provider refused for concurrency but names no number: back the cap off to what we had running (never to 0)
+            cap = _rc_learn(provider, f"concurrency limit of {max(2, inflight_now)}")
+        attempts += 1
+        if attempts > REMOTE_CONCURRENCY_RETRIES or time.monotonic() >= t_end:
+            _RC_STATS["passed_429"] += 1
+            _active_set(request, remote_queue_wait_s=round(waited, 2), remote_429_retries=attempts)
+            return kind, payload
+        _RC_STATS["requeued"] += 1
+        log.info("remote %s refused for concurrency; learned cap %s; re-queueing the request (attempt %d)", provider, cap, attempts)
+
+
 async def _forward_remote(request, path, body, streaming, endpoint=None, model=None):
     """Forward intact or deterministically compacted context to the selected remote endpoint."""
     ep = endpoint or {"base": REMOTE_BASE, "key": REMOTE_KEY, "model": model or REMOTE_MODEL,
@@ -9265,8 +9440,8 @@ async def _forward_remote(request, path, body, streaming, endpoint=None, model=N
     if streaming:
         relay_body = _with_stream_usage(relay_body)   # v6: settle needs the provider's usage
     _active_set(request, remote_sent=True)            # v6: from here the provider may bill
-    kind, payload = await _relay(request, base, path, relay_body, key, streaming,
-                                 provider_name=model)
+    kind, payload = await _relay_gated(request, base, path, relay_body, key, streaming,
+                                       provider_name=model)
     # Settlement needs to know whether the provider produced a completion: a relay that failed
     # before the client was committed, or an HTTP >= 400 answer (402 Insufficient Balance, 4xx,
     # 5xx), is never billed. An ok answer that reaches settlement without usage (hung-up client,
