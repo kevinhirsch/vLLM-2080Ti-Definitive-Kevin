@@ -61,6 +61,9 @@ export VLLM_TQ_GQA_CUDA=${VLLM_TQ_GQA_CUDA:-1}
 export VLLM_TQ_GQA_BUILD_DIR=${VLLM_TQ_GQA_BUILD_DIR:-$V02_ROOT/.deps/tq_gqa_build}
 CC_DEFAULT='{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64],"max_cudagraph_capture_size":64}'
 unset VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK VLLM_PREFIX_CACHE_USE_RETAINED_MTP_BLOCK VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS || true
+# L110/L133/L138 (lane A6): wait (bounded) for foreign GPU processes / a dying predecessor to leave before the boot profiles free memory
+_GATE="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/gpu-boot-gate.sh"
+if [ -f "$_GATE" ]; then . "$_GATE"; gpu_boot_gate; fi
 SPEC_DEFAULT='{"method":"mtp","num_speculative_tokens":3,"disable_eagle_block_drop":true}'
 ARGS=(
   "$V02_VENV/bin/python"
