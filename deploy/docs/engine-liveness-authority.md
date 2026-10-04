@@ -153,6 +153,20 @@ used to survive and turn a later real crash into a "planned-stop". Now:
 | An ignored marker is moved to `planned-restart.stale.json` and the ledger row carries `stale_planned_marker {why, ts, by, reason}`. | collector |
 | The writer removes its own marker when the stop did not consume it (the stop failed, or the engine was not running). | `engine-actuator.py` `drop_planned_marker`, `windowctl.py` engine-stop step |
 
+## 7b. Boot-success gate and automatic rollback to last-known-good (L133 / L152)
+
+`Restart=always` with `StartLimitIntervalSec=0` means a boot configuration that cannot start is retried every 15 s forever (10-02 22:11, 6 boots; 10-03 01:19, 10 boots; 03:01, 4 boots). Each ended only when the window owner intervened.
+
+| Piece | Rule |
+|---|---|
+| **Record** (`lkg_maybe_record`, every tick while `UP`) | After a boot has stayed healthy `LIVENESS_LKG_MIN_UP_S` (600 s) with no fault, no hold, and no config file modified after the boot started, copy the files a boot reads (`active-serve`, `v02.override.env`, `diag.env`, `vllm-qwen27b.env`) and the `vllm-releases/current` target to `lkg/` (`lkg.json` has the hashes). A file a lane staged while the engine ran is never recorded. |
+| **Trigger** (`crash_revert_plan`) | `LIVENESS_BOOT_REVERT_FAULTS` (4, 0 = off) FAULT rows since the engine was last healthy, all with ONE signature, and the current boot configuration differs from the record. A streak with different signatures is weather. A streak with an identical config is not a configuration fault: it is reported as `boot_revert.blocked` and goes on to `CRASH_LOOP` (Halo + Kevin) as before. |
+| **Action** (`_act("revert")`) | The one automatic action taken even while a window holds the engine, because the holder's boot is what is crash-looping. Same gate as every other action (2/h, gap doubling, breaker). Puts the recorded files back (a file the record did not have is removed), swaps `current` back when the old release still exists, keeps the failing configuration in `lkg/reverted-<action id>/`, then `reset-failed` + `restart --no-block`. No stop marker is written (L180). A Halo hand-off `engine-boot-revert` and an event are filed. |
+| **Verdict** | The existing action verifier: `/health` back on a boot that started after the action is `ok`; still down after `VERIFY_S` is `failed` and moves the breaker. Only one revert is possible per streak: afterwards the config equals the record. |
+| **Published** | `liveness-state.json` carries `lkg {recorded_iso, boot_started, release}` and, while a streak exists, `boot_revert`. |
+
+Kill switches: `LIVENESS_BOOT_REVERT_FAULTS=0`, or `LIVENESS_PAUSE` for the whole authority.
+
 ## 8. Deploy and rollback
 
 Deploy is a plain file copy to `~/.local/share/vllm-qwen27b/`, with the old copies archived first:

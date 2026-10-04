@@ -28,7 +28,7 @@ deploy/docs/engine-liveness-authority.md):
 The allow-list is DIAG below: a fixed map name -> env vars. Nothing else can be set through this tool. Every change is
 reversible (stage-diag --clear) and recorded. Flags only take effect at the next engine start.
 """
-import argparse, contextlib, fcntl, json, os, re, signal, subprocess, sys, time, urllib.error, urllib.request
+import argparse, contextlib, fcntl, json, os, re, shutil, signal, subprocess, sys, time, urllib.error, urllib.request
 from datetime import datetime
 
 _TERMINATION_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
@@ -796,6 +796,12 @@ HOLDS_LOCK = f"{BASE}/liveness-holds.lock"
 LSTATE = f"{BASE}/liveness-state.json"
 LACTIONS = f"{BASE}/liveness-actions.jsonl"
 LPAUSE = f"{BASE}/LIVENESS_PAUSE"                 # kill switch: observe + publish state only, never act
+#: L133/L152 (BS3): last-known-good BOOT configuration. A boot config that crash-loops (Restart=always, StartLimitIntervalSec=0) had no gate:
+#: 6 boots 10-02 22:11, 10 boots 10-03 01:19, 4 boots 03:01 each ended only when the window owner intervened. The authority records the
+#: files a boot reads once a boot has stayed healthy LKG_MIN_UP_S, and after BOOT_REVERT_FAULTS identical FAULTs since the last healthy
+#: moment, with the configuration different from that record, it puts the record back (the failing one is kept) and restarts, once, under the gate.
+LKG_FILES = ("active-serve", "v02.override.env", "diag.env", "vllm-qwen27b.env")   # relative to BASE: what serve-active.sh / the unit read at boot
+RELEASES_CURRENT = f"{HOME}/.local/share/vllm-releases/current"                    # symlink the v02 serve scripts resolve once at boot
 WD_STATE = f"{BASE}/watchdog-state.json"          # vllm-watchdog.sh probe counters (read-only here)
 FQ_RUNNING = f"{BASE}/frontier-queue/RUNNING"     # legacy frontier-queue window flag (runner trusts it for 3 h)
 FQ_RUNNING_MAX_S = 10800
@@ -824,6 +830,8 @@ BREAKER_FAILS = _env_i("LIVENESS_BREAKER_FAILS", 3)            # consecutive aut
 VERIFY_S = BOOT_DEADLINE_S + 60                                 # an action is judged failed when /health is still down after this
 CRASH_LOOP_FAULTS = _env_i("LIVENESS_CRASH_LOOP_FAULTS", 5)     # FAULT ledger rows ...
 CRASH_LOOP_WINDOW_S = _env_i("LIVENESS_CRASH_LOOP_WINDOW_S", 1800)  # ... inside this window, engine still not healthy
+LKG_MIN_UP_S = _env_i("LIVENESS_LKG_MIN_UP_S", 600)               # a boot is "known good" after staying healthy this long, with no fault since
+BOOT_REVERT_FAULTS = _env_i("LIVENESS_BOOT_REVERT_FAULTS", 4)     # identical FAULT signatures since the last healthy moment -> revert to last-known-good (0 = off)
 
 #: The declared machine (Never Stuck By Construction): every non-terminal state names its owner, its deadline and its exits.
 #: Published verbatim in LSTATE so the estate's generic progress invariant can hold each state to its own declaration.
@@ -1110,18 +1118,152 @@ def gate(now, actions=None):
     return out
 
 
-def _recent_fault_times(now):
-    """Epoch times of FAULT ledger rows inside the crash-loop window (classify keeps only those after the last healthy moment)."""
+def _recent_faults(now):
+    """FAULT ledger rows inside the crash-loop window as [{t, signature}], oldest first (classify keeps only those after the last healthy moment)."""
     since = datetime.fromtimestamp(now - CRASH_LOOP_WINDOW_S).isoformat(timespec="seconds")
     out = []
     for r in ledger_rows(since=since):
         if r.get("kind") != "FAULT":
             continue
         try:
-            out.append(datetime.fromisoformat(r["ts"]).timestamp())
+            out.append({"t": datetime.fromisoformat(r["ts"]).timestamp(), "signature": str(r.get("signature") or "?")})
         except (KeyError, ValueError, TypeError):
             pass
-    return out
+    return sorted(out, key=lambda x: x["t"])
+
+
+def _recent_fault_times(now):
+    return [x["t"] for x in _recent_faults(now)]
+
+
+# ---- L133/L152: last-known-good boot configuration -------------------------------------------------------------------
+def _sha(path):
+    try:
+        import hashlib
+        return hashlib.sha256(open(path, "rb").read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _release_current():
+    try:
+        return os.readlink(RELEASES_CURRENT)
+    except OSError:
+        return None
+
+
+def _lkg_dir():
+    return f"{BASE}/lkg"      # derived at call time: tests (and lane copies) re-point BASE
+
+
+def lkg_meta():
+    try:
+        return json.load(open(f"{_lkg_dir()}/lkg.json"))
+    except (OSError, ValueError):
+        return None
+
+
+def lkg_current_config():
+    """What a boot started now would read: {file: sha|None} plus the release the serve scripts would resolve."""
+    return {"files": {n: _sha(f"{BASE}/{n}") for n in LKG_FILES}, "release": _release_current()}
+
+
+def lkg_maybe_record(f, boot_t):
+    """Called by tick() while the engine is UP. Record the config files only when they are provably what the running boot read:
+    the boot has stayed healthy LKG_MIN_UP_S, and no file was modified after the boot started (a lane staging its next override
+    while the engine runs must not become 'known good')."""
+    now = f["now"]
+    if not boot_t or now - boot_t < LKG_MIN_UP_S or f.get("holds") or implicit_holds(f):
+        return None
+    if any(t > boot_t for t in (f.get("fault_times") or [])):
+        return None
+    for n in LKG_FILES:
+        try:
+            if os.path.getmtime(f"{BASE}/{n}") > boot_t:
+                return None
+        except OSError:
+            pass
+    cur = lkg_current_config()
+    old = lkg_meta()
+    if old and old.get("boot_started") == boot_t and old.get("files") == cur["files"] and old.get("release") == cur["release"]:
+        return None
+    os.makedirs(_lkg_dir(), exist_ok=True)
+    for n in LKG_FILES:
+        dst = f"{_lkg_dir()}/{n}"
+        if cur["files"][n] is None:
+            if os.path.exists(dst):
+                os.unlink(dst)
+        else:
+            shutil.copyfile(f"{BASE}/{n}", dst + ".tmp")
+            os.replace(dst + ".tmp", dst)
+    meta = {"recorded_at": now, "recorded_iso": now_iso(), "boot_started": boot_t, "healthy_for_s": round(now - boot_t), **cur}
+    with open(f"{_lkg_dir()}/lkg.json.tmp", "w") as fh:
+        json.dump(meta, fh, indent=1)
+    os.replace(f"{_lkg_dir()}/lkg.json.tmp", f"{_lkg_dir()}/lkg.json")
+    return meta
+
+
+def crash_revert_plan(f, carry):
+    """Pure-ish: None (not a boot-failure streak) | {"blocked": why, ...} (a streak with nothing to revert to) | {"revert": True, ...}.
+    A streak = BOOT_REVERT_FAULTS FAULT rows since the engine was last healthy, all with ONE signature (the same cause four times
+    is a configuration, not weather)."""
+    if BOOT_REVERT_FAULTS <= 0 or f.get("healthy"):
+        return None
+    last_ok = float(carry.get("last_healthy") or 0)
+    faults = [x for x in f.get("faults") or [] if x["t"] > last_ok]
+    if len(faults) < BOOT_REVERT_FAULTS:
+        return None
+    tail = faults[-BOOT_REVERT_FAULTS:]
+    sigs = {x["signature"] for x in tail}
+    if len(sigs) != 1:
+        return None
+    sig = next(iter(sigs))
+    base = {"signature": sig, "faults_since_healthy": len(faults), "streak": len(tail)}
+    meta = lkg_meta()
+    if not meta:
+        return {**base, "blocked": "no last-known-good configuration has been recorded yet"}
+    cur = lkg_current_config()
+    differs = [n for n in LKG_FILES if cur["files"][n] != (meta.get("files") or {}).get(n)]
+    if cur["release"] != meta.get("release") and meta.get("release") and os.path.isdir(os.path.join(os.path.dirname(RELEASES_CURRENT), meta["release"])):
+        differs.append("releases/current")
+    if not differs:
+        return {**base, "blocked": "the boot configuration already equals the last-known-good one: this is not a configuration fault"}
+    return {**base, "revert": True, "differs": differs, "lkg_recorded_iso": meta.get("recorded_iso")}
+
+
+def lkg_restore(tag):
+    """Put the last-known-good configuration back. The configuration being replaced is kept under lkg/reverted-<tag>/ (diagnosis)."""
+    meta = lkg_meta()
+    if not meta:
+        return {"error": "no last-known-good"}
+    keep = f"{_lkg_dir()}/reverted-{tag}"
+    os.makedirs(keep, exist_ok=True)
+    cur = lkg_current_config()
+    done = {"restored": [], "removed": [], "kept_in": keep}
+    for n in LKG_FILES:
+        want = (meta.get("files") or {}).get(n)
+        if cur["files"][n] == want:
+            continue
+        if cur["files"][n] is not None:
+            shutil.copyfile(f"{BASE}/{n}", f"{keep}/{n}")
+        if want is None:
+            os.unlink(f"{BASE}/{n}")
+            done["removed"].append(n)
+        else:
+            shutil.copyfile(f"{_lkg_dir()}/{n}", f"{BASE}/{n}.lkg-tmp")
+            os.replace(f"{BASE}/{n}.lkg-tmp", f"{BASE}/{n}")
+            done["restored"].append(n)
+    rel = meta.get("release")
+    if rel and cur["release"] != rel and os.path.isdir(os.path.join(os.path.dirname(RELEASES_CURRENT), rel)):
+        tmp = RELEASES_CURRENT + ".lkg-tmp"
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        os.symlink(rel, tmp)
+        os.replace(tmp, RELEASES_CURRENT)
+        done["release"] = {"from": cur["release"], "to": rel}
+    return done
 
 
 def observe(now=None):
@@ -1145,7 +1287,7 @@ def observe(now=None):
             "planned_lock": _lock_held(), "job": job, "holds": active_holds(now), "offline": _gateway_offline(),
             "frontier_window_age_s": fq_age, "window_procs": [w for w in _window_procs() if w[1] < HOLD_MAX_TTL_S],
             "watchdog_failures": int(wd.get("consecutive_failures") or 0),
-            "fault_times": _recent_fault_times(now), "gate": gate(now)}
+            "faults": _recent_faults(now), "fault_times": _recent_fault_times(now), "gate": gate(now)}
 
 
 def implicit_holds(f):
@@ -1372,6 +1514,14 @@ def _act(action, cause, by, evidence, f, dry_run=False):
         elif action == "start":
             steps.append(("reset-failed", _sudo(["reset-failed", UNIT])))
             steps.append(("start", _sudo(["start", "--no-block", UNIT])))
+        elif action == "revert":
+            # L133/L152: put the last-known-good boot configuration back and boot it. No stop marker is written: the engine in a crash
+            # loop is mostly not running, and a marker nobody consumes would outlive this action (L180).
+            restored = lkg_restore(aid)
+            steps.append(("lkg-restore", restored))
+            row["restored"] = restored
+            steps.append(("reset-failed", _sudo(["reset-failed", UNIT])))
+            steps.append(("restart", _sudo(["restart", "--no-block", UNIT])))
         row["steps"] = steps
         emit("action", f"liveness authority: automatic engine {action} (cause {cause}) by {by}: {evidence}"[:300],
              {"action": f"liveness-{action}", "id": aid, "cause": cause, "by": by, "evidence": evidence, "steps": steps, "gate": g})
@@ -1399,8 +1549,32 @@ def tick(by="liveness-tick", act=True):
         prev = {}
     state, reason, carry = classify(f, prev)
     result = None
+    extra = {}
+    try:
+        if state == "UP":
+            lkg_maybe_record(f, carry.get("boot_started"))
+        plan = crash_revert_plan(f, carry)
+        if plan:
+            extra["boot_revert"] = plan
+    except Exception as e:  # noqa: BLE001  the LKG machinery must never stop the authority from publishing
+        plan = None
+        extra["lkg_error"] = repr(e)[:200]
+    meta = lkg_meta()
+    if meta:
+        extra["lkg"] = {k: meta.get(k) for k in ("recorded_iso", "boot_started", "release")}
     if act and not f.get("paused"):
-        if state == "DOWN" and f["now"] - float(carry.get("down_since") or f["now"]) >= DOWN_GRACE_S:
+        if plan and plan.get("revert"):
+            # a configuration that fails to boot, identically, BOOT_REVERT_FAULTS times: this is the one automatic action that is taken
+            # even while a window holds the engine (the holder's boot is the thing crash-looping), under the same gate as every other.
+            result = _act("revert", "boot-failed-" + re.sub(r"[^a-z0-9]+", "-", plan["signature"].lower()).strip("-"), by,
+                          f"{plan['streak']} identical FAULTs ({plan['signature']}) since the engine was last healthy; "
+                          f"boot configuration differs from last-known-good in: {', '.join(plan['differs'])}", f)
+            if result.get("acted"):
+                emit("observation", f"engine boot configuration reverted to last-known-good after {plan['streak']} identical boot failures "
+                     f"({plan['signature']}); replaced: {', '.join(plan['differs'])}",
+                     {"action": "engine-boot-revert", "plan": plan, "restored": (result.get("steps") or [[None, {}]])[0][1], "gate": result.get("gate")},
+                     handoff=True, action="engine-boot-revert", fingerprint=f"engine-boot-revert-{int(f['now'] // 600)}")
+        elif state == "DOWN" and f["now"] - float(carry.get("down_since") or f["now"]) >= DOWN_GRACE_S:
             result = _act("start", "down-unowned", by, reason, f)
         elif state in ("STUCK_BOOT", "UNRESPONSIVE", "DEAD_CORE"):
             result = _act("recover", state.lower(), by, reason, f)
@@ -1413,7 +1587,9 @@ def tick(by="liveness-tick", act=True):
             write_job(state="abandoned", finished=now_iso(), result={"abandoned": "restart.lock not held: the actuator that ran this job is gone"})
             emit("observation", f"planned restart job by {j.get('by')} abandoned (its actuator died in state {j.get('state')})",
                  {"action": "restart-abandoned", "job": j})
-    out = _publish_state(state, reason, carry, f, {"tick_result": result} if result else None)
+    if result:
+        extra["tick_result"] = result
+    out = _publish_state(state, reason, carry, f, extra or None)
     return out
 
 
