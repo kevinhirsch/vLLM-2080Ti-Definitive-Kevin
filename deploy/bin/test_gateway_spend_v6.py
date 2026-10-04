@@ -144,7 +144,12 @@ class Routing(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(self.led.snapshot()["spent"], (10_000 * 0.01 + 1_000 * 0.5 + 100 * 2.0) / 1e6, places=9)
         self.led.settle("pre", 1.0)
         with patch.object(shim, "REMOTE_PRICES_JSON", PRO_PRICES):
-            self.assertEqual((await shim.handle_completions(Request("estate-remote-pro"))).status, 429)
+            n_sent = len(self.sent)
+            resp = await shim.handle_completions(Request("estate-remote-pro"))
+            # lane GW3: a cap with no room no longer 429s the alias; nothing paid is sent, the local engine serves it
+            self.assertEqual(resp.status, 200)
+            self.assertEqual([b for b, _ in self.sent[n_sent:]], [shim.LOCAL])      # nothing paid went out
+            self.assertEqual(self.sent[-1][1]["model"], shim._local_model_name())
 
     async def test_a_disconnect_after_sending_charges_the_hold(self):
         async def reset(request, *a, **k):

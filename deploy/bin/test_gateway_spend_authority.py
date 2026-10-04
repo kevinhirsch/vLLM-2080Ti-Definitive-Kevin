@@ -379,23 +379,31 @@ class Seam(unittest.IsolatedAsyncioTestCase):
             token=token.decode() if token else None, remote=remote))
         return resp.status, json.loads(resp.body)
 
-    async def test_cap_exhausted_estate_remote_is_refused_before_forwarding(self):
+    async def test_cap_exhausted_estate_remote_is_served_locally_never_forwarded(self):
+        """Lane GW3 (2026-10-03): was a 429. The cap is still never exceeded (no paid call is made); the caller's work is
+        served by the local engine instead of being thrown away."""
         self.led.settle("earlier", 0.99)
         resp = await shim.handle_completions(Request())
-        self.assertEqual(resp.status, 429)
-        self.assertEqual(json.loads(resp.body)["error"]["type"], "spend_cap_exhausted")
-        self.relay.assert_not_called()
+        self.assertEqual(resp.status, 200)
+        self.relay.assert_called_once()
+        self.assertEqual(self.relay.call_args.args[1], shim.LOCAL)
+        self.assertEqual(self.led.snapshot()["in_flight"], 0)
 
-    async def test_explicit_remote_routes_are_refused_with_429_when_the_cap_is_exhausted(self):
+    async def test_forced_window_is_still_refused_with_429_when_the_cap_is_exhausted(self):
         self.led.settle("earlier", 0.99)
         with patch.object(shim, "FORCE_REMOTE", 1), \
                 patch.object(shim, "FORCE_REMOTE_UNTIL_EPOCH", shim.time.time() + 60):  # forced window
             resp = await shim.handle_completions(Request(model="qwen-local"))
         self.assertEqual(resp.status, 429)
+        self.relay.assert_not_called()
+
+    async def test_route_intent_remote_with_no_cap_room_is_served_locally(self):
+        """Lane GW3 class hunt: the intent route had the same forward-into-429 shape as the estate-remote alias."""
+        self.led.settle("earlier", 0.99)
         resp = await shim.handle_completions(Request(model="qwen-local",
                                                      headers={"X-Gateway-Route-Intent": "overflow"}))
-        self.assertEqual(resp.status, 429)
-        self.relay.assert_not_called()
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(self.relay.call_args.args[1], shim.LOCAL)
 
     async def test_cap_exhausted_and_local_down_overflow_is_a_retryable_503(self):
         self.led.settle("earlier", 0.99)
@@ -608,7 +616,7 @@ class TodaysPaceNeverStrandsTheCap(LedgerBase):
 
 
 class ThroughputGuard(unittest.IsolatedAsyncioTestCase):
-    """Cap exhausted: an OVERFLOW is served locally; explicit remote gets 429."""
+    """Cap exhausted: an OVERFLOW is served locally; so is an estate-remote alias (GW3); the forced window still gets 429."""
 
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp(prefix="spend-tg-", dir=_TMP))
@@ -653,10 +661,11 @@ class ThroughputGuard(unittest.IsolatedAsyncioTestCase):
             resp = await shim.handle_completions(Request(model="qwen-local", max_tokens=1000))
         self.assertEqual((resp.status, self.calls), (200, ["remote"]))
 
-    async def test_cap_exhausted_estate_remote_is_429(self):
+    async def test_cap_exhausted_estate_remote_is_served_locally(self):
+        """Lane GW3: was a 429; the cap still binds (nothing paid goes out) but the work is served."""
         resp = await shim.handle_completions(Request(model="estate-remote", max_tokens=1000))
-        self.assertEqual(resp.status, 429)
-        self.assertEqual(self.calls, [])
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(self.calls, ["local"])
 
     async def test_cap_exhausted_and_local_down_is_a_retryable_503(self):
         with patch.object(shim, "local_healthy", AsyncMock(return_value=False)):
