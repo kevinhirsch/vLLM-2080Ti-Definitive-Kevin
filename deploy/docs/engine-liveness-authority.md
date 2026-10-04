@@ -141,6 +141,18 @@ The supervisor side is in Halo spec `05-…`. The pause still exempts restoratio
   - a matching `bash …(_window|_driver|/window).sh` process, for at most 8 h of its runtime;
   - the frontier `RUNNING` flag, for at most 3 h.
 
+### Planned-restart marker TTL (L180)
+
+`planned-restart.json` is written by the actuator and by windowctl immediately before `systemctl stop`, and consumed by the
+fault collector's ExecStopPost. A marker whose stop never happened (engine already down, stop refused, window aborted)
+used to survive and turn a later real crash into a "planned-stop". Now:
+
+| Rule | Where |
+|---|---|
+| The collector ignores a marker older than the stop it claims by more than `FAULT_COLLECTOR_PLANNED_MARKER_MAX_S` (registered knob, default 600 s) or written before the engine boot that just died. Age is the marker's `ts`, else the file mtime. | `engine-fault-collector.py` `stale_marker_reason` |
+| An ignored marker is moved to `planned-restart.stale.json` and the ledger row carries `stale_planned_marker {why, ts, by, reason}`. | collector |
+| The writer removes its own marker when the stop did not consume it (the stop failed, or the engine was not running). | `engine-actuator.py` `drop_planned_marker`, `windowctl.py` engine-stop step |
+
 ## 8. Deploy and rollback
 
 Deploy is a plain file copy to `~/.local/share/vllm-qwen27b/`, with the old copies archived first:

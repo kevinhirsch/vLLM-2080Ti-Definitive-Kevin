@@ -111,6 +111,21 @@ def now_iso():
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+def drop_planned_marker(marker: dict, path=None) -> bool:
+    """L180: remove planned-restart.json iff it is still the marker THIS caller wrote (same ts and by). The collector renames it
+    when the engine's ExecStopPost runs; one that survives `systemctl stop` belongs to a stop that did not happen (engine already
+    down, stop refused) and would relabel a later real crash as a planned stop."""
+    path = path or PLANNED
+    try:
+        cur = json.load(open(path))
+        if cur.get("ts") == marker.get("ts") and cur.get("by") == marker.get("by"):
+            os.unlink(path)
+            return True
+    except (OSError, ValueError):
+        pass
+    return False
+
+
 def sh(cmd, timeout=40):
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -629,12 +644,13 @@ def do_restart(a):
                 drain_facts["total_waited_s"] = round(time.time() - t_drain)
                 drain_facts["engine_active_at_end"] = None if eng.get("running_at_end") is None else eng["running_at_end"] + (eng["waiting_at_end"] or 0)
             write_job(state="stopping", drain=drain_facts)
-            json.dump({"ts": now_iso(), "by": by, "reason": reason, "drain": drain_facts, "active_at_stop": drain_facts.get("active_at_end")},
-                      open(PLANNED, "w"))
+            marker = {"ts": now_iso(), "by": by, "reason": reason, "drain": drain_facts, "active_at_stop": drain_facts.get("active_at_end")}
+            json.dump(marker, open(PLANNED, "w"))
             t_stop = time.time()
             stop_issued = True
             r = subprocess.run(["sudo", "-n", "systemctl", "stop", UNIT], capture_output=True, text=True, timeout=200)
             stop_s = round(time.time() - t_stop, 1)
+            drop_planned_marker(marker)   # L180: the stop returned; a marker still on disk was not consumed -> it is a lie now
             # EF2 measured 2026-10-02: releasing the fence here let live traffic hit the cold engine during warm-up
             # (warm-up 504 s instead of ~160 s). Keep the fence until `start` returns (it returns after the warm-up hook).
             write_job(state="starting-engine", stop_s=stop_s, stop_rc=r.returncode)

@@ -220,11 +220,47 @@ def uptime_before(ts: float):
 
 def main_start_epoch():
     """When systemd last started the engine's main process (ExecMainStartTimestamp), or None."""
+    if os.environ.get("FAULT_COLLECTOR_MAIN_START"):       # tests / replays
+        try:
+            return float(os.environ["FAULT_COLLECTOR_MAIN_START"])
+        except ValueError:
+            pass
     v = sh(f"systemctl show {UNIT} -p ExecMainStartTimestamp --value 2>/dev/null").strip()
     try:
         return datetime.strptime(" ".join(v.split()[1:3]), "%Y-%m-%d %H:%M:%S").timestamp()
     except Exception:  # noqa: BLE001
         return None
+
+
+PLANNED_MARKER_MAX_S = float(os.environ.get("FAULT_COLLECTOR_PLANNED_MARKER_MAX_S") or 600)
+
+
+def marker_epoch(marker: dict, path: str):
+    """When the marker was written: its ISO `ts`, else the file's mtime (older writers put junk in ts)."""
+    try:
+        return datetime.fromisoformat(str(marker["ts"])).timestamp()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+def stale_marker_reason(marker: dict, path: str, stop_t: float, boot_t):
+    """L180: why a planned-restart marker must NOT make this death a planned stop, or None when it is honest.
+    A marker claims "the engine is about to be stopped on purpose". It is only true for the stop that follows it
+    directly: older than PLANNED_MARKER_MAX_S (default 600 s, FAULT_COLLECTOR_PLANNED_MARKER_MAX_S) than the stop it
+    claims, or written before the engine boot that just died, it belongs to a stop that never happened (engine already
+    down, stop refused, window aborted) and would hide a real crash as 'planned'."""
+    t = marker_epoch(marker, path)
+    if t is None:
+        return None
+    if stop_t - t > PLANNED_MARKER_MAX_S:
+        return "older-than-bound"
+    if boot_t and t < boot_t - 2:
+        return "predates-this-boot"
+    return None
 
 
 def _recently_recorded(window_s=240):
@@ -388,11 +424,18 @@ def main():
     # EF2: a stop that SOMEONE REQUESTED (systemctl stop/restart logs "Stopping <unit description>") is planned even when it
     # ended in a SIGKILL after the stop timeout -- 03:45 and 03:55 on 2026-10-02 were EF's own restarts mislabelled FAULT.
     marker = None
+    stale_marker = None
     try:
         if a.at:
             raise FileNotFoundError  # RS: a backfill must never consume the LIVE markers (it ate the 12:05 wedge marker)
         marker = json.load(open(f"{BASE}/planned-restart.json"))
-        os.rename(f"{BASE}/planned-restart.json", f"{BASE}/planned-restart.last.json")
+        why_stale = stale_marker_reason(marker, f"{BASE}/planned-restart.json", now, main_start_epoch())
+        if why_stale:
+            stale_marker = {"why": why_stale, **{k: marker.get(k) for k in ("ts", "by", "reason")}}
+            marker = None
+            os.rename(f"{BASE}/planned-restart.json", f"{BASE}/planned-restart.stale.json")
+        else:
+            os.rename(f"{BASE}/planned-restart.json", f"{BASE}/planned-restart.last.json")
     except Exception:  # noqa: BLE001
         pass
     requested_stop = bool(re.search(r"systemd\[1\]: Stopping vLLM", journal)) and sig in ("unknown-exit",) and not a.at
@@ -451,6 +494,8 @@ def main():
     foreign = foreign_xid_owners(journal, kernel)
     if foreign:
         row["foreign_xids"] = foreign      # Xids on the cards that were NOT the engine's, with the owning unit/lane
+    if stale_marker:
+        row["stale_planned_marker"] = stale_marker     # L180: a marker was present but not honoured; this death is judged on its own evidence
     if a.cause:
         row["cause"] = a.cause
     if a.reconciled:

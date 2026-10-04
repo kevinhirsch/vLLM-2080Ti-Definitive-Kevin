@@ -107,6 +107,18 @@ MARKER = os.environ.get("WINDOWCTL_MARKER", f"{BASE}/window-active.json")
 GATEWAY = os.environ.get("GATEWAY", "http://127.0.0.1:8000")
 ENGINE = os.environ.get("ENGINE_URL", "http://127.0.0.1:8001")
 ENGINE_UNIT = os.environ.get("ENGINE_UNIT", "vllm-qwen27b")
+
+
+def drop_planned_marker(marker: dict) -> bool:
+    """L180: remove planned-restart.json iff it is still the marker THIS caller wrote (same ts and by)."""
+    try:
+        cur = json.load(open(PLANNED))
+        if cur.get("ts") == marker.get("ts") and cur.get("by") == marker.get("by"):
+            os.unlink(PLANNED)
+            return True
+    except (OSError, ValueError):
+        pass
+    return False
 LEGACY_ROOT = f"{HOME}/Desktop/wt-integrate"
 RELEASES = os.environ.get("VLLM_RELEASES_ROOT", f"{HOME}/.local/share/vllm-releases")
 JIT_DIRS = [".deps/tq_gqa_build", ".deps/FlashQLA-SM70-SM75/.torch_extensions_vllm_flashqla_legacy"]
@@ -843,12 +855,18 @@ class Window:
         if self.dry:
             return {"rc": 0, "dry": True}
         if st["engine"] == "stop":
-            json.dump({"ts": now_iso(), "by": self.by, "reason": f"window {self.wid} step {st['name']}: engine stop"},
-                      open(PLANNED, "w"))
+            marker = {"ts": now_iso(), "by": self.by, "reason": f"window {self.wid} step {st['name']}: engine stop"}
+            json.dump(marker, open(PLANNED, "w"))
             self.state["engine_stopped"] = True
             self.save_state()
             res = unitrun.run(self.lane, f"{self.wid}-{st['name']}", ["sudo", "-n", "systemctl", "stop", ENGINE_UNIT],
                               timeout_s=240, out=self.path("steps", f"{st['name']}.log"))
+            # L180: the marker says "the engine is about to be stopped on purpose". The fault collector consumes it when the
+            # engine's ExecStopPost runs. If `systemctl stop` returned and the marker is still there, this window did not stop
+            # a running engine (it was already down, or the stop failed): remove it so it cannot relabel a later crash.
+            # A timed-out stop (rc None, result timeout) may still be mid-ExecStopPost: leave that one alone.
+            if res.get("result") != "timeout" and not res.get("timed_out"):
+                drop_planned_marker(marker)
             return {"rc": res.get("rc"), "unit": res.get("unit")}
         self.gpu_gate(f"engine start ({st['name']})")
         res = unitrun.run(self.lane, f"{self.wid}-{st['name']}", ["sudo", "-n", "systemctl", "start", ENGINE_UNIT],

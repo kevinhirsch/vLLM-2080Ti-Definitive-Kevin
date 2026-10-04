@@ -30,6 +30,8 @@ class World:
         self.pools = []                   # kv_pool_since results (popped per call), default 960000
         self.foreign = []
         self.units = []
+        self.stop_rc = 0                  # rc of `systemctl stop <engine>`
+        self.engine_was_up = True         # False: the engine was already down, so no ExecStopPost runs
         self.actuator_calls = []
         self.root = tmp / "prod"
         (self.root / ".deps" / "tq_gqa_build").mkdir(parents=True)
@@ -101,7 +103,11 @@ class World:
             return {"unit": unitrun.unit_name(lane, job), "rc": 0, "result": "success"}
         if cmd[:3] == ["sudo", "-n", "systemctl"]:
             if cmd[3] == "stop":
-                self.health = None
+                if self.stop_rc == 0 and self.engine_was_up:
+                    self.health = None
+                    if os.path.exists(wc.PLANNED):                       # the collector's ExecStopPost consumes the marker
+                        os.rename(wc.PLANNED, wc.PLANNED[:-5] + ".last.json")
+                return {"unit": unitrun.unit_name(lane, job), "rc": self.stop_rc}
             return {"unit": unitrun.unit_name(lane, job), "rc": 0}
         os.makedirs(os.path.dirname(out), exist_ok=True)
         with open(out, "w") as fh:
@@ -223,7 +229,8 @@ def test_window_happy_path_runs_steps_in_units_and_restores_exactly(world, tmp_p
     assert s["boots"][0]["kv_pool"] == 960000
     assert not os.path.exists(wc.MARKER) and not os.path.exists(gpuguard.BUSY_FILE)
     assert json.load(open(tmp_path / "results" / "summary.json"))["status"] == "ok"
-    assert json.load(open(wc.PLANNED))["by"] == "K5"                       # the stop is recorded as planned
+    assert json.load(open(wc.PLANNED[:-5] + ".last.json"))["by"] == "K5"   # the stop was recorded as planned and consumed by the collector
+    assert not os.path.exists(wc.PLANNED)
 
 
 def test_refused_on_spend_conflict_or_existing_offline_window(world, tmp_path):
@@ -662,3 +669,21 @@ def test_refused_while_the_remote_balance_is_exhausted(world, tmp_path):
     assert not world.units
     s = wc.Window(spec(tmp_path, results=str(tmp_path / "r2"), allow_no_remote=True)).run()
     assert s["status"] != "refused" or not any("balance exhausted" in p for p in s["why"])
+
+
+def test_L180_stop_that_failed_or_found_the_engine_down_leaves_no_planned_marker(world, tmp_path):
+    """A window whose `systemctl stop` did not stop a running engine must not leave a 'planned' marker behind."""
+    for stop_rc, was_up in ((1, True), (0, False)):
+        world.stop_rc, world.engine_was_up = stop_rc, was_up
+        w = wc.Window(spec(tmp_path, window=f"t5-m{stop_rc}{was_up}"))
+        os.makedirs(os.path.join(w.results, "steps"), exist_ok=True)
+        w.step_engine({"name": "stop", "engine": "stop"})
+        assert not os.path.exists(wc.PLANNED), (stop_rc, was_up)
+
+
+def test_L180_drop_only_removes_its_own_marker(world):
+    mine = {"ts": "2026-10-04T01:00:00-07:00", "by": "K5"}
+    json.dump({"ts": "2026-10-04T01:05:00-07:00", "by": "S4"}, open(wc.PLANNED, "w"))
+    assert wc.drop_planned_marker(mine) is False and os.path.exists(wc.PLANNED)
+    json.dump(mine, open(wc.PLANNED, "w"))
+    assert wc.drop_planned_marker(mine) is True and not os.path.exists(wc.PLANNED)
