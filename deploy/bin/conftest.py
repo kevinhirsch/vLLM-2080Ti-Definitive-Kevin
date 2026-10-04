@@ -26,3 +26,14 @@ def _flightrec_in_tmp():
             yield
         finally:
             os.environ.pop("SHIM_FLIGHTREC_DIR", None)
+
+
+# BS3/L138: gpuguard's lease registry defaults to the LIVE runtime dir; gpucap.run() takes a lease per job. Tests get a private one
+# (set before any test module imports gpuguard, which reads the env at import).
+import atexit  # noqa: E402
+import shutil  # noqa: E402
+
+if not os.environ.get("GPU_LEASES_FILE"):
+    _lease_dir = tempfile.mkdtemp(prefix="gpu-leases-test-")
+    os.environ["GPU_LEASES_FILE"] = os.path.join(_lease_dir, "gpu-leases.json")
+    atexit.register(shutil.rmtree, _lease_dir, True)

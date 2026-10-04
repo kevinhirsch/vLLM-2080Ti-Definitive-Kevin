@@ -10,6 +10,7 @@ Run:  python -m pytest -q test_gpu_boot_gate.py
 """
 import os
 import re
+import sys
 import subprocess
 import textwrap
 import time
@@ -24,7 +25,8 @@ def run_gate(tmp_path, smi_body, env_extra=None, timeout=30):
     smi = tmp_path / "nvidia-smi"
     smi.write_text("#!/bin/bash\n" + smi_body)
     smi.chmod(0o755)
-    env = {"PATH": "/usr/bin:/bin", "GPU_GATE_SMI": str(smi), "GPU_GATE_POLL_S": "0.2", **(env_extra or {})}
+    env = {"PATH": "/usr/bin:/bin", "GPU_GATE_SMI": str(smi), "GPU_GATE_POLL_S": "0.2", "V02_GPU_ROGUE_WAIT_S": "0",
+           "GPU_LEASES_FILE": str(tmp_path / "gpu-leases.json"), **(env_extra or {})}
     t0 = time.time()
     r = subprocess.run(["bash", "-c", f". {GATE}; gpu_boot_gate; echo rc=$?"], capture_output=True, text=True, env=env, timeout=timeout)
     return r, time.time() - t0
@@ -82,3 +84,62 @@ def test_both_v02_serve_scripts_run_the_gate_before_launching(script):
 def test_install_ships_the_gate_next_to_the_serve_scripts():
     # install.sh copies every non-test file of deploy/bin to the runtime dir, so the sourced path resolves there
     assert os.path.isfile(GATE) and not os.path.basename(GATE).startswith("test_")
+
+
+# ---- L138: leases ------------------------------------------------------------------------------------------------------
+def rich_smi(pid, mib):
+    """A fake nvidia-smi that answers both queries gpuguard.py makes (gpu uuid map, compute apps with uuid)."""
+    return ('case "$*" in\n'
+            "  *query-gpu*) echo '0, GPU-aaa'; echo '1, GPU-bbb';;\n"
+            f'  *query-compute-apps*) if [ "$1" = "--query-compute-apps=pid,process_name,used_memory,gpu_uuid" ]; then echo "{pid}, python, {mib}, GPU-bbb"; else echo "{pid}, python, {mib}"; fi;;\n'
+            "esac\n")
+
+
+def test_an_unleased_app_gets_the_extra_wait_and_is_named_in_the_audit(tmp_path):
+    victim = subprocess.Popen(["sleep", "60"])
+    try:
+        r, dt = run_gate(tmp_path, rich_smi(victim.pid, 900), {"V02_GPU_WAIT_S": "1", "V02_GPU_ROGUE_WAIT_S": "3",
+                                                              "GPUGUARD_PY": os.path.join(HERE, "gpuguard.py")})
+    finally:
+        victim.kill()
+        victim.wait()
+    assert "rc=0" in r.stdout                                     # still boots anyway
+    assert dt >= 3.5, dt                                          # 1 s base wait + 3 s for the unleased app
+    assert "unleased" in r.stderr and f"pid {victim.pid}" in r.stderr
+
+
+def test_an_app_under_a_sufficient_lease_gets_no_extra_wait(tmp_path):
+    import json
+    victim = subprocess.Popen(["sleep", "60"])
+    try:
+        sys.path.insert(0, HERE)
+        import gpuguard
+        gpuguard.lease_acquire("lp/bench", 1, 1200, pid=victim.pid, ttl_s=600, path=str(tmp_path / "gpu-leases.json"))
+        r, dt = run_gate(tmp_path, rich_smi(victim.pid, 900), {"V02_GPU_WAIT_S": "1", "V02_GPU_ROGUE_WAIT_S": "30",
+                                                              "GPUGUARD_PY": os.path.join(HERE, "gpuguard.py")})
+    finally:
+        victim.kill()
+        victim.wait()
+    assert "rc=0" in r.stdout and dt < 6, dt
+    assert "leased-ok" in r.stderr and "lp/bench" in r.stderr
+
+
+def test_an_app_over_its_lease_is_treated_as_unleased(tmp_path):
+    victim = subprocess.Popen(["sleep", "60"])
+    try:
+        sys.path.insert(0, HERE)
+        import gpuguard
+        gpuguard.lease_acquire("lp/bench", 1, 100, pid=victim.pid, ttl_s=600, path=str(tmp_path / "gpu-leases.json"))
+        r, dt = run_gate(tmp_path, rich_smi(victim.pid, 5000), {"V02_GPU_WAIT_S": "1", "V02_GPU_ROGUE_WAIT_S": "3",
+                                                               "GPUGUARD_PY": os.path.join(HERE, "gpuguard.py")})
+    finally:
+        victim.kill()
+        victim.wait()
+    assert dt >= 3.5 and "leased-over" in r.stderr, (dt, r.stderr)
+
+
+def test_rogue_wait_is_off_with_zero_and_default_is_bounded(tmp_path):
+    text = open(GATE).read()
+    assert "V02_GPU_ROGUE_WAIT_S:-120" in text
+    r, dt = run_gate(tmp_path, rich_smi(1, 900), {"V02_GPU_WAIT_S": "1", "V02_GPU_ROGUE_WAIT_S": "0"})
+    assert "rc=0" in r.stdout and dt < 5

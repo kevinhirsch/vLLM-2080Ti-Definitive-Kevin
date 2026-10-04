@@ -17,6 +17,15 @@ CLI:
   gpuguard.py set --by X --reason R [--ttl S] [--window ID] [--phase P]   # manual busy (pid-scoped to the caller's parent)
   gpuguard.py clear [--window ID]
   gpuguard.py kv-pool [--since EPOCH]  # last 'GPU KV cache size' of the engine journal
+  gpuguard.py lease acquire --owner O --gpu N --mib M [--unit U] [--ttl S]   # L138: declare a non-engine CUDA process BEFORE it starts
+  gpuguard.py lease release --id ID | list
+  gpuguard.py audit [--brief]          # every foreign compute app vs the lease registry; exit 1 when any is unleased or over its lease
+
+L138 -- the GPU lease. A non-engine CUDA process on the production cards is allowed only under a LEASE: owner, GPU, a MiB budget
+and a TTL, recorded in gpu-leases.json (flock-serialised). gpucap.py takes one for every lane job it runs. audit() classifies every
+foreign compute app as leased-ok | leased-over (holds more than its budget + slack) | unleased; the engine boot gate (gpu-boot-gate.sh)
+prints that classification and waits longer for the apps that are NOT under a lease than for the ones that are. Leases that are expired,
+or whose unit/pid is gone, are void.
 """
 from __future__ import annotations
 
@@ -34,6 +43,9 @@ import unitrun  # noqa: E402
 HOME = os.path.expanduser("~")
 BASE = os.environ.get("GPUGUARD_BASE", f"{HOME}/.local/share/vllm-qwen27b")
 BUSY_FILE = os.environ.get("GPU_BUSY_FILE", f"{BASE}/gpu-busy.json")
+LEASES_FILE = os.environ.get("GPU_LEASES_FILE", f"{BASE}/gpu-leases.json")
+LEASE_UNIT_GRACE_S = float(os.environ.get("GPU_LEASE_UNIT_GRACE_S", "120"))
+LEASE_SLACK_MIB = int(os.environ.get("GPU_LEASE_SLACK_MIB", "400"))      # CUDA context + allocator slack beyond the declared budget
 ENGINE_UNIT = os.environ.get("ENGINE_UNIT", "vllm-qwen27b.service")
 ENGINE_CGROUP = os.environ.get("ENGINE_CGROUP", f"/system.slice/{ENGINE_UNIT}")
 NVIDIA_SMI = os.environ.get("NVIDIA_SMI", "nvidia-smi")
@@ -189,6 +201,118 @@ def check(window: str | None = None) -> tuple[bool, str]:
     return True, "free"
 
 
+# ---------------------------------------------------------------- L138: GPU leases
+
+def _leases_locked(path, fn):
+    import fcntl
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".lock", "a+") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            with open(path) as fh:
+                rows = json.load(fh)
+            rows = rows if isinstance(rows, list) else []
+        except (OSError, ValueError):
+            rows = []
+        rows, out = fn(rows)
+        tmp = f"{path}.tmp{os.getpid()}"
+        with open(tmp, "w") as fh:
+            json.dump(rows, fh, indent=1)
+        os.replace(tmp, path)
+        return out
+
+
+def _lease_alive(row, now) -> bool:
+    if now > float(row.get("until") or 0):
+        return False
+    unit = row.get("unit")
+    if unit and unit != "-" and now - float(row.get("since") or now) > LEASE_UNIT_GRACE_S:
+        # a lane job's unit may not exist yet (the lease precedes the launch): after the grace, a unit that is not running voids its lease
+        if not unitrun.is_active(unit):
+            return False
+    pid = row.get("pid")
+    if isinstance(pid, int) and not _alive(pid, row.get("pid_start")):
+        return False
+    return True
+
+
+def lease_acquire(owner: str, gpu, mib: int, unit: str | None = None, ttl_s: float = 3600, pid: int | None = None,
+                  path: str | None = None) -> dict:
+    """Declare a non-engine CUDA process: owner, GPU index (or 'all'), MiB budget, the systemd unit it will run in (gpucap/unitrun)
+    and/or a pid, and a TTL. Returns the lease row (its `id` releases it)."""
+    path = path or LEASES_FILE
+    now = time.time()
+    row = {"id": f"gl-{int(now)}-{os.getpid()}-{abs(hash((owner, unit, mib))) % 10000}", "owner": owner, "gpu": gpu, "mib": int(mib),
+           "unit": unit or "-", "pid": pid, "pid_start": unitrun.proc_start(pid) if isinstance(pid, int) else None,
+           "since": round(now, 1), "until": round(now + ttl_s, 1)}
+
+    def fn(rows):
+        rows = [r for r in rows if _lease_alive(r, now)]
+        rows.append(row)
+        return rows, row
+    return _leases_locked(path, fn)
+
+
+def lease_release(lease_id: str, path: str | None = None) -> bool:
+    path = path or LEASES_FILE
+
+    def fn(rows):
+        keep = [r for r in rows if r.get("id") != lease_id]
+        return keep, len(keep) != len(rows)
+    return _leases_locked(path, fn)
+
+
+def leases(path: str | None = None, now: float | None = None) -> list[dict]:
+    path = path or LEASES_FILE
+    now = time.time() if now is None else now
+    try:
+        with open(path) as fh:
+            rows = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    out = []
+    for r in rows if isinstance(rows, list) else []:
+        if _lease_alive(r, now):
+            out.append(r)
+    return out
+
+
+def _lease_for(app: dict, rows: list[dict]):
+    for r in rows:
+        if r.get("gpu") not in ("all", None, app.get("gpu")) and str(r.get("gpu")) != str(app.get("gpu")):
+            continue
+        if app.get("unit") and r.get("unit") == app["unit"]:
+            return r
+        if isinstance(r.get("pid"), int) and r["pid"] == app["pid"]:
+            return r
+    return None
+
+
+def audit(apps: list[dict] | None = None, rows: list[dict] | None = None, eng: set[int] | None = None) -> dict:
+    """Every foreign compute app against the lease registry. The budget of one lease is shared by all its apps on that GPU."""
+    foreign = foreign_apps(apps, eng)
+    rows = leases() if rows is None else rows
+    used_by_lease: dict = {}
+    for a in foreign:
+        lz = _lease_for(a, rows)
+        if lz:
+            used_by_lease[(lz["id"], a.get("gpu"))] = used_by_lease.get((lz["id"], a.get("gpu")), 0) + int(a.get("used_mib") or 0)
+    out = []
+    for a in foreign:
+        lz = _lease_for(a, rows)
+        if lz is None:
+            st = "unleased"
+        elif used_by_lease[(lz["id"], a.get("gpu"))] > int(lz["mib"]) + LEASE_SLACK_MIB:
+            st = "leased-over"
+        else:
+            st = "leased-ok"
+        out.append({**a, "state": st, "lease": (lz or {}).get("id"), "lease_owner": (lz or {}).get("owner"),
+                    "lease_mib": (lz or {}).get("mib")})
+    bad = [a for a in out if a["state"] != "leased-ok"]
+    return {"apps": out, "ok": not bad, "unleased": [a for a in out if a["state"] == "unleased"],
+            "over": [a for a in out if a["state"] == "leased-over"]}
+
+
 # ---------------------------------------------------------------- KV pool
 
 def kv_pools(text: str) -> list[int]:
@@ -220,6 +344,20 @@ def main(argv=None) -> int:
     p.add_argument("--window")
     p = sp.add_parser("kv-pool")
     p.add_argument("--since", type=float)
+    p = sp.add_parser("audit")
+    p.add_argument("--brief", action="store_true")
+    p = sp.add_parser("lease")
+    ls = p.add_subparsers(dest="lcmd", required=True)
+    q = ls.add_parser("acquire")
+    q.add_argument("--owner", required=True)
+    q.add_argument("--gpu", default="all")
+    q.add_argument("--mib", type=int, required=True)
+    q.add_argument("--unit")
+    q.add_argument("--pid", type=int)
+    q.add_argument("--ttl", type=float, default=3600)
+    q = ls.add_parser("release")
+    q.add_argument("--id", required=True)
+    ls.add_parser("list")
     a = ap.parse_args(argv)
     if a.cmd == "apps":
         apps = compute_apps()
@@ -241,6 +379,24 @@ def main(argv=None) -> int:
         return 0 if clear_busy(a.window) else 1
     if a.cmd == "kv-pool":
         print(json.dumps({"kv_pool_tokens": kv_pool_since(a.since)}))
+        return 0
+    if a.cmd == "audit":
+        res = audit()
+        if a.brief:
+            for x in res["apps"]:
+                print(f"{x['state']:11s} gpu{x.get('gpu')} pid {x['pid']} {x.get('comm') or x.get('name')} {x.get('used_mib')} MiB "
+                      f"unit={x.get('unit') or '?'} lease={x.get('lease') or '-'}({x.get('lease_owner') or '-'}, {x.get('lease_mib') or '-'} MiB)")
+        else:
+            print(json.dumps(res, indent=1))
+        return 0 if res["ok"] else 1
+    if a.cmd == "lease":
+        if a.lcmd == "acquire":
+            gpu = a.gpu if a.gpu == "all" else int(a.gpu)
+            print(json.dumps(lease_acquire(a.owner, gpu, a.mib, a.unit, a.ttl, a.pid)))
+            return 0
+        if a.lcmd == "release":
+            return 0 if lease_release(a.id) else 1
+        print(json.dumps(leases(), indent=1))
         return 0
     return 2
 

@@ -93,6 +93,13 @@ def run(lane, job, cmd, *, gpu, cap_mib, margin_mib=300, out=None, timeout_s=Non
         if r.returncode != 0:
             return {"rc": 3, "result": "gate-refused", "why": (r.stdout or r.stderr).strip()[-300:]}
     unit = unitrun.unit_name(lane, job)
+    # L138: the job holds a GPU lease for its whole run (budget = cap + margin, TTL = its timeout + 10 min), so the engine boot gate and
+    # `gpuguard.py audit` can tell a declared lane bench from an unknown CUDA process.
+    lease = None
+    try:
+        lease = gpuguard.lease_acquire(f"{lane}/{job}", gpu, int(cap_mib) + int(margin_mib), unit=unit, ttl_s=(timeout_s or 3600) + 600)
+    except Exception as e:  # noqa: BLE001  a lease failure must never stop a bench the gate already allowed
+        print(f"gpucap: lease not recorded: {e!r}", file=sys.stderr)
     w = Watcher(unit, int(cap_mib), int(margin_mib), gpu, poll_s)
     th = threading.Thread(target=w.loop, daemon=True)
     th.start()
@@ -102,6 +109,11 @@ def run(lane, job, cmd, *, gpu, cap_mib, margin_mib=300, out=None, timeout_s=Non
     finally:
         w.stop.set()
         th.join(5)
+        if lease:
+            try:
+                gpuguard.lease_release(lease["id"])
+            except Exception as e:  # noqa: BLE001
+                print(f"gpucap: lease not released: {e!r}", file=sys.stderr)
     res["gpu_peak_mib"] = w.peak
     if w.killed:
         res.update(result="gpu-cap-killed", gpu_cap=w.killed, rc=137)
