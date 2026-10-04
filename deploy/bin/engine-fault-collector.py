@@ -263,6 +263,27 @@ def stale_marker_reason(marker: dict, path: str, stop_t: float, boot_t):
     return None
 
 
+def take_marker(name: str, stop_t: float, boot_t):
+    """Consume BASE/<name>.json (-> <name>.last.json) and return (marker | None, stale | None). A marker that fails
+    stale_marker_reason() (L180: older than the stop it claims, or written before the boot that just died) is moved to
+    <name>.stale.json and reported instead of honoured. The wedge-restart and liveness-recover markers had the same
+    no-TTL hole as planned-restart: liveness-recover.json written by the 06:07 medic kill was never consumed and sat on
+    disk waiting to relabel the next death."""
+    path = f"{BASE}/{name}.json"
+    try:
+        m = json.load(open(path))
+    except Exception:  # noqa: BLE001
+        return None, None
+    why = stale_marker_reason(m, path, stop_t, boot_t) if isinstance(m, dict) else "unreadable"
+    try:
+        os.rename(path, f"{BASE}/{name}.{'stale' if why else 'last'}.json")
+    except OSError:
+        pass
+    if why:
+        return None, {"marker": name, "why": why, **{k: (m or {}).get(k) for k in ("ts", "by", "cause", "id")}}
+    return m, None
+
+
 def _recently_recorded(window_s=240):
     try:
         d = json.load(open(f"{BASE}/recorded-fault.json"))
@@ -320,6 +341,40 @@ def _ledger_ts():
     return out
 
 
+def _action_rows():
+    out = []
+    try:
+        for ln in open(f"{BASE}/liveness-actions.jsonl"):
+            try:
+                out.append(json.loads(ln))
+            except ValueError:
+                pass
+    except OSError:
+        pass
+    return out
+
+
+def liveness_action_row(action_id: str):
+    for r in _action_rows():
+        if r.get("id") == action_id and r.get("action") in ("recover", "revert"):
+            return {k: r.get(k) for k in ("id", "cause", "by", "evidence")} | {"ts": datetime.fromtimestamp(float(r.get("t") or 0)).astimezone().isoformat(timespec="seconds")}
+    return None
+
+
+def authority_action_near(death_t: float, before_s: float = 120.0, after_s: float = 5.0):
+    """The liveness authority recover/revert action that issued the kill behind a death at death_t, or None. The action row is written
+    just before the kill, so it precedes the death by seconds. RS reconcile used to call these deaths 'planned-stop (systemctl)' because the
+    authority's own `systemctl kill` / `restart` appear in the sudo journal: 4 medic kills in 24 h (10-03 19:55 .. 10-04 06:07)."""
+    best = None
+    for r in _action_rows():
+        if r.get("action") not in ("recover", "revert") or r.get("dry_run"):
+            continue
+        d = death_t - float(r.get("t") or 0)
+        if -after_s <= d <= before_s and (best is None or d < best[0]):
+            best = (d, r)
+    return best[1] if best else None
+
+
 def reconcile(hours: float):
     """RS: any unit death in the journal with no ledger row within +-240 s is backfilled. A death is the systemd line
     'Main process exited' (covers SIGKILL, crash, exit-0). Cause is attributed from what the journal itself shows: a watchdog
@@ -352,11 +407,14 @@ def reconcile(hours: float):
         near = sh(f'journalctl --since "{datetime.fromtimestamp(t-20).strftime("%Y-%m-%d %H:%M:%S")}" '
                   f'--until "{datetime.fromtimestamp(t+5).strftime("%Y-%m-%d %H:%M:%S")}" --no-pager -o cat 2>/dev/null | grep -E "COMMAND=.*(systemctl|vllm)" | head -3')
         wedge = any(abs(wt - t) <= 90 for wt in wedge_times)
+        auth = None if wedge else authority_action_near(t)
         cause = ("watchdog confirmed generation wedge -> systemctl kill -s KILL" if wedge else
                  ("; ".join(x.strip()[:140] for x in near.splitlines()) or f"code={m.group(2)} status={m.group(3)}; actor not in journal"))
         cmd = [sys.executable, os.path.abspath(__file__), "--at", stamp, "--reconciled", "--no-vault", "--cause", cause]
         if wedge:
             cmd.append("--wedge")
+        elif auth:
+            cmd += ["--liveness-action", auth["id"]]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
         done.append({"at": stamp, "cause": cause, "rc": r.returncode})
         have.append(t)
@@ -392,6 +450,7 @@ def main():
     ap.add_argument("--wedge", action="store_true", help="with --at: the death was a watchdog-confirmed generation wedge")
     ap.add_argument("--cause", default="", help="with --at: free-text cause recorded on the row")
     ap.add_argument("--reconciled", action="store_true", help="internal: row is a backfill (emit an event, not a hand-off)")
+    ap.add_argument("--liveness-action", default="", help="with --at: id of the liveness authority recover/revert action that killed the engine")
     a = ap.parse_args()
     if os.path.exists(f"{BASE}/NO_FAULT_COLLECTOR"):
         return
@@ -441,24 +500,22 @@ def main():
     requested_stop = bool(re.search(r"systemd\[1\]: Stopping vLLM", journal)) and sig in ("unknown-exit",) and not a.at
     killed_after_timeout = result == "timeout" and (os.environ.get("EXIT_STATUS") in ("KILL", "9"))
     wedge = None
-    try:
-        if a.at:
-            raise FileNotFoundError
-        wedge = json.load(open(f"{BASE}/wedge-restart.json"))
-        os.rename(f"{BASE}/wedge-restart.json", f"{BASE}/wedge-restart.last.json")
-    except Exception:  # noqa: BLE001
-        pass
+    stale_others = []
+    if not a.at:
+        wedge, st_w = take_marker("wedge-restart", now, main_start_epoch())
+        if st_w:
+            stale_others.append(st_w)
     # LV 2026-10-03: the liveness authority killed a STUCK_BOOT / UNRESPONSIVE engine (not a generation wedge). Its kill is
     # followed by `systemctl restart`, whose "Stopping" line would otherwise read as an operator stop -> planned-stop, hiding
     # a boot that never came up behind "planned". It is a FAULT whose mechanism was the authority's recovery.
     recovered = None
-    try:
-        if a.at:
-            raise FileNotFoundError
-        recovered = json.load(open(f"{BASE}/liveness-recover.json"))
-        os.rename(f"{BASE}/liveness-recover.json", f"{BASE}/liveness-recover.last.json")
-    except Exception:  # noqa: BLE001
-        pass
+    if not a.at:
+        recovered, st_r = take_marker("liveness-recover", now, main_start_epoch())
+        if st_r:
+            stale_others.append(st_r)
+    elif a.liveness_action:
+        # reconcile backfill: the death was caused by one of the liveness authority's own recover/revert actions (liveness-actions.jsonl)
+        recovered = liveness_action_row(a.liveness_action)
     if a.wedge and a.at:
         wedge = {"by": "watchdog", "wedge": True, "backfilled": True}
     if a.pre_kill and not wedge:
@@ -476,7 +533,7 @@ def main():
         planned = False
     elif marker or (requested_stop and "Traceback" not in journal):
         planned = True
-    if a.reconciled and sig == "unknown-exit" and not wedge and "COMMAND=" in a.cause and re.search(r"systemctl (stop|restart)", a.cause):
+    if a.reconciled and sig == "unknown-exit" and not wedge and not recovered and "COMMAND=" in a.cause and re.search(r"systemctl (stop|restart)", a.cause):
         planned = True  # RS backfill: the journal shows someone ran systemctl stop/restart
     kind = "planned-stop" if planned else "FAULT"
     ts_s = datetime.fromtimestamp(now).strftime("%Y%m%d-%H%M%S")
@@ -496,6 +553,8 @@ def main():
         row["foreign_xids"] = foreign      # Xids on the cards that were NOT the engine's, with the owning unit/lane
     if stale_marker:
         row["stale_planned_marker"] = stale_marker     # L180: a marker was present but not honoured; this death is judged on its own evidence
+    if stale_others:
+        row["stale_markers"] = stale_others
     if a.cause:
         row["cause"] = a.cause
     if a.reconciled:

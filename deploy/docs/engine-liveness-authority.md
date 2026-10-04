@@ -153,6 +153,12 @@ used to survive and turn a later real crash into a "planned-stop". Now:
 | An ignored marker is moved to `planned-restart.stale.json` and the ledger row carries `stale_planned_marker {why, ts, by, reason}`. | collector |
 | The writer removes its own marker when the stop did not consume it (the stop failed, or the engine was not running). | `engine-actuator.py` `drop_planned_marker`, `windowctl.py` engine-stop step |
 
+The same TTL applies to `wedge-restart.json` and `liveness-recover.json` (`take_marker` in the collector; ignored markers go to `<name>.stale.json`, the row carries `stale_markers`).
+Found live 2026-10-04: `liveness-recover.json` from the 06:07 medic kill was never consumed (the unit's ExecStopPost collector printed nothing for any of the 4 authority kills in 24 h; the cgroup
+SIGKILL of `systemctl kill -s KILL` races it), and RS reconcile backfilled those deaths as `planned-stop (systemctl)` because the authority's own `systemctl kill`/`restart` are in the sudo journal.
+Reconcile now reads `liveness-actions.jsonl` (`authority_action_near`: a recover/revert action up to 120 s before the death) and files the death as a FAULT carrying `liveness_recover {id, cause, by}`.
+Still open (needs the engine unit; not tested here): why ExecStopPost produces no output after a cgroup kill. A sudo-safe candidate is to write the ledger row from `_act` before the kill, as the wedge path does with `--pre-kill`.
+
 ## 7b. Boot-success gate and automatic rollback to last-known-good (L133 / L152)
 
 `Restart=always` with `StartLimitIntervalSec=0` means a boot configuration that cannot start is retried every 15 s forever (10-02 22:11, 6 boots; 10-03 01:19, 10 boots; 03:01, 4 boots). Each ended only when the window owner intervened.
