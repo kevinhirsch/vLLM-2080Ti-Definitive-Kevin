@@ -68,6 +68,18 @@ Spec (YAML):
         env: {VLLM_K5_GDN_FUSED: "1"}
         extra_args_append: "--profiler-config {...}"
         timeout_s: 1200
+    - name: live                           # EC 2026-10-03: serve the ESTATE from the candidate and measure on its own traffic
+      live: {duration_s: 1800, poll_s: 15, fail_margin: 0.02}
+      # closes the gateway offline window (the candidate now takes live traffic), then every poll_s checks engine health
+      # (3 bad polls), new Xids, an engine restart / CUDA error in the journal, and the gateway's local failure rate vs the
+      # 30 min before the window. Any trip aborts the window: the restore re-opens the offline window (drain: in-flight
+      # requests finish) and puts the baseline back. Normal end = the gateway stays live; later steps decide.
+      # Sets {{T_LIVE_START}} / {{T_LIVE_END}} (epoch s); {{T_START}} = the window start (the baseline interval ends there).
+  drain: true                   # boot/restore restarts use the engine-actuator's own drain (rides our offline window and
+                                # waits for in-flight gateway AND engine requests, token-progress aware) instead of --no-drain
+  promote: {release: ID, keep_running: true, override_from: <boot step name>}
+                                # keep_running: the engine already runs the promoted state: flip the pointer, make the boot's
+                                # override (minus V02_ROOT) the new override, and do NOT restart again
 Template variables are {{NAME}} (vars, captures, and RESULTS WINDOW LANE STEP PROD_ROOT). Unknown names are an error.
 Every run step gets WINDOW_ID=<window>, WINDOW_RESULTS=<dir> in its env (gpuok.sh lets the owning window through).
 """
@@ -112,10 +124,11 @@ RELEASES = os.environ.get("VLLM_RELEASES_ROOT", f"{HOME}/.local/share/vllm-relea
 JIT_DIRS = [".deps/tq_gqa_build", ".deps/FlashQLA-SM70-SM75/.torch_extensions_vllm_flashqla_legacy"]
 DEFAULT_WATCH_TIMERS = ["vllm-qwen27b-watchdog.timer"]
 VAR_RE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
-STEP_KINDS = ("run", "script", "boot", "engine", "sleep")
+STEP_KINDS = ("run", "script", "boot", "engine", "sleep", "live")
 WATCHDOG_TIMER = "vllm-qwen27b-watchdog.timer"   # its service Wants= the engine: a tick STARTS a stopped engine
-CODE_FILES = ("windowctl.py", "unitrun.py", "gpuguard.py", "release.py", "release_ab_probe.py", "gateway-offline.py", "mini_yaml.py")
-BUILTINS = ("RESULTS", "WINDOW", "LANE", "STEP", "PROD_ROOT")
+CODE_FILES = ("windowctl.py", "unitrun.py", "gpuguard.py", "release.py", "release_ab_probe.py", "gateway-offline.py", "mini_yaml.py",
+              "live_ab_metrics.py")
+BUILTINS = ("RESULTS", "WINDOW", "LANE", "STEP", "PROD_ROOT", "T_START", "T_LIVE_START", "T_LIVE_END")
 
 
 class SpecError(Exception):
@@ -149,6 +162,10 @@ def gateway_offline_mod():
     return _load_module("gateway_offline", os.path.join(HERE, "gateway-offline.py"))
 
 
+def live_metrics_mod():
+    return _load_module("live_ab_metrics", os.path.join(HERE, "live_ab_metrics.py"))
+
+
 def release_mod():
     import release
     return release
@@ -170,8 +187,12 @@ def actuator_hold(*args, timeout=60):
         return {"error": (r.stderr or r.stdout or "")[-300:], "rc": r.returncode}
 
 
-def restart_argv(by, reason, hold=None):
-    argv = ["/usr/bin/python3", ACTUATOR, "restart", "--by", str(by), "--reason", reason, "--no-drain", "--foreground"]
+def restart_argv(by, reason, hold=None, drain=False):
+    """drain=False: the window already waited for local work (wait_s) -> --no-drain. drain=True (spec `drain: true`): the
+    actuator drains itself: it rides our open offline window (never a drain fence) and waits for the gateway's local work AND
+    the engine's own running/waiting requests, past --drain-s while tokens still advance (hard cap --drain-max-s)."""
+    argv = ["/usr/bin/python3", ACTUATOR, "restart", "--by", str(by), "--reason", reason, "--foreground"]
+    argv += ["--drain-s", "240", "--drain-max-s", "600"] if drain else ["--no-drain"]
     if hold:
         argv += ["--hold", hold]          # LV: a planned restart is refused while a hold is held unless it names it
     return argv
@@ -409,6 +430,11 @@ def validate(spec):
         errs.append("ttl_s must be 30..3600 (the gateway's limit; the framework renews it)")
     if spec.get("on_new_xid", "abort") not in ("abort", "continue"):
         errs.append("on_new_xid must be abort|continue")
+    pr = spec.get("promote")
+    if isinstance(pr, dict) and pr.get("keep_running"):
+        boots = [st.get("name") for st in spec.get("steps") or [] if isinstance(st, dict) and "boot" in st]
+        if not pr.get("release") or pr.get("override_from") not in boots:
+            errs.append("promote.keep_running needs `release` and `override_from` naming one of the boot steps")
     known = set(BUILTINS) | set((spec.get("vars") or {}).keys())
     known |= {release_var(st["name"]) for st in spec.get("steps") or [] if isinstance(st, dict) and st.get("name")
               and isinstance(st.get("boot"), dict) and "release" in st["boot"]}
@@ -433,6 +459,10 @@ def validate(spec):
             b = st["boot"]
             if not isinstance(b, dict) or len([k for k in ("release", "tree", "default") if k in b]) != 1:
                 errs.append(f"step {name}: boot needs exactly one of release / tree / default")
+        if "live" in st:
+            lv = st["live"]
+            if not isinstance(lv, dict) or not (isinstance(lv.get("duration_s", 1800), (int, float)) and 1 <= lv.get("duration_s", 1800) <= 7200):
+                errs.append(f"step {name}: live needs a mapping with duration_s 1..7200")
         if st.get("on_fail", "abort") not in ("abort", "continue"):
             errs.append(f"step {name}: on_fail must be abort|continue")
         used = _names_in({k: v for k, v in st.items() if k != "capture"})
@@ -519,6 +549,7 @@ class Window:
         self.vars = dict(preset or {})       # --set VAR=VAL (dry runs: exercise a branch without running the step)
         self.preset = set((preset or {}).keys())
         self.snapshot = {}
+        self.boot_lines = {}                 # boot step name -> the override lines it appended (promote.keep_running reads them)
         self.summary = {"window": self.wid, "lane": self.lane, "by": self.by, "reason": spec["reason"],
                         "results": self.results, "spec": spec_path, "started": now_iso(), "status": "running",
                         "steps": self.steps, "boots": [], "xids": [], "notes": []}
@@ -717,7 +748,7 @@ class Window:
     def remote_tick(self):
         """One poll of the remote watch: two consecutive unhealthy polls (~30 s) = abort. The running step's unit is
         stopped at once so the window reaches its step boundary and restores local now, not after a 20-minute bench."""
-        if self.remote_bad or self.spec.get("allow_no_remote"):
+        if self.remote_bad or self.spec.get("allow_no_remote") or self.state.get("gateway_live"):
             return
         ok, why = remote_health(0)
         if ok:
@@ -739,9 +770,10 @@ class Window:
                 self.log(f"remote watch error: {e!r}")
 
     def check_between_steps(self):
-        if self.remote_bad:
+        live = bool(self.state.get("gateway_live"))      # the candidate serves the estate: local is NOT offline, remote is irrelevant
+        if self.remote_bad and not live:
             raise WindowAbort("aborted-remote", f"remote valve unhealthy while local was offline: {self.remote_bad}")
-        ok, why = (True, "") if self.spec.get("allow_no_remote") else remote_health(0)
+        ok, why = (True, "") if (live or self.spec.get("allow_no_remote")) else remote_health(0)
         if not ok:
             raise WindowAbort("aborted-remote", f"remote valve unhealthy while local was offline: {why}")
         if time.time() - self.t0 > self.max_s:
@@ -760,7 +792,8 @@ class Window:
 
     def env_for(self, step_name):
         return {**{k: str(v) for k, v in (self.spec.get("vars") or {}).items()}, **self.vars, "RESULTS": self.results,
-                "WINDOW": self.wid, "LANE": self.lane, "STEP": step_name, "PROD_ROOT": self.snapshot.get("prod_root", "")}
+                "WINDOW": self.wid, "LANE": self.lane, "STEP": step_name, "PROD_ROOT": self.snapshot.get("prod_root", ""),
+                "T_START": str(int(self.t0))}
 
     def gpu_gate(self, what):
         wait = float(self.spec.get("gpu_gate_wait_s", 300))
@@ -776,7 +809,7 @@ class Window:
         gpuguard.set_busy(self.by, f"{self.wid} boot {label}", ttl_s=timeout_s + 300, window=self.wid, phase="boot")
         t_boot = time.time()
         res = unitrun.run(self.lane, f"{self.wid}-boot-{label}",
-                          restart_argv(self.by, f"window {self.wid} boot {label}", self.state.get("hold")),
+                          restart_argv(self.by, f"window {self.wid} boot {label}", self.state.get("hold"), bool(self.spec.get("drain"))),
                           timeout_s=timeout_s, out=self.path("steps", f"boot-{label}.log"))
         ok, waited = wait_health(max(30.0, timeout_s - (time.time() - t_boot)))
         gpuguard.set_busy(self.by, f"{self.wid} window", ttl_s=self.max_s + 1800, window=self.wid, phase="window")
@@ -830,6 +863,7 @@ class Window:
         if self.dry:
             return {"rc": 0, "dry": True, "override_lines": lines}
         self.write_override(lines)
+        self.boot_lines[st["name"]] = list(lines)
         self.state["boots"] += 1
         self.state["engine_stopped"] = False
         self.save_state()
@@ -921,6 +955,98 @@ class Window:
         res["script_sha256"] = hashlib.sha256(open(src, "rb").read()).hexdigest()[:16] if os.path.exists(src) else None
         return res
 
+    # -- EC: serve the estate from the candidate and watch it
+    def _engine_ident(self):
+        r = subprocess.run(["systemctl", "show", "-p", "MainPID", "-p", "NRestarts", ENGINE_UNIT], capture_output=True, text=True)
+        kv = dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
+        return kv.get("MainPID"), kv.get("NRestarts")
+
+    def _journal_faults(self, since_ts):
+        out = subprocess.run(["journalctl", "-u", ENGINE_UNIT, "--since", f"@{int(since_ts)}", "--no-pager"],
+                             capture_output=True, text=True, timeout=60).stdout
+        return [ln[:200] for ln in out.splitlines() if re.search(r"Traceback|CUDA error|illegal memory|EngineDead|CUDAGRAPH-REFRESH", ln)]
+
+    def step_live(self, st, rendered):
+        cfg = rendered.get("live") or {}
+        dur, poll = float(cfg.get("duration_s", 1800)), float(cfg.get("poll_s", 15))
+        margin, min_fail = float(cfg.get("fail_margin", 0.02)), int(cfg.get("min_fail_n", 3))
+        if self.dry:
+            return {"rc": 0, "dry": True}
+        lam = live_metrics_mod()
+        t_start = float(self.t0)
+        base = lam.request_stats(lam.read_rows("requests-*.jsonl", t_start - float(cfg.get("baseline_s", 1800)), t_start))
+        base_rate = base["local_fail_rate"] or 0.0
+        self.log(f"live: baseline local failure rate {base_rate:.4f} over {base['local_n']} local rows; going live for {dur:.0f} s")
+        pid0, nrest0 = self._engine_ident()
+        if engine_health() != 200:
+            raise WindowAbort("aborted-health", "engine not healthy at the start of the live phase")
+        # the candidate takes the estate's traffic NOW: close our offline window (the renew loop stops with the lease)
+        lease = self.state.get("lease")
+        self.state["lease"] = None
+        self.state["gateway_live"] = True
+        self.save_state()
+        if lease:
+            r = http_json(f"{GATEWAY}/gateway/offline", "DELETE", {"lease": lease})
+            try:
+                gateway_offline_mod().drop_lease(lease)
+            except Exception:  # noqa: BLE001
+                pass
+            if r.get("error") and r.get("http") != 409:
+                self.log(f"live: closing the offline window answered {r.get('error')[:120]}")
+        t_live = time.time()
+        self.vars["T_LIVE_START"] = str(int(t_live))
+        self.log(f"live: gateway window closed at {int(t_live)}; the candidate serves live traffic")
+        bad_health, jsonl = 0, open(self.path("live.jsonl"), "a")
+        try:
+            while time.time() - t_live < dur:
+                time.sleep(poll)
+                now = time.time()
+                reason = None
+                if engine_health() != 200:
+                    bad_health += 1
+                    if bad_health >= 3:
+                        reason = ("aborted-health", "engine /health failed 3 consecutive polls")
+                else:
+                    bad_health = 0
+                pid, nrest = self._engine_ident()
+                if not reason and (pid != pid0 or nrest != nrest0):
+                    reason = ("aborted-fault", f"engine restarted/died (MainPID {pid0}->{pid}, NRestarts {nrest0}->{nrest})")
+                if not reason:
+                    lines = xid_lines()
+                    if self._xid_count is not None and len(lines) > self._xid_count:
+                        new = [attribute_xid(x) for x in lines[self._xid_count:]]
+                        self._xid_count = len(lines)
+                        self.summary["xids"].extend(new)
+                        reason = ("aborted-xid", f"{len(new)} new Xid(s); first: {new[0]['line'][:160]}")
+                if not reason:
+                    faults = self._journal_faults(t_live)
+                    if faults:
+                        self.summary["notes"].append(f"live faults: {faults[:3]}")
+                        reason = ("aborted-fault", f"engine journal: {faults[0]}")
+                cur = lam.request_stats(lam.read_rows("requests-*.jsonl", t_live, now + 1))
+                if not reason and cur["local_n"] >= 15 and cur["local_fail_n"] >= min_fail and \
+                        (cur["local_fail_rate"] or 0) > base_rate + margin:
+                    reason = ("aborted-failrate", f"gateway local failure rate {cur['local_fail_rate']:.3f} "
+                                                  f"({cur['local_fail_n']}/{cur['local_n']}) > baseline {base_rate:.3f} + {margin}")
+                if not reason:
+                    sp = spend_usd()
+                    if sp is not None and sp >= float(self.spec.get("spend_pause_usd", 20)):
+                        reason = ("paused-spend", f"gateway spend ${sp:.2f} reached the pause threshold")
+                if not reason and time.time() - self.t0 > self.max_s:
+                    reason = ("budget", f"window budget max_s={self.max_s:.0f} spent")
+                jsonl.write(json.dumps({"t": int(now), "health_bad": bad_health, "local_n": cur["local_n"], "fail_n": cur["local_fail_n"],
+                                        "ttft_p90": cur["ttft_p90"], "stop": reason[0] if reason else None}) + "\n")
+                jsonl.flush()
+                if reason:
+                    self.vars["T_LIVE_END"] = str(int(now))
+                    raise WindowAbort(*reason)
+        finally:
+            jsonl.close()
+        t_end = time.time()
+        self.vars["T_LIVE_END"] = str(int(t_end))
+        self.log(f"live: {int(t_end - t_live)} s on live traffic, no trip")
+        return {"rc": 0, "live_s": round(t_end - t_live), "baseline_fail_rate": base_rate}
+
     def run_steps(self):
         for st in self.spec["steps"]:
             name = st["name"]
@@ -949,6 +1075,8 @@ class Window:
                 res = self.step_boot(st, rendered)
             elif row["kind"] == "engine":
                 res = self.step_engine(st)
+            elif row["kind"] == "live":
+                res = self.step_live(st, rendered)
             else:
                 if not self.dry:
                     time.sleep(float(rendered["sleep"]))
@@ -963,7 +1091,7 @@ class Window:
             self.log(f"step {name}: rc={res.get('rc')} {res.get('result') or ''} {res.get('error') or ''} "
                      f"({row['duration_s']} s){' captured ' + json.dumps(row.get('captured')) if row.get('captured') else ''}")
             self.save_summary()
-            if self.remote_bad:
+            if self.remote_bad and not self.state.get("gateway_live"):
                 raise WindowAbort("aborted-remote", f"remote valve unhealthy during step {name}: {self.remote_bad}")
             if res.get("rc") not in (0, None) and st.get("on_fail", "abort") == "abort":
                 raise WindowAbort("failed-step", f"step {name} failed rc={res.get('rc')} {res.get('error') or res.get('result') or ''}")
@@ -985,6 +1113,26 @@ class Window:
             self.snapshot["so"] = so_hashes(self.snapshot["prod_root"])
             self.snapshot["jit_backup"] = {}
             self.state["boots"] = max(1, self.state.get("boots", 0))     # the restore boot puts the new default live
+            if p.get("keep_running"):
+                # EC: the engine ALREADY runs the promoted state (the live phase measured exactly this process). The new
+                # override = window-start bytes + the boot's lines minus its V02_ROOT (the `current` pointer now carries the
+                # root), written verbatim as the restore target. No second restart -- unless the engine does not run that root.
+                lines = [ln for ln in self.boot_lines.get(p["override_from"], []) if not ln.startswith("export V02_ROOT=")]
+                base = bytes.fromhex(self.snapshot["override_b64"])
+                body = base + (b"" if not base or base.endswith(b"\n") else b"\n") + "".join(lines).encode()
+                tmp = OVERRIDE + f".tmp{os.getpid()}"
+                with open(tmp, "wb") as fh:
+                    fh.write(body)
+                os.replace(tmp, OVERRIDE)
+                self.snapshot.update(override_b64=body.hex(), override_exists=True, override_bytes=len(body),
+                                     override_sha256=hashlib.sha256(body).hexdigest())
+                out["override_new_sha256"] = self.snapshot["override_sha256"]
+                out["override_lines"] = lines
+                same = running_root() == self.snapshot["prod_root"] and engine_health() == 200
+                out["keep_running"] = bool(same)
+                if same:
+                    self.state["boots"] = 0
+                    self.state["engine_stopped"] = False
         for f in p.get("files") or []:
             f = os.path.expanduser(f)
             try:
@@ -1151,6 +1299,20 @@ def restore_from(snap, state, spec, log=print, results=None):
     expected = max(int(spec.get("expected_kv_pool") or 0), int(snap.get("kv_pool") or 0))
     tol = float(spec.get("kv_pool_tolerance", 0.005))
     rep["kv_pool_expected"] = expected
+    if need_boot and state.get("gateway_live"):
+        # EC: the candidate was serving live traffic (gateway window closed). Any restart -- the rollback above all -- must
+        # drain first: re-open the offline window (accepted work finishes, nothing new is admitted) BEFORE touching the engine.
+        try:
+            st_, lease_ = gateway_offline_mod().open_window(f"{wid}: restore after live phase"[:120], spec.get("by") or lane,
+                                                            int(spec.get("ttl_s", 1800)), int(spec.get("wait_s", 90)), mode="run")
+            if lease_:
+                state["lease"] = lease_
+                log(f"gateway offline window re-opened for the restore restart (local_active={st_.get('local_active')})")
+            else:
+                log(f"could not re-open the gateway offline window ({json.dumps(st_)[:200]}); the actuator drains itself")
+        except Exception as e:  # noqa: BLE001
+            log(f"re-opening the gateway offline window failed: {e!r}; the actuator drains itself")
+        state["gateway_live"] = False
     if need_boot:
         for attempt in (1, 2):
             ok_gpu, foreign = gpuguard.wait_no_foreign(float(spec.get("gpu_gate_wait_s", 300)) * 2)
@@ -1159,7 +1321,7 @@ def restore_from(snap, state, spec, log=print, results=None):
             t_boot = time.time()
             gpuguard.set_busy(state.get("by") or lane, f"{wid} restore boot", ttl_s=1800, window=wid, phase="boot")
             res = unitrun.run(lane, f"{wid}-restore-{attempt}",
-                              restart_argv(spec.get("by") or lane, f"window {wid} restore (attempt {attempt})", state.get("hold")),
+                              restart_argv(spec.get("by") or lane, f"window {wid} restore (attempt {attempt})", state.get("hold"), bool(spec.get("drain"))),
                               timeout_s=1500,
                               out=os.path.join(results or "/tmp", "steps", f"restore-{attempt}.log"))
             healthy, _ = wait_health(1200 - min(900, time.time() - t_boot))

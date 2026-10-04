@@ -1,0 +1,76 @@
+# Lane EC (2026-10-03, Kevin approved ~19:15 MST "Now, timed window"): two engine prefix-cache improvements on LIVE traffic.
+#   L98  copy-based GDN prompt-tail publication  VLLM_GDN_TAIL_PUBLISH=copy + --prefix-match-unit 64  (kevin/lane-cr-engine d8802739e7 + 839305be0f)
+#   L101 prefix-aware short-first                VLLM_SCHED_SHORT_FIRST_PREFIX_AWARE=1               (kevin/cr2/cache-causes 3700bccf0a + 326846fdc2)
+# Candidate = release ec-139774ff28 = integrate 7004df6ae8 + those four commits (clean cherry-picks, branch kevin/lane-ec-engine).
+# BASELINE = the running engine as-is (legacy tree wt-integrate @ 7004df6ae8, window-start override). Its numbers are the 30 min
+# BEFORE the window (telemetry/prefixcache.jsonl + requests-*.jsonl, route local).
+#
+# Flow (one planned restart in, one out only if the verdict is ROLL BACK):
+#   preflight (framework): remote valve healthy, engine healthy, no other window, no GPU-busy signal, spend < $20
+#   gateway offline window + `drain: true`: the engine-actuator waits for the gateway's local work AND the engine's own running /
+#   waiting requests (token-progress aware, hard cap 600 s) -- nothing is cut mid-request
+#   ec-boot -> verify running release, boot log gate, correctness probe (marker/needle/sibling exact, tail_recovered > 0)
+#   live: the offline window is CLOSED; the candidate serves the estate for 30 min. Auto-rollback trips (any one aborts the
+#   window and the restore re-opens the offline window = drain, then boots the baseline back): engine /health bad 3 polls, a new
+#   Xid, an engine restart or CUDA error / Traceback in the journal, the gateway's local failure rate above baseline (+2 pts,
+#   >= 3 failures), spend >= $20, the window budget. Dead-man timer: restores even if this process is killed.
+#   decide: live_ab_metrics.py compare (exit 1 = ROLL BACK -> failed-step -> restore = baseline restored)
+#   promote (only when every step passed): release pointer `current` -> ec release, override = baseline + candidate lines
+#   (minus V02_ROOT), NO second restart (keep_running).
+#
+#   validate: python3 deploy/bin/windowctl.py validate deploy/windows/ec-prefix-cache-live.yaml
+#   run:      python3 deploy/bin/windowctl.py submit deploy/windows/ec-prefix-cache-live.yaml --wait
+#   stop:     systemctl --user stop win-ec-ec-prefix-cache-live      (restores first)
+lane: ec
+window: ec-prefix-cache-live
+reason: "EC L98 copy-tail + L101 prefix-aware short-first, live-traffic window with auto-rollback"
+by: EC
+results: /home/kevin/projects/lanes/ec/win
+max_s: 5400            # drain <=10 min + boot ~6 + probe ~5 + live 30 + decide + (rollback: drain + boot ~10) + slack
+ttl_s: 1800            # renewed every 60 s while the window is open
+wait_s: 300            # accepted local work finishes (the actuator then also waits for the engine itself)
+drain: true
+spend_pause_usd: 20
+gpu_gate_wait_s: 300
+conflicts: [trial_guard.sh]
+on_new_xid: abort
+promote:
+  release: {sha: 139774ff28, label: ec, from: /home/kevin/Desktop/wt-integrate}
+  keep_running: true
+  override_from: ec-boot
+steps:
+  - name: clean
+    timeout_s: 30
+    run: "rm -f {{RESULTS}}/probe_ec.json {{RESULTS}}/verdict.json {{RESULTS}}/boot_evidence.txt"
+  - name: ec-boot
+    boot:
+      release: {sha: 139774ff28, label: ec, from: /home/kevin/Desktop/wt-integrate}
+      label: ec
+      env: {VLLM_GDN_TAIL_PUBLISH: copy, VLLM_SCHED_SHORT_FIRST_PREFIX_AWARE: "1"}
+      extra_args_append: "--prefix-match-unit 64"
+      timeout_s: 1200
+  - name: ec-verify-running
+    timeout_s: 120
+    run: "python3 /home/kevin/Desktop/wt-ec-fw/deploy/bin/release.py verify \"$(basename {{RELEASE_ec_boot}})\" --running | tee {{RESULTS}}/verify_running.json | python3 -c 'import json,sys;v=json.load(sys.stdin);sys.exit(0 if v[\"ok\"] and v[\"engine_runs_this_release\"] else 1)'"
+  - name: ec-boot-evidence
+    timeout_s: 120
+    # the L98 boot must NOT log "Disabling fine-grained prefix-cache hits" (copy mode keeps them); no Traceback / CUDA error since the boot
+    run: |
+      T=$(systemctl show -p ActiveEnterTimestamp --value vllm-qwen27b)
+      journalctl -u vllm-qwen27b --since "$T" --no-pager > {{RESULTS}}/boot_evidence.txt
+      grep -E "Disabling fine-grained|GPU KV cache size|V02_ROOT|prefix_match_unit|Prefix cache" {{RESULTS}}/boot_evidence.txt | cut -c1-240 | tail -8
+      if grep -q "Disabling fine-grained prefix-cache hits" {{RESULTS}}/boot_evidence.txt; then echo "FAIL: fine-grained hits disabled"; exit 1; fi
+      if grep -qE "Traceback|CUDA error|illegal memory" {{RESULTS}}/boot_evidence.txt; then echo "FAIL: error in boot journal"; exit 1; fi
+  - name: ec-probe
+    timeout_s: 900
+    # correctness gate against the candidate directly (the gateway window is still open): every marker / needle / sibling answer exact, tail recovery > 0
+    run: |
+      python3 {{RELEASE_ec_boot}}/tools/cr/tail_reuse_probe.py --label ec --rounds 8 --out {{RESULTS}} | tee {{RESULTS}}/probe_ec.summary
+      python3 -c 'import json;s=json.load(open("{{RESULTS}}/probe_ec.json"))["summary"];ok=s["marker_ok"]==s["of"] and s["needle_ok"]==s["of"] and s["sibling_ok"]==s["sibling_of"] and s["tail_recovered"]>0;print("PROBE", "PASS" if ok else "FAIL", s);raise SystemExit(0 if ok else 1)'
+    outputs: ["{{RESULTS}}/probe_ec.json"]
+  - name: live
+    live: {duration_s: 1800, poll_s: 15, fail_margin: 0.02, min_fail_n: 3, baseline_s: 1800}
+  - name: decide
+    timeout_s: 120
+    run: "python3 /home/kevin/Desktop/wt-ec-fw/deploy/bin/live_ab_metrics.py compare --base-start $(( {{T_START}} - 1800 )) --base-end {{T_START}} --cand-start {{T_LIVE_START}} --cand-end {{T_LIVE_END}} --warmup-s 480 --faults 0 --out {{RESULTS}}/verdict.json"
+    outputs: ["{{RESULTS}}/verdict.json"]

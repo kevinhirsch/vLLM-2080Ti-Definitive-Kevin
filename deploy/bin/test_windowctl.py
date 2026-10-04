@@ -675,3 +675,139 @@ def test_live_tools_refuse_mutations_from_a_test_run():
                  [sys.executable, os.path.join(HERE, "release.py"), "rollback", "--reason", "from a test run"]):
         r = sp.run(argv, capture_output=True, text=True, env=env, timeout=60)
         assert r.returncode in (2, 4) and "test run" in (r.stdout + r.stderr), (argv[1], r.stdout, r.stderr)
+
+
+# ---------------------------------------------------------------- EC: live traffic phase
+
+class LiveMetrics:
+    """Stand-in for live_ab_metrics: the gateway's local-failure picture, set by the test."""
+
+    def __init__(self):
+        self.stats = {"local_n": 0, "local_fail_n": 0, "local_fail_rate": 0.0, "ttft_p90": None}
+        self.calls = 0
+
+    def read_rows(self, *a, **k):
+        return []
+
+    def request_stats(self, rows):
+        self.calls += 1
+        if self.calls == 1:                    # the baseline read: clean
+            return {"local_n": 100, "local_fail_n": 0, "local_fail_rate": 0.0, "ttft_p90": 5.0}
+        return dict(self.stats)
+
+
+@pytest.fixture
+def live(world, monkeypatch):
+    lm = LiveMetrics()
+    monkeypatch.setattr(wc, "live_metrics_mod", lambda: lm)
+    monkeypatch.setattr(wc.Window, "_engine_ident", lambda w: ("100", "0"))
+    monkeypatch.setattr(wc.Window, "_journal_faults", lambda w, t: [])
+    (world.tmp / "rel").mkdir(exist_ok=True)
+    return lm
+
+
+def live_spec(tmp, **over):
+    s = spec(tmp, drain=True, wait_s=0,
+             steps=[{"name": "arm", "boot": {"release": str(tmp / "rel"), "env": {"VLLM_X": "1"}}},
+                    {"name": "live", "live": {"duration_s": 1, "poll_s": 0.05}},
+                    {"name": "after", "run": "echo after live"}])
+    s.update(over)
+    return s
+
+
+def test_the_live_step_validates_and_keep_running_needs_a_boot_step(tmp_path):
+    wc.validate(live_spec(tmp_path))
+    with pytest.raises(wc.SpecError):
+        wc.validate(live_spec(tmp_path, steps=[{"name": "l", "live": {"duration_s": 0}}]))
+    with pytest.raises(wc.SpecError):
+        wc.validate(live_spec(tmp_path, promote={"release": "r1", "keep_running": True, "override_from": "nope"}))
+
+
+def test_live_phase_closes_the_gateway_window_and_a_clean_run_that_is_not_promoted_rolls_back_with_a_drain(world, live, tmp_path):
+    before = world.override.read_bytes()
+    s = wc.Window(live_spec(tmp_path)).run()
+    assert s["status"] == "ok", s.get("why")
+    assert world.lease_closed[0] == "LEASE1"                       # closed for the live phase
+    assert "T_LIVE_START" in s["vars"] and "T_LIVE_END" in s["vars"]
+    assert s["restore"]["ok"], s["restore"]["problems"]
+    assert world.override.read_bytes() == before
+    assert len(world.actuator_calls) == 2                          # candidate boot + restore boot (rollback)
+    assert all("--no-drain" not in c["cmd"] and "--drain-s" in c["cmd"] for c in world.actuator_calls)
+    assert world.lease_closed.count("LEASE1") == 2 and not world.offline    # re-opened for the restore, closed after
+
+
+def test_live_failure_rate_above_baseline_aborts_and_the_restore_re_opens_the_window_first(world, live, tmp_path, monkeypatch):
+    order = []
+    orig_open = world.open_window
+    monkeypatch.setattr(world, "open_window", lambda *a, **k: order.append("open") or orig_open(*a, **k))
+    orig_run = world.unit_run
+    monkeypatch.setattr(unitrun, "run", lambda lane, job, cmd, **k: order.append(job) or orig_run(lane, job, cmd, **k))
+    live.stats = {"local_n": 40, "local_fail_n": 6, "local_fail_rate": 0.15, "ttft_p90": 9.0}
+    s = wc.Window(live_spec(tmp_path, steps=[{"name": "arm", "boot": {"release": str(tmp_path / "rel")}},
+                                             {"name": "live", "live": {"duration_s": 600, "poll_s": 0.05}}])).run()
+    assert s["status"] == "aborted-failrate", s
+    assert s["restore"]["ok"], s["restore"]["problems"]
+    i_boot = order.index("t5-ab-boot-arm")
+    after = order[i_boot + 1:]
+    assert after.index("open") < after.index("t5-ab-restore-1")      # the window is re-opened BEFORE the restore restart
+
+
+@pytest.mark.parametrize("what", ["health", "xid", "fault", "restart"])
+def test_live_phase_trips_on_health_xid_fault_and_engine_restart(world, live, tmp_path, monkeypatch, what):
+    if what == "health":
+        calls = {"n": 0}
+
+        def eh(timeout=3):
+            calls["n"] += 1
+            return None if 6 <= calls["n"] <= 8 else 200
+        monkeypatch.setattr(wc, "engine_health", eh)
+        monkeypatch.setattr(wc, "wait_health", lambda budget_s, **k: (True, 1.0))
+    elif what == "xid":
+        n = {"i": 0}
+
+        def xl():
+            n["i"] += 1
+            return list(world.xids) + (["9 kernel: NVRM: Xid (PCI:0000:02:00): 31, pid=5, new"] if n["i"] > 4 else [])
+        monkeypatch.setattr(wc, "xid_lines", xl)
+    elif what == "fault":
+        monkeypatch.setattr(wc.Window, "_journal_faults", lambda w, t: ["CUDA error: an illegal memory access"])
+    else:
+        ids = iter([("100", "0")] + [("101", "1")] * 50)
+        monkeypatch.setattr(wc.Window, "_engine_ident", lambda w: next(ids))
+    s = wc.Window(live_spec(tmp_path, steps=[{"name": "arm", "boot": {"release": str(tmp_path / "rel")}},
+                                             {"name": "live", "live": {"duration_s": 600, "poll_s": 0.01}}])).run()
+    assert s["status"].startswith("aborted-"), s
+    assert s["restore"]["ok"], s["restore"]["problems"]
+
+
+def test_promote_keep_running_keeps_the_candidate_without_a_second_restart(world, live, tmp_path, monkeypatch):
+    relroot = tmp_path / "releases"
+    (relroot / "r1" / "vllm").mkdir(parents=True)
+    (relroot / "r1" / "vllm" / "_C.abi3.so").write_bytes(b"release-C")
+    fake = FakeRelease(relroot)
+    monkeypatch.setattr(wc, "release_mod", lambda: fake)
+    cand = os.path.realpath(relroot / "r1")
+    booted = {"root": str(world.root)}
+    monkeypatch.setattr(wc, "running_root", lambda: booted["root"])
+    orig = world.unit_run
+
+    def run(*a, **k):
+        res = orig(*a, **k)
+        if "boot-arm" in a[1]:
+            booted["root"] = cand
+        return res
+    monkeypatch.setattr(unitrun, "run", run)
+    sp = live_spec(tmp_path, promote={"release": "r1", "keep_running": True, "override_from": "arm"},
+                   steps=[{"name": "arm", "boot": {"release": "r1", "env": {"VLLM_GDN_TAIL_PUBLISH": "copy"},
+                                                    "extra_args_append": "--prefix-match-unit 64"}},
+                          {"name": "live", "live": {"duration_s": 1, "poll_s": 0.05}}])
+    before = world.override.read_bytes()
+    s = wc.Window(sp).run()
+    assert s["status"] == "ok", s.get("why")
+    assert s["promoted"]["keep_running"] is True and fake.activated[0][1]["restart"] is False
+    assert len(world.actuator_calls) == 1                           # the candidate boot only: NO second restart
+    new = world.override.read_bytes().decode()
+    assert new.startswith(before.decode()) and "export VLLM_GDN_TAIL_PUBLISH=copy" in new
+    assert "V02_ROOT" not in new and "--prefix-match-unit 64" in new
+    assert s["restore"]["ok"], s["restore"]["problems"]
+    assert not world.offline and world.lease_closed == ["LEASE1"]    # gateway stayed live, nothing re-opened
