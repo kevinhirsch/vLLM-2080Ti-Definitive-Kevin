@@ -269,15 +269,30 @@ def test_window_manifest_is_saved_before_launch(fixture, tmp_path, monkeypatch):
     assert [e[0] for e in events] == ['save', 'launch']
 
 
-@pytest.mark.parametrize('failure', ['cleanup', 'restore', 'generation', 'post-generation', None])
+@pytest.mark.parametrize('failure', ['cleanup', 'restore', 'generation', 'post-generation', 'hold-release', None])
 def test_restore_order_and_fail_closed_recovery(fixture, tmp_path, monkeypatch, failure):
     world = World(tmp_path / 'world', monkeypatch)
-    w = wc.Window(window_spec(tmp_path, owned_profiler=fixture['config'], steps=[{'name': 'start', 'profiler': 'start'}]))
+    w = wc.Window(window_spec(tmp_path, owned_profiler=fixture['config'],
+        pause_timers=['vllm-qwen27b-watchdog.timer'], steps=[{'name': 'start', 'profiler': 'start'}]))
     Path(w.results).mkdir(exist_ok=True)
     monkeypatch.setattr(op, 'baseline', lambda *a: fixture['baseline'])
     w.take_snapshot()
-    w.state.update(lease='owned', hold='oldhold', instrumentation=fixture['record'])
+    owned_lease = 'a' * 32
+    w.state.update(lease=owned_lease, hold='oldhold', instrumentation=fixture['record'])
+    w.save_state()
     world.offline = True
+    original_http = world.http
+    def qualified_http(url, method='GET', payload=None, **kwargs):
+        row = original_http(url, method, payload, **kwargs)
+        if url.endswith('/gateway/offline'):
+            row = {**row, 'offline_lease_renewal': 'extend-only-v1'}
+            if method == 'POST':
+                row.update(offline=world.offline, remaining_s=int(payload['ttl_s']))
+        return row
+    monkeypatch.setattr(wc, 'http_json', qualified_http)
+    original_hold = world.hold
+    monkeypatch.setattr(wc, 'actuator_hold', lambda *a, **k: {'error': 'CPU hold refusal'}
+        if failure == 'hold-release' and a[0] == 'release' else original_hold(*a, **k))
     world.timers['vllm-qwen27b-watchdog.timer'] = 'inactive'
     events = []
     monkeypatch.setattr(op, 'cleanup', lambda *a: events.append('cleanup') or {'ok': failure != 'cleanup'})
@@ -310,10 +325,15 @@ def test_restore_order_and_fail_closed_recovery(fixture, tmp_path, monkeypatch, 
         assert world.pid != w.snapshot['runtime_identity']['engine_pid']
     if failure:
         assert not world.lease_closed and world.offline and w.state['hold'] == 'oldhold'
-        assert 'timer' not in events and not w.state['restored']
+        if failure == 'hold-release':
+            assert events.index('generation') < events.index('timer')
+            assert world.timers['vllm-qwen27b-watchdog.timer'] == 'inactive'
+        else:
+            assert 'timer' not in events
+        assert not w.state['restored']
     else:
         assert events.index('generation') < events.index('timer')
-        assert world.lease_closed == ['owned']
+        assert world.lease_closed == [owned_lease]
 
 
 def test_broad_abort_excludes_only_exact_recorded_collector():
@@ -424,7 +444,7 @@ def test_malformed_record_is_not_empty_ownership(tmp_path, monkeypatch):
     result = wc.restore_from(w.snapshot, w.state, w.spec, log=lambda _: None, results=w.results)
     assert not result['ok'] and not w.state['restored'] and world.offline
     assert not world.lease_closed and not world.actuator_calls
-    assert captured[0]['prefix_boundary'] and len(captured[0]['exclude']) == 2
+    assert captured == [] and result['no_actions']
 
 
 def test_known_collector_namespace_is_protected_before_manifest_reservation():

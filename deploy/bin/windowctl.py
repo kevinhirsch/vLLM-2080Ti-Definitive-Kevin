@@ -98,6 +98,7 @@ sys.path.insert(0, HERE)
 import gpuguard  # noqa: E402
 import unitrun  # noqa: E402
 import owned_profiler  # noqa: E402
+import offline_lease_guard  # noqa: E402
 from experiment_controls import runtime_identity, same_configuration, drain_complete, engine_inflight, main_pid, selected_flags
 
 HOME = os.path.expanduser("~")
@@ -118,7 +119,7 @@ DEFAULT_WATCH_TIMERS = ["vllm-qwen27b-watchdog.timer"]
 VAR_RE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 STEP_KINDS = ("run", "script", "boot", "engine", "sleep", "profiler")
 WATCHDOG_TIMER = "vllm-qwen27b-watchdog.timer"   # its service Wants= the engine: a tick STARTS a stopped engine
-CODE_FILES = ("windowctl.py", "owned_profiler.py", "experiment_controls.py", "unitrun.py", "gpuguard.py", "release.py", "release_ab_probe.py", "gateway-offline.py", "mini_yaml.py")
+CODE_FILES = ("windowctl.py", "owned_profiler.py", "offline_lease_guard.py", "experiment_controls.py", "unitrun.py", "gpuguard.py", "release.py", "release_ab_probe.py", "gateway-offline.py", "mini_yaml.py")
 BUILTINS = ("RESULTS", "WINDOW", "LANE", "STEP", "PROD_ROOT")
 CONTROL_ENV = {"WINDOWCTL_BASE": BASE, "V02_OVERRIDE_ENV": OVERRIDE, "ENGINE_ACTUATOR": ACTUATOR,
                "GATEWAY_SPEND_FILE": SPEND_FILE, "ENGINE_URL": ENGINE, "ENGINE_UNIT": ENGINE_UNIT,
@@ -673,8 +674,11 @@ class Window:
                         "results": self.results, "spec": spec_path, "started": now_iso(), "status": "running",
                         "steps": self.steps, "boots": [], "xids": [], "notes": []}
         self._lease_stop = threading.Event()
+        self._renew_thread = None
         self._measurement_lock = threading.RLock()
         self.renew_s = 60.0
+        if 'owned_profiler' in spec:
+            self.renew_s = min(60, max(1, int(spec.get('ttl_s', 1800)) / 3))
         self._remote_stop = threading.Event()
         self.remote_poll_s = 15.0
         self._remote_strikes = 0
@@ -698,7 +702,13 @@ class Window:
         if self.dry:
             return
         tmp = self.path("state.json.tmp")
-        with open(tmp, "w") as fh:
+        if self.state.get('profiler_configured') or 'instrumentation' in self.state:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            os.fchmod(fd, 0o600)
+            fh = os.fdopen(fd, 'w')
+        else:
+            fh = open(tmp, 'w')
+        with fh:
             json.dump(self.state, fh, indent=1)
         os.replace(tmp, self.path("state.json"))
 
@@ -756,6 +766,11 @@ class Window:
             # estate with no serving path at all. Kevin tops up; the gateway's balance probe re-enables remote.
             problems.append("remote provider balance exhausted (402): an engine window would leave no serving path")
         off = http_json(f"{GATEWAY}/gateway/offline")
+        if 'owned_profiler' in spec and not self.dry:
+            try:
+                offline_lease_guard.require_supported(off)
+            except offline_lease_guard.Refused as error:
+                problems.append(str(error))
         if off.get("offline"):
             problems.append(f"another gateway offline window is open (by {off.get('by')}: {off.get('reason')})")
         busy = gpuguard.busy_state()
@@ -818,7 +833,8 @@ class Window:
         self.save_state()
         revoke_and_drain(self.state, int(self.spec.get("wait_s", 90)))
         self.log(f"gateway offline window open (local_active={st.get('local_active')})")
-        threading.Thread(target=self._renew_loop, daemon=True).start()
+        self._renew_thread = threading.Thread(target=self._renew_loop, daemon=True)
+        self._renew_thread.start()
 
     def _renew_loop(self):
         ttl = int(self.spec.get("ttl_s", 1800))
@@ -832,7 +848,18 @@ class Window:
         """Extend our window. The offline window lives only in the shim's memory: a gateway restart mid-window (seen
         2026-10-03 09:13:22, during K5's window) silently forgets it, and then the POST OPENS A NEW window with a new
         lease. Adopt that lease (record it for close/restore/orphan reaping) so the window is never left unfenced."""
-        r = http_json(f"{GATEWAY}/gateway/offline", "POST", {"lease": lease, "ttl_s": ttl, "by": self.by,
+        if 'owned_profiler' in self.spec:
+            try:
+                if lease != self.state.get('lease'):
+                    raise offline_lease_guard.Refused('offline renewal authority changed')
+                r = offline_lease_guard.extend(self.state, self.spec, http_json, GATEWAY)
+            except offline_lease_guard.Refused as error:
+                self.remote_bad = str(error)
+                if not self._lease_stop.is_set():
+                    stop_window_units(self.state)
+                return {'error': str(error)}
+        else:
+            r = http_json(f"{GATEWAY}/gateway/offline", "POST", {"lease": lease, "ttl_s": ttl, "by": self.by,
                                                              "reason": f"{self.wid}: {self.spec['reason']}"[:120]})
         if r.get("error"):
             self.log(f"lease renew failed: {r.get('error')[:120]}")
@@ -1282,7 +1309,8 @@ class Window:
     # -- the restore
     def restore(self):
         report = restore_from(self.snapshot, self.state, self.spec, log=self.log, results=self.results)
-        self.save_state()
+        if 'owned_profiler' not in self.spec and not report.get('owner_busy'):
+            self.save_state()
         return report
 
     def run(self):
@@ -1363,7 +1391,17 @@ class Window:
                 self._lease_stop.set()
                 self._remote_stop.set()          # the watch must never stop the restore's own units
                 if not self.dry and self.snapshot:
-                    self.summary["restore"] = self.restore()
+                    joined = True
+                    if 'owned_profiler' in self.spec and self._renew_thread is not None:
+                        self._renew_thread.join(offline_lease_guard.JOIN_TIMEOUT_S)
+                        joined = not self._renew_thread.is_alive()
+                    if joined:
+                        self.summary["restore"] = self.restore()
+                    else:
+                        self.state['restored'] = False
+                        self.save_state()
+                        self.summary['restore'] = {'ok': False, 'deferred': True,
+                            'problems': ['offline renewal request did not quiesce; dead-man retains recovery ownership']}
                     if not self.summary["restore"].get("ok") and self.summary.get("status") == "ok":
                         self.summary.update(status="restore-failed", why="original production state was not restored and qualified")
             finally:
@@ -1398,7 +1436,48 @@ def stop_window_units(state):
     return unitrun.stop_lane(state['lane'], **args)
 
 
+def pause_recovery_producers(snap, spec):
+    """Only maintenance-declared units; never blanket-stop unrelated consumers."""
+    paused = {}
+    for unit in spec.get('pause_user_units') or []:
+        if (snap.get('user_units') or {}).get(unit) == 'active':
+            now = user_unit_state(unit)
+            paused[unit] = now == 'inactive' or (now == 'active' and bool(set_user_unit(unit, False) and user_unit_state(unit) == 'inactive'))
+    for unit in pause_timers_of(spec):
+        if (snap.get('timers') or {}).get(unit) == 'active':
+            now = timer_state(unit)
+            paused[unit] = now == 'inactive' or (now == 'active' and bool(set_timer(unit, False) and timer_state(unit) == 'inactive'))
+    return paused
+
+
 def restore_from(snap, state, spec, log=print, results=None):
+    # Legacy/default-off behavior is untouched. Instrumented restoration is
+    # serialized across controller/dead-man and extends the original authority
+    # through collector cleanup, engine/canary work, and qualified close.
+    if 'owned_profiler' not in spec:
+        if state.get('profiler_configured') or 'instrumentation' in state:
+            return {'ok': False, 'deferred': True, 'owner_busy': True, 'no_actions': True,
+                    'problems': ['instrumented recovery spec missing; preserving original authority/evidence']}
+        return _restore_from(snap, state, spec, log=log, results=results)
+    guard = offline_lease_guard.RestorationLease(state, spec, http_json, GATEWAY,
+        on_defer=lambda: pause_recovery_producers(snap, spec))
+    try:
+        with guard:
+            report = _restore_from(snap, state, spec, log=log, results=results, lease_guard=guard)
+            if not report.get('ok'):
+                guard.defer()
+        report['offline_lease_guard'] = guard.audit
+        if not report.get('ok'):
+            report['repaused_declared_producers'] = guard.repaused
+        return report
+    except offline_lease_guard.OwnedElsewhere as error:
+        return {'ok': False, 'deferred': True, 'owner_busy': True, 'problems': [str(error)], 'no_actions': True}
+    except (offline_lease_guard.Refused, OSError, ValueError) as error:
+        state['restored'] = False
+        return {'ok': False, 'deferred': True, 'problems': [str(error)[:200]], 'repaused_declared_producers': guard.repaused}
+
+
+def _restore_from(snap, state, spec, log=print, results=None, lease_guard=None):
     """Put production back EXACTLY as the snapshot found it. Idempotent: the window's finally and the dead-man share it."""
     rep = {"ok": True, "problems": []}
 
@@ -1550,6 +1629,8 @@ def restore_from(snap, state, spec, log=print, results=None):
     def restore_timers():
         rep['timers'] = {}
         for t, was in (snap.get('timers') or {}).items():
+            if lease_guard is not None:
+                lease_guard.check()
             now = timer_state(t)
             if now != was and was in ('active', 'inactive'):
                 set_timer(t, was == 'active')
@@ -1576,11 +1657,15 @@ def restore_from(snap, state, spec, log=print, results=None):
         if not rep['profiler_post_generation']['ok']:
             bad('instrumentation changed during generation; producers remain paused')
         else:
+            if lease_guard is not None:
+                lease_guard.check()
             restore_timers()
     if rep["ok"]:
         qualified_identity = runtime_identity(ENGINE_UNIT)
         rep["user_units"] = {}
         for unit, was in (snap.get("user_units") or {}).items():
+            if lease_guard is not None:
+                lease_guard.check()
             current = user_unit_state(unit)
             if current not in ("active", "inactive"):
                 bad(f"user unit {unit} state is unknown during restoration")
@@ -1598,9 +1683,21 @@ def restore_from(snap, state, spec, log=print, results=None):
     if not rep["ok"]:
         state["restored"] = False
         return rep
+    # Instrumented recovery must finish the owned hold release while the exact
+    # offline lease is still alive. A failed release is then safely retryable,
+    # rather than trying another engine restore after admission was reopened.
+    if lease_guard is not None and state.get('hold'):
+        lease_guard.check()
+        h = actuator_hold('release', '--lease', state['hold'])
+        rep['hold_release'] = h
+        if not h or h.get('error') or not h.get('released'):
+            bad('engine hold release failed before offline close')
+            state['restored'] = False
+            return rep
+        state['hold'] = None
     lease = state.get("lease")
     if lease:
-        r = http_json(f"{GATEWAY}/gateway/offline", "DELETE", {"lease": lease})
+        r = lease_guard.close() if lease_guard is not None else http_json(f"{GATEWAY}/gateway/offline", "DELETE", {"lease": lease})
         rep["lease_close"] = "closed" if not r.get("error") else ("already-gone" if r.get("http") == 409 else r.get("error"))
         if r.get("error") and r.get("http") != 409:
             bad("gateway offline window close failed")
@@ -1651,7 +1748,14 @@ def deadman(state_path):
     if state.get("restored"):
         return 0
     results = state["results"]
-    alive = unitrun.proc_start(state["pid"]) == state.get("pid_start")
+    if state.get('profiler_configured') or 'instrumentation' in state:
+        try:
+            process_status = offline_lease_guard.owner_status(state['pid'], state.get('pid_start'), unitrun.PROC)
+            alive = process_status == 'live'
+        except offline_lease_guard.Refused:
+            return 1  # Unknown process authority: no signal, cleanup or state rewrite.
+    else:
+        alive = unitrun.proc_start(state["pid"]) == state.get("pid_start")
     over = time.time() > float(state.get("deadline") or 0) + 900
     if alive and not over:
         return 0
@@ -1672,12 +1776,21 @@ def deadman(state_path):
             fh.write(f"{now_iso()} [dead-man] {msg}\n")
     log(f"window process {state['pid']} is gone without restoring: restoring now")
     if state.get("hold"):
-        log("its engine liveness hold was owner-pid scoped and is void now; restoring without it")
-        state["hold"] = None
+        if (state.get('profiler_configured') or 'instrumentation' in state) and process_status == 'dead-retained':
+            # The deployed actuator still validates owner start ticks for a
+            # zombie. Preserve this exact capability through restart/release.
+            log('dead controller remains in proc: retaining its exact engine hold for owned recovery')
+        else:
+            log("its engine liveness hold was owner-pid scoped and is void now; restoring without it")
+            state["hold"] = None
     rep = restore_from(snap, state, spec, log=log, results=results)
-    state["restored"] = rep["ok"]
-    with open(state_path, "w") as fh:
-        json.dump(state, fh, indent=1)
+    if rep.get('owner_busy'):
+        log('instrumented recovery already owned or caller stale; no state or unit changes')
+        return 0
+    if 'owned_profiler' not in spec:
+        state["restored"] = rep["ok"]
+        with open(state_path, "w") as fh:
+            json.dump(state, fh, indent=1)
     try:
         s = json.load(open(os.path.join(results, "summary.json")))
     except (OSError, ValueError):
