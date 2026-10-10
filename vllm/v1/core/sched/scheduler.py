@@ -516,6 +516,28 @@ class Scheduler(SchedulerInterface):
         self.prefill_share_exact = (
             os.environ.get("VLLM_SCHED_PREFILL_SHARE_EXACT", "0") == "1"
         )
+        # [FORK][HALO] Optional batch-wide prompt-work cap while an existing
+        # decode row can run. Unlike the per-request long-prefill threshold,
+        # multiple short/tail prefills share this one quota. No-decode batches
+        # retain their configured budget. Keep independent of wall-time sharing.
+        self.mixed_prefill_quota = int(
+            os.environ.get("VLLM_SCHED_MIXED_PREFILL_QUOTA", "0")
+        )
+        if self.mixed_prefill_quota < 0 or (
+            self.mixed_prefill_quota
+            and self.mixed_prefill_quota < max(1, self.num_prefill_lookahead)
+        ):
+            raise ValueError(
+                "VLLM_SCHED_MIXED_PREFILL_QUOTA must be 0 (off) or at least "
+                "the MTP prefill lookahead"
+            )
+        if (
+            self.mixed_prefill_quota
+            and not self.scheduler_config.enable_chunked_prefill
+        ):
+            raise ValueError(
+                "VLLM_SCHED_MIXED_PREFILL_QUOTA requires chunked prefill"
+            )
         self._ps_last_t: float = 0.0
         self._ps_last_had_chunk: bool = False
         self._ps_chunk_secs: float = 0.0
@@ -538,6 +560,53 @@ class Scheduler(SchedulerInterface):
             n > 0 and self._prefill_remaining(self.requests[request_id]) > 0
             for request_id, n in num_scheduled_tokens.items()
         )
+
+    def _runnable_decode_for_quota(self, defer_decode_for_prefill_batch: bool) -> bool:
+        """Scheduler-ready running decode, not a waiting first-token request."""
+        for request in self.running:
+            if self._prefill_remaining(request) > 0:
+                continue
+            if self.current_step < request.next_decode_eligible_step:
+                continue
+            if (
+                request.num_computed_tokens
+                >= self.max_model_len - self.num_sampled_tokens_per_step
+            ):
+                continue
+            if (
+                request.num_output_placeholders > 0
+                and request.num_computed_tokens + 2 - request.num_output_placeholders
+                >= request.num_prompt_tokens + request.max_tokens
+            ):
+                continue
+            if (
+                defer_decode_for_prefill_batch
+                and not request.is_prefill_chunk
+                and request.num_output_tokens == 0
+            ):
+                continue
+            if (
+                request.num_tokens_with_spec + request.num_output_placeholders
+                > request.num_computed_tokens
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _prefill_work(request: Request, computed: int, scheduled: int) -> int:
+        # Output history replay after preemption is prefill too. Draft/query
+        # padding beyond this frontier is decode work and does not spend quota.
+        end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        return min(max(scheduled, 0), max(end - computed, 0))
+
+    def _limit_mixed_prefill(
+        self, request: Request, computed: int, scheduled: int, remaining: int | None
+    ) -> int:
+        if remaining is None:
+            return scheduled
+        work = self._prefill_work(request, computed, scheduled)
+        # If the complete prompt tail fits, preserve any attached decode rows.
+        return min(scheduled, remaining) if work > remaining else scheduled
 
     def _prefill_share_cooldown(self, now: float) -> bool:
         """[FORK][LANE EF2] Update the chunk-time estimate from the previous
@@ -597,6 +666,8 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
+        *,
+        prefill_chunk_limit: int | None = None,
     ) -> int:
         """Clip a prefill chunk so it ends where Mamba state must be cached.
 
@@ -655,6 +726,8 @@ class Scheduler(SchedulerInterface):
             long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
             if long_prefill_threshold > 0:
                 max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
+            if prefill_chunk_limit is not None:
+                max_prefill_tokens = min(max_prefill_tokens, prefill_chunk_limit)
             aligned_end = end // block_size * block_size
             if aligned_end > start or block_size <= max_prefill_tokens:
                 end = aligned_end
@@ -978,6 +1051,14 @@ class Scheduler(SchedulerInterface):
                     preempted_reqs.append(healed)
             self._heal_queue.clear()
 
+        mixed_prefill_budget = (
+            self.mixed_prefill_quota
+            if self.mixed_prefill_quota > 0
+            and self._runnable_decode_for_quota(defer_decode_for_prefill_batch)
+            else None
+        )
+        scheduled_prefill_work: dict[str, int] = {}
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -1063,6 +1144,10 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
+            num_new_tokens = self._limit_mixed_prefill(
+                request, request.num_computed_tokens, num_new_tokens,
+                mixed_prefill_budget,
+            )
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -1098,7 +1183,8 @@ class Scheduler(SchedulerInterface):
             # Apply Mamba alignment before encoder caps.
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
-                    request, num_new_tokens
+                    request, num_new_tokens,
+                    prefill_chunk_limit=mixed_prefill_budget,
                 )
 
             # Schedule encoder inputs.
@@ -1190,6 +1276,10 @@ class Scheduler(SchedulerInterface):
                             restored = num_scheduled_tokens.pop(preempted_req_id)
                             token_budget += restored
                             input_budget += restored + draft_slots
+                            if mixed_prefill_budget is not None:
+                                mixed_prefill_budget += scheduled_prefill_work.pop(
+                                    preempted_req_id, 0
+                                )
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
@@ -1226,6 +1316,13 @@ class Scheduler(SchedulerInterface):
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
+            if mixed_prefill_budget is not None:
+                work = self._prefill_work(
+                    request, request.num_computed_tokens, num_new_tokens
+                )
+                scheduled_prefill_work[request_id] = work
+                mixed_prefill_budget -= work
+                assert mixed_prefill_budget >= 0
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
             req_index += 1
@@ -1525,6 +1622,16 @@ class Scheduler(SchedulerInterface):
 
                     num_new_tokens = min(num_new_tokens, request_token_budget)
                     assert num_new_tokens > 0
+                    num_new_tokens = self._limit_mixed_prefill(
+                        request, num_computed_tokens, num_new_tokens,
+                        mixed_prefill_budget,
+                    )
+                    if num_new_tokens == 0:
+                        # Preserve queue ordering for the next step, while a
+                        # cached/decode-ready peer can still use decode budget.
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
 
                     # Apply Mamba alignment before encoder caps.
                     if self.need_mamba_block_aligned_split:
@@ -1533,6 +1640,7 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens,
                             num_new_local_computed_tokens,
                             num_external_computed_tokens,
+                            prefill_chunk_limit=mixed_prefill_budget,
                         )
                         if num_new_tokens == 0:
                             break
@@ -1727,6 +1835,13 @@ class Scheduler(SchedulerInterface):
                     request_id
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
+                if mixed_prefill_budget is not None:
+                    work = self._prefill_work(
+                        request, num_computed_tokens, num_new_tokens
+                    )
+                    scheduled_prefill_work[request_id] = work
+                    mixed_prefill_budget -= work
+                    assert mixed_prefill_budget >= 0
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
                 request.status = RequestStatus.RUNNING
