@@ -25,6 +25,20 @@ def response(content='done', tokens=1, tools=None):
 
 
 class MeasurementTests(unittest.TestCase):
+    def test_output_receipt_is_content_free_and_compares_tool_semantics(self):
+        original = response('private prose', tools=[{'id': 'random-a', 'function': {'name': 'f', 'arguments': '{"x":1}'}}])
+        changed_id = copy.deepcopy(original)
+        changed_id['choices'][0]['message']['tool_calls'][0]['id'] = 'random-b'
+        changed_id['choices'][0]['message']['tool_calls'][0]['function']['arguments'] = '{ "x": 1 }'
+        first, second = m.response_receipt(original), m.response_receipt(changed_id)
+        self.assertEqual(first['assistant_output_sha256'], second['assistant_output_sha256'])
+        self.assertNotIn('private prose', json.dumps(first))
+        self.assertNotIn('random-a', json.dumps(first))
+        changed_id['choices'][0]['message']['tool_calls'][0]['function']['arguments'] = '{"x":2}'
+        self.assertNotEqual(first['assistant_output_sha256'], m.response_receipt(changed_id)['assistant_output_sha256'])
+        self.assertEqual(first['finish_reason'], 'tool_calls')
+        self.assertIsNone(m.response_receipt({'choices': [False]})['finish_reason'])
+
     def test_profile_merges_nested_thinking_and_wins_sampling(self):
         payload = run_eval.build_base_payload({'temperature': .9, 'chat_template_kwargs': {'other': 4}},
                     {'temperature': .7, 'chat_template_kwargs': {'enable_thinking': False}})

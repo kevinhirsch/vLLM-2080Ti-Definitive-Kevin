@@ -85,22 +85,27 @@ def probe(out, reps=2, max_tokens=128, port=8001, engine_pid=None, identity_file
     for i, p in enumerate(PROMPTS):
         texts = []
         completion_tokens = []
+        receipts = []
         for _ in range(reps):
             measurement.require_offline_window()
             measurement.verify_loaded_native(provenance, identity_file, native_manifest)
             if "chat" in p:
-                r = _post("/v1/chat/completions", {"model": m, "messages": [{"role": "user", "content": p["chat"]}],
-                                                   "max_tokens": max_tokens, "temperature": 0, "seed": 0,
-                                                   "chat_template_kwargs": {"enable_thinking": False}}, port)
+                payload = {"model": m, "messages": [{"role": "user", "content": p["chat"]}],
+                           "max_tokens": max_tokens, "temperature": 0, "seed": 0,
+                           "chat_template_kwargs": {"enable_thinking": False}}
+                r = _post("/v1/chat/completions", payload, port)
                 texts.append(r["choices"][0]["message"].get("content") or "")
             else:
-                r = _post("/v1/completions", {"model": m, "prompt": p["completion"], "max_tokens": max_tokens,
-                                              "temperature": 0, "seed": 0}, port)
+                payload = {"model": m, "prompt": p["completion"], "max_tokens": max_tokens,
+                           "temperature": 0, "seed": 0}
+                r = _post("/v1/completions", payload, port)
                 texts.append(r["choices"][0].get("text") or "")
             completion_tokens.append(r["usage"]["completion_tokens"])
+            receipts.append({**measurement.response_receipt(r), 'usage': r['usage'],
+                             'request_sha256': measurement.canonical_hash(payload)})
         rows.append({"i": i, "texts": texts, "completion_tokens": completion_tokens,
                      "generation_verified": True, "prompt_sha256": measurement.canonical_hash(p),
-                     "self_consistent": len(set(texts)) == 1})
+                     "self_consistent": len(set(texts)) == 1, 'receipts': receipts})
     if measurement.runtime_identity(int(engine_pid))['fingerprint'] != provenance['fingerprint']:
         raise ValueError('Engine identity changed during identity probe')
     res = {"model": m, "reps": reps, "max_tokens": max_tokens, "prompts": rows,

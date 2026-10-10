@@ -11,6 +11,20 @@ import measure_ux as ux
 
 
 class ProbeTests(unittest.TestCase):
+    def test_request_receipt_saves_finish_digest_usage_and_http_failure(self):
+        case = {'id': 'one', 'kind': 'prose', 'request': {'messages': [{'role': 'user', 'content': 'synthetic'}]}, 'served_prompt_tokens': 10}
+        result = {'status': 'ok', 'response': {'choices': [{'message': {'content': 'private output'}, 'finish_reason': 'length'}],
+                    'usage': {'prompt_tokens': 10, 'completion_tokens': 2}}, 'timeline': {'first_prose_s': 1}, 'request_payload_sha256': 'a'*64}
+        with patch.object(ux.measurement, 'post_chat', return_value=result):
+            receipt = ux.measure_case('http://127.0.0.1:8001', case, 0)
+        self.assertEqual(receipt['output_receipt']['finish_reason'], 'length')
+        self.assertEqual(receipt['usage']['prompt_tokens'], 10)
+        self.assertNotIn('private output', json.dumps(receipt))
+        with patch.object(ux.measurement, 'post_chat', return_value={'status': 'http_error', 'status_code': 400}):
+            receipt = ux.measure_case('http://127.0.0.1:8001', case, 0)
+        self.assertFalse(receipt['valid'])
+        self.assertEqual(receipt['http_status_code'], 400)
+
     def test_prepared_synthetic_suite_has_greedy_and_halo_tools(self):
         suite = ux.prepared_cases(profile_names=('greedy', 'halo-non-thinking'))
         self.assertEqual(len(suite['cases']), 6)

@@ -85,6 +85,35 @@ def generation_error(response):
     return None
 
 
+def response_receipt(response):
+    """Content-free generation identity; omit response/call IDs and bodies."""
+    choices = response.get('choices') if isinstance(response, dict) else None
+    choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+    message = choice.get('message') or {'content': choice.get('text')}
+    if not isinstance(message, dict):
+        message = {}
+    content, reasoning = message.get('content'), message.get('reasoning_content')
+    tools = []
+    calls = message.get('tool_calls')
+    for call in calls if isinstance(calls, list) else []:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get('function') or {}
+        if not isinstance(fn, dict):
+            continue
+        arguments = fn.get('arguments')
+        try:
+            arguments = json.loads(arguments)
+        except (ValueError, TypeError):
+            pass
+        tools.append({'name': fn.get('name'), 'arguments': arguments})
+    return {'finish_reason': choice.get('finish_reason'),
+            'content_sha256': canonical_hash(content), 'reasoning_sha256': canonical_hash(reasoning),
+            'assistant_output_sha256': canonical_hash({'content': content, 'reasoning': reasoning, 'tools': tools}),
+            'has_visible_prose': isinstance(content, str) and bool(content.strip()),
+            'has_reasoning': isinstance(reasoning, str) and bool(reasoning.strip()), 'tool_calls_count': len(tools)}
+
+
 def quantile(values, q):
     if not values:
         return None

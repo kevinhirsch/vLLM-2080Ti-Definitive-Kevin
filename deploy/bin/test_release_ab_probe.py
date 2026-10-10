@@ -107,3 +107,25 @@ def test_probe_native_rejection_precedes_model_discovery_and_generation(monkeypa
     discover.assert_not_called()
     post.assert_not_called()
     assert not (tmp_path/'result.json').exists()
+
+
+def test_probe_records_prompt_usage_finish_output_digest_and_actual_request_hash(monkeypatch, tmp_path):
+    from unittest.mock import Mock
+    identity = {'pid': 123, 'fingerprint': 'stable'}
+    for name in ('require_offline_window', 'verify_models_root'):
+        monkeypatch.setattr(ab.measurement, name, Mock())
+    monkeypatch.setattr(ab.measurement, 'runtime_identity', Mock(return_value=identity))
+    monkeypatch.setattr(ab.measurement, 'verify_loaded_native', Mock(return_value={'verified': True}))
+    monkeypatch.setattr(ab, 'model_id', lambda port: 'qwen-local')
+    def post(path, payload, port):
+        choice = {'finish_reason': 'stop'}
+        choice['message' if path.endswith('/chat/completions') else 'text'] = {'content': 'synthetic result'} if path.endswith('/chat/completions') else 'synthetic result'
+        return {'usage': {'prompt_tokens': 17, 'completion_tokens': 3}, 'choices': [choice]}
+    monkeypatch.setattr(ab, '_post', post)
+    result = ab.probe(tmp_path/'probe.json', reps=2, engine_pid=123)
+    for row in result['prompts']:
+        assert len(row['receipts']) == 2
+        assert row['receipts'][0]['finish_reason'] == 'stop'
+        assert row['receipts'][0]['usage']['prompt_tokens'] == 17
+        assert len(row['receipts'][0]['request_sha256']) == 64
+        assert 'synthetic result' not in json.dumps(row['receipts'])

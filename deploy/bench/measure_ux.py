@@ -164,6 +164,8 @@ def measure_case(base, case, index, headers=None, expected=None, nonce=None):
     decode = arrivals[-1]-arrivals[0] if len(arrivals) > 1 else None
     return {'case': case['id'], 'stream': index, 'status': result['status'],
             'valid': result['status'] == 'ok' and not error, 'error': error or result.get('error'),
+            'http_status_code': result.get('status_code'),
+            'output_receipt': measurement.response_receipt(result.get('response') or {}),
             'timeline': timeline, 'usage': usage, 'prepared_prompt_tokens': requested,
             'request_sha256': result.get('request_payload_sha256'),
             'counted_generated_tokens_s': timeline.get('counted_generated_tokens_s'),
