@@ -84,6 +84,7 @@ class Scheduler(SchedulerInterface):
     progress_guard_enabled: bool = False
     short_first_enabled: bool = False
     prefill_share_enabled: bool = False
+    prefill_share_exact: bool = False
 
     def __init__(
         self,
@@ -508,6 +509,13 @@ class Scheduler(SchedulerInterface):
         self.prefill_share_enabled: bool = (
             self.prefill_share < 1.0 and self.need_mamba_block_aligned_split
         )
+        # [FORK][HALO] A smaller long_prefill_token_threshold can schedule
+        # sub-block chunks. Their phase is determined by the request's token
+        # position, not by whether the step reaches one cache block. Default
+        # off keeps the deployed timing policy available as an A/B control.
+        self.prefill_share_exact = (
+            os.environ.get("VLLM_SCHED_PREFILL_SHARE_EXACT", "0") == "1"
+        )
         self._ps_last_t: float = 0.0
         self._ps_last_had_chunk: bool = False
         self._ps_chunk_secs: float = 0.0
@@ -518,6 +526,18 @@ class Scheduler(SchedulerInterface):
         """Prompt tokens still to prefill (0 for a decode-phase row)."""
         prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
         return max(prefill_end - request.num_computed_tokens, 0)
+
+    def _step_has_prefill(self, num_scheduled_tokens: dict[str, int]) -> bool:
+        """Classify work before the worker advances computed-token positions."""
+        if not self.prefill_share_exact:
+            return any(
+                n >= self.cache_config.block_size
+                for n in num_scheduled_tokens.values()
+            )
+        return any(
+            n > 0 and self._prefill_remaining(self.requests[request_id]) > 0
+            for request_id, n in num_scheduled_tokens.items()
+        )
 
     def _prefill_share_cooldown(self, now: float) -> bool:
         """[FORK][LANE EF2] Update the chunk-time estimate from the previous
@@ -1754,9 +1774,7 @@ class Scheduler(SchedulerInterface):
 
         if self.prefill_share_enabled:
             self._ps_last_t = _now
-            self._ps_last_had_chunk = any(
-                v >= self.cache_config.block_size for v in num_scheduled_tokens.values()
-            )
+            self._ps_last_had_chunk = self._step_has_prefill(num_scheduled_tokens)
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
