@@ -342,7 +342,7 @@ def list_units(lane: str | None = None) -> list[dict]:
     return [{"unit": x.get("unit"), "active": x.get("active"), "sub": x.get("sub")} for x in rows]
 
 
-def stop_lane(lane: str, prefix: str | None = None, exclude=()) -> list[str]:
+def stop_lane(lane: str, prefix: str | None = None, exclude=(), *, prefix_boundary=False) -> list[str]:
     """Stop every RUNNING unit of a lane (optionally only those starting with <lane>-<prefix>), except `exclude`."""
     want = unit_name(lane, prefix) if prefix else unit_name(lane, "x")[:-2] + "-"
     stopped = []
@@ -350,7 +350,9 @@ def stop_lane(lane: str, prefix: str | None = None, exclude=()) -> list[str]:
         u = row.get("unit") or ""
         if u in exclude or u.removesuffix(".service") in exclude:
             continue
-        if u.startswith(want) and row.get("active") in ("active", "activating", "deactivating"):
+        name = u.removesuffix('.service')
+        matches = (name == want or name.startswith(want + '-')) if prefix and prefix_boundary else u.startswith(want)
+        if matches and row.get("active") in ("active", "activating", "deactivating"):
             if stop(u):
                 stopped.append(u)
     return stopped

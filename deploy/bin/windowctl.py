@@ -97,6 +97,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import gpuguard  # noqa: E402
 import unitrun  # noqa: E402
+import owned_profiler  # noqa: E402
 from experiment_controls import runtime_identity, same_configuration, drain_complete, engine_inflight, main_pid, selected_flags
 
 HOME = os.path.expanduser("~")
@@ -115,9 +116,9 @@ RELEASES = os.environ.get("VLLM_RELEASES_ROOT", f"{HOME}/.local/share/vllm-relea
 JIT_DIRS = [".deps/tq_gqa_build", ".deps/FlashQLA-SM70-SM75/.torch_extensions_vllm_flashqla_legacy"]
 DEFAULT_WATCH_TIMERS = ["vllm-qwen27b-watchdog.timer"]
 VAR_RE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
-STEP_KINDS = ("run", "script", "boot", "engine", "sleep")
+STEP_KINDS = ("run", "script", "boot", "engine", "sleep", "profiler")
 WATCHDOG_TIMER = "vllm-qwen27b-watchdog.timer"   # its service Wants= the engine: a tick STARTS a stopped engine
-CODE_FILES = ("windowctl.py", "experiment_controls.py", "unitrun.py", "gpuguard.py", "release.py", "release_ab_probe.py", "gateway-offline.py", "mini_yaml.py")
+CODE_FILES = ("windowctl.py", "owned_profiler.py", "experiment_controls.py", "unitrun.py", "gpuguard.py", "release.py", "release_ab_probe.py", "gateway-offline.py", "mini_yaml.py")
 BUILTINS = ("RESULTS", "WINDOW", "LANE", "STEP", "PROD_ROOT")
 CONTROL_ENV = {"WINDOWCTL_BASE": BASE, "V02_OVERRIDE_ENV": OVERRIDE, "ENGINE_ACTUATOR": ACTUATOR,
                "GATEWAY_SPEND_FILE": SPEND_FILE, "ENGINE_URL": ENGINE, "ENGINE_UNIT": ENGINE_UNIT,
@@ -504,6 +505,32 @@ def _names_in(obj):
 
 def validate(spec):
     errs = []
+    profiler_ops = [s.get('profiler') for s in spec.get('steps') or [] if isinstance(s, dict) and 'profiler' in s]
+    if 'owned_profiler' in spec:
+        try:
+            owned_profiler.validate_config(spec['owned_profiler'])
+        except owned_profiler.Refused as error:
+            errs.append(str(error))
+        if profiler_ops not in (['start'], ['start', 'stop']):
+            errs.append('owned_profiler needs one start and at most one later stop')
+        if spec.get('promote'):
+            errs.append('instrumented windows cannot promote')
+        lane, wid = str(spec.get('lane', '')), str(spec.get('window', ''))
+        if any(not re.fullmatch('[A-Za-z0-9_.-]{1,64}', value) for value in (lane, wid)):
+            errs.append('instrumented lane/window identifiers must be1..64 safe characters')
+        reserved = {unitrun.unit_name(lane, wid + suffix) for suffix in ('-profiler', '-deadman', '-restore-1', '-restore-2')}
+        if len(reserved) != 4:
+            errs.append('instrumentation unit namespace collision')
+        for step in spec.get('steps') or []:
+            if not isinstance(step, dict) or 'profiler' in step:
+                continue
+            name = str(step.get('name', ''))
+            boot = step.get('boot')
+            job = f'{wid}-boot-{boot.get("label") or name}' if isinstance(boot, dict) else f'{wid}-{name}'
+            if unitrun.unit_name(lane, job) in reserved:
+                errs.append('step unit collides with reserved instrumentation/recovery unit')
+    elif profiler_ops:
+        errs.append('profiler step requires owned_profiler manifest configuration')
     for k in ("lane", "window", "reason", "steps"):
         if not spec.get(k):
             errs.append(f"missing '{k}'")
@@ -540,6 +567,8 @@ def validate(spec):
             continue
         if "engine" in st and st["engine"] not in ("stop", "start"):
             errs.append(f"step {name}: engine must be stop|start")
+        if 'profiler' in st and (st['profiler'] not in ('start', 'stop') or st.get('on_fail', 'abort') != 'abort' or 'when' in st):
+            errs.append(f'step {name}: profiler must be unconditional start|stop with on_fail abort')
         if "boot" in st:
             b = st["boot"]
             if not isinstance(b, dict) or len([k for k in ("release", "tree", "default") if k in b]) != 1:
@@ -634,6 +663,8 @@ class Window:
         self.state = {"window": self.wid, "lane": self.lane, "by": self.by, "results": self.results, "pid": os.getpid(),
                       "pid_start": unitrun.proc_start(os.getpid()), "lease": None, "boots": 0, "engine_stopped": False,
                       "deadman_unit": None, "restored": False, "started": now_iso(), "deadline": self.t0 + self.max_s}
+        if 'owned_profiler' in spec:
+            self.state['profiler_configured'] = True
         self.steps = []
         self.vars = dict(preset or {})       # --set VAR=VAL (dry runs: exercise a branch without running the step)
         self.preset = set((preset or {}).keys())
@@ -753,6 +784,8 @@ class Window:
         }
         if any(st not in ("active", "inactive") for st in snap["user_units"].values()):
             raise WindowAbort("refused", "cannot snapshot exact active/inactive user unit states")
+        if 'owned_profiler' in self.spec and not self.dry:
+            snap['owned_profiler'] = owned_profiler.baseline(self.spec['owned_profiler'], identity)
         for f in list(self.spec.get("snapshot_files") or []) + [f"{BASE}/active-serve", f"{BASE}/v02.model.json", f"{BASE}/diag.env"]:
             f = os.path.expanduser(f)
             try:
@@ -806,7 +839,7 @@ class Window:
             if self._lease_stop.is_set():
                 return r
             self.remote_bad = "offline lease renewal failed"
-            unitrun.stop_lane(self.lane, prefix=self.wid, exclude=(unitrun.unit_name(self.lane, f"{self.wid}-deadman") + ".service",))
+            stop_window_units(self.state)
             return r
         new = r.get("lease")
         if new and new != lease:
@@ -820,7 +853,7 @@ class Window:
             self.log("gateway had forgotten the offline window (gateway restart?): re-opened it with a new lease")
             self.remote_bad = "gateway restarted or changed the offline lease"
             if not self._lease_stop.is_set():
-                unitrun.stop_lane(self.lane, prefix=self.wid, exclude=(unitrun.unit_name(self.lane, f"{self.wid}-deadman") + ".service",))
+                stop_window_units(self.state)
         with self._measurement_lock:
             phase = self.state.get("measurement")
             if phase and not self._lease_stop.is_set():
@@ -829,7 +862,7 @@ class Window:
                     "runtime_identity": phase["runtime_identity"], "ttl_s": 180, "renew": True})
                 if renewed.get("active") is not True or renewed.get("fingerprint") != phase["runtime_identity"]["fingerprint"]:
                     self.remote_bad = "measurement phase renewal failed"
-                    unitrun.stop_lane(self.lane, prefix=self.wid, exclude=(unitrun.unit_name(self.lane, f"{self.wid}-deadman") + ".service",))
+                    stop_window_units(self.state)
                 else:
                     phase["until"] = renewed["until"]
                     self.save_state()
@@ -874,8 +907,7 @@ class Window:
         if self._remote_strikes >= 2:
             self.remote_bad = why
             self.log("remote valve down while local is offline: stopping the running step, restoring local")
-            unitrun.stop_lane(self.lane, prefix=self.wid,
-                              exclude=(unitrun.unit_name(self.lane, f"{self.wid}-deadman") + ".service",))
+            stop_window_units(self.state)
 
     def _remote_watch_loop(self):
         while not self._remote_stop.wait(self.remote_poll_s):
@@ -997,6 +1029,11 @@ class Window:
 
     def step_boot(self, st, rendered):
         b = rendered["boot"]
+        if 'instrumentation' in self.state and not self.state['instrumentation'].get('cleaned') and not self.dry:
+            owned_profiler.collection_active(self.state['instrumentation'], self.state)
+            configured = self.spec['owned_profiler'].get('injection_env', {})
+            if any((b.get('env') or {}).get(k) != v for k, v in configured.items()):
+                raise WindowAbort('refused', 'instrumentation permission must be explicit in boot.env')
         label = b.get("label") or st["name"]
         lines = [f"# windowctl {self.wid} arm {label} {now_iso()}\n"]
         if "release" in b:
@@ -1045,6 +1082,24 @@ class Window:
         if not boot["healthy"]:
             return {"rc": 1, "error": "boot not healthy", "boot": boot}
         return {"rc": 0, "boot": boot}
+
+    def step_profiler(self, st):
+        if self.dry:
+            return {'rc': 0, 'dry': True, 'profiler': st['profiler']}
+        try:
+            if st['profiler'] == 'start':
+                record = owned_profiler.reserve(self.spec['owned_profiler'], self.state, self.snapshot['owned_profiler'])
+                self.state['instrumentation'] = record
+                self.save_state()  # recovery authority is durable before any collector launch
+                receipt = owned_profiler.start(record, self.state)
+                return {'rc': 0, 'profiler': 'started', 'receipt': receipt}
+            result = owned_profiler.cleanup(self.state['instrumentation'], self.state)
+            if result['ok']:
+                self.state['instrumentation']['cleaned'] = True
+                self.save_state()
+            return {'rc': 0 if result['ok'] else 1, 'profiler': 'cleanup', 'receipt': result}
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+            return {'rc': 1, 'error': str(error)[:200]}
 
     def step_engine(self, st):
         if self.dry:
@@ -1169,6 +1224,8 @@ class Window:
                 res = self.step_boot(st, rendered)
             elif row["kind"] == "engine":
                 res = self.step_engine(st)
+            elif row['kind'] == 'profiler':
+                res = self.step_profiler(st)
             else:
                 if not self.dry:
                     time.sleep(float(rendered["sleep"]))
@@ -1325,6 +1382,22 @@ def _raise_terminated(signum, _frame):
     raise Terminated(signum)
 
 
+def abort_exclusions(state):
+    """Broad job interruption leaves the exact collector for typed cleanup."""
+    lane, wid = state['lane'], state['window']
+    units = [unitrun.unit_name(lane, f'{wid}-deadman') + '.service']
+    if state.get('profiler_configured') or 'instrumentation' in state:
+        units.append(unitrun.unit_name(lane, f'{wid}-profiler') + '.service')
+    return tuple(units)
+
+
+def stop_window_units(state):
+    args = {'prefix': state['window'], 'exclude': abort_exclusions(state)}
+    if state.get('profiler_configured') or 'instrumentation' in state:
+        args['prefix_boundary'] = True  # window2 must never match window
+    return unitrun.stop_lane(state['lane'], **args)
+
+
 def restore_from(snap, state, spec, log=print, results=None):
     """Put production back EXACTLY as the snapshot found it. Idempotent: the window's finally and the dead-man share it."""
     rep = {"ok": True, "problems": []}
@@ -1340,14 +1413,25 @@ def restore_from(snap, state, spec, log=print, results=None):
         bad(e.why)
         state["restored"] = False
         return rep  # keep the offline fence, hold, and dead-man for a later recovery
-    # 1. nothing of this window keeps running
-    rep["stopped_units"] = unitrun.stop_lane(lane, prefix=wid, exclude=(unitrun.unit_name(lane, f"{wid}-deadman") + ".service",))
+    # Stop probes even if collector ownership later defers. Keep the collector
+    # intact until its exact unit/session evidence passes typed cleanup.
+    rep["stopped_units"] = stop_window_units(state)
     try:
         wait_for_drain(state, int(spec.get("wait_s", 90)))
     except WindowAbort as e:
         bad(e.why)
         state["restored"] = False
         return rep
+    if 'instrumentation' in state:
+        if 'owned_profiler' not in spec or 'owned_profiler' not in snap:
+            bad('instrumentation source/snapshot configuration missing; preserving recovery fence')
+            state['restored'] = False
+            return rep
+        rep['profiler_cleanup'] = owned_profiler.cleanup(state['instrumentation'], state)
+        if not rep['profiler_cleanup']['ok']:
+            bad('owned profiler cleanup deferred; preserving recovery fence')
+            state['restored'] = False
+            return rep
     # 2. override bytes, verbatim
     want = bytes.fromhex(snap["override_b64"])
     try:
@@ -1411,7 +1495,7 @@ def restore_from(snap, state, spec, log=print, results=None):
     if changed:
         bad(f"production .so differ from the snapshot: {changed[:6]}")
     # 3. engine: back on the snapshot's root and config, with the expected KV pool
-    need_boot = state.get("boots", 0) > 0 or state.get("engine_stopped") or engine_health() != 200 \
+    need_boot = 'instrumentation' in state or state.get("boots", 0) > 0 or state.get("engine_stopped") or engine_health() != 200 \
         or not same_configuration(snap.get("runtime_identity"), runtime_identity(ENGINE_UNIT)) or libraries_changed
     expected = max(int(spec.get("expected_kv_pool") or 0), int(snap.get("kv_pool") or 0))
     tol = float(spec.get("kv_pool_tolerance", 0.005))
@@ -1457,16 +1541,27 @@ def restore_from(snap, state, spec, log=print, results=None):
         bad(f"engine runs from {rr}, window started on {snap['prod_root']}")
     if not same_configuration(snap.get("runtime_identity"), runtime_identity(ENGINE_UNIT)):
         bad("restored model, root or serving flags do not match original runtime")
-    # 4. timers, exactly as found (pause_timers included)
-    rep["timers"] = {}
-    for t, was in (snap.get("timers") or {}).items():
-        now = timer_state(t)
-        if now != was and was in ("active", "inactive"):
-            set_timer(t, was == "active")
+    if 'owned_profiler' in spec:
+        rep['profiler_restoration'] = owned_profiler.restored(snap.get('owned_profiler'), runtime_identity(ENGINE_UNIT), spec['owned_profiler'])
+        if not rep['profiler_restoration']['ok'] or not rep['ok']:
+            bad('fresh engine instrumentation restoration unqualified; producers remain paused')
+            state['restored'] = False
+            return rep
+    def restore_timers():
+        rep['timers'] = {}
+        for t, was in (snap.get('timers') or {}).items():
             now = timer_state(t)
-        rep["timers"][t] = {"was": was, "now": now}
-        if was in ("active", "inactive") and now != was:
-            bad(f"timer {t} is {now}, was {was}")
+            if now != was and was in ('active', 'inactive'):
+                set_timer(t, was == 'active')
+                now = timer_state(t)
+            rep['timers'][t] = {'was': was, 'now': now}
+            if was in ('active', 'inactive') and now != was:
+                bad(f'timer {t} is {now}, was {was}')
+
+    # Legacy timing remains unchanged. Instrumented windows also require the
+    # real-generation canary before resuming any producer timer.
+    if 'owned_profiler' not in spec:
+        restore_timers()
     # 6. gateway window closed, busy signal + marker + dead-man cleared
     rep["health_after"] = engine_health()
     if rep["health_after"] != 200:
@@ -1475,6 +1570,13 @@ def restore_from(snap, state, spec, log=print, results=None):
         rep["generation"] = restoration_generation(snap["runtime_identity"])
         if not rep["generation"].get("ok"):
             bad("restored engine did not qualify with a real generation")
+    if rep['ok'] and 'owned_profiler' in spec:
+        # The canary may trigger lazy loads. Re-check after it, before producers.
+        rep['profiler_post_generation'] = owned_profiler.restored(snap.get('owned_profiler'), runtime_identity(ENGINE_UNIT), spec['owned_profiler'])
+        if not rep['profiler_post_generation']['ok']:
+            bad('instrumentation changed during generation; producers remain paused')
+        else:
+            restore_timers()
     if rep["ok"]:
         qualified_identity = runtime_identity(ENGINE_UNIT)
         rep["user_units"] = {}
