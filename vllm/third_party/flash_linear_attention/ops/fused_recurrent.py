@@ -115,13 +115,14 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
             # request's row, and before the tensor for ``i_n == 0``); a stale or
             # too-large count reads past the row. The garbage int then flows into
             # ``h0 + state_idx * stride_init_state_token`` and faults the SM
-            # (Xid 13 / Xid 31). Mask the load to the row; ``other=0`` falls into
-            # the invalid-state path below (null block id is 0).
+            # (Xid 13 / Xid 31). A masked load must yield a negative index,
+            # independent of whether the caller uses null block 0 or PAD -1.
+            # Zero is a real state slot when the caller uses PAD -1.
             idx_in_row = (i_t >= 0) & (i_t < stride_indices_seq)
             state_idx = tl.load(
                 ssm_state_indices + i_n * stride_indices_seq + i_t,
                 mask=idx_in_row,
-                other=0,
+                other=-1,
             ).to(tl.int64)
             if state_idx < 0 or state_idx == null_block_id:
                 # Do not expose uninitialised output for a rejected row.
