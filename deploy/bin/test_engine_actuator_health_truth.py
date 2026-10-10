@@ -55,21 +55,30 @@ class RestartOutcome(unittest.TestCase):
         self.addCleanup(td.cleanup)
         d = td.name
         self.events, self.c = [], Clock()
+        self.pid = 1
         self.health = iter([True] + [False] * 3 + [True] * 50)   # before the restart: healthy; after start: 3 misses then up
 
         def run(cmd, **kw):
+            if cmd[3] == "stop":
+                self.pid = 0
+            elif cmd[3] == "start":
+                self.pid = 2
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
         for p in (patch.object(ea, "LOCK", f"{d}/l"), patch.object(ea, "JOB", f"{d}/j.json"), patch.object(ea, "PLANNED", f"{d}/p.json"), patch.object(ea, "HOLDS", f"{d}/holds.json"),
                   patch.object(ea, "admin_token", return_value="t"), patch.object(ea, "engine_healthy", lambda: next(self.health)),
                   patch.object(ea, "status", return_value={"gateway": {}}), patch.object(ea, "staged_flags", return_value=[]),
                   patch.object(ea, "active_flags", return_value=[]), patch.object(ea, "faults_summary", return_value={"faults": 0}),
+                  patch.object(ea, "main_pid", lambda unit: self.pid),
+                  patch.object(ea, "runtime_identity", return_value={"engine_pid": 2}),
+                  patch.object(ea, "offline_and_wait", return_value=({"active_at_end": 0, "strategy": "offline-window"}, None)),
+                  patch.object(ea, "wait_engine_idle", return_value={"idle": True, "running_at_end": 0, "waiting_at_end": 0}),
                   patch.object(ea, "emit", side_effect=lambda *a, **k: self.events.append(a)),
                   patch.object(ea.subprocess, "run", run), patch.object(ea.time, "time", self.c.time),
                   patch.object(ea.time, "sleep", self.c.sleep)):
             p.start(); self.addCleanup(p.stop)
         self.args = argparse.Namespace(by="test", reason="health truth test", flags=None, clear_diag=False, drain_s=5,
-                                       drain_max_s=5, no_drain=True, force=False, foreground=True, health_wait_s=60)
+                                       drain_max_s=5, no_drain=False, force=False, foreground=True, health_wait_s=60)
 
     def test_outcome_is_measured_health_not_one_instant_probe(self):
         self.assertEqual(ea.do_restart(self.args), 0)

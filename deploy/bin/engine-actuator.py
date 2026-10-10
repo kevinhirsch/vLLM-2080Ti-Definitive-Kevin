@@ -29,6 +29,7 @@ The allow-list is DIAG below: a fixed map name -> env vars. Nothing else can be 
 reversible (stage-diag --clear) and recorded. Flags only take effect at the next engine start.
 """
 import argparse, contextlib, fcntl, json, os, re, signal, subprocess, sys, time, urllib.error, urllib.request
+from experiment_controls import main_pid, runtime_identity, engine_inflight as control_engine_inflight
 from datetime import datetime
 
 _TERMINATION_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
@@ -358,7 +359,7 @@ def drain_and_wait(deadline_s, reason, token, by=None):
         while time.time() - t0 < deadline_s:
             try:
                 d = http(f"{GATEWAY}/gateway/drain", token=token)
-                active = int(d.get("active") or 0)
+                active = int(d["active"]) if d.get("draining") is True and isinstance(d.get("active"), int) else None
                 if active == 0:
                     break
             except Exception:  # noqa: BLE001
@@ -481,7 +482,8 @@ def offline_and_wait(deadline_s, reason, token, by=None, hard_cap_s=None):
     # restart latency only. Past deadline_s keep waiting while the engine is still making token progress, up to hard_cap_s.
     def _active():
         try:
-            return int(http(f"{GATEWAY}/gateway/offline", token=token).get("local_active") or 0)
+            current = http(f"{GATEWAY}/gateway/offline", token=token)
+            return current["local_active"] if current.get("offline") is True and isinstance(current.get("local_active"), int) else None
         except Exception:  # noqa: BLE001
             return None
     try:
@@ -501,17 +503,7 @@ def engine_inflight(engine=None, timeout=3):
     The gateway fence/offline window only counts requests the gateway accepted; callers that go straight to :8001
     (bypassing routing, the spend ledger and the drain) are visible only here. FX2 2026-10-03: the 23:18 planned restart
     stopped the engine under one such caller."""
-    try:
-        txt = urllib.request.urlopen(f"{engine or ENGINE}/metrics", timeout=timeout).read().decode("utf-8", "replace")
-    except Exception:  # noqa: BLE001
-        return None
-    out = {}
-    for key, name in (("running", "vllm:num_requests_running"), ("waiting", "vllm:num_requests_waiting")):
-        m = re.search(r"^" + re.escape(name) + r"(?:\{[^}]*\})?\s+([0-9.eE+-]+)\s*$", txt, re.M)
-        if not m:
-            return None
-        out[key] = int(float(m.group(1)))
-    return out
+    return control_engine_inflight(engine or ENGINE, timeout=timeout)
 
 
 def wait_engine_idle(budget_s, engine=None, poll_s=2.0, settle=2, hard_cap_s=None, **kw):
@@ -599,11 +591,18 @@ def do_restart(a):
             emit("observation", f"planned engine restart by {by} skipped: flags {want or 'none'} already active", {"action": "restart-skipped-noop", "by": by, "reason": reason, **skipped})
             print(json.dumps(skipped))
             return 0
+    healthy = engine_healthy()
+    original_pid = main_pid(UNIT)
+    if original_pid is None:
+        print(json.dumps({"refused": "system engine MainPID could not be read"}))
+        return 3
+    if original_pid and a.no_drain:
+        print(json.dumps({"refused": "planned restart of a running engine requires a verified drain"}))
+        return 3
     write_job(state="starting", by=by, reason=reason, started=now_iso(), finished=None, drain=None, result=None)
     if a.flags is not None or a.clear_diag:
         names = [] if a.clear_diag else [x for x in (a.flags or "").split(",") if x]
         write_diag(names, by, reason)
-    healthy = engine_healthy()
     before = status()
     inflight_before = (before["gateway"].get("drain") or {}).get("active")
     emit("action", f"planned engine restart requested by {by}: {reason}",
@@ -613,7 +612,7 @@ def do_restart(a):
     try:
         with terminate_as_exception():
             drain_facts, lease = ({"skipped": "engine unhealthy; nothing to drain"}, None)
-            if healthy and not a.no_drain:
+            if original_pid:
                 write_job(state="draining")
                 t_drain = time.time()
                 hard_cap = float(max(a.drain_s, getattr(a, "drain_max_s", 0) or 0))
@@ -628,24 +627,34 @@ def do_restart(a):
                 drain_facts["engine"] = eng
                 drain_facts["total_waited_s"] = round(time.time() - t_drain)
                 drain_facts["engine_active_at_end"] = None if eng.get("running_at_end") is None else eng["running_at_end"] + (eng["waiting_at_end"] or 0)
+                if drain_facts.get("active_at_end") != 0 or eng.get("idle") is not True:
+                    refused = {"refused": "gateway or direct-engine drain incomplete or unreadable", "drain": drain_facts}
+                    write_job(state="refused", finished=now_iso(), result=refused)
+                    print(json.dumps(refused))
+                    return 3
             write_job(state="stopping", drain=drain_facts)
             json.dump({"ts": now_iso(), "by": by, "reason": reason, "drain": drain_facts, "active_at_stop": drain_facts.get("active_at_end")},
                       open(PLANNED, "w"))
             t_stop = time.time()
             stop_issued = True
             r = subprocess.run(["sudo", "-n", "systemctl", "stop", UNIT], capture_output=True, text=True, timeout=200)
+            if r.returncode != 0 or main_pid(UNIT) != 0:
+                raise RuntimeError("system engine stop failed or old MainPID remains")
             stop_s = round(time.time() - t_stop, 1)
             # EF2 measured 2026-10-02: releasing the fence here let live traffic hit the cold engine during warm-up
             # (warm-up 504 s instead of ~160 s). Keep the fence until `start` returns (it returns after the warm-up hook).
             write_job(state="starting-engine", stop_s=stop_s, stop_rc=r.returncode)
             try:
                 r2 = subprocess.run(["sudo", "-n", "systemctl", "start", UNIT], capture_output=True, text=True, timeout=900)
-                started = True
+                started = r2.returncode == 0
             finally:
                 with shielded():
                     release_lease(lease, token)
                 lease = None
             ok, health_wait_s = wait_engine_healthy(getattr(a, "health_wait_s", HEALTH_WAIT_S))
+            new_pid = main_pid(UNIT)
+            ok = bool(ok and r2.returncode == 0 and new_pid and new_pid != original_pid
+                      and runtime_identity(UNIT))
             res = {"restart_rc": r2.returncode, "stop_s": stop_s, "healthy_after": ok, "health_wait_s": health_wait_s,
                    "drain": drain_facts, "diag_active": active_flags()}
             write_job(state="done" if ok else "failed", finished=now_iso(), result=res)

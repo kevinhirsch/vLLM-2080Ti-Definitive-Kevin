@@ -44,6 +44,8 @@ Spec (YAML):
   watch_timers: [vllm-qwen27b-watchdog.timer]   # snapshotted + restored exactly (default)
   pause_timers: []              # stopped for the window, restarted by restore AND by the dead-man. The engine watchdog
                                 # timer is added automatically when any step stops the engine (keep_watchdog_timer: true opts out)
+  watch_user_units: []          # exact active/inactive snapshot through systemctl --user
+  pause_user_units: []          # e.g. [estate-core.service]; maintenance stop, restored after generation canary
   on_new_xid: abort             # abort | continue
   remote_quiet_s: 900           # refuse to open unless the remote valve is healthy AND had no breaker/402/429 for this
                                 # long; during the window it is polled every 15 s and 2 bad polls abort + restore local
@@ -95,6 +97,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import gpuguard  # noqa: E402
 import unitrun  # noqa: E402
+from experiment_controls import runtime_identity, same_configuration, drain_complete, engine_inflight, main_pid, selected_flags
 
 HOME = os.path.expanduser("~")
 BASE = os.environ.get("WINDOWCTL_BASE", f"{HOME}/.local/share/vllm-qwen27b")
@@ -114,8 +117,12 @@ DEFAULT_WATCH_TIMERS = ["vllm-qwen27b-watchdog.timer"]
 VAR_RE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 STEP_KINDS = ("run", "script", "boot", "engine", "sleep")
 WATCHDOG_TIMER = "vllm-qwen27b-watchdog.timer"   # its service Wants= the engine: a tick STARTS a stopped engine
-CODE_FILES = ("windowctl.py", "unitrun.py", "gpuguard.py", "release.py", "release_ab_probe.py", "gateway-offline.py", "mini_yaml.py")
+CODE_FILES = ("windowctl.py", "experiment_controls.py", "unitrun.py", "gpuguard.py", "release.py", "release_ab_probe.py", "gateway-offline.py", "mini_yaml.py")
 BUILTINS = ("RESULTS", "WINDOW", "LANE", "STEP", "PROD_ROOT")
+CONTROL_ENV = {"WINDOWCTL_BASE": BASE, "V02_OVERRIDE_ENV": OVERRIDE, "ENGINE_ACTUATOR": ACTUATOR,
+               "GATEWAY_SPEND_FILE": SPEND_FILE, "ENGINE_URL": ENGINE, "ENGINE_UNIT": ENGINE_UNIT,
+               "GATEWAY": GATEWAY, "WINDOWCTL_LOCK": LOCK, "WINDOWCTL_MARKER": MARKER,
+               "VLLM_RELEASES_ROOT": RELEASES}
 
 
 class SpecError(Exception):
@@ -157,13 +164,13 @@ def release_mod():
 def actuator_hold(*args, timeout=60):
     """Lane LV's engine-liveness hold (`engine-actuator.py hold ...`). While a window holds it the liveness authority
     and the watchdog take no automatic action, and stops are attributed to the holder. Returns the parsed JSON, or
-    None when the deployed actuator has no `hold` subcommand yet (then the window runs as before)."""
+    None when the deployed actuator has no `hold` subcommand yet (the window must refuse to run)."""
     try:
         r = subprocess.run(["/usr/bin/python3", ACTUATOR, "hold", *args], capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError):
         return None
-    if r.returncode == 2 and "invalid choice" in (r.stderr or ""):
-        return None
+    if r.returncode:
+        return {"error": "actuator hold command failed", "rc": r.returncode}
     try:
         return json.loads((r.stdout or "").strip().splitlines()[-1])
     except (ValueError, IndexError):
@@ -171,7 +178,7 @@ def actuator_hold(*args, timeout=60):
 
 
 def restart_argv(by, reason, hold=None):
-    argv = ["/usr/bin/python3", ACTUATOR, "restart", "--by", str(by), "--reason", reason, "--no-drain", "--foreground"]
+    argv = ["/usr/bin/python3", ACTUATOR, "restart", "--by", str(by), "--reason", reason, "--foreground"]
     if hold:
         argv += ["--hold", hold]          # LV: a planned restart is refused while a hold is held unless it names it
     return argv
@@ -285,6 +292,26 @@ def set_timer(timer, active: bool):
     return r.returncode == 0
 
 
+def user_unit_state(unit):
+    try:
+        r = subprocess.run(["systemctl", "--user", "show", unit, "--property=LoadState,ActiveState"],
+                           capture_output=True, text=True, timeout=15)
+        values = dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
+        active = values.get("ActiveState")
+        return active if r.returncode == 0 and values.get("LoadState") == "loaded" and active in ("active", "inactive") else "unknown"
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
+def set_user_unit(unit, active):
+    try:
+        r = subprocess.run(["systemctl", "--user", "start" if active else "stop", unit],
+                           capture_output=True, text=True, timeout=120)
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def running_root():
     r = subprocess.run(["systemctl", "show", "-p", "MainPID", "--value", ENGINE_UNIT], capture_output=True, text=True)
     try:
@@ -292,6 +319,76 @@ def running_root():
         return os.path.realpath(os.readlink(f"/proc/{pid}/cwd")) if pid else None
     except (OSError, ValueError):
         return None
+
+
+def revoke_and_drain(state, timeout_s=120, *, clock=time.monotonic, sleep=time.sleep):
+    """Revoke first, then require two zero gateway+engine samples before any restart."""
+    if state.get("measurement"):
+        r = http_json(f"{GATEWAY}/gateway/measurement", "DELETE", {"window": state["window"]})
+        if r.get("error") or r.get("active") is not False:
+            raise WindowAbort("drain-failed", "measurement admission could not be revoked")
+        state["measurement"] = None
+    token_file = state.pop("measurement_token_file", None)
+    if token_file:
+        try:
+            os.unlink(token_file)
+        except FileNotFoundError:
+            pass
+    if not state.get("lease"):
+        return
+    end, zeros = clock() + max(2, timeout_s), 0
+    while True:
+        gateway = http_json(f"{GATEWAY}/gateway/offline")
+        engine = engine_inflight(ENGINE)
+        if engine is None and main_pid(ENGINE_UNIT) == 0:
+            engine = {"running": 0, "waiting": 0}
+        if gateway.get("offline") is not True:
+            raise WindowAbort("drain-failed", "offline admission fence disappeared")
+        zeros = zeros + 1 if drain_complete(gateway, engine) else 0
+        if zeros >= 2:
+            return
+        if clock() >= end:
+            raise WindowAbort("drain-failed", "gateway or engine still busy, or drain metrics unreadable")
+        sleep(1)
+
+
+def boot_environment_matches(identity, expected):
+    try:
+        raw = open(f"/proc/{identity['engine_pid']}/environ", "rb").read()
+        values = dict(v.decode("utf-8", "replace").split("=", 1) for v in raw.split(b"\0") if b"=" in v)
+        return all(values.get(k) == str(v) for k, v in expected.items())
+    except (OSError, TypeError, KeyError):
+        return False
+
+
+def restoration_generation(expected, timeout=45):
+    """Prove that the restored, identified engine can complete a real local generation."""
+    try:
+        before = runtime_identity(ENGINE_UNIT)
+        if not same_configuration(expected, before):
+            return {"ok": False, "error": "runtime changed before generation"}
+        with urllib.request.urlopen(ENGINE.rstrip("/") + "/v1/models", timeout=5) as response:
+            models = json.load(response)
+        model = models["data"][0]["id"]
+        payload = {"model": model, "messages": [{"role": "user", "content": "Reply with exactly CONTROL_OK."}],
+                   "temperature": 0, "max_tokens": 32, "stream": False,
+                   "chat_template_kwargs": {"enable_thinking": False}}
+        request = urllib.request.Request(ENGINE.rstrip("/") + "/v1/chat/completions",
+                                         data=json.dumps(payload).encode(), method="POST",
+                                         headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            result = json.load(response)
+        choice = result["choices"][0]
+        content = choice["message"].get("content")
+        tokens = result.get("usage", {}).get("completion_tokens", 0)
+        after = runtime_identity(ENGINE_UNIT)
+        ok = (isinstance(content, str) and content.strip() == "CONTROL_OK"
+              and choice.get("finish_reason") == "stop" and isinstance(tokens, int) and tokens > 0
+              and before == after)
+        return {"ok": ok, "model": model, "finish_reason": choice.get("finish_reason"),
+                "completion_tokens": tokens, "runtime_unchanged": before == after}
+    except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
+        return {"ok": False, "error": type(error).__name__}
 
 
 def so_hashes(root):
@@ -409,6 +506,10 @@ def validate(spec):
         errs.append("ttl_s must be 30..3600 (the gateway's limit; the framework renews it)")
     if spec.get("on_new_xid", "abort") not in ("abort", "continue"):
         errs.append("on_new_xid must be abort|continue")
+    for key in ("watch_user_units", "pause_user_units"):
+        units = spec.get(key) or []
+        if not isinstance(units, list) or any(not isinstance(u, str) or not re.fullmatch(r"[A-Za-z0-9_.@:-]+\.(service|timer)", u) for u in units):
+            errs.append(f"{key} must be a list of explicit user service/timer names")
     known = set(BUILTINS) | set((spec.get("vars") or {}).keys())
     known |= {release_var(st["name"]) for st in spec.get("steps") or [] if isinstance(st, dict) and st.get("name")
               and isinstance(st.get("boot"), dict) and "release" in st["boot"]}
@@ -433,6 +534,14 @@ def validate(spec):
             b = st["boot"]
             if not isinstance(b, dict) or len([k for k in ("release", "tree", "default") if k in b]) != 1:
                 errs.append(f"step {name}: boot needs exactly one of release / tree / default")
+        if st.get("measurement"):
+            m = st["measurement"]
+            if kinds[0] not in ("run", "script") or not isinstance(m, (dict, bool)):
+                errs.append(f"step {name}: measurement requires a run/script step and a mapping or true")
+            elif isinstance(m, dict) and "ttl_s" in m and not (isinstance(m["ttl_s"], int) and 1 <= m["ttl_s"] <= 900):
+                errs.append(f"step {name}: measurement ttl_s must be 1..900")
+            if not isinstance(st.get("timeout_s", 900), int) or not 1 <= st.get("timeout_s", 900) <= 3600:
+                errs.append(f"step {name}: measurement timeout_s must be 1..3600")
         if st.get("on_fail", "abort") not in ("abort", "continue"):
             errs.append(f"step {name}: on_fail must be abort|continue")
         used = _names_in({k: v for k, v in st.items() if k != "capture"})
@@ -523,6 +632,7 @@ class Window:
                         "results": self.results, "spec": spec_path, "started": now_iso(), "status": "running",
                         "steps": self.steps, "boots": [], "xids": [], "notes": []}
         self._lease_stop = threading.Event()
+        self._measurement_lock = threading.RLock()
         self.renew_s = 60.0
         self._remote_stop = threading.Event()
         self.remote_poll_s = 15.0
@@ -617,17 +727,23 @@ class Window:
             ov = open(OVERRIDE, "rb").read()
         except OSError:
             ov = None
-        root = running_root() or LEGACY_ROOT
+        identity = runtime_identity(ENGINE_UNIT)
+        if not identity:
+            raise WindowAbort("refused", "cannot identify original engine process, model, root and flags")
+        root = identity["root"]
         snap = {
             "taken": now_iso(), "override_exists": ov is not None, "override_b64": (ov or b"").hex(),
             "override_sha256": hashlib.sha256(ov or b"").hexdigest(), "override_bytes": len(ov or b""),
             "timers": {t: timer_state(t) for t in (self.spec.get("watch_timers") or DEFAULT_WATCH_TIMERS) + pause_timers_of(self.spec)},
-            "prod_root": root, "so": so_hashes(root), "health": engine_health(),
+            "prod_root": root, "runtime_identity": identity, "so": so_hashes(root), "health": engine_health(),
             "kv_pool": gpuguard.kv_pool_since(), "spend": spend_usd(),
             "xid_count": len(xid_lines()), "jit_backup": {},
             "files": {},
+            "user_units": {u: user_unit_state(u) for u in dict.fromkeys((self.spec.get("watch_user_units") or []) + (self.spec.get("pause_user_units") or []))},
         }
-        for f in self.spec.get("snapshot_files") or []:
+        if any(st not in ("active", "inactive") for st in snap["user_units"].values()):
+            raise WindowAbort("refused", "cannot snapshot exact active/inactive user unit states")
+        for f in list(self.spec.get("snapshot_files") or []) + [f"{BASE}/active-serve", f"{BASE}/v02.model.json", f"{BASE}/diag.env"]:
             f = os.path.expanduser(f)
             try:
                 snap["files"][f] = open(f, "rb").read().hex()
@@ -657,6 +773,7 @@ class Window:
             raise WindowAbort("refused", f"gateway offline window not opened: {json.dumps(st)[:300]}")
         self.state["lease"] = lease
         self.save_state()
+        revoke_and_drain(self.state, int(self.spec.get("wait_s", 90)))
         self.log(f"gateway offline window open (local_active={st.get('local_active')})")
         threading.Thread(target=self._renew_loop, daemon=True).start()
 
@@ -676,6 +793,10 @@ class Window:
                                                              "reason": f"{self.wid}: {self.spec['reason']}"[:120]})
         if r.get("error"):
             self.log(f"lease renew failed: {r.get('error')[:120]}")
+            if self._lease_stop.is_set():
+                return r
+            self.remote_bad = "offline lease renewal failed"
+            unitrun.stop_lane(self.lane, prefix=self.wid, exclude=(unitrun.unit_name(self.lane, f"{self.wid}-deadman") + ".service",))
             return r
         new = r.get("lease")
         if new and new != lease:
@@ -687,6 +808,21 @@ class Window:
                 pass
             self.summary["notes"].append(f"{now_iso()} gateway forgot the offline window (restart?); re-opened it")
             self.log("gateway had forgotten the offline window (gateway restart?): re-opened it with a new lease")
+            self.remote_bad = "gateway restarted or changed the offline lease"
+            if not self._lease_stop.is_set():
+                unitrun.stop_lane(self.lane, prefix=self.wid, exclude=(unitrun.unit_name(self.lane, f"{self.wid}-deadman") + ".service",))
+        with self._measurement_lock:
+            phase = self.state.get("measurement")
+            if phase and not self._lease_stop.is_set():
+                renewed = http_json(f"{GATEWAY}/gateway/measurement", "POST", {
+                    "offline_lease": self.state["lease"], "window": self.wid, "phase": phase["phase"],
+                    "runtime_identity": phase["runtime_identity"], "ttl_s": 180, "renew": True})
+                if renewed.get("active") is not True or renewed.get("fingerprint") != phase["runtime_identity"]["fingerprint"]:
+                    self.remote_bad = "measurement phase renewal failed"
+                    unitrun.stop_lane(self.lane, prefix=self.wid, exclude=(unitrun.unit_name(self.lane, f"{self.wid}-deadman") + ".service",))
+                else:
+                    phase["until"] = renewed["until"]
+                    self.save_state()
         return r
 
     def take_hold(self):
@@ -694,9 +830,8 @@ class Window:
         h = actuator_hold("acquire", "--kind", "engine", "--by", "windowctl", "--reason", f"{self.wid}: {self.spec['reason']}"[:120],
                           "--ttl", str(ttl), "--owner-pid", str(os.getpid()))
         if h is None:
-            self.summary["notes"].append("engine-actuator has no `hold` yet (LV not deployed): window runs without a liveness hold")
-            return
-        if not h.get("lease"):
+            raise WindowAbort("refused", "engine actuator hold is unavailable")
+        if h.get("error") or not h.get("lease"):
             raise WindowAbort("refused", f"engine liveness hold not granted: {json.dumps(h)[:300]}")
         self.state["hold"] = h["lease"]
         self.save_state()
@@ -706,13 +841,14 @@ class Window:
         unit = unitrun.unit_name(self.lane, f"{self.wid}-deadman")
         r = subprocess.run(["systemd-run", "--user", f"--unit={unit}", "--collect", "--quiet", "--expand-environment=no",
                             "--on-active=120", "--on-unit-active=120", "--timer-property=AccuracySec=10s",
+                            *[f"--setenv={key}={value}" for key, value in CONTROL_ENV.items()],
                             sys.executable, os.path.abspath(__file__), "deadman", "--state", self.path("state.json")],
                            capture_output=True, text=True, timeout=60)
         if r.returncode == 0:
             self.state["deadman_unit"] = unit
             self.save_state()
         else:
-            self.summary["notes"].append(f"dead-man timer NOT armed: {r.stderr.strip()[:200]}")
+            raise WindowAbort("refused", "dead-man timer could not be armed")
 
     def remote_tick(self):
         """One poll of the remote watch: two consecutive unhealthy polls (~30 s) = abort. The running step's unit is
@@ -762,6 +898,47 @@ class Window:
         return {**{k: str(v) for k, v in (self.spec.get("vars") or {}).items()}, **self.vars, "RESULTS": self.results,
                 "WINDOW": self.wid, "LANE": self.lane, "STEP": step_name, "PROD_ROOT": self.snapshot.get("prod_root", "")}
 
+    def open_measurement(self, st):
+        with self._measurement_lock:
+            return self._open_measurement(st)
+
+    def _open_measurement(self, st):
+        config = st.get("measurement")
+        if not config or self.dry:
+            return {}
+        config = config if isinstance(config, dict) else {}
+        revoke_and_drain(self.state, int(self.spec.get("wait_s", 90)))
+        identity = runtime_identity(ENGINE_UNIT)
+        if not identity or engine_health() != 200:
+            raise WindowAbort("measurement-refused", "healthy identified engine required")
+        phase = str(config.get("phase") or st["name"])
+        ttl = int(config.get("ttl_s") or min(900, int(st.get("timeout_s", 300))))
+        self.state["measurement"] = {"window": self.wid, "phase": phase, "runtime_identity": identity, "until": 0}
+        self.save_state()  # a timed-out grant may still exist; dead-man must revoke it
+        r = http_json(f"{GATEWAY}/gateway/measurement", "POST", {
+            "offline_lease": self.state.get("lease"), "window": self.wid, "phase": phase,
+            "ttl_s": ttl, "max_s": min(3600, int(st.get("timeout_s", 900))), "runtime_identity": identity})
+        token = r.pop("token", None)  # never stored in summary/state/command line
+        if r.get("active") is not True or not token or r.get("fingerprint") != identity["fingerprint"]:
+            if r.get("active"):
+                self.state["measurement"] = {"window": self.wid, "phase": phase}
+                self.save_state()
+                revoke_and_drain(self.state, int(self.spec.get("wait_s", 90)))
+            raise WindowAbort("measurement-refused", "gateway did not grant the exact measurement phase")
+        self.state["measurement"] = {k: r[k] for k in ("window", "phase", "until")}
+        self.state["measurement"]["runtime_identity"] = identity
+        token_file = self.path(".measurement-token")
+        self.state["measurement_token_file"] = token_file
+        self.save_state()
+        fd = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(token)
+        identity_file = self.path("steps", f"{st['name']}-measurement-identity.json")
+        with open(identity_file, "w") as f:
+            json.dump({"window": self.wid, "phase": phase, **identity}, f, sort_keys=True)
+        return {"WINDOW_BENCH_TOKEN_FILE": token_file, "WINDOW_BENCH_IDENTITY_FILE": identity_file}
+
     def gpu_gate(self, what):
         wait = float(self.spec.get("gpu_gate_wait_s", 300))
         ok, foreign = gpuguard.wait_no_foreign(wait)
@@ -769,18 +946,30 @@ class Window:
             raise WindowAbort("gpu-foreign", f"{what}: foreign compute apps on the GPUs after {wait:.0f} s "
                                              f"(would shrink the KV pool): {gpuguard.describe(foreign)}")
 
-    def restart_engine(self, label, timeout_s):
+    def restart_engine(self, label, timeout_s, expected_root=None, expected_env=None, expected_identity=None, expected_flags=None):
         """Drained restart through the existing engine actuator, in its own unit. The window already holds the
-        gateway offline window, so the actuator does not open another one (--no-drain)."""
+        gateway offline window, which the actuator reuses while verifying its own drain."""
+        revoke_and_drain(self.state, int(self.spec.get("wait_s", 90)))
+        before = runtime_identity(ENGINE_UNIT)
         self.gpu_gate(f"boot {label}")
         gpuguard.set_busy(self.by, f"{self.wid} boot {label}", ttl_s=timeout_s + 300, window=self.wid, phase="boot")
         t_boot = time.time()
         res = unitrun.run(self.lane, f"{self.wid}-boot-{label}",
                           restart_argv(self.by, f"window {self.wid} boot {label}", self.state.get("hold")),
                           timeout_s=timeout_s, out=self.path("steps", f"boot-{label}.log"))
-        ok, waited = wait_health(max(30.0, timeout_s - (time.time() - t_boot)))
+        ok, waited = wait_health(max(30.0, timeout_s - (time.time() - t_boot))) if res.get("rc") == 0 else (False, 0)
+        identity = runtime_identity(ENGINE_UNIT)
+        fresh = bool(identity and (not before or identity["engine_pid"] != before["engine_pid"]
+                                  or identity["pid_start"] != before["pid_start"]))
+        verified = bool(res.get("rc") == 0 and fresh and identity
+                        and identity["root"] == os.path.realpath(expected_root or self.snapshot["prod_root"])
+                        and identity["model_path"] == self.snapshot["runtime_identity"]["model_path"]
+                        and boot_environment_matches(identity, expected_env or {})
+                        and (expected_flags is None or identity.get("flags") == expected_flags)
+                        and (not expected_identity or same_configuration(expected_identity, identity)))
         gpuguard.set_busy(self.by, f"{self.wid} window", ttl_s=self.max_s + 1800, window=self.wid, phase="window")
-        boot = {"label": label, "unit": res.get("unit"), "actuator_rc": res.get("rc"), "healthy": ok,
+        boot = {"label": label, "unit": res.get("unit"), "actuator_rc": res.get("rc"), "healthy": bool(ok and verified),
+                "runtime_identity": identity, "fresh_process": fresh, "identity_verified": verified,
                 "boot_s": round(time.time() - t_boot, 1), "kv_pool": gpuguard.kv_pool_since(t_boot - 5),
                 "running_root": running_root()}
         self.summary["boots"].append(boot)
@@ -833,7 +1022,15 @@ class Window:
         self.state["boots"] += 1
         self.state["engine_stopped"] = False
         self.save_state()
-        boot = self.restart_engine(label, int(b.get("timeout_s", 1200)))
+        root = root if "release" in b or "tree" in b else self.snapshot["prod_root"]
+        flags = dict(self.snapshot["runtime_identity"]["flags"])
+        flags.update(selected_flags(shlex.split(str((b.get("env") or {}).get("VLLM_SERVE_EXTRA_ARGS", "")))))
+        flags.update(selected_flags(shlex.split(str(b.get("extra_args_append") or ""))))
+        expected_env = dict(b.get("env") or {})
+        if b.get("extra_args_append"):
+            expected_env["VLLM_SERVE_EXTRA_ARGS"] = (cur + " " + b["extra_args_append"]).strip()
+        boot = self.restart_engine(label, int(b.get("timeout_s", 1200)), root, expected_env,
+                                   self.snapshot["runtime_identity"] if "default" in b else None, flags)
         boot["override_lines"] = lines
         if not boot["healthy"]:
             return {"rc": 1, "error": "boot not healthy", "boot": boot}
@@ -843,20 +1040,19 @@ class Window:
         if self.dry:
             return {"rc": 0, "dry": True}
         if st["engine"] == "stop":
+            revoke_and_drain(self.state, int(self.spec.get("wait_s", 90)))
             json.dump({"ts": now_iso(), "by": self.by, "reason": f"window {self.wid} step {st['name']}: engine stop"},
                       open(PLANNED, "w"))
             self.state["engine_stopped"] = True
             self.save_state()
             res = unitrun.run(self.lane, f"{self.wid}-{st['name']}", ["sudo", "-n", "systemctl", "stop", ENGINE_UNIT],
                               timeout_s=240, out=self.path("steps", f"{st['name']}.log"))
-            return {"rc": res.get("rc"), "unit": res.get("unit")}
-        self.gpu_gate(f"engine start ({st['name']})")
-        res = unitrun.run(self.lane, f"{self.wid}-{st['name']}", ["sudo", "-n", "systemctl", "start", ENGINE_UNIT],
-                          timeout_s=900, out=self.path("steps", f"{st['name']}.log"))
-        ok, _ = wait_health(float(st.get("timeout_s", 900)))
-        self.state["engine_stopped"] = not ok
+            return {"rc": 0 if res.get("rc") == 0 and main_pid(ENGINE_UNIT) == 0 else 1, "unit": res.get("unit")}
+        boot = self.restart_engine(st["name"], float(st.get("timeout_s", 900)), self.snapshot["prod_root"],
+                                   expected_identity=self.snapshot["runtime_identity"])
+        self.state["engine_stopped"] = not boot["healthy"]
         self.save_state()
-        return {"rc": 0 if ok else 1, "unit": res.get("unit"), "kv_pool": gpuguard.kv_pool_since(time.time() - 900)}
+        return {"rc": 0 if boot["healthy"] else 1, "boot": boot}
 
     def snapshot_scripts(self, st, cmd):
         """snaprun for `run:` too: every existing *.sh file the command names is copied to a READ-ONLY snapshot in the
@@ -896,8 +1092,21 @@ class Window:
         out = self.path("steps", f"{st['name']}.log")
         if self.dry:
             return {"rc": 0, "dry": True, "argv": argv, "env": env}
-        res = unitrun.run(self.lane, f"{self.wid}-{st['name']}", argv, timeout_s=int(st.get("timeout_s", 1800)), env=env,
-                          cwd=rendered.get("cwd"), out=out)
+        env.update(self.open_measurement(st))
+        identity = runtime_identity(ENGINE_UNIT)
+        if identity:
+            identity_file = self.path("steps", f"{st['name']}-engine-identity.json")
+            with open(identity_file, "w") as f:
+                json.dump(identity, f, sort_keys=True)
+            env.update(WINDOW_ENGINE_PID=str(identity["engine_pid"]), WINDOW_ENGINE_IDENTITY_FILE=identity_file)
+        try:
+            res = unitrun.run(self.lane, f"{self.wid}-{st['name']}", argv, timeout_s=int(st.get("timeout_s", 1800)), env=env,
+                              cwd=rendered.get("cwd"), out=out)
+        finally:
+            if st.get("measurement"):
+                with self._measurement_lock:
+                    revoke_and_drain(self.state, int(self.spec.get("wait_s", 90)))
+                    self.save_state()
         missing = [p for p in (rendered.get("outputs") or []) if not os.path.exists(p)]
         res["missing_outputs"] = missing
         if snaps:
@@ -982,6 +1191,10 @@ class Window:
             out["release"] = rel.activate(rid, reason=f"window {self.wid} promoted: {self.spec['reason']}"[:200], by=self.by,
                                           restart=False)
             self.snapshot["prod_root"] = os.path.realpath(root)
+            identity = runtime_identity(ENGINE_UNIT)
+            if not identity or identity["root"] != self.snapshot["prod_root"]:
+                raise WindowAbort("promotion-refused", "promoted runtime must already have passed the window")
+            self.snapshot["runtime_identity"] = identity
             self.snapshot["so"] = so_hashes(self.snapshot["prod_root"])
             self.snapshot["jit_backup"] = {}
             self.state["boots"] = max(1, self.state.get("boots", 0))     # the restore boot puts the new default live
@@ -1000,7 +1213,9 @@ class Window:
 
     # -- the restore
     def restore(self):
-        return restore_from(self.snapshot, self.state, self.spec, log=self.log, results=self.results)
+        report = restore_from(self.snapshot, self.state, self.spec, log=self.log, results=self.results)
+        self.save_state()
+        return report
 
     def run(self):
         os.makedirs(self.path("steps"), exist_ok=True)
@@ -1045,8 +1260,16 @@ class Window:
             self.take_hold()
             for t in pause_timers_of(self.spec):
                 if self.snapshot["timers"].get(t) == "active":
-                    set_timer(t, False)
+                    if not set_timer(t, False) or timer_state(t) != "inactive":
+                        raise WindowAbort("refused", f"could not pause timer {t}")
                     self.log(f"paused timer {t} (restore + dead-man restart it)")
+            for unit in self.spec.get("pause_user_units") or []:
+                if self.snapshot["user_units"][unit] == "active":
+                    if not set_user_unit(unit, False) or user_unit_state(unit) != "inactive":
+                        raise WindowAbort("refused", f"could not verify maintenance stop of user unit {unit}")
+                    self.state.setdefault("maintenance_stops", []).append({"unit": unit, "prior": "active", "after": "inactive"})
+                    self.save_state()
+                    self.log(f"maintenance stop of user unit {unit}; exact prior activity restored after engine generation canary")
             self.open_gateway()
             threading.Thread(target=self._remote_watch_loop, daemon=True).start()
             self.run_steps()
@@ -1073,6 +1296,8 @@ class Window:
                 self._remote_stop.set()          # the watch must never stop the restore's own units
                 if not self.dry and self.snapshot:
                     self.summary["restore"] = self.restore()
+                    if not self.summary["restore"].get("ok") and self.summary.get("status") == "ok":
+                        self.summary.update(status="restore-failed", why="original production state was not restored and qualified")
             finally:
                 for sg, h in prev.items():
                     signal.signal(sg, h)
@@ -1098,6 +1323,12 @@ def restore_from(snap, state, spec, log=print, results=None):
         rep["problems"].append(msg)
         log(f"RESTORE PROBLEM: {msg}")
     lane, wid = state["lane"], state["window"]
+    try:
+        revoke_and_drain(state, int(spec.get("wait_s", 90)))
+    except WindowAbort as e:
+        bad(e.why)
+        state["restored"] = False
+        return rep  # keep the offline fence, hold, and dead-man for a later recovery
     # 1. nothing of this window keeps running
     rep["stopped_units"] = unitrun.stop_lane(lane, prefix=wid, exclude=(unitrun.unit_name(lane, f"{wid}-deadman") + ".service",))
     # 2. override bytes, verbatim
@@ -1145,28 +1376,53 @@ def restore_from(snap, state, spec, log=print, results=None):
         rep["files"][f] = "verbatim" if ok_f else "DIFFERS"
         if not ok_f:
             bad(f"file {f} not restored verbatim")
+    # 5. production .so: unchanged, or put back from the JIT backup
+    root = snap.get("prod_root")
+    now_so = so_hashes(root)
+    changed = sorted(k for k in set(now_so) | set(snap.get("so") or {}) if now_so.get(k) != (snap.get("so") or {}).get(k))
+    libraries_changed = bool(changed)
+    if changed:
+        for rel, backup in (snap.get("jit_backup") or {}).items():
+            if any(c.startswith(rel + "/") for c in changed) and os.path.isdir(backup):
+                tgt = os.path.join(root, rel)
+                log(f"prod JIT dir {rel} changed during the window: restoring it from the snapshot backup")
+                shutil.rmtree(tgt, ignore_errors=True)
+                shutil.copytree(backup, tgt, symlinks=True)
+        now_so = so_hashes(root)
+        changed = sorted(k for k in set(now_so) | set(snap.get("so") or {}) if now_so.get(k) != (snap.get("so") or {}).get(k))
+    rep["so_changed_after_restore"] = changed
+    if changed:
+        bad(f"production .so differ from the snapshot: {changed[:6]}")
     # 3. engine: back on the snapshot's root and config, with the expected KV pool
     need_boot = state.get("boots", 0) > 0 or state.get("engine_stopped") or engine_health() != 200 \
-        or (running_root() and running_root() != snap.get("prod_root"))
+        or not same_configuration(snap.get("runtime_identity"), runtime_identity(ENGINE_UNIT)) or libraries_changed
     expected = max(int(spec.get("expected_kv_pool") or 0), int(snap.get("kv_pool") or 0))
     tol = float(spec.get("kv_pool_tolerance", 0.005))
     rep["kv_pool_expected"] = expected
     if need_boot:
         for attempt in (1, 2):
+            revoke_and_drain(state, int(spec.get("wait_s", 90)))
             ok_gpu, foreign = gpuguard.wait_no_foreign(float(spec.get("gpu_gate_wait_s", 300)) * 2)
             if not ok_gpu:
                 rep.setdefault("foreign_at_restore", []).append(gpuguard.describe(foreign))
             t_boot = time.time()
+            previous = runtime_identity(ENGINE_UNIT)
             gpuguard.set_busy(state.get("by") or lane, f"{wid} restore boot", ttl_s=1800, window=wid, phase="boot")
             res = unitrun.run(lane, f"{wid}-restore-{attempt}",
                               restart_argv(spec.get("by") or lane, f"window {wid} restore (attempt {attempt})", state.get("hold")),
                               timeout_s=1500,
                               out=os.path.join(results or "/tmp", "steps", f"restore-{attempt}.log"))
-            healthy, _ = wait_health(1200 - min(900, time.time() - t_boot))
+            healthy, _ = wait_health(1200 - min(900, time.time() - t_boot)) if res.get("rc") == 0 else (False, 0)
+            current = runtime_identity(ENGINE_UNIT)
+            fresh = bool(current and (not previous or current["engine_pid"] != previous["engine_pid"]
+                                     or current["pid_start"] != previous["pid_start"]))
+            verified = bool(res.get("rc") == 0 and fresh and same_configuration(snap.get("runtime_identity"), current))
+            healthy = bool(healthy and verified)
             pool = gpuguard.kv_pool_since(t_boot - 5)
             rep[f"restore_boot_{attempt}"] = {"unit": res.get("unit"), "rc": res.get("rc"), "healthy": healthy,
+                                              "runtime_identity": current, "identity_verified": verified,
                                               "kv_pool": pool, "boot_s": round(time.time() - t_boot, 1)}
-            low = bool(expected and pool and pool < expected * (1 - tol))
+            low = bool(expected and (not pool or pool < expected * (1 - tol)))
             if healthy and not low:
                 break
             log(f"restore boot {attempt}: healthy={healthy} KV pool {pool} (expected >= {expected * (1 - tol):.0f})")
@@ -1180,8 +1436,10 @@ def restore_from(snap, state, spec, log=print, results=None):
         rep["kv_pool"] = gpuguard.kv_pool_since()
     rr = running_root()
     rep["running_root"] = rr
-    if rr and snap.get("prod_root") and rr != snap["prod_root"]:
+    if not rr or rr != snap.get("prod_root"):
         bad(f"engine runs from {rr}, window started on {snap['prod_root']}")
+    if not same_configuration(snap.get("runtime_identity"), runtime_identity(ENGINE_UNIT)):
+        bad("restored model, root or serving flags do not match original runtime")
     # 4. timers, exactly as found (pause_timers included)
     rep["timers"] = {}
     for t, was in (snap.get("timers") or {}).items():
@@ -1192,27 +1450,41 @@ def restore_from(snap, state, spec, log=print, results=None):
         rep["timers"][t] = {"was": was, "now": now}
         if was in ("active", "inactive") and now != was:
             bad(f"timer {t} is {now}, was {was}")
-    # 5. production .so: unchanged, or put back from the JIT backup
-    root = snap.get("prod_root")
-    now_so = so_hashes(root)
-    changed = sorted(k for k in set(now_so) | set(snap.get("so") or {}) if now_so.get(k) != (snap.get("so") or {}).get(k))
-    if changed:
-        for rel, backup in (snap.get("jit_backup") or {}).items():
-            if any(c.startswith(rel + "/") for c in changed) and os.path.isdir(backup):
-                tgt = os.path.join(root, rel)
-                log(f"prod JIT dir {rel} changed during the window: restoring it from the snapshot backup")
-                shutil.rmtree(tgt, ignore_errors=True)
-                shutil.copytree(backup, tgt, symlinks=True)
-        now_so = so_hashes(root)
-        changed = sorted(k for k in set(now_so) | set(snap.get("so") or {}) if now_so.get(k) != (snap.get("so") or {}).get(k))
-    rep["so_changed_after_restore"] = changed
-    if changed:
-        bad(f"production .so differ from the snapshot: {changed[:6]}")
     # 6. gateway window closed, busy signal + marker + dead-man cleared
+    rep["health_after"] = engine_health()
+    if rep["health_after"] != 200:
+        bad("engine health after restore is not 200")
+    if rep["ok"]:
+        rep["generation"] = restoration_generation(snap["runtime_identity"])
+        if not rep["generation"].get("ok"):
+            bad("restored engine did not qualify with a real generation")
+    if rep["ok"]:
+        qualified_identity = runtime_identity(ENGINE_UNIT)
+        rep["user_units"] = {}
+        for unit, was in (snap.get("user_units") or {}).items():
+            current = user_unit_state(unit)
+            if current not in ("active", "inactive"):
+                bad(f"user unit {unit} state is unknown during restoration")
+                rep["user_units"][unit] = {"was": was, "now": current}
+                continue
+            if current != was:
+                if not set_user_unit(unit, was == "active"):
+                    bad(f"user unit {unit} could not be restored to {was}")
+                current = user_unit_state(unit)
+            rep["user_units"][unit] = {"was": was, "now": current}
+            if was not in ("active", "inactive") or current != was:
+                bad(f"user unit {unit} is {current}, was {was}")
+        if qualified_identity != runtime_identity(ENGINE_UNIT):
+            bad("engine identity changed while restoring user unit activity")
+    if not rep["ok"]:
+        state["restored"] = False
+        return rep
     lease = state.get("lease")
     if lease:
         r = http_json(f"{GATEWAY}/gateway/offline", "DELETE", {"lease": lease})
         rep["lease_close"] = "closed" if not r.get("error") else ("already-gone" if r.get("http") == 409 else r.get("error"))
+        if r.get("error") and r.get("http") != 409:
+            bad("gateway offline window close failed")
         try:
             go = gateway_offline_mod()
             go.drop_lease(lease)
@@ -1220,11 +1492,19 @@ def restore_from(snap, state, spec, log=print, results=None):
             pass
     off = http_json(f"{GATEWAY}/gateway/offline")
     rep["planned_offline_after"] = off.get("offline")
-    if off.get("offline") and lease and off.get("by") == (spec.get("by") or lane):
-        bad("gateway offline window still open after restore")
+    if lease and off.get("offline") is not False:
+        bad("gateway offline window is still open or unreadable after restore")
+    if not rep["ok"]:
+        state["restored"] = False
+        return rep
+    state["lease"] = None  # dead-man may retry a remaining hold release after successful close
     if state.get("hold"):
         h = actuator_hold("release", "--lease", state["hold"])
         rep["hold_release"] = h
+        if not h or h.get("error") or not h.get("released"):
+            bad("engine hold release failed")
+            state["restored"] = False
+            return rep
         state["hold"] = None
     gpuguard.clear_busy(wid)
     try:
@@ -1238,10 +1518,7 @@ def restore_from(snap, state, spec, log=print, results=None):
     rep["xid_count_after"] = len(xid_lines())
     rep["xid_new"] = rep["xid_count_after"] - int(snap.get("xid_count") or 0)
     rep["spend_after"] = spend_usd()
-    rep["health_after"] = engine_health()
-    if rep["health_after"] != 200:
-        bad("engine health after restore is not 200")
-    state["restored"] = True
+    state["restored"] = rep["ok"]
     log(f"restore {'OK' if rep['ok'] else 'FAILED'}: {json.dumps({k: rep[k] for k in ('override_verbatim', 'kv_pool', 'timers', 'so_changed_after_restore', 'health_after')}, default=str)[:600]}")
     return rep
 
@@ -1279,7 +1556,7 @@ def deadman(state_path):
         log("its engine liveness hold was owner-pid scoped and is void now; restoring without it")
         state["hold"] = None
     rep = restore_from(snap, state, spec, log=log, results=results)
-    state["restored"] = True
+    state["restored"] = rep["ok"]
     with open(state_path, "w") as fh:
         json.dump(state, fh, indent=1)
     try:
@@ -1290,7 +1567,7 @@ def deadman(state_path):
              restored_by="dead-man", finished=now_iso())
     with open(os.path.join(results, "summary.json"), "w") as fh:
         json.dump(s, fh, indent=1, default=str)
-    return 0
+    return 0 if rep["ok"] else 1
 
 
 def main(argv=None):
@@ -1341,7 +1618,8 @@ def main(argv=None):
         validate(spec)
         unit = unitrun.unit_name(f"win-{spec['lane']}", spec["window"])
         argv = ["systemd-run", "--user", f"--unit={unit}", "--collect", "--expand-environment=no", "-p", "TimeoutStopSec=1800",
-                "-p", "KillMode=mixed", f"--setenv=PATH={os.environ.get('PATH', '/usr/bin:/bin')}", f"--setenv=HOME={HOME}"]
+                "-p", "KillMode=mixed", f"--setenv=PATH={os.environ.get('PATH', '/usr/bin:/bin')}", f"--setenv=HOME={HOME}",
+                *[f"--setenv={key}={value}" for key, value in CONTROL_ENV.items()]]
         if a.wait:
             argv.append("--wait")
         # snaprun rule for the framework itself: it (and the dead-man it arms) runs from a read-only snapshot of its

@@ -57,12 +57,17 @@ class KilledRestart(unittest.TestCase):
         d = self.tmp.name
         self.gw = FakeGateway()
         self.events, self.systemctl = [], []
+        self.pid = 1
         self.args = argparse.Namespace(by="test", reason="killed mid-restart test", flags=None, clear_diag=False,
                                        drain_s=5, drain_max_s=5, no_drain=False, force=False, foreground=True)
         self.saved = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
 
         def run(cmd, **kw):
             self.systemctl.append(cmd[3:])
+            if cmd[3] == "stop":
+                self.pid = 0
+            elif cmd[3] == "start":
+                self.pid = 2
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
         for p in (patch.object(ea, "LOCK", f"{d}/restart.lock"), patch.object(ea, "JOB", f"{d}/job.json"), patch.object(ea, "HOLDS", f"{d}/holds.json"),
@@ -70,6 +75,8 @@ class KilledRestart(unittest.TestCase):
                   patch.object(ea, "admin_token", return_value="t"), patch.object(ea, "engine_healthy", return_value=True),
                   patch.object(ea, "status", return_value={"gateway": {}}), patch.object(ea, "staged_flags", return_value=[]),
                   patch.object(ea, "active_flags", return_value=[]),
+                  patch.object(ea, "main_pid", lambda unit: self.pid),
+                  patch.object(ea, "runtime_identity", return_value={"engine_pid": 2}),
                   patch.object(ea, "faults_summary", return_value={"faults": 0}),
                   patch.object(ea, "emit", side_effect=lambda *a, **k: self.events.append(a)),
                   patch.object(ea.subprocess, "run", run),
@@ -131,7 +138,7 @@ class KilledRestart(unittest.TestCase):
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
         with patch.object(ea, "wait_drained", return_value={"waited_s": 1, "active_at_end": 0, "end_reason": "drained", "extended_s": 0}), \
-                patch.object(ea, "wait_engine_idle", return_value={"running_at_end": 0, "waiting_at_end": 0}), \
+                patch.object(ea, "wait_engine_idle", return_value={"idle": True, "running_at_end": 0, "waiting_at_end": 0}), \
                 patch.object(ea.subprocess, "run", run):
             self.assertEqual(ea.do_restart(self.args), 143)
         self.assertIsNone(self.gw.window_lease)
@@ -149,7 +156,7 @@ class KilledRestart(unittest.TestCase):
 
     def test_normal_restart_releases_once_and_is_unchanged(self):
         with patch.object(ea, "wait_drained", return_value={"waited_s": 1, "active_at_end": 0, "end_reason": "drained", "extended_s": 0}), \
-                patch.object(ea, "wait_engine_idle", return_value={"running_at_end": 0, "waiting_at_end": 0}):
+                patch.object(ea, "wait_engine_idle", return_value={"idle": True, "running_at_end": 0, "waiting_at_end": 0}):
             self.assertEqual(ea.do_restart(self.args), 0)
         self.assertEqual([c for c in self.gw.calls if c[1] == "DELETE"], [("/gateway/offline", "DELETE", {"lease": "W1"})])
         self.assertEqual(self.systemctl, [["stop", ea.UNIT], ["start", ea.UNIT]])

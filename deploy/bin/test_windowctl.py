@@ -1,6 +1,7 @@
 """RL (L147): one window framework -- declarative spec, exact snapshot/restore, gates, units, dead-man."""
 import json
 import os
+import pathlib
 import subprocess
 import sys
 import time
@@ -12,6 +13,7 @@ sys.path.insert(0, HERE)
 import gpuguard  # noqa: E402
 import unitrun  # noqa: E402
 import windowctl as wc  # noqa: E402
+ARM_DEADMAN = wc.Window.arm_deadman
 
 K5_SPEC = os.path.join(HERE, "..", "windows", "k5-gdn-fused-ab.yaml")
 
@@ -26,12 +28,15 @@ class World:
         self.lease_closed = []
         self.xids = ["1 kernel: NVRM: Xid (PCI:0000:01:00): 31, pid=1, old"]
         self.timers = {"vllm-qwen27b-watchdog.timer": "active"}
+        self.user_units = {}
         self.spend = 5.0
         self.pools = []                   # kv_pool_since results (popped per call), default 960000
         self.foreign = []
         self.units = []
         self.actuator_calls = []
         self.root = tmp / "prod"
+        self.running = self.root
+        self.pid = 100
         (self.root / ".deps" / "tq_gqa_build").mkdir(parents=True)
         (self.root / "vllm").mkdir()
         (self.root / ".deps" / "tq_gqa_build" / "tq_gqa_sm75.so").write_bytes(b"prod-tq")
@@ -41,16 +46,26 @@ class World:
         self.busy = tmp / "busy.json"
         mp = monkeypatch
         mp.setattr(wc, "OVERRIDE", str(self.override))
+        mp.setattr(wc, "BASE", str(tmp))
         mp.setattr(wc, "PLANNED", str(tmp / "planned.json"))
         mp.setattr(wc, "LOCK", str(tmp / "window.lock"))
         mp.setattr(wc, "MARKER", str(tmp / "window-active.json"))
         mp.setattr(gpuguard, "BUSY_FILE", str(self.busy))
         mp.setattr(wc, "engine_health", lambda timeout=3: self.health)
         mp.setattr(wc, "wait_health", lambda budget_s, **k: (self.health == 200, 1.0))
-        mp.setattr(wc, "running_root", lambda: str(self.root))
+        mp.setattr(wc, "running_root", lambda: str(self.running) if self.health == 200 else None)
+        mp.setattr(wc, "runtime_identity", self.identity)
+        mp.setattr(wc, "main_pid", lambda unit: self.pid if self.health == 200 else 0)
+        mp.setattr(wc, "engine_inflight", lambda engine: {"running": 0, "waiting": 0} if self.health == 200 else None)
+        mp.setattr(wc, "boot_environment_matches", lambda identity, expected: True)
+        mp.setattr(wc, "restoration_generation", lambda expected: {"ok": True, "completion_tokens": 3})
+        actual_drain = wc.revoke_and_drain
+        mp.setattr(wc, "revoke_and_drain", lambda state, timeout_s=120: actual_drain(state, timeout_s, sleep=lambda _: None))
         mp.setattr(wc, "xid_lines", lambda: list(self.xids))
         mp.setattr(wc, "timer_state", lambda t: self.timers.get(t, "inactive"))
         mp.setattr(wc, "set_timer", lambda t, on: self.timers.__setitem__(t, "active" if on else "inactive") or True)
+        mp.setattr(wc, "user_unit_state", lambda u: self.user_units.get(u, "unknown"))
+        mp.setattr(wc, "set_user_unit", lambda u, on: self.user_units.__setitem__(u, "active" if on else "inactive") or True)
         mp.setattr(wc, "spend_usd", lambda: self.spend)
         mp.setattr(wc, "http_json", self.http)
         mp.setattr(wc, "gateway_offline_mod", lambda: self)
@@ -62,9 +77,16 @@ class World:
         self.cap = {"remote_configured": True, "remote_usable": True, "remote_budget_ok": True, "remote_dead_for_s": 0,
                     "mode": "local+remote", "mode_changes": []}
         self.holds = []
-        self.hold_supported = False
+        self.hold_supported = True
         mp.setattr(wc, "actuator_hold", self.hold)
         mp.setattr(unitrun, "owner_of_pid", lambda pid, at=None: {"unit": "k2-bench.service", "lane": "k2"} if pid == 777 else None)
+
+    def identity(self, unit=None):
+        if self.health != 200:
+            return None
+        return {"engine_pid": self.pid, "pid_start": str(self.pid), "root": str(self.running),
+                "model_path": "/models/test", "flags": {}, "runtime_flags": {}, "argv_sha256": "test",
+                "fingerprint": f"pid{self.pid}"}
 
     def hold(self, *args, timeout=60):
         self.holds.append(args)
@@ -88,7 +110,7 @@ class World:
                 return {"offline": False}
             if method == "POST":
                 return {"lease": payload.get("lease")}
-            return {"offline": self.offline, "by": "K5" if self.offline else None}
+            return {"offline": self.offline, "local_active": 0, "by": "K5" if self.offline else None}
         if url.endswith("/gateway/capacity"):
             return dict(self.cap)
         return {}
@@ -98,6 +120,8 @@ class World:
         if any("engine-actuator.py" in c for c in cmd):
             self.actuator_calls.append({"cmd": cmd, "override": self.override.read_bytes()})
             self.health = 200
+            self.pid += 1
+            self.running = pathlib.Path(wc.override_value(self.override.read_bytes(), "V02_ROOT") or self.root)
             return {"unit": unitrun.unit_name(lane, job), "rc": 0, "result": "success"}
         if cmd[:3] == ["sudo", "-n", "systemctl"]:
             if cmd[3] == "stop":
@@ -213,7 +237,7 @@ def test_window_happy_path_runs_steps_in_units_and_restores_exactly(world, tmp_p
     assert ov.startswith(before.decode())                                  # window-start override + the arm's diff
     assert f"export V02_ROOT={rel}" in ov and "export VLLM_K5_GDN_FUSED=1" in ov
     assert "export VLLM_SERVE_EXTRA_ARGS='--foo 1 --profiler-config {}'" in ov
-    assert "--no-drain" in arm["cmd"] and "--foreground" in arm["cmd"]
+    assert "--no-drain" not in arm["cmd"] and "--foreground" in arm["cmd"]
     assert len(world.actuator_calls) == 2                                   # arm boot + restore boot
     assert world.lease_closed == ["LEASE1"] and not world.offline
     jobs = [u["job"] for u in world.units]
@@ -345,7 +369,7 @@ def test_deadman_restores_when_the_window_process_is_gone(world, tmp_path, monke
     res = tmp_path / "results"
     res.mkdir()
     snap = {"override_b64": b"export A=1\n".hex(), "override_exists": True, "timers": {}, "prod_root": str(world.root),
-            "so": wc.so_hashes(str(world.root)), "kv_pool": 960000, "xid_count": 1, "jit_backup": {}}
+            "runtime_identity": world.identity(), "so": wc.so_hashes(str(world.root)), "kv_pool": 960000, "xid_count": 1, "jit_backup": {}}
     (res / "snapshot.json").write_text(json.dumps(snap))
     p = subprocess.Popen(["true"])
     p.wait()
@@ -353,6 +377,7 @@ def test_deadman_restores_when_the_window_process_is_gone(world, tmp_path, monke
              "boots": 1, "engine_stopped": False, "deadline": time.time() + 999, "restored": False}
     (res / "state.json").write_text(json.dumps(state))
     world.override.write_bytes(b"export A=arm\n")
+    world.offline = True
     assert wc.deadman(str(res / "state.json")) == 0
     assert world.override.read_bytes() == b"export A=1\n"
     assert world.lease_closed == ["L9"]
@@ -419,6 +444,7 @@ def test_promote_after_success_makes_the_new_state_the_restore_target(world, tmp
         res = orig(*a, **k)
         if "restore" in a[1]:
             booted["root"] = os.path.realpath(relroot / "r1")         # the restore boot lands on `current`
+            world.running = pathlib.Path(booted["root"])
         return res
     monkeypatch.setattr(unitrun, "run", run)
     sp = spec(tmp_path, snapshot_files=[str(f)], promote={"release": "r1", "files": [str(f)]},
@@ -459,11 +485,142 @@ def test_engine_liveness_hold_is_taken_named_on_every_restart_and_released(world
     assert world.holds[-1] == ("release", "--lease", "HOLD1")
 
 
-def test_without_lv_deployed_the_window_runs_and_says_so(world, tmp_path):
+def test_without_lv_deployed_the_window_refuses_to_run(world, tmp_path):
     (tmp_path / "rel").mkdir()
+    world.hold_supported = False
     s = wc.Window(spec(tmp_path)).run()
-    assert s["status"] == "ok" and any("no `hold` yet" in n for n in s["notes"])
-    assert all("--hold" not in c["cmd"] for c in world.actuator_calls)
+    assert s["status"] == "refused" and "hold is unavailable" in s["why"]
+    assert not world.actuator_calls
+
+
+def test_deadman_arm_failure_refuses_before_steps(world, tmp_path, monkeypatch):
+    w = wc.Window(spec(tmp_path, steps=[{"name": "measure", "run": "true"}]))
+    monkeypatch.setattr(wc.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a[0], 1, "", "denied"))
+    with pytest.raises(wc.WindowAbort, match="could not be armed"):
+        ARM_DEADMAN(w)
+    assert not world.units
+
+
+@pytest.mark.parametrize("failure", ["refused", "old-pid", "wrong-model", "wrong-env"])
+def test_healthy_old_or_wrong_engine_cannot_pass_a_boot(world, tmp_path, monkeypatch, failure):
+    w = wc.Window(spec(tmp_path, steps=[{"name": "measure", "run": "true"}]))
+    w.take_snapshot()
+    original = world.unit_run
+    def run(*a, **k):
+        if failure == "refused":
+            return {"rc": 3, "unit": "refused"}
+        if failure == "old-pid":
+            return {"rc": 0, "unit": "old"}
+        return original(*a, **k)
+    monkeypatch.setattr(unitrun, "run", run)
+    if failure == "wrong-model":
+        monkeypatch.setattr(wc, "runtime_identity", lambda unit: {**world.identity(), "model_path": "/models/wrong"})
+    if failure == "wrong-env":
+        monkeypatch.setattr(wc, "boot_environment_matches", lambda identity, expected: False)
+    boot = w.restart_engine("test", 10)
+    assert not boot["healthy"] and not boot["identity_verified"]
+
+
+def test_failed_restore_keeps_offline_fence_and_deadman_available(world, tmp_path, monkeypatch):
+    w = wc.Window(spec(tmp_path, steps=[{"name": "measure", "run": "true"}]))
+    w.take_snapshot()
+    world.offline = True
+    w.state.update(lease="LEASE1", boots=1)
+    monkeypatch.setattr(unitrun, "run", lambda *a, **k: {"rc": 3, "unit": "refused"})
+    report = w.restore()
+    assert not report["ok"] and w.state["restored"] is False
+    assert world.offline and not world.lease_closed
+
+
+@pytest.mark.parametrize("original", ["active", "inactive"])
+def test_user_maintenance_stop_restores_exact_state_only_after_generation(world, tmp_path, monkeypatch, original):
+    world.user_units["estate-core.service"] = original
+    events = []
+    def generation(expected):
+        events.append(("generation", world.user_units["estate-core.service"]))
+        return {"ok": True}
+    monkeypatch.setattr(wc, "restoration_generation", generation)
+    def set_unit(unit, on):
+        events.append(("start" if on else "stop", unit))
+        world.user_units[unit] = "active" if on else "inactive"
+        return True
+    monkeypatch.setattr(wc, "set_user_unit", set_unit)
+    s = wc.Window(spec(tmp_path, pause_user_units=["estate-core.service"], steps=[{"name": "measure", "run": "true"}])).run()
+    assert s["restore"]["ok"] and world.user_units["estate-core.service"] == original
+    assert s["restore"]["user_units"]["estate-core.service"] == {"was": original, "now": original}
+    assert events == ([('stop', 'estate-core.service'), ('generation', 'inactive'), ('start', 'estate-core.service')]
+                      if original == "active" else [('generation', 'inactive')])
+
+
+def test_unknown_user_state_refuses_before_any_pause_or_engine_step(world, tmp_path):
+    s = wc.Window(spec(tmp_path, pause_user_units=["estate-core.service"], steps=[{"name": "measure", "run": "true"}])).run()
+    assert s["status"] == "refused" and "cannot snapshot" in s["why"]
+    assert not world.units and not world.holds and not world.offline
+
+
+def test_generation_failure_keeps_core_paused_and_admission_closed(world, tmp_path, monkeypatch):
+    world.user_units["estate-core.service"] = "active"
+    monkeypatch.setattr(wc, "restoration_generation", lambda expected: {"ok": False})
+    w = wc.Window(spec(tmp_path, pause_user_units=["estate-core.service"], steps=[{"name": "measure", "run": "true"}]))
+    s = w.run()
+    assert s["status"] == "restore-failed" and not s["restore"]["ok"]
+    assert world.user_units["estate-core.service"] == "inactive" and world.offline
+    assert w.state["hold"] == "HOLD1" and not w.state["restored"]
+    assert not world.lease_closed
+
+
+def test_deadman_restores_paused_user_service_after_generation(world, tmp_path, monkeypatch):
+    world.user_units["estate-core.service"] = "active"
+    w = wc.Window(spec(tmp_path, pause_user_units=["estate-core.service"], steps=[{"name": "measure", "run": "true"}]))
+    os.makedirs(w.path("steps"), exist_ok=True)
+    w.take_snapshot()
+    world.user_units["estate-core.service"] = "inactive"
+    world.offline = True
+    w.state.update(lease="LEASE1", pid=999999, pid_start="dead")
+    w.save_state()
+    monkeypatch.setattr(unitrun, "proc_start", lambda pid: None)
+    assert wc.deadman(w.path("state.json")) == 0
+    assert world.user_units["estate-core.service"] == "active" and not world.offline
+    assert json.load(open(w.path("state.json")))["restored"]
+
+
+def test_missing_explicit_cli_flag_does_not_pass_arm(world, tmp_path):
+    (tmp_path / "rel").mkdir()
+    s = wc.Window(spec(tmp_path, steps=[{"name": "arm", "boot": {"tree": str(tmp_path / "rel"),
+                                               "extra_args_append": "--long-prefill-token-threshold 32768"}}])).run()
+    assert s["status"] == "failed-step" and not s["boots"][0]["identity_verified"]
+    assert s["restore"]["ok"]
+
+
+def test_direct_run_exports_observed_engine_pid_without_scoped_gateway(world, tmp_path):
+    s = wc.Window(spec(tmp_path, steps=[{"name": "measure", "run": "true"}])).run()
+    env = next(u["env"] for u in world.units if u["job"] == "t5-ab-measure")
+    identity = json.load(open(env["WINDOW_ENGINE_IDENTITY_FILE"]))
+    assert env["WINDOW_ENGINE_PID"] == str(identity["engine_pid"])
+    assert "WINDOW_BENCH_TOKEN_FILE" not in env and s["restore"]["ok"]
+
+
+def test_phase_token_is_private_transient_and_not_saved_in_state(world, tmp_path, monkeypatch):
+    w = wc.Window(spec(tmp_path, steps=[{"name": "measure", "run": "true", "measurement": {"ttl_s": 180}}]))
+    os.makedirs(w.path("steps"), exist_ok=True)
+    w.take_snapshot()
+    w.state["lease"] = "LEASE1"
+    world.offline = True
+    def http(url, method="GET", payload=None, timeout=8):
+        if url.endswith("/gateway/measurement"):
+            if method == "DELETE":
+                return {"active": False}
+            return {"active": True, "token": "private-phase-token", "until": time.time() + 180,
+                    "window": w.wid, "phase": payload["phase"], **payload["runtime_identity"]}
+        return world.http(url, method, payload, timeout)
+    monkeypatch.setattr(wc, "http_json", http)
+    env = w.open_measurement(w.spec["steps"][0])
+    token = pathlib.Path(env["WINDOW_BENCH_TOKEN_FILE"])
+    assert token.read_text() == "private-phase-token" and token.stat().st_mode & 0o777 == 0o600
+    assert "private-phase-token" not in pathlib.Path(w.path("state.json")).read_text()
+    assert "private-phase-token" not in pathlib.Path(env["WINDOW_BENCH_IDENTITY_FILE"]).read_text()
+    wc.revoke_and_drain(w.state, 1)
+    assert not token.exists() and w.state["measurement"] is None
 
 
 def test_engine_stop_auto_pauses_the_watchdog_timer_and_restores_it(world, tmp_path, monkeypatch):

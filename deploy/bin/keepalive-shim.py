@@ -6016,6 +6016,102 @@ def _flow_refusal_response(r):
 # with Retry-After, lets accepted local work finish, and ends by itself (lease) or by DELETE. The admission
 # FENCE (/gateway/drain) stays for the instant of a gateway code swap only.
 _OFFLINE = {"until": 0.0, "lease": None, "reason": None, "by": None, "t0": None, "ttl_s": None, "refused": 0}
+from experiment_controls import runtime_identity as measurement_runtime_identity
+
+# A phase token is deliberately memory-only: gateway publication revokes it.
+# It only exempts estate-local requests from THIS offline window, never from
+# capacity, health, spend, context, or gateway-publication guards.
+_MEASUREMENT = {}
+MEASUREMENT_MAX_TTL_S = 900
+
+
+def _measurement_valid(now=None):
+    now = time.time() if now is None else now
+    m = _MEASUREMENT
+    if (not m or now >= m.get("until", 0) or not _local_offline(now)
+            or m.get("offline_lease") != _OFFLINE.get("lease")):
+        return False
+    identity = measurement_runtime_identity(pid=m["runtime_identity"]["engine_pid"])
+    return bool(identity and identity == m["runtime_identity"])
+
+
+def _measurement_receipt():
+    return {**{k: _MEASUREMENT[k] for k in ("window", "phase", "until", "deadline") if k in _MEASUREMENT},
+            **(_MEASUREMENT.get("runtime_identity") or {})}
+
+
+def _measurement_request(request, body=None):
+    token = request.headers.get("X-Window-Token", "")
+    if not token or not _measurement_valid():
+        return False
+    try:
+        j = json.loads(body) if body is not None else request.get("measurement_body", {})
+    except (ValueError, TypeError):
+        return False
+    return bool(isinstance(j, dict) and j.get("model") == "estate-local"
+                and hmac.compare_digest(token, _MEASUREMENT.get("token", "")))
+
+
+def _request_local_offline(request):
+    return _local_offline() and not _measurement_request(request)
+
+
+async def gateway_measurement(request):
+    # This endpoint remains closed when no admin token is configured, unlike
+    # legacy dashboard compatibility. A phase token grants local admission.
+    if not SHIM_ADMIN_TOKEN or not _admin_ok(request):
+        return web.json_response({"error": "configured admin token required"}, status=401)
+    if request.method == "GET":
+        identity = await asyncio.to_thread(measurement_runtime_identity)
+        return web.json_response({"active": _measurement_valid(), **_measurement_receipt(),
+                                  "observed_runtime_identity": identity})
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError
+    except (ValueError, TypeError):
+        return web.json_response({"error": "JSON object required"}, status=400)
+    if request.method == "DELETE":
+        if _MEASUREMENT and body.get("window") != _MEASUREMENT.get("window"):
+            return web.json_response({"error": "measurement window mismatch"}, status=409)
+        _MEASUREMENT.clear()  # queued calls lose admission before the drain begins
+        return web.json_response({"active": False, "local_active": _offline_status()["local_active"]})
+    try:
+        ttl = int(body.get("ttl_s", 300))
+        max_s = int(body.get("max_s", 900))
+        if not 1 <= ttl <= MEASUREMENT_MAX_TTL_S:
+            raise ValueError
+        if not 1 <= max_s <= 3600:
+            raise ValueError
+        if not all(isinstance(body.get(k), str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", body[k])
+                   for k in ("window", "phase")):
+            raise ValueError
+    except (ValueError, TypeError):
+        return web.json_response({"error": "bounded window/phase, ttl_s 1..900 and max_s 1..3600 required"}, status=400)
+    if (_draining() or not _local_offline() or body.get("offline_lease") != _OFFLINE.get("lease")):
+        return web.json_response({"error": "matching offline window required; publication must be idle"}, status=409)
+    if body.get("renew"):
+        if (not _measurement_valid() or body.get("window") != _MEASUREMENT.get("window")
+                or body.get("phase") != _MEASUREMENT.get("phase")
+                or body.get("runtime_identity") != _MEASUREMENT.get("runtime_identity")):
+            return web.json_response({"error": "live matching phase required for renewal"}, status=409)
+        until = min(time.time() + ttl, _MEASUREMENT["deadline"], _OFFLINE["until"])
+        if until <= time.time():
+            return web.json_response({"error": "phase deadline exhausted"}, status=409)
+        _MEASUREMENT["until"] = until
+        return web.json_response({"active": True, **_measurement_receipt()})
+    if _measurement_valid():
+        return web.json_response({"error": "measurement phase already active"}, status=409)
+    identity = await asyncio.to_thread(measurement_runtime_identity)
+    if (_measurement_valid() or not identity or identity != body.get("runtime_identity") or not _health.get("ok")
+            or _draining() or not _local_offline() or body.get("offline_lease") != _OFFLINE.get("lease")
+            or _offline_status()["local_active"] != 0):
+        return web.json_response({"error": "healthy exact runtime identity required"}, status=409)
+    _MEASUREMENT.clear()
+    _MEASUREMENT.update(window=body["window"], phase=body["phase"], runtime_identity=identity,
+                        offline_lease=body["offline_lease"], token=os.urandom(32).hex(),
+                        deadline=time.time() + max_s, until=min(time.time() + ttl, time.time() + max_s, _OFFLINE["until"]))
+    return web.json_response({"active": True, **_measurement_receipt(), "token": _MEASUREMENT["token"]})
 OFFLINE_MAX_TTL_S = 3600
 # [GW2 2026-10-03] A planned offline window must survive a gateway restart. It used to live only in _OFFLINE, so the
 # 09:11 gateway publish dropped K5's window mid-benchmark: the engine was stopped, the gateway believed it was not in a
@@ -8437,7 +8533,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
         info = _ACTIVE.get(id(request)) or {}
         route = "local" if base.rstrip("/") == LOCAL.rstrip("/") else "remote"
         provider = (_local_model_name() if route == "local" else (provider_name or REMOTE_MODEL))
-        return {
+        receipt = {
             "X-Gateway-Route": route,
             "X-Gateway-Provider": str(provider),
             "X-Gateway-Reason": str(info.get("reason") or "admitted"),
@@ -8451,6 +8547,9 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
             "X-Gateway-Context-Compacted": "1" if info.get("context_compacted") else "0",
             "X-Gateway-Context-Omitted": str(info.get("context_omitted") or "0"),
         }
+        if route == "local" and info.get("measurement"):
+            receipt["X-Window-Identity"] = json.dumps(info["measurement"], separators=(",", ":"))
+        return receipt
     try:
         if streaming:
             # bound time-to-response-headers for streaming so a backend that accepts the
@@ -9153,6 +9252,14 @@ def _with_stream_usage(relay_body):
 async def handle_completions(request):
     """Register the request as live work for the dashboard, then run the router (below)."""
     body = await request.read()          # aiohttp caches the body; the router re-reads it for free
+    if request.headers.get("X-Window-Token"):
+        try:
+            request["measurement_body"] = json.loads(body)
+        except (ValueError, TypeError):
+            request["measurement_body"] = {}
+        if not _measurement_request(request):
+            return web.json_response({"error": {"type": "window_measurement_invalid",
+                                                "message": "measurement lease expired, revoked, or runtime changed"}}, status=503)
     await _warm_token_estimate(body)     # [GW2] the one /tokenize round trip, off the event loop
     # Check after the await and before _ACTIVE registration, with no await in
     # between. The drain endpoint runs on this same event loop: every request
@@ -9192,6 +9299,10 @@ async def handle_completions(request):
                  "t0": time.time(), "phase": "routing", "route": None, "reason": None,
                  "preview": _preview(_cb)[:100], "bg": is_background(_cb, request), "tiny": is_tiny(_cb),
                  "spend_key": os.urandom(16).hex(), **_request_identity(request, body)})
+    if request.headers.get("X-Window-Token"):
+        if not _measurement_request(request):
+            return web.json_response({"error": {"type": "window_measurement_invalid"}}, status=503)
+        info["measurement"] = _measurement_receipt()
     _ACTIVE[id(request)] = info
     _resp = None
     try:
@@ -9413,7 +9524,7 @@ async def _route_completions(request, _no_overflow=False):
         _pw = probe_word(body)
         if _pw:
             _ok, _why = probe_synth_decision(_pw, alias_kind, time.time() - _LAST_LOCAL_OK, bool(_health["ok"]),
-                                             bool(_local_offline() or (remote_ok() and effective_force_remote())))
+                                             bool(_request_local_offline(request) or (remote_ok() and effective_force_remote())))
             if _ok:
                 _MICRO_STATS["probe_synth"] += 1
                 _active_set(request, route="synth", reason="probe", phase="done", synth=True)
@@ -9609,7 +9720,7 @@ async def _route_completions(request, _no_overflow=False):
     # CF: PLANNED local-offline window (benchmark / engine upgrade): the remote valve carries the estate inside
     # the daily cap; callers that must stay local (pinned, estate-local) and everything when no remote can take
     # work are told to retry -- the engine is being worked on, so nothing is admitted to it.
-    if _local_offline():
+    if _request_local_offline(request):
         if remote_only_ok and not alias_local_only and not local_pin:
             if not overflow_ok:
                 _stall_brake_not_applied("local-offline", client)
@@ -9760,6 +9871,8 @@ async def _route_completions(request, _no_overflow=False):
         nonlocal reserved, claimed_at
         global _inflight, _inflight_tokens, _inflight_reserved_tokens, _inflight_computed
         claimed_at = time.time()
+        if request.headers.get("X-Window-Token"):
+            _active_set(request, measurement=_measurement_receipt())
         _flow_bump()
         _inflight += units
         _inflight_tokens += ptok
@@ -9791,7 +9904,9 @@ async def _route_completions(request, _no_overflow=False):
         tiny_limit = admission_lane_limit(background, effective_budget(), FG_RESERVED,
                                           halo_control=halo_control, tiny=True,
                                           tiny_extra_lanes=TINY_EXTRA_LANES)
-        if (_health["ok"] and (_inflight + units) <= tiny_limit
+        if (_health["ok"] and not _request_local_offline(request)
+                and (not request.headers.get("X-Window-Token") or _measurement_request(request))
+                and (_inflight + units) <= tiny_limit
                 and _memory_available(reservation, halo_control=halo_control)):
             claim_local()
             log.info("route %s TINY units=%d inflight=%d/%d -> local(tiny)",
@@ -9873,7 +9988,7 @@ async def _route_completions(request, _no_overflow=False):
                        and _inflight == 0 and _waiting <= (1 if queued else 0))
         admit_units = min(effective_budget(), _desired_const) if bg_big_idle else units
         win_ok = bg_big_idle or prefill_window_ok(est_computed, halo_control)
-        ok = bool(_health["ok"] and not _local_offline() and admit_units >= sequences
+        ok = bool(_health["ok"] and not _request_local_offline(request) and admit_units >= sequences
                   and ((_inflight + admit_units) <= lane_limit or bg_big_idle)
                   and _memory_available(reservation, halo_control=halo_control) and win_ok)
         return ok, admit_units, bg_big_idle, win_ok
@@ -9922,8 +10037,10 @@ async def _route_completions(request, _no_overflow=False):
             if _client_gone(request):
                 client_gone_queued = True
                 break           # the caller hung up while queued: admit nothing, prefill nothing
-            if ((_local_offline() or not _health["ok"]) and overflow_ok and not alias_local_only and not local_pin
-                    and not (background and BG_LOCAL_ONLY and not _local_offline())):
+            if request.headers.get("X-Window-Token") and not _measurement_request(request):
+                break           # phase revoked/expired while queued: never admit it to a later arm
+            if ((_request_local_offline(request) or not _health["ok"]) and overflow_ok and not alias_local_only and not local_pin
+                    and not (background and BG_LOCAL_ONLY and not _request_local_offline(request))):
                 break           # a planned offline window opened, or local died, under a waiter: the valve takes it
             _fits, _admit_units, _bg_big_idle, _win_ok = _legacy_fits()
             if _fits and flow_turn(flow_t):
@@ -9978,7 +10095,7 @@ async def _route_completions(request, _no_overflow=False):
 
     if not admitted:
         # distinguish WHY we couldn't admit: lane-count vs total-context (size-aware) cap
-        if _local_offline():
+        if _request_local_offline(request):
             reason = "local-offline"
         elif not _health["ok"]:
             reason = "local-down"
@@ -9992,7 +10109,7 @@ async def _route_completions(request, _no_overflow=False):
             reason = "cap"
         if _qol_broke:
             reason = "qol"                # predicted local first token too late and remote measurably faster
-        elif _qol_live and not _local_offline() and _health["ok"]:
+        elif _qol_live and not _request_local_offline(request) and _health["ok"]:
             _q = qol_decide(_early_cls, est_computed, ptok, units=units, waited=waited, own=_qol_own())
             _q.update(qol_at="wait-timeout", qol_legacy="remote")
             _active_set(request, **_q)
@@ -12923,6 +13040,9 @@ def make_app():
     app.router.add_get("/gateway/offline", gateway_offline)                   # CF: planned local-offline window
     app.router.add_post("/gateway/offline", gateway_offline)
     app.router.add_delete("/gateway/offline", gateway_offline)
+    app.router.add_get("/gateway/measurement", gateway_measurement)
+    app.router.add_post("/gateway/measurement", gateway_measurement)
+    app.router.add_delete("/gateway/measurement", gateway_measurement)
     app.router.add_get("/gateway/drain", gateway_drain)
     app.router.add_post("/gateway/drain", gateway_drain)
     app.router.add_delete("/gateway/drain", gateway_drain)
