@@ -10,6 +10,7 @@
 #   * speculative-config gains disable_eagle_block_drop=true: upstream #53388 supersedes our
 #     VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK retention patch (keeps the trailing aligned Mamba block under MTP).
 set -euo pipefail
+_serve_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # experiment overrides (V02_* variables), written by window frameworks/lanes; absent = production defaults
 V02_OVERRIDE_ENV=${V02_OVERRIDE_ENV:-/home/kevin/.local/share/vllm-qwen27b/v02.override.env}
 V02_RELEASES=${V02_RELEASES:-/home/kevin/.local/share/vllm-releases}
@@ -18,6 +19,29 @@ V02_RELEASES=${V02_RELEASES:-/home/kevin/.local/share/vllm-releases}
 _pp_in=${PYTHONPATH-__unset__}
 [ -f "$V02_OVERRIDE_ENV" ] && . "$V02_OVERRIDE_ENV"
 if [ "${PYTHONPATH-__unset__}" != "$_pp_in" ] && [ -n "${PYTHONPATH:-}" ]; then V02_PYTHONPATH=${V02_PYTHONPATH:-$PYTHONPATH}; fi
+# switch-model.sh stores the checkpoint separately from runtime tuning. Read JSON as data,
+# never source a generated shell file; quoted array arguments also preserve spaces in paths.
+V02_MODEL_CONFIG=${V02_MODEL_CONFIG:-$_serve_dir/v02.model.json}
+_model_selection=$(python3 - "$V02_MODEL_CONFIG" "${V02_MODEL_PATH:-}" <<'PY'
+import json, os, sys
+config = json.load(open(sys.argv[1])) if os.path.isfile(sys.argv[1]) else {}
+model = sys.argv[2] or config.get("model") or "/home/kevin/Desktop/models/Qwen3.8-27B-HauhauCS-Aggressive-W4A16-twolven"
+names = config.get("served_model_name", [])
+if not isinstance(model, str) or not os.path.isabs(model) or any(ord(c) < 32 for c in model):
+    raise SystemExit("invalid model path in V02_MODEL_CONFIG")
+if not isinstance(names, list) or any(not isinstance(n, str) or not n or n.startswith("-") or any(ord(c) < 33 for c in n) for n in names):
+    raise SystemExit("invalid served_model_name in V02_MODEL_CONFIG")
+print(model)
+for name in names:
+    print(name)
+PY
+)
+mapfile -t _selection <<<"$_model_selection"
+V02_MODEL_PATH=${_selection[0]}
+MODEL_NAMES=(estate-hauhaucs qwen3.8-27b-hauhaucs-aggressive estate-abliterated
+  qwen3.8-27b-abliterated qwen-local qwen3.8-27b-uncensored qwen3.6:27b
+  qwen3.8-27b-gptq-int4 qwen27b-int4-tqk8v4-two250K-mtp3-text-only-cu128)
+if [ "${#_selection[@]}" -gt 1 ]; then MODEL_NAMES=("${_selection[@]:1}"); fi
 # lane S3/U2b (2026-10-02, Kevin approved 23:03): DEFAULT STACK = text-only (--language-model-only: no vision tower, image/video requests 400) + int4 lm_head +
 # int4 MTP block (load-time RTN+MSE-clip quantization cached in <model>-u2cache; fidelity top-1 93.2% / KL 0.009 vs bf16 over 3,636 estate rows).
 # Measured vs the bf16/vision build: weights 9.6 -> 7.97 GiB/rank, KV pool 711,996 -> 919,122 tokens (+29%), natural decode 64-68 -> 81-84 tok/s,
@@ -61,22 +85,16 @@ export VLLM_TQ_GQA_CUDA=${VLLM_TQ_GQA_CUDA:-1}
 export VLLM_TQ_GQA_BUILD_DIR=${VLLM_TQ_GQA_BUILD_DIR:-$V02_ROOT/.deps/tq_gqa_build}
 CC_DEFAULT='{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64],"max_cudagraph_capture_size":64}'
 unset VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK VLLM_PREFIX_CACHE_USE_RETAINED_MTP_BLOCK VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS || true
+# L110/L133/L138 (lane A6): preserve the deployed bounded wait for a dying predecessor / foreign GPU process.
+_GATE="$_serve_dir/gpu-boot-gate.sh"
+if [ -f "$_GATE" ]; then . "$_GATE"; gpu_boot_gate; fi
 SPEC_DEFAULT='{"method":"mtp","num_speculative_tokens":3,"disable_eagle_block_drop":true}'
 ARGS=(
   "$V02_VENV/bin/python"
   -m vllm.entrypoints.openai.api_server
   --host 0.0.0.0 --port 8001
-  --model /home/kevin/Desktop/models/Qwen3.8-27B-HauhauCS-Aggressive-W4A16-twolven
-  --served-model-name
-    estate-hauhaucs
-    qwen3.8-27b-hauhaucs-aggressive
-    estate-abliterated
-    qwen3.8-27b-abliterated
-    qwen-local
-    qwen3.8-27b-uncensored
-    qwen3.6:27b
-    qwen3.8-27b-gptq-int4
-    qwen27b-int4-tqk8v4-two250K-mtp3-text-only-cu128
+  --model "$V02_MODEL_PATH"
+  --served-model-name "${MODEL_NAMES[@]}"
   --dtype half
   ${V02_ASYNC_FLAG:---no-async-scheduling}
   --tensor-parallel-size 2
@@ -109,7 +127,7 @@ if [ "${V02_ACCESS_LOG:-0}" != "1" ]; then ARGS+=( --disable-uvicorn-access-log 
 # Optional upstream #243 SSD prefix-KV persistence (experimental, opt-in): V02_SSD_KV_DIR=/path V02_SSD_KV_CPU_BYTES=N
 if [ -n "${V02_SSD_KV_DIR:-}" ]; then
   export PYTHONHASHSEED=0
-  FP=$("$V02_VENV/bin/python" "$V02_ROOT/tools/checkpoint_fingerprint.py" /home/kevin/Desktop/models/Qwen3.8-27B-HauhauCS-Aggressive-W4A16-twolven "")
+  FP=$("$V02_VENV/bin/python" "$V02_ROOT/tools/checkpoint_fingerprint.py" "$V02_MODEL_PATH" "")
   ARGS+=( --kv-transfer-config "$(python3 -c 'import json,os,sys;print(json.dumps({"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":int(sys.argv[2]),"spec_name":"TieringOffloadingSpec","secondary_tiers":[{"type":"fs","root_dir":os.path.join(sys.argv[1],"checkpoint-"+sys.argv[3])}]}},separators=(",",":")))' "$V02_SSD_KV_DIR" "${V02_SSD_KV_CPU_BYTES:-8589934592}" "$FP")" )
 fi
 if [ -n "${VLLM_SERVE_EXTRA_ARGS:-}" ]; then

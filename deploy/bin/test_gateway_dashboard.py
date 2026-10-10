@@ -191,6 +191,127 @@ def _lib_source():
 
 
 @unittest.skipUnless(shutil.which("node"), "node not installed")
+class LocalModelControls(unittest.TestCase):
+    """Exercise the actual async page actions without contacting a gateway or engine."""
+    OLD = "/models/default"
+    TARGET = "/models/requested"
+
+    def js(self, body, frames, *, post_status=200, post_body=None):
+        html = PAGE.read_text(encoding="utf-8")
+        source = html[html.index("/*MODEL-SWITCH-START*/"):html.index("/*MODEL-SWITCH-END*/")]
+        listing = {"models_dir": "/models", "models": [
+            {"name": "default", "path": self.OLD, "servable": True, "live": True, "gb": 14, "desc": "Int4"},
+            {"name": "requested", "path": self.TARGET, "servable": True, "live": False, "gb": 14, "desc": "Int4"},
+        ]}
+        fixtures = json.dumps({"frames": frames, "listing": listing, "postStatus": post_status,
+                               "postBody": post_body if post_body is not None else {"switching_to": self.TARGET}})
+        prog = _lib_source() + "\nconst fixture=" + fixtures + r""";
+let now=0,nextTimer=0,timers=[],buttons=[{disabled:false},{disabled:false}],polls=0,posts=[],confirms=0,frame;
+const messages=[],nodes={'#mdir':{textContent:''},'#lm':{_html:''},'#lmmsg':{_text:''}};
+Object.defineProperty(nodes['#lm'],'innerHTML',{
+  get(){return this._html;},set(v){this._html=v;buttons=Array.from(v.matchAll(/<button\b[^>]*>/g),m=>({disabled:/\bdisabled\b/.test(m[0])}));}
+});
+Object.defineProperty(nodes['#lmmsg'],'textContent',{
+  get(){return this._text;},set(v){this._text=v;messages.push(v);}
+});
+const $=s=>nodes[s],$$=s=>buttons,esc=DashLib.esc,FS={models:{due:1},stats:{due:1},capacity:{due:1}};
+Date.now=()=>now;
+global.setTimeout=(fn,ms)=>{const id=++nextTimer;timers.push({id,at:now+ms,fn});return id;};
+global.clearTimeout=id=>{timers=timers.filter(t=>t.id!==id);};
+global.confirm=()=>{confirms++;return true;};
+const response=(status,value)=>({ok:status>=200&&status<300,status,json:async()=>value});
+global.fetch=async url=>{
+  if(url==='/gateway/models/local'){frame=fixture.frames[Math.min(polls++,fixture.frames.length-1)];return response(200,fixture.listing);}
+  if(url==='/v1/models'){
+    if(frame.error)throw new Error(frame.error);
+    return response(200,frame.native||{data:[{id:'same-stable-alias',root:frame.root}]});
+  }
+  if(url==='/health/local')return response(frame.healthy?200:503,null);
+  throw new Error('unexpected endpoint '+url);
+};
+async function adminFetch(url,opts){posts.push({url,body:JSON.parse(opts.body)});return response(fixture.postStatus,fixture.postBody);}
+async function flush(){for(let i=0;i<30;i++)await Promise.resolve();}
+async function advance(){await flush();timers.sort((a,b)=>a.at-b.at);const t=timers.shift();if(!t)throw new Error('no pending poll');now=t.at;t.fn();await flush();}
+const snap=()=>({message:nodes['#lmmsg'].textContent,pending:!!localSwitchPending,disabled:buttons.map(b=>b.disabled),polls,posts:posts.length});
+""" + source + "\n(async()=>{" + body + r"""})().catch(e=>{console.error(e.stack);process.exitCode=1;});"""
+        r = subprocess.run(["node", "-e", prog], capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
+
+    def test_live_badge_uses_checkpoint_root_and_ignores_old_script_and_alias(self):
+        out = self.js("await loadLocalModels();console.log(JSON.stringify(nodes['#lm'].innerHTML));", [
+            {"native": {"data": [{"id": "default", "root": self.TARGET}, {"id": "estate", "root": None}]}, "healthy": True}])
+        old, loaded = re.findall(r"<tr>.*?</tr>", out)
+        self.assertNotIn("LIVE", old)
+        self.assertIn(">Switch</button>", old)
+        self.assertIn("LIVE", loaded)
+        self.assertIn(">current</span>", loaded)
+        self.assertNotIn("<button", loaded)
+
+    def test_unhealthy_engine_has_no_live_badge_even_when_it_declares_the_root(self):
+        out = self.js("await loadLocalModels();console.log(JSON.stringify(nodes['#lm'].innerHTML));", [
+            {"root": self.TARGET, "healthy": False}])
+        self.assertNotIn("LIVE", out)
+        self.assertNotIn(">current</span>", out)
+
+    def test_acceptance_waits_for_target_root_and_local_health(self):
+        out = self.js("""
+const work=switchLocal('/models/requested');await flush();const queued=snap();
+await advance();const declaredButUnhealthy=snap();await advance();await work;
+console.log(JSON.stringify({queued,declaredButUnhealthy,done:snap(),messages,FS}));
+""", [{"root": self.OLD, "healthy": True}, {"root": self.TARGET, "healthy": False},
+       {"root": self.TARGET, "healthy": True}])
+        for stage in (out["queued"], out["declaredButUnhealthy"]):
+            self.assertTrue(stage["pending"])
+            self.assertTrue(all(stage["disabled"]))
+            self.assertNotIn("Switched:", stage["message"])
+        self.assertEqual(out["done"]["posts"], 1)
+        self.assertFalse(out["done"]["pending"])
+        self.assertFalse(any(out["done"]["disabled"]))
+        self.assertEqual(out["done"]["message"], "Switched: /models/requested is loaded.")
+        self.assertEqual([v["due"] for v in out["FS"].values()], [0, 0, 0])
+
+    def test_http_failure_never_claims_acceptance_or_starts_polling(self):
+        out = self.js("await switchLocal('/models/requested');console.log(JSON.stringify(snap()));", [
+            {"root": self.OLD, "healthy": True}], post_status=401, post_body={})
+        self.assertIn("Switch failed: HTTP 401", out["message"])
+        self.assertEqual(out["polls"], 0)
+        self.assertFalse(out["pending"])
+        self.assertFalse(any(out["disabled"]))
+
+    def test_helper_refusal_is_reported_even_with_success_http_status(self):
+        out = self.js("await switchLocal('/models/requested');console.log(JSON.stringify(snap()));", [
+            {"root": self.OLD, "healthy": True}], post_body={"refused": "engine held by a maintenance window"})
+        self.assertIn("Switch failed: engine held", out["message"])
+        self.assertEqual(out["polls"], 0)
+
+    def test_temporary_status_failure_is_retried_and_duplicate_click_is_ignored(self):
+        out = self.js("""
+const work=switchLocal('/models/requested');await flush();const unavailable=snap();
+await switchLocal('/models/default');const duplicates=snap();await advance();await work;
+console.log(JSON.stringify({unavailable,duplicates,confirms,done:snap()}));
+""", [{"error": "connection reset", "healthy": False}, {"root": self.TARGET, "healthy": True}])
+        self.assertIn("temporarily unavailable", out["unavailable"]["message"])
+        self.assertTrue(out["unavailable"]["pending"])
+        self.assertEqual(out["duplicates"]["posts"], 1)
+        self.assertEqual(out["confirms"], 1)
+        self.assertIn("Switched:", out["done"]["message"])
+
+    def test_wrong_checkpoint_times_out_without_reporting_success(self):
+        out = self.js("""
+const work=switchLocal('/models/requested');await flush();
+for(let i=0;localSwitchPending&&i<250;i++)await advance();await work;
+console.log(JSON.stringify({done:snap(),now,messages}));
+""", [{"root": self.OLD, "healthy": True}])
+        self.assertEqual(out["now"], 20 * 60 * 1000)
+        self.assertIn("not confirmed within 20 minutes", out["done"]["message"])
+        self.assertIn("logs before retrying", out["done"]["message"])
+        self.assertFalse(out["done"]["pending"])
+        self.assertFalse(any(out["done"]["disabled"]))
+        self.assertFalse(any(m.startswith("Switched:") for m in out["messages"]))
+
+
+@unittest.skipUnless(shutil.which("node"), "node not installed")
 class DashLibMapping(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
