@@ -282,7 +282,8 @@ def git_identity(path):
 def runtime_identity(pid):
     """Whitelist engine flags; never record arbitrary argv or environment."""
     proc = Path('/proc') / str(pid)
-    args = proc.joinpath('cmdline').read_bytes().decode().rstrip('\0').split('\0')
+    raw_argv = proc.joinpath('cmdline').read_bytes()
+    args = raw_argv.decode().rstrip('\0').split('\0')
     flags = {}
     allowed = {'--model', '--generation-config', '--served-model-name', '--tensor-parallel-size', '--kv-cache-dtype', '--speculative-config', '--max-model-len', '--gdn-prefill-backend', '--per-request-spec-decode-metrics',
                '--long-prefill-token-threshold', '--max-num-partial-prefills', '--max-long-partial-prefills', '--dtype', '--gpu-memory-utilization', '--compilation-config', '--hf-overrides', '--max-num-seqs', '--max-num-batched-tokens', '--scheduling-policy', '--mamba-cache-mode', '--limit-mm-per-prompt', '--mm-processor-kwargs', '--chat-template', '--reasoning-parser', '--tool-call-parser', '--additional-config', '--kv-transfer-config',
@@ -303,14 +304,21 @@ def runtime_identity(pid):
     # Field 22 begins after the parenthesized executable name, whose spaces
     # cannot safely be split as an ordinary whitespace-delimited record.
     start_ticks = proc.joinpath('stat').read_text().rsplit(')', 1)[1].split()[19]
-    identity = {'pid': int(pid), 'start_ticks': start_ticks, 'source': git_identity(cwd), 'flags': flags}
-    safe_env_keys = {'VLLM_SCHED_INVARIANT_GUARD', 'VLLM_SCHED_PREFILL_SHARE', 'VLLM_SCHED_SHORT_FIRST', 'VLLM_SCHED_SHORT_FIRST_RUN', 'CUDA_VISIBLE_DEVICES', 'PYTHONPATH', 'VLLM_USE_V1', 'VLLM_TQ_GQA_CUDA', 'VLLM_TQ_GQA_GROUP', 'VLLM_TQ_GQA_BATCH_THRESHOLD', 'VLLM_TQ_GQA_BUILD_DIR', 'VLLM_K5_GDN_FUSED', 'VLLM_U2_INT4_HEAD', 'VLLM_U2_INT4_MTP', 'VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK', 'VLLM_PREFIX_CACHE_USE_RETAINED_MTP_BLOCK', 'VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS'}
+    identity = {'pid': int(pid), 'start_ticks': start_ticks, 'source': git_identity(cwd), 'flags': flags,
+                'argv_sha256': hashlib.sha256(raw_argv).hexdigest()}
+    safe_env_keys = {'VLLM_SCHED_SHORT_FIRST_PREFIX_AWARE', 'VLLM_SCHED_PREFILL_SHARE_EXACT', 'VLLM_SCHED_INVARIANT_GUARD', 'VLLM_SCHED_PREFILL_SHARE', 'VLLM_SCHED_SHORT_FIRST', 'VLLM_SCHED_SHORT_FIRST_RUN', 'CUDA_VISIBLE_DEVICES', 'PYTHONPATH', 'VLLM_USE_V1', 'VLLM_TQ_GQA_CUDA', 'VLLM_TQ_GQA_GROUP', 'VLLM_TQ_GQA_BATCH_THRESHOLD', 'VLLM_TQ_GQA_BUILD_DIR', 'VLLM_K5_GDN_FUSED', 'VLLM_U2_INT4_HEAD', 'VLLM_U2_INT4_MTP', 'VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK', 'VLLM_PREFIX_CACHE_USE_RETAINED_MTP_BLOCK', 'VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS'}
     identity['runtime_env'] = {}
     for raw in proc.joinpath('environ').read_bytes().split(b'\0'):
         key, sep, value = raw.decode(errors='replace').partition('=')
         if sep and key in safe_env_keys:
             identity['runtime_env'][key] = value
-    identity['provenance_limits'] = 'Process/source/config snapshot; weight manifest uses sizes/mtime, not full weight hashes; loaded worker native artifacts require controller frozen build manifest'
+    identity['provenance_limits'] = 'Process/source/config snapshot; weight manifest uses sizes/mtime, not full weight hashes; mapped native files are checked separately against the controller/release manifest; dispatched CUDA functions require a live profiling receipt'
+    release_manifest = cwd / 'RELEASE.json'
+    if release_manifest.is_file():
+        release = json.loads(release_manifest.read_text())
+        identity['source'].pop('unavailable', None)
+        identity['source'].update({'identity_source': 'RELEASE.json', 'sha': release.get('sha'), 'release_id': release.get('id'),
+                                   'release_manifest': file_identity(release_manifest)})
     checkpoint = flags.get('--model')
     if checkpoint:
         checkpoint = str((cwd / checkpoint).resolve()) if not Path(checkpoint).is_absolute() else checkpoint
@@ -385,3 +393,128 @@ def require_offline_window(gateway='http://127.0.0.1:8000', drained=False):
     if drained and (state.get('local_active') or state.get('local_inflight_units')):
         raise ValueError('Accepted local requests have not drained')
     return {'offline': True, 'remaining_s': state['remaining_s']}
+
+
+def _process_start(pid, proc_root):
+    return (proc_root / str(pid) / 'stat').read_text().rsplit(')', 1)[1].split()[19]
+
+
+def _process_tree(pid, proc_root):
+    """Follow all thread child lists; no name/pattern matching of other jobs."""
+    found, pending = set(), [pid]
+    while pending:
+        current = pending.pop()
+        if current in found:
+            continue
+        found.add(current)
+        tasks = proc_root / str(current) / 'task'
+        if not tasks.is_dir():
+            raise ValueError('Cannot attest engine descendant process tree')
+        for task in tasks.iterdir():
+            for child in (task / 'children').read_text().split():
+                pending.append(int(child))
+    return sorted(found)
+
+
+def verify_loaded_native(identity, identity_file=None, manifest_file=None, proc_root=Path('/proc')):
+    """Hash frozen native files and match mapped inode/device in engine workers.
+
+    Accept immutable RELEASE.json or an explicitly supplied controller legacy
+    snapshot {prod_root, so}. Never interpret the legacy tree as immutable.
+    This proves mapped host files, not which CUDA function was dispatched.
+    """
+    import os
+    root = Path(identity['source']['path']).resolve()
+    pid = identity['pid']
+    if _process_start(pid, proc_root) != str(identity['start_ticks']):
+        raise ValueError('Engine PID/start changed before native attestation')
+    attested = None
+    if identity_file:
+        expected = json.loads(Path(identity_file).read_text())
+        if (expected.get('engine_pid') != pid or str(expected.get('pid_start')) != str(identity['start_ticks'])
+                or Path(expected.get('root', '')).resolve() != root):
+            raise ValueError('Controller engine identity does not match actual PID/start/root')
+        actual_argv = (proc_root / str(pid) / 'cmdline').read_bytes()
+        if expected.get('argv_sha256') and hashlib.sha256(actual_argv).hexdigest() != expected['argv_sha256']:
+            raise ValueError('Controller command-line identity mismatch')
+        actual_env = dict(raw.decode(errors='replace').split('=', 1) for raw in
+                          (proc_root / str(pid) / 'environ').read_bytes().split(b'\0') if b'=' in raw)
+        if any(actual_env.get(key) != value for key, value in expected.get('runtime_flags', {}).items()):
+            raise ValueError('Controller runtime control identity mismatch')
+        attested = file_identity(identity_file)
+    path = Path(manifest_file).resolve() if manifest_file else root / 'RELEASE.json'
+    if (root / 'RELEASE.json').is_file() and path != root / 'RELEASE.json':
+        raise ValueError('Immutable engine requires its own RELEASE.json; override the inherited legacy manifest')
+    manifest = json.loads(path.read_text())
+    legacy = 'prod_root' in manifest
+    if legacy:
+        if not manifest_file or Path(manifest['prod_root']).resolve() != root:
+            raise ValueError('Legacy native snapshot must be explicitly supplied for the actual engine root')
+        kind = 'controller legacy snapshot; mutable tree checked against frozen hashes'
+    else:
+        if path.name != 'RELEASE.json' or path.parent != root or manifest.get('dirty') is not False:
+            raise ValueError('Immutable engine requires its own clean RELEASE.json')
+        index = root / 'RELEASE.files.sha256'
+        if file_identity(index)['sha256'] != manifest.get('files_sha256'):
+            raise ValueError('Frozen release file index hash mismatch')
+        kind = 'immutable release'
+    expected_so = manifest.get('so')
+    if not isinstance(expected_so, dict) or not expected_so:
+        raise ValueError('Native manifest has no frozen .so hashes')
+    wanted = {}
+    basenames = set()
+    for relative, digest in expected_so.items():
+        candidate = root / relative
+        resolved = candidate.resolve()
+        if (Path(relative).is_absolute() or '..' in Path(relative).parts or not resolved.is_relative_to(root)
+                or not str(relative).endswith('.so') or not isinstance(digest, str)
+                or not re.fullmatch(r'[0-9a-f]{64}', digest)):
+            raise ValueError('Invalid native manifest entry')
+        if file_identity(resolved)['sha256'] != digest:
+            raise ValueError(f'Frozen native hash mismatch: {relative}')
+        wanted[resolved] = {'relative': relative, 'sha256': digest}
+        basenames.add(resolved.name)
+    processes = _process_tree(pid, proc_root)
+    loaded, workers = [], []
+    for current in processes:
+        start = _process_start(current, proc_root)
+        seen = set()
+        for line in (proc_root / str(current) / 'maps').read_text().splitlines():
+            fields = line.split(None, 5)
+            if len(fields) < 6:
+                continue
+            mapped = fields[5].replace('\\040', ' ')
+            clean = mapped.removesuffix(' (deleted)')
+            candidate = Path(clean)
+            # The legacy root contains its real .venv. Those third-party torch,
+            # numpy and uvloop libraries are not part of snapshot.so. Only own
+            # vLLM/JIT native directories and manifested basename collisions
+            # belong to this gate; off-tree copies of our kernels still fail.
+            own_directory = candidate.is_absolute() and any(candidate.is_relative_to(root / name) for name in ('vllm', '.deps'))
+            relevant = (candidate.name in basenames or '/vllm/' in clean or own_directory) and '.so' in candidate.name
+            if not relevant:
+                continue
+            if mapped.endswith(' (deleted)'):
+                raise ValueError('Deleted native mapping in engine process')
+            resolved = candidate.resolve()
+            if resolved not in wanted:
+                raise ValueError(f'Off-tree or unmanifested native mapping: {candidate.name}')
+            stat = resolved.stat()
+            major, minor = (int(part, 16) for part in fields[3].split(':'))
+            if stat.st_ino != int(fields[4]) or os.major(stat.st_dev) != major or os.minor(stat.st_dev) != minor:
+                raise ValueError(f'Mapped native inode/device was replaced: {candidate.name}')
+            if resolved not in seen:
+                loaded.append({'pid': current, 'pid_start': start, **wanted[resolved],
+                               'inode': stat.st_ino, 'device': fields[3]})
+                seen.add(resolved)
+        if _process_start(current, proc_root) != start:
+            raise ValueError('Engine worker PID/start changed during native attestation')
+        workers.append({'pid': current, 'pid_start': start})
+    if not loaded:
+        raise ValueError('No manifest-owned native mappings found in engine process tree')
+    if _process_start(pid, proc_root) != str(identity['start_ticks']):
+        raise ValueError('Engine PID/start changed during native attestation')
+    return {'verified': True, 'kind': kind, 'root': str(root), 'manifest': file_identity(path),
+            'controller_identity_file': attested, 'source_sha': manifest.get('sha'),
+            'expected_native_files': len(wanted), 'processes': workers, 'loaded': loaded,
+            'scope': 'mapped host ELF files and disk hashes; does not prove CUDA dispatch or launch arguments'}

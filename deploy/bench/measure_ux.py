@@ -201,6 +201,8 @@ def main(argv=None):
     parser.add_argument('--prompt-tokens', type=int, default=32768)
     parser.add_argument('--tokenize-base', help='loopback engine URL for CPU-only /tokenize, never generation')
     parser.add_argument('--profiles', default='greedy')
+    parser.add_argument('--native-manifest', default=os.environ.get('WINDOW_NATIVE_MANIFEST'), help='explicit legacy snapshot; immutable roots use RELEASE.json')
+    parser.add_argument('--engine-identity-file', default=os.environ.get('WINDOW_ENGINE_IDENTITY_FILE'))
     parser.add_argument('--suite', type=Path)
     parser.add_argument('--out', type=Path)
     parser.add_argument('--base', default='http://127.0.0.1:8001')
@@ -264,6 +266,7 @@ def main(argv=None):
     provenance = measurement.runtime_identity(args.engine_pid)
     provenance['model_roots'] = measurement.verify_models_root('http://127.0.0.1:8001', provenance)
     measurement.require_offline_window(drained=True)
+    provenance['native_attestation'] = measurement.verify_loaded_native(provenance, args.engine_identity_file, args.native_manifest)
     provenance['measurement_files'] = [measurement.file_identity(Path(__file__)), measurement.file_identity(ROOT/'evalkit/measurement.py')]
     if expected and (expected['engine_pid'] != args.engine_pid or expected['root'] != provenance['source']['path']):
         parser.error('Window identity does not match actual engine PID/source')
@@ -301,6 +304,7 @@ def main(argv=None):
                         output['valid_run'] = False
                         args.out.write_text(json.dumps(output, indent=2) + '\n')
                         return 1
+                native = measurement.verify_loaded_native(provenance, args.engine_identity_file, args.native_manifest)
                 before = measurement.scrape_spec_counters('http://127.0.0.1:8001')
                 start = time.perf_counter()
                 with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
@@ -308,7 +312,7 @@ def main(argv=None):
                 wall = time.perf_counter()-start
                 after = measurement.scrape_spec_counters('http://127.0.0.1:8001')
                 summary = {**wave_summary(rows, count, wall), 'case': case['id'], 'rep': rep,
-                           'engine_spec_counter_delta': measurement.spec_counter_delta(before, after, isolated=bool(expected))}
+                           'native_attestation': native, 'engine_spec_counter_delta': measurement.spec_counter_delta(before, after, isolated=bool(expected))}
                 output['requests'].extend([{**r, 'rep': rep, 'concurrency': count} for r in rows])
                 output['waves'].append(summary)
                 # Persist completed waves on failure; no request bodies/text/tokens.

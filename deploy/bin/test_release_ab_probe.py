@@ -90,3 +90,20 @@ def test_post_rejects_http400_and_empty_generation(monkeypatch):
     response.read.return_value = json.dumps({'usage': {'completion_tokens': 0}, 'choices': [{'message': {'content': ''}, 'finish_reason': 'stop'}]}).encode()
     with pytest.raises(ValueError, match='zero'):
         ab._post('/v1/chat/completions', {})
+
+
+def test_probe_native_rejection_precedes_model_discovery_and_generation(monkeypatch, tmp_path):
+    from unittest.mock import Mock
+    import pytest
+    monkeypatch.setattr(ab.measurement, 'require_offline_window', Mock())
+    monkeypatch.setattr(ab.measurement, 'runtime_identity', Mock(return_value={'pid': 123}))
+    native = Mock(side_effect=ValueError('Frozen native hash mismatch'))
+    monkeypatch.setattr(ab.measurement, 'verify_loaded_native', native)
+    discover, post = Mock(), Mock()
+    monkeypatch.setattr(ab, 'model_id', discover)
+    monkeypatch.setattr(ab, '_post', post)
+    with pytest.raises(ValueError, match='native hash'):
+        ab.probe(tmp_path/'result.json', engine_pid=123, native_manifest='/snapshot.json')
+    discover.assert_not_called()
+    post.assert_not_called()
+    assert not (tmp_path/'result.json').exists()

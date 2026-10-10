@@ -273,6 +273,8 @@ def run_agentic_chain_item(item, out_dir, profile=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tag")
+    ap.add_argument("--native-manifest", default=os.environ.get("WINDOW_NATIVE_MANIFEST"), help="explicit legacy controller snapshot; immutable roots use RELEASE.json")
+    ap.add_argument("--engine-identity-file", default=os.environ.get("WINDOW_ENGINE_IDENTITY_FILE"))
     ap.add_argument("--profile", help="JSON sampling profile applied to every item and agentic step")
     ap.add_argument("--validate-fixtures", action="store_true", help="offline fixture validation; no engine calls")
     ap.add_argument("--prepare", type=Path, help="write offline baseline fixture/settings manifest")
@@ -304,6 +306,7 @@ def main():
     provenance = measurement.runtime_identity(args.engine_pid)
     provenance["model_roots"] = measurement.verify_models_root(config.BASE_URL, provenance)
     measurement.require_offline_window(drained=True)
+    provenance["native_attestation"] = measurement.verify_loaded_native(provenance, args.engine_identity_file, args.native_manifest)
     provenance["measurement_files"] = [measurement.file_identity(ROOT / name) for name in
         ("run_eval.py", "measurement.py", "scoring.py", "predicates.py", "config.py", "corpus.py")]
     out_dir = RESULTS_DIR / args.tag
@@ -326,6 +329,7 @@ def main():
         item_t0 = time.time()
         try:
             measurement.require_offline_window(drained=True)
+            measurement.verify_loaded_native(provenance, args.engine_identity_file, args.native_manifest)
             if item["category"] == "agentic_chain":
                 score = run_agentic_chain_item(item, out_dir, profile)
             else:

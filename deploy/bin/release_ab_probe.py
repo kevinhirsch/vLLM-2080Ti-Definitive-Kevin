@@ -70,13 +70,24 @@ def model_id(port=8001):
         c.close()
 
 
-def probe(out, reps=2, max_tokens=128, port=8001):
+def probe(out, reps=2, max_tokens=128, port=8001, engine_pid=None, identity_file=None, native_manifest=None):
+    engine_pid = engine_pid or os.environ.get('WINDOW_ENGINE_PID')
+    if not engine_pid:
+        raise ValueError('Identity probe requires the controller-identified engine PID')
+    identity_file = identity_file or os.environ.get('WINDOW_ENGINE_IDENTITY_FILE')
+    native_manifest = native_manifest or os.environ.get('WINDOW_NATIVE_MANIFEST')
+    measurement.require_offline_window(drained=True)
+    provenance = measurement.runtime_identity(int(engine_pid))
+    native = measurement.verify_loaded_native(provenance, identity_file, native_manifest)
+    measurement.verify_models_root(f'http://127.0.0.1:{port}', provenance)
     m = model_id(port)
     rows = []
     for i, p in enumerate(PROMPTS):
         texts = []
         completion_tokens = []
         for _ in range(reps):
+            measurement.require_offline_window()
+            measurement.verify_loaded_native(provenance, identity_file, native_manifest)
             if "chat" in p:
                 r = _post("/v1/chat/completions", {"model": m, "messages": [{"role": "user", "content": p["chat"]}],
                                                    "max_tokens": max_tokens, "temperature": 0, "seed": 0,
@@ -90,7 +101,10 @@ def probe(out, reps=2, max_tokens=128, port=8001):
         rows.append({"i": i, "texts": texts, "completion_tokens": completion_tokens,
                      "generation_verified": True, "prompt_sha256": measurement.canonical_hash(p),
                      "self_consistent": len(set(texts)) == 1})
-    res = {"model": m, "reps": reps, "max_tokens": max_tokens, "prompts": rows}
+    if measurement.runtime_identity(int(engine_pid))['fingerprint'] != provenance['fingerprint']:
+        raise ValueError('Engine identity changed during identity probe')
+    res = {"model": m, "reps": reps, "max_tokens": max_tokens, "prompts": rows,
+           "provenance": provenance, "native_attestation": native}
     with open(out, "w") as fh:
         json.dump(res, fh, indent=1)
     return res
@@ -165,6 +179,9 @@ def main(argv=None):
     p.add_argument("--out", required=True)
     p.add_argument("--reps", type=int, default=2)
     p.add_argument("--max-tokens", type=int, default=128)
+    p.add_argument("--engine-pid", type=int, default=os.environ.get('WINDOW_ENGINE_PID'))
+    p.add_argument("--engine-identity-file", default=os.environ.get('WINDOW_ENGINE_IDENTITY_FILE'))
+    p.add_argument("--native-manifest", default=os.environ.get('WINDOW_NATIVE_MANIFEST'))
     p = sp.add_parser("compare")
     p.add_argument("--results", required=True)
     p.add_argument("--base", default="base")
@@ -173,7 +190,8 @@ def main(argv=None):
     p.add_argument("--kv-tol", type=float, default=0.002)
     a = ap.parse_args(argv)
     if a.cmd == "probe":
-        r = probe(a.out, a.reps, a.max_tokens)
+        r = probe(a.out, a.reps, a.max_tokens, engine_pid=a.engine_pid,
+                  identity_file=a.engine_identity_file, native_manifest=a.native_manifest)
         print(json.dumps({"model": r["model"], "self_consistent": [x["self_consistent"] for x in r["prompts"]]}))
         return 0
     r = compare(a.results, a.base, a.cand, a.tok_tol, a.kv_tol)

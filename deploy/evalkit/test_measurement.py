@@ -1,6 +1,7 @@
 """No inference: synthetic SSE, fake HTTP responses and real quality specs."""
 import copy
 import io
+import os
 import json
 from pathlib import Path
 import sys
@@ -155,6 +156,120 @@ class MeasurementTests(unittest.TestCase):
         with patch.object(m.requests, 'get', return_value=fake):
             with self.assertRaises(m.requests.RequestException):
                 m.require_offline_window()
+
+    def native_fixture(self, directory, legacy=False):
+        base = Path(directory)
+        root = base/'release'
+        library = root/'vllm/kernel.so'
+        library.parent.mkdir(parents=True)
+        library.write_bytes(b'synthetic ELF bytes; no executable code')
+        digest = m.file_identity(library)['sha256']
+        index = root/'RELEASE.files.sha256'
+        index.write_text(digest+'  vllm/kernel.so\n')
+        manifest = root/'RELEASE.json'
+        manifest.write_text(json.dumps({'dirty': False, 'sha': 'a'*40,
+                                       'so': {'vllm/kernel.so': digest}, 'files_sha256': m.file_identity(index)['sha256']}))
+        proc = base/'proc'
+        for pid, start, children in ((1, '111', '2'), (2, '222', '')):
+            folder = proc/str(pid)
+            (folder/'task'/str(pid)).mkdir(parents=True)
+            (folder/'task'/str(pid)/'children').write_text(children)
+            (folder/'stat').write_text(f'{pid} (worker process) '+ ' '.join(['S']+['0']*18+[start]))
+            (folder/'cmdline').write_bytes(b'\0'.join([b'python', b'--long-prefill-token-threshold', b'1000'])+b'\0')
+            (folder/'environ').write_bytes(b'VLLM_SCHED_SHORT_FIRST_PREFIX_AWARE=1\0VLLM_SCHED_PREFILL_SHARE_EXACT=1\0API_TOKEN=secret-test-value\0')
+            (folder/'cwd').symlink_to(root)
+            (folder/'maps').write_text('')
+        stat = library.stat()
+        maps = proc/'2/maps'
+        maps.write_text(f'1000-2000 r-xp 00000000 {os.major(stat.st_dev):x}:{os.minor(stat.st_dev):x} {stat.st_ino} {library}\n')
+        identity = {'pid': 1, 'start_ticks': '111', 'source': {'path': str(root)}}
+        selected = None
+        if legacy:
+            selected = base/'snapshot.json'
+            selected.write_text(json.dumps({'prod_root': str(root), 'so': {'vllm/kernel.so': digest}, 'override_b64': 'private-content-not-recorded'}))
+            manifest.unlink()
+        return identity, proc, library, maps, selected
+
+    def test_native_manifest_attests_descendant_maps_and_explicit_legacy(self):
+        for legacy in (False, True):
+            with tempfile.TemporaryDirectory() as tmp:
+                identity, proc, library, maps, manifest = self.native_fixture(tmp, legacy)
+                result = m.verify_loaded_native(identity, manifest_file=manifest, proc_root=proc)
+                self.assertTrue(result['verified'])
+                self.assertEqual(result['loaded'][0]['pid'], 2)
+                self.assertEqual(result['expected_native_files'], 1)
+                self.assertNotIn('private-content', json.dumps(result))
+                self.assertIn('does not prove CUDA dispatch', result['scope'])
+                self.assertEqual('legacy' in result['kind'], legacy)
+
+    def test_explicit_wrong_native_manifest_rejects_on_immutable_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            identity, proc, library, maps, _ = self.native_fixture(tmp)
+            old = Path(tmp)/'snapshot.json'
+            old.write_text(json.dumps({'prod_root': '/different-production-root', 'so': {}}))
+            with self.assertRaises(ValueError):
+                m.verify_loaded_native(identity, manifest_file=old, proc_root=proc)
+            result = m.verify_loaded_native(identity, manifest_file=library.parent.parent/'RELEASE.json', proc_root=proc)
+            self.assertEqual(result['kind'], 'immutable release')
+
+    def test_legacy_venv_third_party_mapping_is_outside_native_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            identity, proc, library, maps, manifest = self.native_fixture(tmp, legacy=True)
+            third_party = Path(identity['source']['path'])/'.venv/lib/python3.10/site-packages/torch/libtorch.so'
+            maps.write_text(maps.read_text()+f'3000-4000 r-xp 00000000 00:00 999 {third_party}\n')
+            self.assertTrue(m.verify_loaded_native(identity, manifest_file=manifest, proc_root=proc)['verified'])
+
+    def test_legacy_without_explicit_matching_snapshot_rejects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            identity, proc, library, maps, manifest = self.native_fixture(tmp, legacy=True)
+            with self.assertRaises(FileNotFoundError):
+                m.verify_loaded_native(identity, proc_root=proc)
+            manifest.write_text(json.dumps({'prod_root': '/wrong-root', 'so': {}}))
+            with self.assertRaises(ValueError):
+                m.verify_loaded_native(identity, manifest_file=manifest, proc_root=proc)
+
+    def test_native_hash_deleted_replaced_and_offtree_mappings_reject(self):
+        for problem in ('hash', 'deleted', 'inode', 'offtree'):
+            with self.subTest(problem=problem), tempfile.TemporaryDirectory() as tmp:
+                identity, proc, library, maps, _ = self.native_fixture(tmp)
+                if problem == 'hash':
+                    library.write_bytes(b'changed bytes')
+                elif problem == 'deleted':
+                    maps.write_text(maps.read_text().strip()+' (deleted)\n')
+                elif problem == 'inode':
+                    fields = maps.read_text().split(None, 5)
+                    fields[4] = str(int(fields[4])+1)
+                    maps.write_text(' '.join(fields))
+                else:
+                    other = Path(tmp)/'other/vllm/kernel.so'
+                    maps.write_text(maps.read_text().replace(str(library), str(other)))
+                with self.assertRaises(ValueError):
+                    m.verify_loaded_native(identity, proc_root=proc)
+
+    def test_controller_native_identity_must_match_pid_start_root_and_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            identity, proc, library, maps, _ = self.native_fixture(tmp)
+            control = Path(tmp)/'identity.json'
+            expected = {'engine_pid': 1, 'pid_start': '111', 'root': identity['source']['path'],
+                        'runtime_flags': {'VLLM_SCHED_PREFILL_SHARE_EXACT': '1'}}
+            control.write_text(json.dumps(expected))
+            self.assertTrue(m.verify_loaded_native(identity, identity_file=control, proc_root=proc)['verified'])
+            for change in ({'engine_pid': 2}, {'pid_start': 'different'}, {'root': '/wrong'},
+                           {'runtime_flags': {'VLLM_SCHED_PREFILL_SHARE_EXACT': '0'}}):
+                control.write_text(json.dumps({**expected, **change}))
+                with self.assertRaises(ValueError):
+                    m.verify_loaded_native(identity, identity_file=control, proc_root=proc)
+
+    def test_new_scheduler_controls_record_without_unrelated_credentials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            identity, proc, library, maps, _ = self.native_fixture(tmp)
+            real_path = Path
+            with patch.object(m, 'Path', side_effect=lambda value: proc if value == '/proc' else real_path(value)):
+                recorded = m.runtime_identity(1)
+            self.assertEqual(recorded['runtime_env']['VLLM_SCHED_SHORT_FIRST_PREFIX_AWARE'], '1')
+            self.assertEqual(recorded['runtime_env']['VLLM_SCHED_PREFILL_SHARE_EXACT'], '1')
+            self.assertEqual(recorded['flags']['--long-prefill-token-threshold'], '1000')
+            self.assertNotIn('secret-test-value', json.dumps(recorded))
 
     def test_counter_bonus_and_reset_semantics(self):
         before = dict(drafts=10, draft_tokens=30, accepted_tokens=20)
