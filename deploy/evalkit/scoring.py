@@ -15,6 +15,8 @@ import re
 import subprocess
 import tempfile
 
+from measurement import generation_error
+
 from predicates import check_predicate, call_matches, expand_value_from_previous
 
 # ---------------------------------------------------------------------------
@@ -217,6 +219,11 @@ def score_agentic_chain(item, raw_record):
         raw_step = steps_raw[i]
         if raw_step.get("status") != "ok":
             results.append({"passed": False, "reason": f"step status={raw_step.get('status')}"})
+            all_passed = False
+            continue
+        error = generation_error(raw_step.get("response"))
+        if error:
+            results.append({"passed": False, "reason": error})
             all_passed = False
             continue
         message = raw_step["response"]["choices"][0]["message"]

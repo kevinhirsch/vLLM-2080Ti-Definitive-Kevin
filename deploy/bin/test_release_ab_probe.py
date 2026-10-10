@@ -14,7 +14,7 @@ def write(d, name, obj):
 
 
 def probe(texts):
-    return {"prompts": [{"i": i, "texts": t, "self_consistent": len(set(t)) == 1} for i, t in enumerate(texts)]}
+    return {"prompts": [{"i": i, "texts": t, "completion_tokens": [1]*len(t), "generation_verified": True, "self_consistent": len(set(t)) == 1} for i, t in enumerate(texts)]}
 
 
 def setup(d, kv=(922358, 922358), base_texts=None, cand_texts=None, tok=(80.0, 80.0), ev=("15/15 passed", "15/15 passed")):
@@ -53,3 +53,40 @@ def test_each_gate_fails_on_its_own(tmp_path):
 def test_too_few_comparable_prompts_is_not_a_pass(tmp_path):
     setup(str(tmp_path), base_texts=[["a", "b"], ["c", "d"], ["e", "e"], ["f", "g"]])
     assert ab.compare(str(tmp_path))["gates"]["greedy_identical"] is False
+
+
+def test_zero_tokens_and_legacy_unverified_probe_fail(tmp_path):
+    setup(str(tmp_path))
+    data = json.load(open(tmp_path / 'probe_release.json'))
+    data['prompts'][0]['completion_tokens'] = [0, 0]
+    write(str(tmp_path), 'probe_release.json', data)
+    assert not ab.compare(str(tmp_path))['gates']['generation_verified']
+    for row in data['prompts']:
+        row.pop('generation_verified')
+    write(str(tmp_path), 'probe_release.json', data)
+    assert not ab.compare(str(tmp_path))['ok']
+
+
+def test_candidate_second_rep_and_missing_fixture_are_gated(tmp_path):
+    setup(str(tmp_path), cand_texts=[['a', 'BAD'], ['b', 'b'], ['c', 'c'], ['q', 'q']])
+    assert not ab.compare(str(tmp_path))['gates']['greedy_identical']
+    setup(str(tmp_path))
+    data = json.load(open(tmp_path / 'probe_release.json'))
+    data['prompts'].pop()
+    write(str(tmp_path), 'probe_release.json', data)
+    assert not ab.compare(str(tmp_path))['gates']['greedy_identical']
+
+
+def test_post_rejects_http400_and_empty_generation(monkeypatch):
+    from unittest.mock import Mock
+    import pytest
+    response = Mock(status=400)
+    connection = Mock()
+    connection.getresponse.return_value = response
+    monkeypatch.setattr(ab.http.client, 'HTTPConnection', lambda *a, **k: connection)
+    with pytest.raises(ValueError, match='HTTP 400'):
+        ab._post('/v1/chat/completions', {})
+    response.status = 200
+    response.read.return_value = json.dumps({'usage': {'completion_tokens': 0}, 'choices': [{'message': {'content': ''}, 'finish_reason': 'stop'}]}).encode()
+    with pytest.raises(ValueError, match='zero'):
+        ab._post('/v1/chat/completions', {})

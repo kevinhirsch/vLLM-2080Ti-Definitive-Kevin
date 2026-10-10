@@ -8,8 +8,9 @@ scoring.py, and saves EVERY raw response (success, HTTP error, or crash) to
 results/<tag>/<item_id>.json so score_only.py can independently re-derive
 pass/fail later without hitting the network again.
 
-Never talk to :8000 (the capacity-gateway shim) -- config.BASE_URL is the
-single source of truth for the endpoint and is hardcoded to :8001.
+Generation goes directly to :8001, using config.BASE_URL. The runner reads
+the gateway offline fence before generation; it never routes inference via
+the gateway.
 
 Usage:
     python3 run_eval.py --tag smoke --categories tool_call,instruction
@@ -17,6 +18,7 @@ Usage:
 """
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -29,6 +31,7 @@ import requests
 import config
 import corpus
 import scoring
+import measurement
 
 ROOT = Path(__file__).resolve().parent
 ITEMS_DIR = ROOT / "items"
@@ -41,6 +44,9 @@ CATEGORY_ORDER = [
 
 
 def load_items(categories=None, limit_per_category=None):
+    if categories and set(categories) - set(CATEGORY_ORDER):
+        raise ValueError(f"Unknown categories: {sorted(set(categories) - set(CATEGORY_ORDER))}")
+    seen = set()
     items = []
     for cat in CATEGORY_ORDER:
         if categories and cat not in categories:
@@ -52,7 +58,15 @@ def load_items(categories=None, limit_per_category=None):
         if limit_per_category:
             files = files[:limit_per_category]
         for f in files:
-            items.append(json.loads(f.read_text()))
+            item = json.loads(f.read_text())
+            if item["id"] in seen:
+                raise ValueError(f"Duplicate fixture ID {item['id']!r}; results would overwrite")
+            seen.add(item["id"])
+            if item["category"] != cat:
+                raise ValueError(f"Fixture category disagrees with directory: {f}")
+            if not item["id"].replace("_", "").replace("-", "").isalnum():
+                raise ValueError(f"Unsafe fixture ID {item['id']!r}")
+            items.append(item)
     return items
 
 
@@ -101,33 +115,42 @@ def capture_journal(item_id, start_iso, out_dir):
 
 
 def post_chat(payload, timeout_s=180):
-    url = config.BASE_URL + "/v1/chat/completions"
-    t0 = time.time()
-    try:
-        r = requests.post(url, json=payload, timeout=timeout_s)
-        wall = time.time() - t0
-        if r.status_code != 200:
-            return {"status": "http_error", "status_code": r.status_code, "body": r.text[:4000], "wall_s": wall}
-        return {"status": "ok", "response": r.json(), "wall_s": wall}
-    except requests.exceptions.RequestException as e:
-        wall = time.time() - t0
-        return {"status": "engine-crash", "error": str(e), "wall_s": wall}
+    return measurement.post_chat(config.BASE_URL, payload, timeout_s)
 
 
-def build_base_payload(request_spec):
-    payload = {
+def build_base_payload(request_spec, profile=None):
+    return measurement.merge_request({
         "model": config.MODEL_NAME,
         "chat_template_kwargs": dict(config.DEFAULT_CHAT_TEMPLATE_KWARGS),
-    }
-    payload.update(request_spec)
-    return payload
+    }, request_spec, profile)
+
+
+def fixture_manifest(items, profile=None):
+    """Offline validation/preparation: no inference or health requests."""
+    rows = []
+    for item in items:
+        req = item.get("request", {})
+        if item["category"] == "agentic_chain":
+            if not item.get("steps") or not item.get("tools"):
+                raise ValueError(f"Invalid chain fixture {item['id']}")
+        elif not req or "check" not in item:
+            raise ValueError(f"Invalid fixture {item['id']}")
+        rows.append({"id": item["id"], "category": item["category"],
+                     "fixture_sha256": measurement.canonical_hash(item),
+                     "sampling": {k: v for k, v in build_base_payload(req, profile).items()
+                                  if k in measurement.SAMPLING_KEYS}})
+    counts = {}
+    for row in rows:
+        counts[row["category"]] = counts.get(row["category"], 0) + 1
+    return {"total_items": len(rows), "by_category": counts, "fixtures": rows,
+            "manifest_sha256": measurement.canonical_hash(rows), "profile": profile or {}}
 
 
 def approx_tokens(s):
     return len(s) / config.CHARS_PER_TOKEN
 
 
-def run_single_shot_item(item, out_dir):
+def run_single_shot_item(item, out_dir, profile=None):
     req = dict(item["request"])
     large_prompt = False
 
@@ -143,9 +166,9 @@ def run_single_shot_item(item, out_dir):
             for m in req.get("messages", [])
         )
 
-    payload = build_base_payload(req)
+    payload = build_base_payload(req, profile)
     start_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    result = post_chat(payload)
+    result = post_chat(payload, timeout_s=item.get("timeout_s", 180))
 
     raw_record = {"id": item["id"], "category": item["category"], "request": payload, "result": result}
 
@@ -162,6 +185,8 @@ def run_single_shot_item(item, out_dir):
         score = {"passed": False, "reason": "engine-crash"}
     elif result["status"] == "http_error":
         score = {"passed": False, "reason": f"http {result['status_code']}"}
+    elif result["status"] != "ok" or measurement.generation_error(result.get("response")):
+        score = {"passed": False, "reason": result.get("error") or measurement.generation_error(result.get("response")) or result["status"]}
     else:
         msg = result["response"]["choices"][0]["message"]
         finish_reason = result["response"]["choices"][0].get("finish_reason")
@@ -187,7 +212,7 @@ def run_single_shot_item(item, out_dir):
     return score
 
 
-def run_agentic_chain_item(item, out_dir):
+def run_agentic_chain_item(item, out_dir, profile=None):
     messages = [{"role": "user", "content": item["user"]}]
     steps_raw = []
     prev_inject_result = None
@@ -197,24 +222,28 @@ def run_agentic_chain_item(item, out_dir):
         if aborted:
             break
         req = {
+            **item.get("request", {}),
+            **spec.get("request", {}),
             "messages": list(messages),
             "max_tokens": spec.get("max_tokens", 300),
         }
         if not spec.get("final"):
             req["tools"] = item["tools"]
             req["tool_choice"] = "auto"
-        payload = build_base_payload(req)
-        result = post_chat(payload)
+        payload = build_base_payload(req, profile)
+        result = post_chat(payload, timeout_s=spec.get("timeout_s", item.get("timeout_s", 180)))
+        error = measurement.generation_error(result.get("response")) if result["status"] == "ok" else None
 
-        if result["status"] != "ok":
-            steps_raw.append({"status": result["status"], "detail": result})
+        if result["status"] != "ok" or error:
+            steps_raw.append({"status": "invalid_generation" if error else result["status"], "request": payload, "detail": result})
             if result["status"] == "engine-crash":
                 wait_for_recovery()
             aborted = True
             continue
 
         msg = result["response"]["choices"][0]["message"]
-        steps_raw.append({"status": "ok", "response": result["response"]})
+        steps_raw.append({"status": "ok", "request": payload, "response": result["response"],
+                          "timeline": result.get("timeline"), "wall_s": result.get("wall_s")})
         messages.append(msg)
 
         if spec.get("final"):
@@ -243,19 +272,40 @@ def run_agentic_chain_item(item, out_dir):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tag", required=True)
+    ap.add_argument("--tag")
+    ap.add_argument("--profile", help="JSON sampling profile applied to every item and agentic step")
+    ap.add_argument("--validate-fixtures", action="store_true", help="offline fixture validation; no engine calls")
+    ap.add_argument("--prepare", type=Path, help="write offline baseline fixture/settings manifest")
+    ap.add_argument("--engine-pid", type=int, default=int(os.environ.get("WINDOW_ENGINE_PID", "0")) or None, help="required live engine PID for process/checkpoint provenance")
     ap.add_argument("--categories", default=None, help="comma-separated category filter")
     ap.add_argument("--limit-per-category", type=int, default=None)
     ap.add_argument("--force", action="store_true",
                      help="clear pre-existing results under --tag instead of failing")
     args = ap.parse_args()
 
+    profile = measurement.load_profile(args.profile)
     categories = set(args.categories.split(",")) if args.categories else None
     items = load_items(categories, args.limit_per_category)
     if not items:
         print("No items matched -- nothing to run.", file=sys.stderr)
         sys.exit(1)
 
+    manifest = fixture_manifest(items, profile)
+    if args.validate_fixtures or args.prepare:
+        if args.prepare:
+            args.prepare.parent.mkdir(parents=True, exist_ok=True)
+            args.prepare.write_text(json.dumps(manifest, indent=2) + "\n")
+        print(json.dumps({k: manifest[k] for k in ("total_items", "by_category", "manifest_sha256")}))
+        return 0
+    if not args.tag or Path(args.tag).name != args.tag:
+        ap.error("Use a simple --tag for live runs")
+    if not args.engine_pid:
+        ap.error("Live runs require --engine-pid; offline --validate-fixtures does not")
+    provenance = measurement.runtime_identity(args.engine_pid)
+    provenance["model_roots"] = measurement.verify_models_root(config.BASE_URL, provenance)
+    measurement.require_offline_window(drained=True)
+    provenance["measurement_files"] = [measurement.file_identity(ROOT / name) for name in
+        ("run_eval.py", "measurement.py", "scoring.py", "predicates.py", "config.py", "corpus.py")]
     out_dir = RESULTS_DIR / args.tag
     if out_dir.exists() and any(out_dir.glob("*.json")):
         if args.force:
@@ -269,16 +319,17 @@ def main():
             sys.exit(1)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    summary = {"tag": args.tag, "started": datetime.now(timezone.utc).isoformat(), "items": []}
+    summary = {"tag": args.tag, "started": datetime.now(timezone.utc).isoformat(), "items": [], "fixture_manifest": manifest, "provenance": provenance}
     t0 = time.time()
 
     for item in items:
         item_t0 = time.time()
         try:
+            measurement.require_offline_window(drained=True)
             if item["category"] == "agentic_chain":
-                score = run_agentic_chain_item(item, out_dir)
+                score = run_agentic_chain_item(item, out_dir, profile)
             else:
-                score = run_single_shot_item(item, out_dir)
+                score = run_single_shot_item(item, out_dir, profile)
         except Exception as e:
             score = {"passed": False, "reason": f"runner exception: {e!r}"}
             (out_dir / f"{item['id']}.json").write_text(json.dumps(
@@ -303,11 +354,21 @@ def main():
     summary["total_items"] = sum(v["total"] for v in by_cat.values())
     summary["wall_s"] = round(total_wall, 2)
     summary["finished"] = datetime.now(timezone.utc).isoformat()
+    try:
+        summary["runtime_unchanged"] = measurement.runtime_identity(args.engine_pid)["fingerprint"] == provenance["fingerprint"]
+    except (OSError, ValueError):
+        summary["runtime_unchanged"] = False
+    if not summary["runtime_unchanged"]:
+        summary["valid_run"] = False
+        summary["invalid_reason"] = "engine/source/config identity changed during run"
+    else:
+        summary["valid_run"] = True
 
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     print(f"\n{summary['total_pass']}/{summary['total_items']} passed, {total_wall:.1f}s total")
     print(f"Results: {out_dir}")
+    return 0 if summary["valid_run"] and summary["total_pass"] == summary["total_items"] else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

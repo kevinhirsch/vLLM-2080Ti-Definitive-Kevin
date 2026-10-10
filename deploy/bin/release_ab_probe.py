@@ -22,6 +22,10 @@ import json
 import os
 import re
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "evalkit"))
+import measurement
 
 PROMPTS = [
     {"chat": "List the first eight prime numbers, comma separated, then explain in one sentence why 1 is not prime."},
@@ -33,14 +37,37 @@ PROMPTS = [
 
 def _post(path, body, port=8001, timeout=600):
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
-    c.request("POST", path, json.dumps(body), {"Content-Type": "application/json"})
-    return json.loads(c.getresponse().read())
+    try:
+        c.request("POST", path, json.dumps(body), {"Content-Type": "application/json"})
+        response = c.getresponse()
+        if response.status != 200:
+            raise ValueError(f"Generation HTTP {response.status}")
+        data = json.loads(response.read())
+        check = data
+        if path == "/v1/completions" and isinstance(data, dict):
+            check = {**data, "choices": [{**choice, "message": {"content": choice.get("text")}}
+                     for choice in data.get("choices", [])]}
+        error = measurement.generation_error(check)
+        if error:
+            raise ValueError(f"Generation failed: {error}")
+        return data
+    finally:
+        c.close()
 
 
 def model_id(port=8001):
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
-    c.request("GET", "/v1/models")
-    return json.loads(c.getresponse().read())["data"][0]["id"]
+    try:
+        c.request("GET", "/v1/models")
+        response = c.getresponse()
+        if response.status != 200:
+            raise ValueError(f"Model discovery HTTP {response.status}")
+        data = json.loads(response.read()).get("data")
+        if not data or not data[0].get("id"):
+            raise ValueError("Model discovery returned no model")
+        return data[0]["id"]
+    finally:
+        c.close()
 
 
 def probe(out, reps=2, max_tokens=128, port=8001):
@@ -48,6 +75,7 @@ def probe(out, reps=2, max_tokens=128, port=8001):
     rows = []
     for i, p in enumerate(PROMPTS):
         texts = []
+        completion_tokens = []
         for _ in range(reps):
             if "chat" in p:
                 r = _post("/v1/chat/completions", {"model": m, "messages": [{"role": "user", "content": p["chat"]}],
@@ -58,7 +86,10 @@ def probe(out, reps=2, max_tokens=128, port=8001):
                 r = _post("/v1/completions", {"model": m, "prompt": p["completion"], "max_tokens": max_tokens,
                                               "temperature": 0, "seed": 0}, port)
                 texts.append(r["choices"][0].get("text") or "")
-        rows.append({"i": i, "texts": texts, "self_consistent": len(set(texts)) == 1})
+            completion_tokens.append(r["usage"]["completion_tokens"])
+        rows.append({"i": i, "texts": texts, "completion_tokens": completion_tokens,
+                     "generation_verified": True, "prompt_sha256": measurement.canonical_hash(p),
+                     "self_consistent": len(set(texts)) == 1})
     res = {"model": m, "reps": reps, "max_tokens": max_tokens, "prompts": rows}
     with open(out, "w") as fh:
         json.dump(res, fh, indent=1)
@@ -93,16 +124,26 @@ def compare(results, base="base", cand="release", tok_tol=0.05, kv_tol=0.002):
     gates["kv_pool_equal"] = bool(kb and kc and abs(kc - kb) <= kb * kv_tol)
     pb, pc = load(f"probe_{base}.json"), load(f"probe_{cand}.json")
     comparable, mism, skipped = 0, [], []
+    def verified(probe):
+        rows = (probe or {}).get('prompts') or []
+        return bool(rows) and all(row.get('generation_verified') is True and row.get('texts')
+            and len(row.get('completion_tokens') or []) == len(row['texts'])
+            and all(isinstance(n, int) and not isinstance(n, bool) and n > 0 for n in row['completion_tokens'])
+            and all(isinstance(text, str) and bool(text.strip()) for text in row['texts']) for row in rows)
+    gates['generation_verified'] = verified(pb) and verified(pc)
+    same_fixtures = bool(pb and pc and len(pb['prompts']) == len(pc['prompts']) and
+                         [r['i'] for r in pb['prompts']] == [r['i'] for r in pc['prompts']] and
+                         [r.get('prompt_sha256') for r in pb['prompts']] == [r.get('prompt_sha256') for r in pc['prompts']])
     if pb and pc:
         for rb, rc in zip(pb["prompts"], pc["prompts"]):
             if not rb["self_consistent"]:
                 skipped.append(rb["i"])
                 continue
             comparable += 1
-            if rc["texts"][0] != rb["texts"][0]:
-                mism.append({"i": rb["i"], "base": rb["texts"][0][:160], cand: rc["texts"][0][:160]})
+            if not rc["texts"] or any(text != rb["texts"][0] for text in rc["texts"]):
+                mism.append({"i": rb["i"], "base": rb["texts"][0][:160], cand: (rc["texts"][0] if rc["texts"] else "")[:160]})
     facts["greedy"] = {"comparable": comparable, "mismatch": mism, "base_not_self_consistent": skipped}
-    gates["greedy_identical"] = comparable >= 2 and not mism
+    gates["greedy_identical"] = same_fixtures and comparable >= 2 and not mism
     qb, qc = load(f"quick_{base}.json"), load(f"quick_{cand}.json")
     tb, tc = _mean((qb or {}).get("natural_tok_s")), _mean((qc or {}).get("natural_tok_s"))
     facts["natural_tok_s"] = {base: tb, cand: tc}

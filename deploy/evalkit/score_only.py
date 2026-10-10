@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 import scoring  # noqa: E402
+import measurement  # noqa: E402
 
 ITEMS_DIR = ROOT / "items"
 RESULTS_DIR = ROOT / "results"
@@ -40,6 +41,9 @@ def _index_items_dir():
             continue
         for f in cat_dir.glob("item_*.json"):
             spec = json.loads(f.read_text())
+            if spec["id"] in _ITEM_SPEC_CACHE:
+                _ITEM_SPEC_CACHE.clear()
+                raise ValueError(f"Duplicate fixture ID {spec['id']!r}")
             _ITEM_SPEC_CACHE[spec["id"]] = spec
     return _ITEM_SPEC_CACHE
 
@@ -57,6 +61,9 @@ def rescore_single_shot(item, raw):
     if result.get("status") != "ok":
         return {"passed": False, "reason": f"unknown raw status {result.get('status')!r}"}
 
+    error = measurement.generation_error(result.get("response"))
+    if error:
+        return {"passed": False, "reason": error}
     resp = result["response"]
     choice = resp["choices"][0]
     msg = choice["message"]

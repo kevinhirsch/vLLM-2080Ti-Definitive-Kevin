@@ -13,6 +13,10 @@ import sys
 import time
 import urllib.request
 from typing import Any
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "evalkit"))
+import measurement
 
 import requests
 
@@ -80,72 +84,39 @@ def chat(base_url: str, model: str, messages: list[dict[str, Any]], *,
             raise ValueError("'stream' is reserved — pass stream= to chat()")
         payload.update(extra)
 
-    start = time.perf_counter()
     if not stream:
-        r = requests.post(f"{base_url.rstrip('/')}/chat/completions",
-                          json=payload, timeout=timeout)
+        start = time.perf_counter()
+        r = requests.post(f"{base_url.rstrip('/')}/chat/completions", json=payload, timeout=timeout)
         r.raise_for_status()
-        d = r.json()
-        total = time.perf_counter() - start
-        ch = (d.get("choices") or [{}])[0]
-        usage = d.get("usage") or {}
-        ct = usage.get("completion_tokens") or 0
-        return {
-            "content": (ch.get("message") or {}).get("content") or "",
-            "reasoning": (ch.get("message") or {}).get("reasoning_content") or "",
-            "finish_reason": ch.get("finish_reason"),
-            "ttft_s": None,
-            "total_s": total,
-            # decode-only rate is unmeasurable without streaming (total time
-            # includes prefill) — report None rather than an understated number
-            "decode_tps": None,
-            "completion_tokens": ct,
-            "prompt_tokens": usage.get("prompt_tokens") or 0,
-        }
-
-    r = requests.post(f"{base_url.rstrip('/')}/chat/completions",
-                      json=payload, timeout=timeout, stream=True)
-    r.raise_for_status()
-    first_tok_t = None
-    content_parts: list[str] = []
-    reasoning_parts: list[str] = []
-    finish = None
-    usage: dict[str, Any] = {}
-    for line in r.iter_lines(decode_unicode=True):
-        if not line or not line.startswith("data:"):
-            continue
-        data = line[5:].strip()
-        if data == "[DONE]":
-            break
-        try:
-            d = json.loads(data)
-        except json.JSONDecodeError:
-            continue
-        if d.get("usage"):
-            usage = d["usage"]
-        for ch in d.get("choices") or []:
-            delta = ch.get("delta") or {}
-            tok = delta.get("content") or delta.get("reasoning_content")
-            if tok:
-                if first_tok_t is None:
-                    first_tok_t = time.perf_counter()
-                (content_parts if delta.get("content")
-                 else reasoning_parts).append(tok)
-            if ch.get("finish_reason"):
-                finish = ch["finish_reason"]
-    end = time.perf_counter()
-    ct = usage.get("completion_tokens") or 0
-    decode_window = (end - first_tok_t) if first_tok_t else 0.0
-    return {
-        "content": "".join(content_parts),
-        "reasoning": "".join(reasoning_parts),
-        "finish_reason": finish,
-        "ttft_s": (first_tok_t - start) if first_tok_t else None,
-        "total_s": end - start,
-        "decode_tps": (ct / decode_window) if decode_window > 0 else 0.0,
-        "completion_tokens": ct,
-        "prompt_tokens": usage.get("prompt_tokens") or 0,
-    }
+        data = r.json()
+        error = measurement.generation_error(data)
+        if error:
+            raise ValueError(error)
+        ch = data['choices'][0]
+        usage = data['usage']
+        return {"content": ch['message'].get('content') or '',
+                "reasoning": ch['message'].get('reasoning_content') or '',
+                "tool_calls": ch['message'].get('tool_calls') or [],
+                "finish_reason": ch.get('finish_reason'), "ttft_s": None,
+                "decode_tps": None, "total_s": time.perf_counter()-start, "completion_tokens": usage['completion_tokens'],
+                "prompt_tokens": usage.get('prompt_tokens'), "timeline": None}
+    result = measurement.post_chat(base_url.rstrip('/').removesuffix('/v1'), payload, timeout)
+    if result['status'] != 'ok':
+        raise ValueError(f"Generation failed: {result['status']} {result.get('error') or result.get('status_code')}")
+    data, timeline = result['response'], result['timeline']
+    ch = data['choices'][0]
+    arrivals = timeline['generated_event_times_s']
+    interval = arrivals[-1] - arrivals[0] if len(arrivals) > 1 else 0
+    tokens = data['usage']['completion_tokens']
+    return {"content": ch['message'].get('content') or '',
+            "reasoning": ch['message'].get('reasoning_content') or '',
+            "tool_calls": ch['message'].get('tool_calls') or [],
+            "finish_reason": ch.get('finish_reason'),
+            "ttft_s": timeline['first_generated_delta_s'], "total_s": timeline['wall_s'],
+            "decode_tps": timeline.get("counted_generated_tokens_s") if timeline.get("counted_generated_tokens_s") is not None else ((tokens-1)/interval if interval > 0 else None),
+            "decode_tps_semantics": timeline["counted_rate_semantics"] if timeline.get("counted_generated_tokens_s") is not None else "estimate over first-to-last generated SSE delta; first bundle token count unknown",
+            "completion_tokens": tokens, "prompt_tokens": data['usage'].get('prompt_tokens'),
+            "timeline": timeline, "speculative_decoding": data.get('metrics', {}).get('speculative_decoding')}
 
 
 def scrape_spec_metrics(base_url: str) -> dict[str, float] | None:
