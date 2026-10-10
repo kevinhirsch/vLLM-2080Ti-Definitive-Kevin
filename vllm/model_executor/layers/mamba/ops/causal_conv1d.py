@@ -767,6 +767,7 @@ def _causal_conv1d_update_kernel(
     bias_ptr,
     conv_state_ptr,
     conv_state_indices_ptr,
+    recurrent_state_indices_ptr,
     num_accepted_tokens_ptr,
     query_start_loc_ptr,  # (batch + 1)
     block_idx_last_scheduled_token,  # (batch,)
@@ -778,6 +779,8 @@ def _causal_conv1d_update_kernel(
     seqlen: tl.constexpr,
     state_len: tl.constexpr,
     num_cache_lines,  # added to support vLLM larger cache lines
+    num_tokens,
+    recurrent_num_slots,
     # Strides
     stride_x_seq: tl.constexpr,
     stride_x_dim: tl.constexpr,
@@ -788,6 +791,8 @@ def _causal_conv1d_update_kernel(
     stride_conv_state_dim: tl.constexpr,
     stride_conv_state_tok: tl.constexpr,
     stride_state_indices: tl.constexpr,
+    stride_recurrent_indices_seq: tl.constexpr,
+    stride_recurrent_indices_col: tl.constexpr,
     stride_o_seq: tl.constexpr,
     stride_o_dim: tl.constexpr,
     stride_o_token: tl.int64,
@@ -802,6 +807,10 @@ def _causal_conv1d_update_kernel(
     IS_SPEC_DECODING: tl.constexpr,
     NP2_STATELEN: tl.constexpr,
     HAS_NULL_BLOCK: tl.constexpr,
+    GUARD_BOUNDS: tl.constexpr,
+    STATE_INDICES_WIDTH: tl.constexpr,
+    HAS_RECURRENT_BOUNDS: tl.constexpr,
+    RECURRENT_INDICES_WIDTH: tl.constexpr,
     BLOCK_N: tl.constexpr,
     launch_pdl: tl.constexpr,
 ):
@@ -827,21 +836,120 @@ def _causal_conv1d_update_kernel(
         conv_state_init = 0
         current_last_index = 0
 
-    # cache_idx
-    conv_states_input_coord = tl.load(
-        conv_state_indices_ptr + idx_seq * stride_state_indices + conv_state_init
-    ).to(tl.int64)
-
-    if HAS_NULL_BLOCK:  # noqa
-        if conv_states_input_coord == null_block_id:
-            # not processing as this is not the actual sequence
+    if GUARD_BOUNDS:
+        # K5 opts in before either convolution or recurrent state is mutated.
+        # All checks use device metadata, so this remains capture-friendly.
+        if IS_VARLEN:
+            query_start_index = tl.load(query_start_loc_ptr + idx_seq).to(tl.int64)
+            query_end_index = tl.load(query_start_loc_ptr + idx_seq + 1).to(tl.int64)
+        else:
+            query_start_index = idx_seq * seqlen
+            query_end_index = query_start_index + seqlen
+        query_len = query_end_index - query_start_index
+        invalid_row = (
+            (query_start_index < 0)
+            | (query_end_index < query_start_index)
+            | (query_end_index > num_tokens)
+            | (query_len > max_seqlen)
+        )
+        valid_init_col = (conv_state_init >= 0) & (
+            conv_state_init < STATE_INDICES_WIDTH
+        )
+        valid_last_col = (current_last_index >= 0) & (
+            current_last_index < STATE_INDICES_WIDTH
+        )
+        conv_states_input_coord = tl.load(
+            conv_state_indices_ptr + idx_seq * stride_state_indices + conv_state_init,
+            mask=valid_init_col,
+            other=-1,
+        ).to(tl.int64)
+        conv_states_offset = tl.load(
+            conv_state_indices_ptr + idx_seq * stride_state_indices + current_last_index,
+            mask=valid_last_col,
+            other=-1,
+        ).to(tl.int64)
+        invalid_row |= (
+            ~valid_init_col
+            | ~valid_last_col
+            | (conv_states_input_coord < 0)
+            | (conv_states_input_coord >= num_cache_lines)
+            | (conv_states_offset < 0)
+            | (conv_states_offset >= num_cache_lines)
+        )
+        if HAS_NULL_BLOCK:
+            invalid_row |= (conv_states_input_coord == null_block_id) | (
+                conv_states_offset == null_block_id
+            )
+        if HAS_RECURRENT_BOUNDS:
+            accepted = tl.load(num_accepted_tokens_ptr + idx_seq).to(tl.int64)
+            source_col = accepted - 1
+            valid_source_col = (source_col >= 0) & (
+                source_col < RECURRENT_INDICES_WIDTH
+            )
+            source_slot = tl.load(
+                recurrent_state_indices_ptr
+                + idx_seq * stride_recurrent_indices_seq
+                + source_col * stride_recurrent_indices_col,
+                mask=valid_source_col,
+                other=-1,
+            ).to(tl.int64)
+            invalid_row |= (
+                ~valid_source_col
+                | (source_slot < 0)
+                | (source_slot >= recurrent_num_slots)
+            )
+            if HAS_NULL_BLOCK:
+                invalid_row |= source_slot == null_block_id
+            for col in tl.static_range(RECURRENT_INDICES_WIDTH):
+                destination = tl.load(
+                    recurrent_state_indices_ptr
+                    + idx_seq * stride_recurrent_indices_seq
+                    + col * stride_recurrent_indices_col
+                ).to(tl.int64)
+                bad_destination = destination >= recurrent_num_slots
+                if HAS_NULL_BLOCK:
+                    bad_destination &= destination != null_block_id
+                invalid_row |= bad_destination
+        if invalid_row:
+            # Corrupt query bounds must never turn rejection into an OOB store.
+            if IS_VARLEN:
+                safe_start = tl.minimum(tl.maximum(query_start_index, 0), num_tokens)
+                safe_end = tl.minimum(tl.maximum(query_end_index, 0), num_tokens)
+                zero_offset = safe_start * stride_o_token
+                zero_len = tl.maximum(safe_end - safe_start, 0)
+            else:
+                zero_offset = idx_seq * stride_o_seq
+                zero_len = seqlen
+            zero = tl.zeros((BLOCK_N,), dtype=tl.float32)
+            for idx_token in tl.range(zero_len):
+                tl.store(
+                    o_ptr
+                    + zero_offset
+                    + idx_token * stride_o_token
+                    + idx_feats * stride_o_dim,
+                    zero,
+                    mask=idx_feats < dim,
+                )
             if launch_pdl:
                 tl.extra.cuda.gdc_launch_dependents()
             return
+    else:
+        # Preserve the default upstream path when the optional K5 guard is off.
+        conv_states_input_coord = tl.load(
+            conv_state_indices_ptr + idx_seq * stride_state_indices + conv_state_init
+        ).to(tl.int64)
+
+        if HAS_NULL_BLOCK:  # noqa
+            if conv_states_input_coord == null_block_id:
+                # not processing as this is not the actual sequence
+                if launch_pdl:
+                    tl.extra.cuda.gdc_launch_dependents()
+                return
 
     if IS_VARLEN:
-        query_start_index = tl.load(query_start_loc_ptr + idx_seq).to(tl.int64)
-        query_end_index = tl.load(query_start_loc_ptr + (idx_seq + 1)).to(tl.int64)
+        if not GUARD_BOUNDS:
+            query_start_index = tl.load(query_start_loc_ptr + idx_seq).to(tl.int64)
+            query_end_index = tl.load(query_start_loc_ptr + (idx_seq + 1)).to(tl.int64)
         # revise state_len and seqlen
         state_len = state_len - (seqlen - (query_end_index - query_start_index))
         seqlen = query_end_index - query_start_index
@@ -964,9 +1072,10 @@ def _causal_conv1d_update_kernel(
 
     # Get the state from the initial_state_idx
     # cache_idx
-    conv_states_offset = tl.load(
-        conv_state_indices_ptr + idx_seq * stride_state_indices + current_last_index
-    ).to(tl.int64)
+    if not GUARD_BOUNDS:
+        conv_states_offset = tl.load(
+            conv_state_indices_ptr + idx_seq * stride_state_indices + current_last_index
+        ).to(tl.int64)
     conv_state_ptrs_target = (
         conv_state_ptr
         + (conv_states_offset * stride_conv_state_seq)  # Offset from seq
@@ -1129,6 +1238,10 @@ def causal_conv1d_update(
     initial_state_idx: torch.Tensor | None = None,
     validate_data=False,
     out: torch.Tensor | None = None,
+    *,
+    guard_bounds: bool = False,
+    state_indices_2d: torch.Tensor | None = None,
+    recurrent_num_slots: int | None = None,
 ):
     """
     x: Input tensor which can take the following shapes:
@@ -1168,6 +1281,11 @@ def causal_conv1d_update(
             indices 0 and 3
     out: optional output tensor with the same shape as `x`. When omitted,
         the input is overwritten.
+    guard_bounds: optional K5 device-side bounds guard. Invalid rows produce
+        zero output only within the input token allocation and leave state
+        untouched. Default behavior is unchanged.
+    state_indices_2d, recurrent_num_slots: optional paired K5 recurrent-state
+        metadata checked before convolution mutation when guard_bounds is set.
     """
     if validate_data:
         assert null_block_id is not None
@@ -1205,6 +1323,66 @@ def causal_conv1d_update(
     _, width = weight.shape
     # conv_state: (..., dim, state_len), where state_len >= width - 1
     num_cache_lines, _, state_len = conv_state.size()
+
+    if guard_bounds:
+        if conv_state_indices is None:
+            raise ValueError("guard_bounds requires conv_state_indices")
+        if conv_state_indices.dim() not in (1, 2) or (
+            conv_state_indices.dim() == 2 and conv_state_indices.size(1) < 1
+        ):
+            raise ValueError("conv_state_indices must have nonempty rows")
+        if conv_state_indices.stride(0) < 1 or (
+            conv_state_indices.dim() == 2 and conv_state_indices.stride(1) != 1
+        ):
+            raise ValueError("conv_state_indices requires positive row and unit column strides")
+        required_state_len = width - 1 + (
+            seqlen - 1 if num_accepted_tokens is not None else 0
+        )
+        if state_len < required_state_len:
+            raise ValueError("conv_state is shorter than the launch-time state window")
+        metadata = [conv_state_indices]
+        if query_start_loc is not None:
+            if query_start_loc.numel() < batch + 1:
+                raise ValueError("query_start_loc must contain at least batch + 1 entries")
+            if max_query_len < 1:
+                raise ValueError("guard_bounds requires a positive max_query_len")
+            metadata.append(query_start_loc)
+        if num_accepted_tokens is not None:
+            if num_accepted_tokens.numel() < batch:
+                raise ValueError("num_accepted_tokens must contain at least batch entries")
+            metadata.append(num_accepted_tokens)
+        if (state_indices_2d is None) != (recurrent_num_slots is None):
+            raise ValueError("recurrent bounds metadata must be supplied together")
+        if state_indices_2d is not None:
+            if num_accepted_tokens is None:
+                raise ValueError("recurrent bounds require num_accepted_tokens")
+            if (
+                state_indices_2d.dim() != 2
+                or state_indices_2d.size(0) != batch
+                or not 1 <= state_indices_2d.size(1) <= 8
+                or not isinstance(recurrent_num_slots, int)
+                or recurrent_num_slots < 1
+            ):
+                raise ValueError("invalid K5 recurrent bounds shape or slot count")
+            metadata.append(state_indices_2d)
+        if block_idx_last_scheduled_token is not None:
+            if initial_state_idx is None:
+                raise ValueError("guard_bounds requires initial_state_idx for APC")
+            if (
+                initial_state_idx.numel() != batch
+                or block_idx_last_scheduled_token.numel() != batch
+            ):
+                raise ValueError("APC indices must contain batch entries")
+            metadata.extend([initial_state_idx, block_idx_last_scheduled_token])
+        if any(
+            item.dtype not in (torch.int32, torch.int64)
+            or item.device != x.device
+            or (item is not conv_state_indices and not item.is_contiguous())
+            for item in metadata
+        ):
+            raise ValueError("guard metadata must use supported integer strides on x.device")
+    elif state_indices_2d is not None or recurrent_num_slots is not None:
+        raise ValueError("recurrent bounds metadata requires guard_bounds")
 
     if validate_data:
         assert dim == weight.size(0)
@@ -1257,6 +1435,7 @@ def causal_conv1d_update(
         bias,
         conv_state,
         conv_state_indices,
+        state_indices_2d,
         num_accepted_tokens,
         query_start_loc,
         block_idx_last_scheduled_token,
@@ -1268,6 +1447,8 @@ def causal_conv1d_update(
         seqlen,
         state_len,
         num_cache_lines,
+        x.size(0) if query_start_loc is not None else batch * seqlen,
+        recurrent_num_slots if recurrent_num_slots is not None else 0,
         # stride
         stride_x_seq,
         stride_x_dim,
@@ -1278,6 +1459,8 @@ def causal_conv1d_update(
         stride_istate_dim,
         stride_istate_token,
         stride_state_indices,
+        state_indices_2d.stride(0) if state_indices_2d is not None else 0,
+        state_indices_2d.stride(1) if state_indices_2d is not None else 0,
         stride_o_seq,
         stride_o_dim,
         stride_o_token,
@@ -1292,6 +1475,16 @@ def causal_conv1d_update(
         IS_SPEC_DECODING=num_accepted_tokens is not None,
         NP2_STATELEN=np2_statelen,
         HAS_NULL_BLOCK=null_block_id is not None,
+        GUARD_BOUNDS=guard_bounds,
+        STATE_INDICES_WIDTH=(
+            conv_state_indices.size(1)
+            if conv_state_indices is not None and conv_state_indices.dim() == 2
+            else 1
+        ),
+        HAS_RECURRENT_BOUNDS=state_indices_2d is not None,
+        RECURRENT_INDICES_WIDTH=(
+            state_indices_2d.size(1) if state_indices_2d is not None else 1
+        ),
         BLOCK_N=256,
         launch_pdl=current_platform.is_arch_support_pdl(),
     )
