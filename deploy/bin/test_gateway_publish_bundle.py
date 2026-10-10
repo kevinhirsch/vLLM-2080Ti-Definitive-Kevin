@@ -132,3 +132,20 @@ def test_mutated_manifest_cannot_delete_unrelated_file(private_bundle):
     with pytest.raises(RuntimeError, match="manifest changed"):
         bundle.restore(state)
     assert (runtime / "active-serve").read_text() == "incumbent\n"
+
+
+def test_commit_moving_during_snapshot_refused_before_backups(private_bundle, monkeypatch):
+    source, runtime, backup = private_bundle
+    actual = bundle.subprocess.check_output
+    heads = []
+    def moving_head(argv, **kwargs):
+        result = actual(argv, **kwargs)
+        if argv[-2:] == ["rev-parse", "HEAD"]:
+            heads.append(result)
+            if len(heads) == 2:
+                return "0" * 40 + "\n"
+        return result
+    monkeypatch.setattr(bundle.subprocess, "check_output", moving_head)
+    with pytest.raises(RuntimeError, match="commit changed"):
+        bundle.snapshot(source, runtime, backup)
+    assert not backup.exists()

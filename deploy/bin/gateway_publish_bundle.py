@@ -51,13 +51,13 @@ def _write(path, data, mode):
         Path(tmp).unlink(missing_ok=True)
 
 
-def _committed(source_dir, name):
+def _committed(source_dir, name, head):
     source = source_dir / name
     _regular(source)
     repo = Path(subprocess.check_output(["git", "-C", str(source_dir), "rev-parse", "--show-toplevel"], text=True).strip()).resolve()
     relative = source.relative_to(repo).as_posix()
-    blob = subprocess.check_output(["git", "-C", str(repo), "show", f"HEAD:{relative}"])
-    row = subprocess.check_output(["git", "-C", str(repo), "ls-tree", "HEAD", "--", relative], text=True).split()
+    blob = subprocess.check_output(["git", "-C", str(repo), "show", f"{head}:{relative}"])
+    row = subprocess.check_output(["git", "-C", str(repo), "ls-tree", head, "--", relative], text=True).split()
     if not row or row[0] not in ("100644", "100755") or source.read_bytes() != blob:
         raise RuntimeError(f"control bundle source differs from committed regular file: {source}")
     mode = 0o755 if row[0] == "100755" else 0o644
@@ -76,13 +76,13 @@ def snapshot(source_dir: Path, runtime_dir: Path, backup_dir: Path):
     source_dir, runtime_dir, backup_dir = map(lambda p: Path(p).resolve(), (source_dir, runtime_dir, backup_dir))
     if not runtime_dir.is_dir() or backup_dir.exists():
         raise RuntimeError("bundle needs an existing runtime directory and fresh backup directory")
+    repo = Path(subprocess.check_output(["git", "-C", str(source_dir), "rev-parse", "--show-toplevel"], text=True).strip()).resolve()
+    head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
     candidates = []
-    repo = None
     for name in CONTROL_FILES:
-        current_repo, candidate, mode = _committed(source_dir, name)
-        if repo is not None and current_repo != repo:
+        current_repo, candidate, mode = _committed(source_dir, name, head)
+        if current_repo != repo:
             raise RuntimeError("control bundle source roots differ")
-        repo = current_repo
         target = runtime_dir / name
         previous = None
         previous_mode = None
@@ -92,7 +92,8 @@ def snapshot(source_dir: Path, runtime_dir: Path, backup_dir: Path):
             previous = target.read_bytes()
             previous_mode = stat.S_IMODE(target.stat().st_mode)
         candidates.append((name, candidate, mode, previous, previous_mode))
-    head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    if subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip() != head:
+        raise RuntimeError("control bundle source commit changed during snapshot")
     backup_dir.mkdir(mode=0o700, parents=False)
     rows = []
     for name, candidate, mode, previous, previous_mode in candidates:
