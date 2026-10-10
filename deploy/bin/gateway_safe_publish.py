@@ -1,20 +1,10 @@
 #!/usr/bin/env python3
-"""Publish a committed gateway after Halo runs and accepted calls have drained.
+"""Publish committed gateway bytes through externally owned Core maintenance.
 
-The gateway's /gateway/drain admission fence and /gateway/lanes.active share
-one event loop. A request either registered before the fence and is counted,
-or sees the fence and is refused with Retry-After before it can consume local
-or paid work. A bounded wait aborts and releases the fence; it never kills an
-accepted call to make a release finish on schedule.
-
-Halo's separate bounded start lease pauses new incident runs while its fast
-lease enforcer keeps existing repairs supervised. The publisher verifies that
-the installed supervisor honors the lease before draining gateway calls.
-
-L77 (2026-10-03): a publisher killed by SIGTERM/SIGHUP/SIGINT (e.g. an outer `timeout`) used to leave its Halo start pause
-standing until expiry, which blocked Halo incident runs for an hour. Termination signals are now converted to an exception
-so every `finally` runs (Halo pause released by token, drain fences closed, temp state removed). Both leases carry the
-owner pid so a SIGKILLed publisher's leftovers are taken over by the next publish (audit-logged) instead of refused.
+Snapshot exact files and unit activity before taking the existing engine hold
+and durable all-traffic drain. Qualification requires unchanged engine identity,
+loaded startup-module hashes, and a successful direct generation. Independent
+recovery owns interrupted transactions; retired Halo pause authority is untouched.
 """
 from __future__ import annotations
 
@@ -22,6 +12,7 @@ import argparse
 import contextlib
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -32,6 +23,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+import urllib.error
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
@@ -232,8 +224,10 @@ CONFIG_SCHEMA_NAME = "gateway_config_schema.py"
 # module-only change is a full publish, never the no-restart "current" path. (filename, result key). A module absent
 # from the source tree is "absent" (not an error); a first install is removed again on rollback.
 GATEWAY_MODULES = (
-    (CONFIG_SCHEMA_NAME, "config_schema"),
+    ("gateway_config_schema.py", "config_schema"),
+    ("experiment_controls.py", "experiment_controls"),
 )
+REQUIRED_GATEWAY_MODULES = frozenset({"experiment_controls.py"})
 
 
 def _module_names() -> list[str]:
@@ -247,6 +241,8 @@ def _module_sources() -> dict:
         src = SOURCE.with_name(name)
         if src.is_file():
             out[name] = src.read_bytes()
+        elif name in REQUIRED_GATEWAY_MODULES:
+            raise RuntimeError(f"required gateway module is missing: {name}")
     return out
 
 
@@ -382,9 +378,18 @@ def _refuse_if_offline_window(token: str, phase: str) -> None:
     st = _http("/gateway/offline", token=token)
     if st.get("http_status") not in (None, 200) or "offline" not in st:
         raise RuntimeError(f"planned-offline status unreadable before {phase}: {str(st)[:200]}")
-    if st.get("offline"):
+    if st.get("offline") is not False:
         raise RuntimeError(f"planned offline window open ({st.get('reason')!r} by {st.get('by')!r}, "
                            f"{st.get('remaining_s')} s left): publish refused at {phase}")
+    try:
+        measurement = _http("/gateway/measurement", token=token)
+    except urllib.error.HTTPError as error:
+        # Bootstrap only: the actual legacy shim has no measurement endpoint.
+        if error.code == 404 and b'"/gateway/measurement"' not in RUNTIME.read_bytes():
+            return
+        raise RuntimeError("measurement authority is unreadable") from error
+    if measurement.get("active") is not False:
+        raise RuntimeError(f"measurement window active or unknown at {phase}")
 
 
 def _halo_active_runs() -> list[str]:
@@ -516,16 +521,29 @@ def _wait_halo_quiet(timeout_s: float) -> None:
         time.sleep(3)
 
 
-def _wait_empty(token: str, timeout_s: float) -> None:
+def _wait_empty(token: str, timeout_s: float, state=None) -> None:
     deadline = time.monotonic() + timeout_s
+    zero_polls = 0
     while time.monotonic() < deadline:
+        if state is not None:
+            _renew_publish_hold(state)
+            _assert_engine(state["engine"])
         drain = _http("/gateway/drain", token=token)
         spend = _http("/gateway/spend", token=token)
-        if not drain.get("draining") or float(drain.get("until") or 0) - time.time() < 30:
+        if (drain.get("draining") is not True or drain.get("invalid_state")
+                or (drain.get("durable") is not True and float(drain.get("until") or 0) - time.time() < 30)):
             raise RuntimeError("drain lease expired before accepted calls completed")
-        if int(drain.get("active") or 0) == 0 and int(spend.get("in_flight") or 0) == 0:
+        if state is not None and drain.get("durable") is True and drain.get("lease_sha256") != _sha(state["lease"].encode()):
+            raise RuntimeError("durable drain has another lease owner")
+        if not _known_count(drain.get("active")) or not _known_count(spend.get("in_flight")):
+            raise RuntimeError("accepted-call counts are unknown")
+        engine = _controls().engine_inflight(_controls().ENGINE) if state is not None else {"running": 0, "waiting": 0}
+        if not isinstance(engine, dict) or not all(_known_count(engine.get(k)) for k in ("running", "waiting")):
+            raise RuntimeError("engine drain counts are unknown")
+        zero_polls = zero_polls + 1 if drain["active"] == spend["in_flight"] == engine["running"] == engine["waiting"] == 0 else 0
+        if zero_polls >= 2:
             return
-        time.sleep(3)
+        time.sleep(1)
     raise TimeoutError("accepted calls did not drain within the deployment bound")
 
 
@@ -602,176 +620,828 @@ def _fence_failed_release(token: str, timeout_s: float) -> str:
     return lease
 
 
-def publish(timeout_s: float = 1500, halo_wait_s: float = 1800) -> dict:
-    """Publish with termination-safe leases: SIGTERM/SIGHUP/SIGINT become PublishTerminated and the finally releases."""
-    with _terminate_as_exception():
-        return _publish(timeout_s, halo_wait_s)
+PUBLISH_STATE_ROOT = RUNTIME.parent / "gateway-publications"
+DURABLE_DRAIN_STATE = RUNTIME.parent / "gateway-drain-state.json"
+MAINTENANCE_UNITS = ("estate-self-repair.timer", "estate-self-repair.service", "estate-core.service")
+CONTROL_CODE = ("gateway_safe_publish.py", "windowctl.py", "experiment_controls.py", "gpuguard.py", "unitrun.py",
+                "gateway_publish_bundle.py")
+_CONTROL_API = None
 
 
-def _publish(timeout_s: float, halo_wait_s: float) -> dict:
-    if not 1 <= timeout_s <= 1700:
-        raise ValueError("timeout_s must be 1..1700")
-    if not 1 <= halo_wait_s <= 1800:
-        raise ValueError("halo_wait_s must be 1..1800")
-    source = SOURCE.read_bytes()
-    committed = subprocess.check_output(["git", "show", "HEAD:deploy/bin/keepalive-shim.py"], cwd=REPO)
-    if source != committed:
-        raise RuntimeError("gateway source differs from committed HEAD")
-    dash = DASH_SOURCE.read_bytes()
-    dash_committed = subprocess.check_output(["git", "show", "HEAD:deploy/bin/gateway_dashboard.html"], cwd=REPO)
-    if dash != dash_committed:
-        raise RuntimeError("dashboard source differs from committed HEAD")
-    modules = _module_sources()
-    for name, data in modules.items():
-        if data != subprocess.check_output(["git", "show", "HEAD:deploy/bin/" + name], cwd=REPO):
+def _controls():
+    """Use the existing window controller's typed unit, hold and canary mechanics."""
+    global _CONTROL_API
+    if _CONTROL_API is None:
+        sys.path.insert(0, str(HERE))
+        spec = importlib.util.spec_from_file_location("gateway_publish_window_controls", HERE / "windowctl.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _CONTROL_API = module
+    _CONTROL_API.ACTUATOR = str(ACTUATOR)
+    return _CONTROL_API
+
+
+def _bundle():
+    spec = importlib.util.spec_from_file_location("gateway_publish_bundle", HERE / "gateway_publish_bundle.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _refuse_core_cgroup():
+    try:
+        groups = Path("/proc/self/cgroup").read_text()
+    except OSError as error:
+        raise RuntimeError("publication cgroup is unreadable") from error
+    if any("estate-core.service" in row.split("/") for row in groups.splitlines()):
+        raise RuntimeError("Core cannot pause its own control-group; use externally owned --submit maintenance")
+
+
+def _known_count(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _assert_engine(expected):
+    if not expected or _controls().runtime_identity(_controls().ENGINE_UNIT) != expected:
+        raise RuntimeError("engine process generation or exact serving configuration changed")
+
+
+def _hold_call(*args):
+    row = _controls().actuator_hold(*args, timeout=30)
+    if not isinstance(row, dict) or row.get("error") or row.get("refused"):
+        raise RuntimeError("engine actuator hold authority unavailable or refused")
+    return row
+
+
+def _acquire_publish_hold(ttl_s):
+    # Plain acquire-mode survives writer death; recovery renews the bounded
+    # lease. An owned hold would become void exactly when recovery is needed.
+    row = _hold_call("acquire", "--kind", "engine", "--by", "gateway-safe-publish",
+                     "--reason", "governed gateway publication and independent recovery", "--ttl", str(int(ttl_s)))
+    if not row.get("lease"):
+        raise RuntimeError("engine actuator did not grant a publication hold")
+    return row["lease"]
+
+
+def _renew_publish_hold(state):
+    if state.get("actuator_sha256") and (not ACTUATOR.is_file() or _sha(ACTUATOR.read_bytes()) != state["actuator_sha256"]):
+        raise RuntimeError("publication actuator code changed during maintenance")
+    if state.get("hold"):
+        row = _hold_call("renew", "--lease", state["hold"], "--ttl", "3600")
+        if row.get("lease") != state["hold"]:
+            raise RuntimeError("publication engine hold expired or changed owner")
+
+
+def _save_state(path, state):
+    _atomic_write(path, (json.dumps(state, sort_keys=True) + "\n").encode(), 0o600)
+
+
+@contextlib.contextmanager
+def _exclusive(path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError("another serving maintenance transaction holds " + path.name) from error
+        yield
+
+
+def _capture_committed():
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
+    sources = {"keepalive-shim.py": SOURCE.read_bytes(), "gateway_dashboard.html": DASH_SOURCE.read_bytes(), **_module_sources()}
+    code = {name: (HERE / name).read_bytes() for name in CONTROL_CODE}
+    for name, data in {**sources, **code}.items():
+        if data != subprocess.check_output(["git", "show", f"{head}:deploy/bin/{name}"], cwd=REPO):
             raise RuntimeError(f"{name} source differs from committed HEAD")
-    if not RUNTIME.is_file():
+    if DROPIN.read_bytes() != subprocess.check_output(["git", "show", f"{head}:deploy/systemd/vllm-keepalive-shim.service.d/zz-graceful-stop.conf"], cwd=REPO):
+        raise RuntimeError("graceful-stop prerequisite source differs from committed HEAD")
+    if head != subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip():
+        raise RuntimeError("publication HEAD changed during source capture")
+    return head, sources, code
+
+
+def _snapshot_files(directory, sources):
+    records = {}
+    backup = directory / "files"
+    backup.mkdir(mode=0o700)
+    for name, candidate in sources.items():
+        path = RUNTIME.with_name(name)
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise RuntimeError(f"nonregular runtime file: {name}")
+        old = path.read_bytes() if path.exists() else None
+        mode = path.stat().st_mode & 0o7777 if old is not None else None
+        if old is not None:
+            _atomic_write(backup / (name + ".previous"), old, 0o600)
+        _atomic_write(backup / (name + ".candidate"), candidate, 0o600)
+        records[name] = {"previous_sha256": _sha(old) if old is not None else None, "previous_mode": mode,
+                         "candidate_sha256": _sha(candidate), "candidate_mode": 0o755 if name == "keepalive-shim.py" else 0o644}
+    if records["keepalive-shim.py"]["previous_sha256"] is None:
         raise RuntimeError("live gateway file is missing")
-    previous = RUNTIME.read_bytes()
-    if previous == source and _modules_current(modules):
-        # Same gateway code AND the same startup-loaded modules: the page alone may still be new. It is read per
-        # request, so no drain or restart is needed. (Lane SH: a module-only change used to take this path -- the
-        # new module sat on disk unloaded until some later restart paired it with whatever shim was live then.)
-        state = _install_gateway_files(dash)
-        return {"status": "current", "sha256": _sha(source), "dashboard": state["dashboard"], "dashboard_sha256": _sha(dash),
-                "config_schema": state.get("config_schema")}
-    token = os.environ.get("SHIM_ADMIN_TOKEN") or TOKEN_FILE.read_text().strip()
+    return records
+
+
+def _file_matches(path, digest, mode):
+    if digest is None:
+        return not path.exists() and not path.is_symlink()
+    return (not path.is_symlink() and path.is_file() and _sha(path.read_bytes()) == digest
+            and path.stat().st_mode & 0o7777 == mode)
+
+
+def _apply_files(state_path, state, restored=False):
+    which = "previous" if restored else "candidate"
+    # Refuse a foreign writer before touching any destination.
+    for name, row in state["files"].items():
+        if not any(_file_matches(RUNTIME.with_name(name), row[k + "_sha256"], row[k + "_mode"])
+                   for k in ("previous", "candidate")):
+            raise RuntimeError(f"runtime file changed outside publication: {name}")
+    captured = {}
+    for name, row in state["files"].items():
+        if row[which + "_sha256"] is not None:
+            data = (state_path.parent / "files" / (name + "." + which)).read_bytes()
+            if _sha(data) != row[which + "_sha256"]:
+                raise RuntimeError(f"publication backup hash mismatch: {name}")
+            captured[name] = data
+    for name, row in state["files"].items():
+        path = RUNTIME.with_name(name)
+        if row[which + "_sha256"] is None:
+            path.unlink(missing_ok=True)
+            continue
+        _atomic_write(path, captured[name], row[which + "_mode"])
+    if not _files_verified(state, restored):
+        raise RuntimeError("publication file readback mismatch")
+
+
+def _files_verified(state, restored=False):
+    which = "previous" if restored else "candidate"
+    return all(_file_matches(RUNTIME.with_name(name), row[which + "_sha256"], row[which + "_mode"])
+               for name, row in state["files"].items())
+
+
+def _persist_bootstrap_fence(opened):
+    lease, until = opened.get("lease"), opened.get("until")
+    if not isinstance(lease, str) or not re.fullmatch(r"[0-9a-f]{32}", lease) or not _known_count(opened.get("active")):
+        raise RuntimeError("gateway did not grant an identifiable drain")
+    if not isinstance(until, (int, float)) or isinstance(until, bool) or until - time.time() < 30:
+        raise RuntimeError("gateway granted an expired drain")
+    if DURABLE_DRAIN_STATE.exists():
+        info = DURABLE_DRAIN_STATE.stat()
+        if DURABLE_DRAIN_STATE.is_symlink() or not DURABLE_DRAIN_STATE.is_file() or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise RuntimeError("untrusted durable drain file")
+        prior = json.loads(DURABLE_DRAIN_STATE.read_text())
+        if prior.get("lease") != lease or prior.get("durable") is not True:
+            raise RuntimeError("unknown durable drain owner")
+        return
+    row = {"v": 1, "durable": True, "lease": lease, "until": until, "reason": "governed gateway publish",
+           "record": {"t0": time.time(), "reason": "governed gateway publish", "by": _BY, "ttl_s": 1800,
+                      "active_at_open": opened["active"], "refused": 0, "refused_by_client": {}}}
+    _atomic_write(DURABLE_DRAIN_STATE, (json.dumps(row, sort_keys=True) + "\n").encode(), 0o600)
+
+
+def _arm_recovery(state_path, state):
+    unit = state["recovery_unit"]
+    # Snapshot executable code: recovery must not follow later checkout edits.
+    program = state_path.parent / "code" / "gateway_safe_publish.py"
+    env = {**_controls().CONTROL_ENV, "ENGINE_ACTUATOR": str(ACTUATOR)}
+    argv = ["systemd-run", "--user", f"--unit={unit}", "--collect", "--quiet", "--expand-environment=no",
+            "--on-active=30", "--on-unit-active=30", "--timer-property=AccuracySec=5s",
+            *[f"--setenv={k}={v}" for k, v in env.items()], "/usr/bin/python3", str(program), "--recover", str(state_path)]
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+    if result.returncode:
+        raise RuntimeError("independent publication recovery timer could not be armed")
+
+
+def _restore_units(state):
+    # Core resumes first, repair service next, timer last. Inactive units remain
+    # inactive; a new process PID is expected for an originally active service.
+    for unit in reversed(state["pause_units"]):
+        original = state["unit_states"][unit]
+        current = _controls().user_unit_state(unit)
+        if current == "unknown" or (current != original and not _controls().set_user_unit(unit, original == "active")):
+            raise RuntimeError(f"user unit restoration failed: {unit}")
+        if _controls().user_unit_state(unit) != original:
+            raise RuntimeError(f"user unit restoration readback failed: {unit}")
+
+
+def _pause_units(state):
+    for unit in state["pause_units"]:
+        current = _controls().user_unit_state(unit)
+        if current not in ("active", "inactive"):
+            raise RuntimeError(f"maintenance unit activity is unknown: {unit}")
+        if current == "active" and (not _controls().set_user_unit(unit, False)
+                                    or _controls().user_unit_state(unit) != "inactive"):
+            raise RuntimeError(f"maintenance stop/readback failed: {unit}")
+
+
+def _recover_qualified_fence(token, state_path, state):
+    """Partial release is retried under new qualification, never rollback."""
+    _assert_engine(state["engine"])
+    restored = state.get("qualified") == "previous"
+    if not _files_verified(state, restored) or (state.get("bundle") and not _bundle().verify(state["bundle"], restored=restored)):
+        raise RuntimeError("qualified publication bytes changed before recovery")
+    _refuse_if_offline_window(token, "recovery")
+    drain = _http("/gateway/drain", token=token)
+    if drain.get("draining") is True:
+        if (drain.get("durable") is not True or drain.get("invalid_state")
+                or drain.get("lease_sha256") != _sha(state["lease"].encode())):
+            raise RuntimeError("qualified recovery drain has an unknown owner")
+        opened = _http("/gateway/drain", "POST", {"ttl_s": 1800, "durable": True, "lease": state["lease"]}, token)
+    elif drain.get("draining") is False and not DURABLE_DRAIN_STATE.exists():
+        opened = _http("/gateway/drain", "POST", {"ttl_s": 1800, "durable": True,
+                       "reason": "qualified publication recovery", "by": _BY}, token)
+        state["lease"] = opened.get("lease")
+        _save_state(state_path, state)
+    else:
+        raise RuntimeError("qualified recovery drain state is unknown")
+    _persist_bootstrap_fence(opened)
+    _pause_units(state)
+    _assert_engine(state["engine"])
+    if not ACTUATOR.is_file() or _sha(ACTUATOR.read_bytes()) != state["actuator_sha256"]:
+        raise RuntimeError("publication actuator code changed during recovery")
+    row = _controls().actuator_hold("renew", "--lease", state["hold"], "--ttl", "3600", timeout=30)
+    if isinstance(row, dict) and row.get("refused") == "no such live hold (released, expired, or its holder died)":
+        state["hold"] = _acquire_publish_hold(3600)  # existing authority refuses any foreign holder
+        _save_state(state_path, state)
+    elif not isinstance(row, dict) or row.get("error") or row.get("refused") or row.get("lease") != state["hold"]:
+        raise RuntimeError("qualified publication hold recovery failed")
+    state.update(drain_closed=False, hold_closed=False, units_restored=False)
+    _save_state(state_path, state)
+    _wait_empty(token, 120, state)
+
+
+def _retain_qualified_fence(token, state_path, state):
+    """Failed cleanup cannot leave the current process admitting new work."""
+    try:
+        _pause_units(state)
+    except Exception as error:
+        state["producer_pause_error"] = type(error).__name__
+    try:
+        drain = _http("/gateway/drain", token=token)
+        if (drain.get("draining") is True and drain.get("durable") is True and not drain.get("invalid_state")
+                and drain.get("lease_sha256") == _sha(state["lease"].encode())):
+            opened = _http("/gateway/drain", "POST", {"ttl_s": 1800, "durable": True, "lease": state["lease"]}, token)
+        elif drain.get("draining") is False and not DURABLE_DRAIN_STATE.exists():
+            opened = _http("/gateway/drain", "POST", {"ttl_s": 1800, "durable": True,
+                           "reason": "qualified publication cleanup incomplete", "by": _BY}, token)
+            state["lease"] = opened.get("lease")
+            _save_state(state_path, state)
+        else:
+            raise RuntimeError("cleanup admission fence is unknown")
+        _persist_bootstrap_fence(opened)
+        state["drain_closed"] = False
+        _save_state(state_path, state)
+    except Exception as error:
+        state["fence_retention_error"] = type(error).__name__
+        state["deadline"] = time.time() + 1900  # allow the verified accepted-call stop grace
+        with contextlib.suppress(OSError):
+            _save_state(state_path, state)
+        _run("sudo", "-n", "systemctl", "stop", SERVICE)
+        if _controls().main_pid(SERVICE) != 0:
+            raise RuntimeError("failed qualification cleanup could not stop gateway admission")
+        state["status"] = "manual-recovery-required"
+        _save_state(state_path, state)
+
+
+def _qualify(token, state, *, restored=False, require_new=False):
+    _renew_publish_hold(state)
+    _assert_engine(state["engine"])
+    pid = _controls().main_pid(SERVICE)
+    proc = _proc_stat(pid) if isinstance(pid, int) and pid > 0 else None
+    if not proc or proc[0] in {"Z", "X"} or (require_new and pid == state["gateway_pid"]):
+        raise RuntimeError("gateway restart did not produce a new SYSTEM-unit PID")
     if _http("/health", token=token).get("http_status") != 200:
         raise RuntimeError("gateway health unreadable")
     spend = _http("/gateway/spend", token=token)
-    if not (spend.get("enforce") and spend.get("durable") and float(spend.get("cap") or 0) == 25.0):
-        raise RuntimeError("hard $25 spend authority is not healthy")
-    drain_before = _http("/gateway/drain", token=token)
-    if drain_before.get("draining") and not _reap_orphan_drain(token):
-        raise RuntimeError("another publisher already holds the drain lease")
-    _refuse_if_offline_window(token, "start")
+    which = "previous" if restored else "candidate"
+    if not (spend.get("enforce") is True and spend.get("durable") is True and spend.get("cap") == 25.0
+            and spend.get("attribution_gap_usd") == 0
+            and spend.get("gateway_sha256") == state["files"]["keepalive-shim.py"][which + "_sha256"]):
+        raise RuntimeError("gateway spend/source readback failed")
+    drain = _http("/gateway/drain", token=token)
+    if (drain.get("draining") is not True or drain.get("durable") is not True or drain.get("invalid_state")
+            or drain.get("lease_sha256") != _sha(state["lease"].encode())):
+        raise RuntimeError("restarted gateway did not retain the durable all-traffic fence")
+    persisted = json.loads(DURABLE_DRAIN_STATE.read_text())
+    if persisted.get("lease") != state["lease"] or persisted.get("durable") is not True:
+        raise RuntimeError("durable publication fence readback failed")
+    sources = {name: RUNTIME.with_name(name).read_bytes() for name in _module_names()
+               if state["files"].get(name, {}).get(which + "_sha256") is not None}
+    if not _modules_loaded_match(token, sources) or not _files_verified(state, restored):
+        raise RuntimeError("published file or startup-module readback failed")
+    if state.get("bundle") and not _bundle().verify(state["bundle"], restored=restored):
+        raise RuntimeError("control bundle readback failed")
+    canary = _controls().restoration_generation(state["engine"], timeout=60)
+    _assert_engine(state["engine"])
+    after = _proc_stat(pid)
+    if _controls().main_pid(SERVICE) != pid or not after or after[0] in {"Z", "X"} or after[1] != proc[1]:
+        raise RuntimeError("gateway generation changed during qualification")
+    if (not isinstance(canary, dict) or canary.get("ok") is not True or canary.get("runtime_unchanged") is not True
+            or canary.get("finish_reason") != "stop" or not _known_count(canary.get("completion_tokens"))
+            or canary["completion_tokens"] <= 0):
+        raise RuntimeError("engine did not complete the direct successful generation canary")
+    state["gateway_generation"] = {"pid": pid, "pid_start": proc[1]}
+    return canary
 
-    halo_pause = None
-    live_hold = None
-    lease = None
-    rollback_lease = None
-    backup = None
-    installed = False
-    dash_state = {"changed": False}
+
+def _finish_release(token, state_path, state, restored=False):
+    # Qualification has completed while producers and all traffic remain held.
+    state["qualified"] = "previous" if restored else "candidate"
+    _save_state(state_path, state)
+    _restore_units(state)
+    _assert_engine(state["engine"])
+    state["units_restored"] = True
+    _save_state(state_path, state)
+    if state.get("lease"):
+        current = _http("/gateway/drain", token=token)
+        if current.get("draining") is True:
+            result = _http("/gateway/drain", "DELETE", {"lease": state["lease"]}, token)
+            if result.get("draining") is not False:
+                raise RuntimeError("qualified gateway did not close the owned drain")
+        elif current.get("draining") is not False or DURABLE_DRAIN_STATE.exists():
+            raise RuntimeError("qualified drain release state is unknown")
+        # A bootstrap old process does not delete the new durable state itself.
+        if DURABLE_DRAIN_STATE.exists():
+            row = json.loads(DURABLE_DRAIN_STATE.read_text())
+            if row.get("lease") != state["lease"]:
+                raise RuntimeError("durable drain ownership changed during release")
+            DURABLE_DRAIN_STATE.unlink()
+            fd = os.open(DURABLE_DRAIN_STATE.parent, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        state["drain_closed"] = True
+        _save_state(state_path, state)
+    if state.get("hold"):
+        _assert_engine(state["engine"])
+        if _hold_call("release", "--lease", state["hold"]).get("released") != 1:
+            raise RuntimeError("publication engine hold release failed")
+        state["hold_closed"] = True
+        _save_state(state_path, state)
+    state["status"] = "rolled-back" if restored else "published"
+    state["finished"] = time.time()
+    _save_state(state_path, state)
     try:
-        halo_pause = _begin_halo_quiesce(halo_wait_s, timeout_s)
-        _assert_halo_quiesce_live(halo_pause)
-        live_hold = _liveness_hold(halo_wait_s + timeout_s + 300)
-        _wait_halo_quiet(halo_wait_s)
-        # Unit readiness is installed without stopping the current process.
-        _run("sudo", "-n", "install", "-D", "-m", "0644", str(DROPIN), str(DROPIN_LIVE))
-        _run("sudo", "-n", "systemctl", "daemon-reload")
-        stop_time = _unit_seconds(subprocess.check_output(["systemctl", "show", "-p", "TimeoutStopUSec",
-                                                           "--value", SERVICE], text=True).strip())
-        if stop_time < 1830:
-            raise RuntimeError("systemd stop timeout is shorter than accepted-call grace")
-        backup = RUNTIME.with_name(f"{RUNTIME.name}.bak-{int(time.time())}-{os.getpid()}")
-        _atomic_write(backup, previous)
-        opened = _http("/gateway/drain", "POST", {"ttl_s": 1800, "reason": "governed gateway publish", "by": _BY}, token)
-        lease = opened["lease"]
-        _record_drain(lease)
-        _mark_halo_quiesce_phase(halo_pause, "draining")
-        _wait_empty(token, timeout_s)
-        # The minute scheduler and ten-second enforcer share this lock. Hold
-        # it only across the final active-run check and quick restart, never
-        # during the potentially long drain.
-        with HALO_SUPERVISOR_LOCK.open("a+") as guard:
-            fcntl.flock(guard, fcntl.LOCK_EX)
-            active = _halo_active_runs()
-            if active:
-                raise RuntimeError(f"Halo became active during gateway drain: {active[:6]}")
-            _refuse_if_offline_window(token, "restart")    # one opened during the Halo wait, before the fence went up
-            dash_state = _install_gateway_files(dash)  # before the restart: the new shim finds its page at once
-            _atomic_write(RUNTIME, source)
-            installed = True
+        cleanup = subprocess.run(["systemctl", "--user", "stop", state["recovery_unit"] + ".timer"],
+                                 capture_output=True, timeout=30)
+        if cleanup.returncode:
+            _audit("recovery-timer-cleanup-pending", receipt=str(state_path))
+    except (OSError, subprocess.SubprocessError):
+        _audit("recovery-timer-cleanup-pending", receipt=str(state_path))
+
+
+def _supports_durable(data):
+    import ast
+    try:
+        return any(isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "DURABLE_DRAIN_PROTOCOL" for t in n.targets)
+                   and isinstance(n.value, ast.Constant) and n.value.value == 1 for n in ast.parse(data).body)
+    except (SyntaxError, ValueError):
+        return False
+
+
+def _rollback(token, state_path, state):
+    _renew_publish_hold(state)
+    _assert_engine(state["engine"])
+    if state.get("drain_requested") and not state.get("lease"):
+        raise RuntimeError("drain grant is unknown; automatic release cannot invent its owner")
+    _pause_units(state)
+    if state.get("restart_intent"):
+        # Never restore files underneath uncounted accepted work.
+        _wait_empty(token, 120, state)
+        _apply_files(state_path, state, restored=True)
+        if state.get("bundle"):
+            _bundle().restore(state["bundle"])
+        previous = (state_path.parent / "files" / "keepalive-shim.py.previous").read_bytes()
+        if not _supports_durable(previous):
+            state["deadline"] = time.time() + 1900
+            _save_state(state_path, state)
+            _run("sudo", "-n", "systemctl", "stop", SERVICE)
+            if _controls().main_pid(SERVICE) != 0:
+                raise RuntimeError("legacy rollback gateway stop did not clear the SYSTEM-unit PID")
+            state["status"] = "manual-recovery-required"
+            _save_state(state_path, state)
+            raise RuntimeError("legacy rollback has no durable all-traffic fence; exact files restored, gateway kept stopped")
+        state["gateway_pid"] = _controls().main_pid(SERVICE)
+        _save_state(state_path, state)
+        _run("sudo", "-n", "systemctl", "restart", SERVICE)
+        state["generation_canary"] = _qualify(token, state, restored=True, require_new=True)
+    else:
+        # Original process still has the owned in-memory fence. Verify original
+        # bytes and exact engine generation before restoring its producer state.
+        _apply_files(state_path, state, restored=True)
+        if state.get("bundle"):
+            _bundle().restore(state["bundle"])
+        _assert_engine(state["engine"])
+        state["generation_canary"] = _controls().restoration_generation(state["engine"], timeout=60)
+        if (state["generation_canary"].get("ok") is not True or state["generation_canary"].get("runtime_unchanged") is not True
+                or state["generation_canary"].get("finish_reason") != "stop"
+                or not _known_count(state["generation_canary"].get("completion_tokens"))
+                or state["generation_canary"]["completion_tokens"] <= 0):
+            raise RuntimeError("original engine generation canary failed during abort")
+        _assert_engine(state["engine"])
+    _finish_release(token, state_path, state, restored=True)
+
+
+def _legacy_fallback(state_path, state):
+    """A bootstrap fence cannot rely on a legacy process's expiring memory.
+
+    A manual SYSTEM-unit stop honors its verified accepted-call grace. It does
+    not restart or modify the engine and prevents TTL from reopening generation.
+    """
+    if state.get("qualified") == "candidate":
+        return  # already qualified bytes must never be reverted by release cleanup
+    if not state.get("lease") and not state.get("drain_requested"):
+        return
+    previous = (state_path.parent / "files" / "keepalive-shim.py.previous").read_bytes()
+    if _supports_durable(previous):
+        return
+    state["deadline"] = time.time() + 1900
+    with contextlib.suppress(OSError):
+        _save_state(state_path, state)
+    try:
+        _pause_units(state)
+        _renew_publish_hold(state)
+    except Exception as error:
+        state["fallback_authority_error"] = type(error).__name__
+        with contextlib.suppress(OSError):
+            _save_state(state_path, state)
+    _run("sudo", "-n", "systemctl", "stop", SERVICE)
+    if _controls().main_pid(SERVICE) != 0:
+        raise RuntimeError("legacy recovery fallback did not stop the gateway SYSTEM unit")
+    _apply_files(state_path, state, restored=True)
+    if state.get("bundle"):
+        _bundle().restore(state["bundle"])
+    state["status"] = "manual-recovery-required"
+    _save_state(state_path, state)
+
+
+def publish(timeout_s: float = 1500, halo_wait_s: float = 1800, *, control_bundle=None, state_dir=None, expected_head=None) -> dict:
+    """External maintenance transaction; interrupted work remains owned by recovery."""
+    with _terminate_as_exception(), _exclusive(Path("/tmp/vllm-gateway-publish.lock")), _exclusive(_controls().LOCK):
+        return _publish(timeout_s, halo_wait_s, control_bundle=control_bundle, state_dir=state_dir, expected_head=expected_head)
+
+
+def _publish(timeout_s: float, halo_wait_s: float, *, control_bundle=None, state_dir=None, expected_head=None) -> dict:
+    if not 1 <= timeout_s <= 1700 or not 1 <= halo_wait_s <= 1800:
+        raise ValueError("publication waits outside documented bounds")
+    if control_bundle not in (None, "model-switch"):
+        raise ValueError("unknown opt-in control bundle")
+    _refuse_core_cgroup()
+    head, sources, code = _capture_committed()
+    if expected_head is not None and head != expected_head:
+        raise RuntimeError("publisher HEAD differs from the requested committed HEAD")
+    token = os.environ.get("SHIM_ADMIN_TOKEN") or TOKEN_FILE.read_text().strip()
+    if not token:
+        raise RuntimeError("configured gateway admin token is required")
+    # These gates also run for a no-op/page-only publication. It must not be a
+    # way around active windows or unknown serving authority.
+    _refuse_if_offline_window(token, "start")
+    drain = _http("/gateway/drain", token=token)
+    spend = _http("/gateway/spend", token=token)
+    if (drain.get("draining") is not False or not _known_count(drain.get("active"))
+            or not _known_count(spend.get("in_flight")) or spend.get("enforce") is not True
+            or spend.get("durable") is not True or spend.get("cap") != 25.0
+            or spend.get("attribution_gap_usd") != 0):
+        raise RuntimeError("gateway drain/spend authority is unknown or already owned")
+    if DURABLE_DRAIN_STATE.exists():
+        raise RuntimeError("an unresolved durable gateway drain requires recovery")
+    # Host prerequisite, not a publication mutation: exact rollback must not
+    # leave a newly installed privileged drop-in behind.
+    grace = _unit_seconds(subprocess.check_output(["systemctl", "show", "-p", "TimeoutStopUSec", "--value", SERVICE], text=True).strip())
+    if not DROPIN_LIVE.is_file() or DROPIN_LIVE.read_bytes() != DROPIN.read_bytes() or grace < 1830:
+        raise RuntimeError("committed graceful-stop host prerequisite is not installed")
+    api = _controls()
+    engine = api.runtime_identity(api.ENGINE_UNIT)
+    if not engine:
+        raise RuntimeError("engine runtime identity is unreadable")
+    gateway_pid = api.main_pid(SERVICE)
+    gateway_stat = _proc_stat(gateway_pid) if isinstance(gateway_pid, int) and gateway_pid > 0 else None
+    if not gateway_stat or gateway_stat[0] in {"Z", "X"}:
+        raise RuntimeError("gateway SYSTEM-unit generation is unreadable")
+    unit_states = {unit: api.user_unit_state(unit) for unit in MAINTENANCE_UNITS}
+    if any(value not in ("active", "inactive") for value in unit_states.values()):
+        raise RuntimeError("maintenance unit activity is unknown")
+    directory = Path(state_dir) if state_dir else PUBLISH_STATE_ROOT / ("publish-" + secrets.token_hex(12))
+    if directory.resolve().parent != PUBLISH_STATE_ROOT.resolve():
+        raise RuntimeError("publication state must be under its private transaction root")
+    directory.mkdir(mode=0o700, parents=True, exist_ok=state_dir is not None)
+    state_path = directory / "state.json"
+    state = {"v": 1, "transaction": directory.name, "status": "preparing", "source_head": head,
+             **_own_stamp(), "deadline": time.time() + timeout_s + 300, "engine": engine,
+             "gateway_pid": gateway_pid, "gateway_start": gateway_stat[1], "pause_units": list(MAINTENANCE_UNITS),
+             "unit_states": unit_states, "hold": None, "lease": None, "installed": False, "restart_intent": False,
+             "recovery_unit": "gateway-publish-" + secrets.token_hex(12) + "-recovery",
+             "control_bundle": control_bundle, "files": _snapshot_files(directory, sources),
+             "actuator_sha256": _sha(ACTUATOR.read_bytes())}
+    (directory / "code").mkdir(mode=0o700)
+    for name, data in code.items():
+        _atomic_write(directory / "code" / name, data, 0o600)
+    state["code_hashes"] = {name: _sha(data) for name, data in code.items()}
+    if control_bundle:
+        state["bundle"] = _bundle().snapshot(HERE, RUNTIME.parent, directory / "control-files")
+    _save_state(state_path, state)  # exact snapshots precede every maintenance action
+    PUBLISH_STATE_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _atomic_write(PUBLISH_STATE_ROOT / "active.json", (json.dumps({"receipt": str(state_path), "source_head": head}) + "\n").encode(), 0o600)
+    _arm_recovery(state_path, state)
+    try:
+        state["hold"] = _acquire_publish_hold(max(3600, timeout_s + 900))
+        _save_state(state_path, state)
+        _refuse_if_offline_window(token, "fence")
+        state["drain_requested"] = True
+        _save_state(state_path, state)
+        opened = _http("/gateway/drain", "POST", {"ttl_s": 1800, "durable": True,
+                       "reason": "governed gateway publish", "by": _BY}, token)
+        state["lease"] = opened.get("lease")
+        _save_state(state_path, state)  # grant survives a kill before bootstrap persistence
+        _persist_bootstrap_fence(opened)
+        _pause_units(state)
+        _assert_engine(engine)
+        _wait_empty(token, timeout_s, state)
+        _refuse_if_offline_window(token, "restart")
+        _renew_publish_hold(state)
+        _assert_engine(engine)
+        state["installed"] = True  # partial atomic install is also recoverable
+        state["status"] = "installing"
+        _save_state(state_path, state)
+        _apply_files(state_path, state)
+        if state.get("bundle"):
+            _bundle().install(state["bundle"])
+        restart = any(row["previous_sha256"] != row["candidate_sha256"]
+                      for name, row in state["files"].items() if name != "gateway_dashboard.html")
+        # A legacy process must restart once to gain durable admission, even if
+        # its source happens to compare equal to an incomplete deployment.
+        restart = restart or _http("/gateway/drain", token=token).get("durable") is not True
+        if restart:
+            state["restart_intent"] = True
+            _save_state(state_path, state)
             _run("sudo", "-n", "systemctl", "restart", SERVICE)
-        for _ in range(30):
+        state["status"] = "qualifying"
+        _save_state(state_path, state)
+        deadline = time.monotonic() + 90
+        while True:
             try:
-                health = _http("/health", token=token)
-                new_spend = _http("/gateway/spend", token=token)
-                if (health.get("http_status") == 200 and new_spend.get("gateway_sha256") == _sha(source)
-                        and new_spend.get("enforce") and new_spend.get("durable")
-                        and new_spend.get("attribution_gap_usd", 0) == 0
-                        and _modules_loaded_match(token, modules)):
-                    return {"status": "published", "sha256": _sha(source), "dashboard": dash_state["dashboard"] if "dashboard" in dash_state else "current",
-                            "dashboard_sha256": _sha(dash), "backup": str(backup), "spent": new_spend.get("spent"),
-                            "config_schema": dash_state.get("config_schema")}
-            except Exception:
-                pass
-            time.sleep(1)
-        raise RuntimeError("new gateway failed health/spend/readback checks")
-    except PublishTerminated as term:
-        # Killed (outer timeout, operator, logout). Do not start a long fenced rollback inside a dying process: release
-        # every lease in the finally below and say loudly what state the gateway is in.
-        if installed:
-            _audit("terminated-after-install", signal=term.signum, backup=str(backup),
-                   note="new gateway file installed and restarted but NOT verified; roll back from the backup if it is unhealthy")
-        else:
+                state["generation_canary"] = _qualify(token, state, require_new=restart)
+                break
+            except (OSError, RuntimeError, urllib.error.URLError):
+                # An engine change is irreversible for this publisher: don't
+                # wait or overwrite it with a gateway rollback.
+                _assert_engine(engine)
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(1)
+        _finish_release(token, state_path, state)
+        return _receipt(state_path, state)
+    except BaseException as error:
+        state["error"] = type(error).__name__ + ": " + str(error)[:300]
+        # A qualified candidate is not rolled back because timer cleanup or
+        # producer restoration failed. Recovery finishes that same release.
+        if state.get("qualified") == "candidate":
+            state["status"] = "release-pending"
             with _shielded():
-                _restore_gateway_files(dash_state)
-            _audit("terminated-before-install", signal=term.signum)
-        raise
-    except Exception as publish_error:
-        if installed:
-            try:
-                rollback_lease = _fence_failed_release(token, timeout_s)
-            except Exception as fence_error:
-                raise RuntimeError(
-                    "gateway publish failed; automatic rollback refused because the new process "
-                    f"could not be safely drained: {fence_error}"
-                ) from publish_error
-            with HALO_SUPERVISOR_LOCK.open("a+") as guard:
-                fcntl.flock(guard, fcntl.LOCK_EX)
-                active = _halo_active_runs()
-                if active:
-                    raise RuntimeError(
-                        f"gateway rollback refused while Halo runs are active: {active[:6]}") from publish_error
-                _atomic_write(RUNTIME, previous)
-                _restore_gateway_files(dash_state)
-                _run("sudo", "-n", "systemctl", "restart", SERVICE)
-        else:
-            _restore_gateway_files(dash_state)
-        raise
-    finally:
-        with _shielded():
-            release_errors = []
-            for held in (lease, rollback_lease):
-                _release_drain(token, held)
-            _liveness_release(live_hold)
-            if backup is not None and not installed:
                 with contextlib.suppress(OSError):
-                    backup.unlink(missing_ok=True)       # a publish that never swapped the file has no use for its backup
-            try:
-                _end_halo_quiesce(halo_pause)           # halo_pause None: a signal landed before the token returned; match by pid
-            except Exception as exc:
-                release_errors.append(exc)
-                _audit("halo-pause-release-failed", error=repr(exc))
-        if release_errors and sys.exc_info()[0] is None:
-            raise release_errors[0]
+                    _save_state(state_path, state)
+                try:
+                    _retain_qualified_fence(token, state_path, state)
+                except BaseException as retention_error:
+                    state["retention_error"] = type(retention_error).__name__
+                    with contextlib.suppress(OSError):
+                        _save_state(state_path, state)
+        else:
+            state["status"] = "recovery-required"
+            _save_state(state_path, state)
+            with _shielded():
+                try:
+                    _rollback(token, state_path, state)
+                except BaseException as recovery_error:
+                    state["recovery_error"] = type(recovery_error).__name__ + ": " + str(recovery_error)[:300]
+                    if state.get("status") != "manual-recovery-required":
+                        state["status"] = "recovery-required"
+                    _save_state(state_path, state)
+                    try:
+                        _legacy_fallback(state_path, state)
+                    except BaseException as stop_error:
+                        state["fallback_error"] = type(stop_error).__name__
+                        _save_state(state_path, state)
+        _audit("publication-failed", receipt=str(state_path), status=state["status"], error=state["error"])
+        raise
+
+
+def _receipt(path, state):
+    status = "published" if state.get("status") == "published" else (
+        "recovery-required" if state.get("status") in ("rolled-back", "recovery-required", "manual-recovery-required") else "submitted")
+    return {"status": status,
+            "transaction": state["transaction"], "receipt": str(path), "source_head": state["source_head"],
+            "sha256": state["files"]["keepalive-shim.py"]["candidate_sha256"],
+            "modules": {name: state["files"][name]["candidate_sha256"] for name in _module_names() if name in state["files"]},
+            "control_bundle": state.get("control_bundle"), "qualified": state.get("qualified"),
+            "engine_fingerprint": state["engine"]["fingerprint"], "generation_canary": state.get("generation_canary"),
+            "gateway_generation": state.get("gateway_generation")}
+
+
+def _read_recovery(path):
+    path = Path(path)
+    if path.is_symlink() or path.parent.is_symlink():
+        raise RuntimeError("untrusted publication recovery journal")
+    path = path.resolve()
+    if (path.name != "state.json" or not path.is_file()
+            or path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077):
+        raise RuntimeError("untrusted publication recovery journal")
+    state = json.loads(path.read_text())
+    if (state.get("v") != 1 or state.get("transaction") != path.parent.name
+            or path.parent.parent != PUBLISH_STATE_ROOT.resolve()
+            or state.get("pause_units") != list(MAINTENANCE_UNITS)
+            or set(state.get("unit_states", {})) != set(MAINTENANCE_UNITS)
+            or any(v not in ("active", "inactive") for v in state["unit_states"].values())):
+        raise RuntimeError("invalid publication recovery journal")
+    allowed = {"keepalive-shim.py", "gateway_dashboard.html", *_module_names()}
+    if (not isinstance(state.get("files"), dict)
+            or not {"keepalive-shim.py", "gateway_dashboard.html", *REQUIRED_GATEWAY_MODULES}.issubset(state["files"])
+            or not set(state["files"]).issubset(allowed)):
+        raise RuntimeError("invalid publication recovery file manifest")
+    for row in state["files"].values():
+        for which in ("previous", "candidate"):
+            digest, mode = row.get(which + "_sha256"), row.get(which + "_mode")
+            if which == "previous" and digest is None and mode is None:
+                continue
+            if (not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                    or isinstance(mode, bool) or not isinstance(mode, int) or not 0 <= mode <= 0o7777):
+                raise RuntimeError("invalid publication recovery file metadata")
+    for name, digest in state.get("code_hashes", {}).items():
+        if name not in CONTROL_CODE or _sha((path.parent / "code" / name).read_bytes()) != digest:
+            raise RuntimeError("publication recovery code changed")
+    if set(state.get("code_hashes", {})) != set(CONTROL_CODE):
+        raise RuntimeError("publication recovery code manifest incomplete")
+    return path, state
+
+
+def recover(path):
+    path, state = _read_recovery(path)
+    if state.get("status") in ("published", "rolled-back"):
+        return _receipt(path, state)
+    if not _owner_dead(state) and time.time() < state["deadline"]:
+        return {"status": "pending", "receipt": str(path)}
+    if not _owner_dead(state):
+        # Stop only the exact publisher PID/start generation, never the Core
+        # control group or a pattern matching unrelated probes.
+        os.kill(state["pid"], signal.SIGTERM)
+        for _ in range(10):
+            if _owner_dead(state):
+                break
+            time.sleep(1)
+        if not _owner_dead(state):
+            raise RuntimeError("expired publisher still owns its recovery transaction")
+    _refuse_core_cgroup()
+    with _exclusive(Path("/tmp/vllm-gateway-publish.lock")), _exclusive(_controls().LOCK), _shielded():
+        token = ""
+        try:
+            if state.get("status") == "manual-recovery-required":
+                _renew_publish_hold(state)
+                return {"status": "recovery-required", "receipt": str(path), "why": "gateway remains stopped for manual recovery"}
+            token = os.environ.get("SHIM_ADMIN_TOKEN") or TOKEN_FILE.read_text().strip()
+            if state.get("qualified") in ("candidate", "previous"):
+                _recover_qualified_fence(token, path, state)
+                restored = state["qualified"] == "previous"
+                state["generation_canary"] = _qualify(token, state, restored=restored)
+                _finish_release(token, path, state, restored=restored)
+            else:
+                _renew_publish_hold(state)
+                _rollback(token, path, state)
+        except Exception as error:
+            state["recovery_error"] = type(error).__name__
+            with contextlib.suppress(OSError):
+                _save_state(path, state)
+            if state.get("qualified") == "candidate":
+                _retain_qualified_fence(token, path, state)
+            else:
+                _legacy_fallback(path, state)
+            raise
+    return _receipt(path, state)
+
+
+def _submission_unit_state(unit):
+    known = _controls().user_unit_state(unit)
+    if known != "unknown":
+        return known
+    # The maintenance snapshot deliberately rejects transitions. Submission
+    # has a different contract: a known loaded activating worker is pending.
+    try:
+        result = subprocess.run(["systemctl", "--user", "show", unit, "--property=LoadState,ActiveState"],
+                                capture_output=True, text=True, timeout=15)
+        values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+        if result.returncode == 0 and values.get("LoadState") == "loaded" and values.get("ActiveState") == "activating":
+            return "activating"
+    except (OSError, subprocess.SubprocessError, AttributeError):
+        pass
+    return "unknown"
+
+
+def submit(timeout_s=1500, halo_wait_s=1800, *, control_bundle=None, expected_head=None):
+    head, sources, _ = _capture_committed()
+    if expected_head is not None and expected_head != head:
+        raise RuntimeError("publisher HEAD differs from the Core's expected committed HEAD")
+    active = PUBLISH_STATE_ROOT / "active.json"
+    if active.exists():
+        pointer = json.loads(active.read_text())
+        if not Path(pointer["receipt"]).exists():
+            request = json.loads((Path(pointer["receipt"]).parent / "submission.json").read_text())
+            if request["source_head"] != head or request.get("control_bundle") != control_bundle:
+                raise RuntimeError("another committed publication subject is submitted")
+            if request.get("status") == "submission-failed" or _submission_unit_state(request["unit"] + ".service") not in ("active", "activating"):
+                return {"status": "recovery-required", "receipt": pointer["receipt"], "source_head": head}
+            return {"status": "submitted", **request, "sha256": _sha(sources["keepalive-shim.py"]),
+                    "modules": {n: _sha(sources[n]) for n in _module_names() if n in sources}}
+        path, state = _read_recovery(pointer["receipt"])
+        if state["source_head"] != head or state.get("control_bundle") != control_bundle:
+            if state.get("status") not in ("published", "rolled-back"):
+                raise RuntimeError("another committed publication subject is active")
+        elif state.get("status") == "published":
+            token = os.environ.get("SHIM_ADMIN_TOKEN") or TOKEN_FILE.read_text().strip()
+            if (not _files_verified(state) or not _modules_loaded_match(token, {n: sources[n] for n in _module_names() if n in sources})
+                    or (state.get("bundle") and not _bundle().verify(state["bundle"]))):
+                raise RuntimeError("completed publication receipt no longer matches runtime")
+            if _controls().runtime_identity(_controls().ENGINE_UNIT) == state["engine"]:
+                gateway = state.get("gateway_generation", {})
+                proc = _proc_stat(gateway.get("pid"))
+                if (_controls().main_pid(SERVICE) != gateway.get("pid")
+                        or not proc or proc[0] in {"Z", "X"} or proc[1] != gateway.get("pid_start")):
+                    # A loaded shim replacement must be qualified again too.
+                    gateway = None
+                _refuse_if_offline_window(token, "receipt")
+                health, spend = _http("/health", token=token), _http("/gateway/spend", token=token)
+                if (health.get("http_status") != 200 or spend.get("gateway_sha256") != _sha(sources["keepalive-shim.py"])
+                        or spend.get("enforce") is not True or spend.get("durable") is not True or spend.get("cap") != 25.0
+                        or spend.get("attribution_gap_usd") != 0):
+                    raise RuntimeError("completed publication authority readback failed")
+                if gateway is not None:
+                    return _receipt(path, state)
+            # A completed receipt belongs to its process generation. Requalify
+            # a later authorized engine generation through a fresh transaction.
+        elif state.get("status") in ("recovery-required", "manual-recovery-required", "rolled-back"):
+            return {"status": "recovery-required", "receipt": str(path), "source_head": head}
+        else:
+            return _receipt(path, state)
+    PUBLISH_STATE_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory = PUBLISH_STATE_ROOT / ("publish-" + secrets.token_hex(12))
+    directory.mkdir(mode=0o700)
+    unit = "gateway-publish-" + secrets.token_hex(12)
+    # Submission metadata is separate from the recovery journal created by the
+    # worker. It exists before launch, so the receipt survives its caller dying.
+    request = {"v": 1, "source_head": head, "transaction": directory.name, "unit": unit,
+               "receipt": str(directory / "state.json"), "control_bundle": control_bundle}
+    _atomic_write(directory / "submission.json", (json.dumps(request, sort_keys=True) + "\n").encode(), 0o600)
+    _atomic_write(active, (json.dumps(request, sort_keys=True) + "\n").encode(), 0o600)
+    env = {**_controls().CONTROL_ENV, "ENGINE_ACTUATOR": str(ACTUATOR)}
+    argv = ["systemd-run", "--user", f"--unit={unit}", "--collect", "--quiet", "--expand-environment=no",
+            "--property=KillMode=control-group", "--property=TimeoutStopSec=1800",
+            *[f"--setenv={k}={v}" for k, v in env.items()], "/usr/bin/python3", str(Path(__file__).resolve()),
+            "--apply", "--state-dir", str(directory), "--expected-head", head,
+            "--timeout-s", str(timeout_s), "--halo-wait-s", str(halo_wait_s)]
+    if control_bundle:
+        argv.extend(["--control-bundle", control_bundle])
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+    if result.returncode:
+        request["status"] = "submission-failed"
+        _atomic_write(directory / "submission.json", (json.dumps(request, sort_keys=True) + "\n").encode(), 0o600)
+        raise RuntimeError("independent publication unit could not be submitted")
+    return {"status": "submitted", **request, "sha256": _sha(sources["keepalive-shim.py"]),
+            "modules": {n: _sha(sources[n]) for n in _module_names() if n in sources}}
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--apply", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true")
+    mode.add_argument("--submit", action="store_true", help="dispatch independent maintenance; return a durable receipt")
+    mode.add_argument("--recover", metavar="STATE", help="independent recovery timer entry point")
     parser.add_argument("--timeout-s", type=float, default=1500)
-    parser.add_argument("--halo-wait-s", type=float, default=1800)
+    parser.add_argument("--halo-wait-s", type=float, default=1800, help="legacy CLI compatibility; no retired Halo authority is changed")
+    parser.add_argument("--control-bundle", choices=("model-switch",))
+    parser.add_argument("--state-dir", help="private transaction directory for a submitted worker")
+    parser.add_argument("--expected-head", help="exact committed source HEAD requested by Core")
     args = parser.parse_args()
-    if not args.apply:
+    if not (args.apply or args.submit or args.recover):
         print(json.dumps({"status": "preview", "source_sha256": _sha(SOURCE.read_bytes()),
                           "live_sha256": _sha(RUNTIME.read_bytes()),
                           "dashboard_source_sha256": _sha(DASH_SOURCE.read_bytes()),
-                          "dashboard_live_sha256": _sha(DASH_RUNTIME.read_bytes()) if DASH_RUNTIME.is_file() else None},
-                         sort_keys=True))
+                          "dashboard_live_sha256": _sha(DASH_RUNTIME.read_bytes()) if DASH_RUNTIME.is_file() else None}, sort_keys=True))
         return
-    lock_path = Path("/tmp/vllm-gateway-publish.lock")
-    with lock_path.open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        try:
-            print(json.dumps(publish(args.timeout_s, args.halo_wait_s), sort_keys=True))
-        except PublishTerminated as term:
-            # Leases are already released (publish()'s finally). Exit the conventional 128+signal.
-            print(json.dumps({"status": "terminated", "signal": term.signum, "leases_released": True}, sort_keys=True))
-            sys.exit(128 + term.signum)
+    try:
+        if args.submit:
+            with _exclusive(PUBLISH_STATE_ROOT / "submit.lock"):
+                result = submit(args.timeout_s, args.halo_wait_s, control_bundle=args.control_bundle, expected_head=args.expected_head)
+        elif args.recover:
+            result = recover(args.recover)
+        else:
+            result = publish(args.timeout_s, args.halo_wait_s, control_bundle=args.control_bundle,
+                             state_dir=args.state_dir, expected_head=args.expected_head)
+        print(json.dumps(result, sort_keys=True))
+        if result.get("status") == "recovery-required":
+            sys.exit(1)
+    except (Exception, PublishTerminated) as error:
+        print(json.dumps({"status": "recovery-required", "error": type(error).__name__,
+                          "why": str(error)[:300]}, sort_keys=True))
+        sys.exit(128 + error.signum if isinstance(error, PublishTerminated) else 1)
 
 
 if __name__ == "__main__":

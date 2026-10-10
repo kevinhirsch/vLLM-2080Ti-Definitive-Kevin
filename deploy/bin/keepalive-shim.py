@@ -28,6 +28,8 @@ NEVER manages the vLLM process (that's vllm-qwen27b.service + its watchdog).
 """
 import asyncio, os, sys, json, time, logging, collections, subprocess, re, hmac, math, hashlib
 import fcntl
+import contextlib
+import stat
 import threading
 import copy
 import datetime
@@ -1179,6 +1181,14 @@ _ACTIVE = {}          # id(request) -> {name, ip, ua, ep, model, ptok, maxtok, s
 _DRAIN_UNTIL = 0.0
 _DRAIN_LEASE = None
 _DRAIN_REASON = None
+# A governed publication survives replacement of this process. Ordinary drains
+# keep their historical TTL; a durable publication stays fenced until its exact
+# lease is explicitly closed after qualification or recovery.
+_DRAIN_DURABLE = False
+_DRAIN_INVALID = None
+DURABLE_DRAIN_PROTOCOL = 1
+DRAIN_STATE_FILE = os.environ.get("SHIM_DRAIN_STATE_FILE") or os.path.join(os.path.dirname(STATS_FILE), "gateway-drain-state.json")
+PUBLISH_STATE_ROOT = os.environ.get("SHIM_PUBLISH_STATE_ROOT") or os.path.join(os.path.dirname(STATS_FILE), "gateway-publications")
 # RS (2026-10-02): every drain is one durable record. Before this a drain left NO trace of who raised it, why, how long it held,
 # or how many requests it refused (the 503 reason text was a constant), so "why was the estate down 20 min?" was unanswerable.
 # Events are append-only JSONL: {"event":"open"|"close", ...}; `close.how` is delete | expired | gateway-restart.
@@ -1218,6 +1228,8 @@ def _drain_reap(now=None):
 def _drain_startup_recover():
     """A previous gateway process may have died/been replaced while a drain was open (every publish does exactly that):
     close it in the ledger as `gateway-restart` so open/close always pair."""
+    if _drain_restore():
+        return
     try:
         last = None
         with open(_DRAIN_LEDGER) as fh:
@@ -1234,12 +1246,119 @@ def _drain_startup_recover():
 
 
 def _draining(now=None):
-    return (time.time() if now is None else now) < _DRAIN_UNTIL
+    return bool(_DRAIN_DURABLE or _DRAIN_INVALID) or (time.time() if now is None else now) < _DRAIN_UNTIL
+
+
+def _drain_persist():
+    """Persist before admitting a durable drain; write failures cannot open work."""
+    row = {"v": 1, "durable": True, "lease": _DRAIN_LEASE, "until": _DRAIN_UNTIL,
+           "reason": _DRAIN_REASON, "record": _DRAIN_REC}
+    path = DRAIN_STATE_FILE
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp.%d" % os.getpid()
+    try:
+        with open(tmp, "x") as out:
+            os.chmod(tmp, 0o600)
+            json.dump(row, out, sort_keys=True)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, path)
+        fd = os.open(os.path.dirname(path), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+
+
+def _publication_drain_fallback():
+    """An unfinished publisher journal fences restart even after partial DELETE.
+
+    Only private, owned, confined journals may reconstruct their exact lease.
+    Unknown journals fence admission without inventing an owner or expiry.
+    """
+    global _DRAIN_DURABLE, _DRAIN_INVALID, _DRAIN_UNTIL, _DRAIN_LEASE, _DRAIN_REASON, _DRAIN_REC
+    root = os.path.realpath(PUBLISH_STATE_ROOT)
+    pointer = os.path.join(root, "active.json")
+    try:
+        if not os.path.lexists(pointer):
+            return False
+        def private_json(path):
+            info = os.lstat(path)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077):
+                raise ValueError("untrusted publication journal")
+            with open(path) as source:
+                return json.load(source)
+        active = private_json(pointer)
+        receipt = active["receipt"]
+        if (not isinstance(receipt, str) or os.path.realpath(receipt) != receipt
+                or os.path.basename(receipt) != "state.json"
+                or os.path.dirname(os.path.dirname(receipt)) != root):
+            raise ValueError("unconfined publication journal")
+        row = private_json(receipt)
+        if (row.get("v") != 1 or row.get("transaction") != os.path.basename(os.path.dirname(receipt))
+                or not isinstance(row.get("source_head"), str) or not re.fullmatch(r"[0-9a-f]{40}", row["source_head"])
+                or row["source_head"] != active.get("source_head")):
+            raise ValueError("invalid publication journal")
+        if row.get("status") in ("published", "rolled-back"):
+            expected = "candidate" if row["status"] == "published" else "previous"
+            canary = row.get("generation_canary") or {}
+            if (row.get("qualified") != expected or canary.get("ok") is not True
+                    or canary.get("runtime_unchanged") is not True or canary.get("finish_reason") != "stop"
+                    or isinstance(canary.get("completion_tokens"), bool)
+                    or not isinstance(canary.get("completion_tokens"), int) or canary["completion_tokens"] <= 0):
+                raise ValueError("unqualified publication completion")
+            return False
+        lease = row.get("lease")
+        if not isinstance(lease, str) or not re.fullmatch(r"[0-9a-f]{32}", lease):
+            raise ValueError("unfinished publication has no identifiable drain")
+        _DRAIN_DURABLE, _DRAIN_INVALID = True, None
+        _DRAIN_LEASE, _DRAIN_UNTIL = lease, time.time() + 1800
+        _DRAIN_REASON = "unfinished governed gateway publication"
+        _DRAIN_REC = {"t0": time.time(), "reason": _DRAIN_REASON, "by": "gateway_safe_publish recovery",
+                      "ttl_s": 1800, "active_at_open": 0, "refused": 0, "refused_by_client": {}}
+        _drain_persist()
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+        _DRAIN_INVALID = type(error).__name__
+    return True
+
+
+def _drain_restore():
+    """Unknown persisted state is an admission fence, never evidence of no owner."""
+    global _DRAIN_DURABLE, _DRAIN_INVALID, _DRAIN_UNTIL, _DRAIN_LEASE, _DRAIN_REASON, _DRAIN_REC
+    try:
+        with open(DRAIN_STATE_FILE) as source:
+            row = json.load(source)
+    except FileNotFoundError:
+        return _publication_drain_fallback()
+    except (OSError, ValueError) as error:
+        _DRAIN_INVALID = type(error).__name__
+        return True
+    try:
+        rec = row["record"]
+        until = row["until"]
+        if (row.get("v") != 1 or row.get("durable") is not True
+                or not isinstance(row.get("lease"), str) or not re.fullmatch(r"[0-9a-f]{32}", row["lease"])
+                or isinstance(until, bool) or not isinstance(until, (int, float)) or not math.isfinite(until) or until <= 0
+                or not isinstance(rec, dict) or not isinstance(rec.get("by"), str)
+                or not isinstance(rec.get("refused_by_client"), dict)
+                or not isinstance(rec.get("refused"), int) or rec["refused"] < 0
+                or not isinstance(rec.get("t0"), (int, float)) or not math.isfinite(rec["t0"])
+                or not isinstance(rec.get("ttl_s"), int) or not 30 <= rec["ttl_s"] <= 1800
+                or not isinstance(rec.get("active_at_open"), int) or rec["active_at_open"] < 0):
+            raise ValueError("invalid durable drain state")
+        _DRAIN_DURABLE, _DRAIN_INVALID = True, None
+        _DRAIN_LEASE, _DRAIN_UNTIL, _DRAIN_REASON, _DRAIN_REC = row["lease"], until, row.get("reason"), rec
+    except (KeyError, TypeError, ValueError) as error:
+        _DRAIN_INVALID = type(error).__name__
+    return True
 
 
 async def gateway_drain(request):
     """Admin-controlled, leased admission fence for lossless gateway publication."""
-    global _DRAIN_UNTIL, _DRAIN_LEASE, _DRAIN_REASON, _DRAIN_REC
+    global _DRAIN_UNTIL, _DRAIN_LEASE, _DRAIN_REASON, _DRAIN_REC, _DRAIN_DURABLE, _DRAIN_INVALID
     if request.method == "GET":
         _drain_reap()
         return web.json_response({"draining": _draining(), "active": len(_ACTIVE),
@@ -1247,7 +1366,9 @@ async def gateway_drain(request):
                                   "reason": _DRAIN_REASON if _draining() else None,
                                   "by": _DRAIN_REC["by"] if _DRAIN_REC else None,
                                   "since": _DRAIN_REC["t0"] if _DRAIN_REC else None,
-                                  "refused": _DRAIN_REC["refused"] if _DRAIN_REC else None})
+                                  "refused": _DRAIN_REC["refused"] if _DRAIN_REC else None,
+                                  "durable": _DRAIN_DURABLE, "invalid_state": _DRAIN_INVALID,
+                                  "lease_sha256": hashlib.sha256(_DRAIN_LEASE.encode()).hexdigest() if _DRAIN_LEASE else None})
     if not _admin_ok(request):
         return web.json_response({"error": "admin token required"}, status=401)
     if request.method == "DELETE":
@@ -1257,17 +1378,44 @@ async def gateway_drain(request):
             body = None
         if not isinstance(body, dict) or body.get("lease") != _DRAIN_LEASE or not _DRAIN_LEASE:
             return web.json_response({"error": "drain lease mismatch"}, status=409)
+        if _DRAIN_DURABLE:
+            try:
+                os.unlink(DRAIN_STATE_FILE)
+                fd = os.open(os.path.dirname(DRAIN_STATE_FILE), os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except OSError:
+                # A missing/unreadable durable file cannot be called an owned
+                # release. Recreate it after unlink-success/fsync-failure if
+                # possible; the unfinished publication journal also fences a
+                # replacement process if the filesystem remains unavailable.
+                with contextlib.suppress(OSError):
+                    _drain_persist()
+                return web.json_response({"error": "durable drain release failed"}, status=503)
         _DRAIN_UNTIL, _DRAIN_LEASE, _DRAIN_REASON = 0.0, None, None
+        _DRAIN_DURABLE, _DRAIN_INVALID = False, None
         _drain_close_record("delete")
         return web.json_response({"draining": False, "active": len(_ACTIVE)})
     try:
         body = await request.json()
         ttl = int(body.get("ttl_s"))
-        if not isinstance(body, dict) or not 30 <= ttl <= 1800:
+        if not isinstance(body, dict) or not 30 <= ttl <= 1800 or not isinstance(body.get("durable", False), bool):
             raise ValueError("ttl_s outside [30, 1800]")
     except (ValueError, TypeError, AttributeError):
         return web.json_response({"error": "ttl_s must be 30..1800 seconds"}, status=400)
     _drain_reap()
+    if body.get("durable") and not SHIM_ADMIN_TOKEN:
+        return web.json_response({"error": "configured admin token required for durable drain"}, status=401)
+    if _DRAIN_DURABLE and body.get("lease") == _DRAIN_LEASE and not _DRAIN_INVALID:
+        _DRAIN_UNTIL = time.time() + ttl
+        try:
+            _drain_persist()
+        except OSError:
+            return web.json_response({"error": "durable drain renewal failed"}, status=503)
+        return web.json_response({"draining": True, "durable": True, "active": len(_ACTIVE),
+                                  "until": _DRAIN_UNTIL, "lease": _DRAIN_LEASE})
     if _draining():
         return web.json_response({"error": "another drain lease is active", "active": len(_ACTIVE),
                                   "until": _DRAIN_UNTIL, "reason": _DRAIN_REASON,
@@ -1278,10 +1426,16 @@ async def gateway_drain(request):
     by = str(body.get("by") or request.headers.get("X-Client") or request.headers.get("User-Agent") or "?")[:80]
     _DRAIN_REC = {"t0": time.time(), "reason": _DRAIN_REASON, "by": by, "ttl_s": ttl, "active_at_open": len(_ACTIVE),
                   "refused": 0, "refused_by_client": {}}
+    _DRAIN_DURABLE = bool(body.get("durable"))
+    if _DRAIN_DURABLE:
+        try:
+            _drain_persist()
+        except OSError:
+            return web.json_response({"error": "durable drain persistence failed; admission remains fenced"}, status=503)
     _drain_ledger_write({"event": "open", "t": round(_DRAIN_REC["t0"], 3), "reason": _DRAIN_REASON, "by": by, "ttl_s": ttl,
                          "active": len(_ACTIVE)})
     return web.json_response({"draining": True, "active": len(_ACTIVE),
-                              "until": _DRAIN_UNTIL, "lease": _DRAIN_LEASE})
+                              "until": _DRAIN_UNTIL, "lease": _DRAIN_LEASE, "durable": _DRAIN_DURABLE})
 _CLIENT_NAMES_FILE = "/home/kevin/.local/share/vllm-qwen27b/clients.map"   # "<ip or X-Client> = <friendly name>"
 _client_names_cache = {"t": 0.0, "map": {}}
 
@@ -6016,7 +6170,8 @@ def _flow_refusal_response(r):
 # with Retry-After, lets accepted local work finish, and ends by itself (lease) or by DELETE. The admission
 # FENCE (/gateway/drain) stays for the instant of a gateway code swap only.
 _OFFLINE = {"until": 0.0, "lease": None, "reason": None, "by": None, "t0": None, "ttl_s": None, "refused": 0}
-from experiment_controls import runtime_identity as measurement_runtime_identity
+measurement_runtime_identity = _load_gateway_module(
+    "experiment_controls.py", "experiment_controls", required=True).runtime_identity
 
 # A phase token is deliberately memory-only: gateway publication revokes it.
 # It only exempts estate-local requests from THIS offline window, never from

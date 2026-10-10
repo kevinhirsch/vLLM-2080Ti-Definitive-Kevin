@@ -46,8 +46,15 @@ class _Tree(unittest.TestCase):
             self.addCleanup(p.stop)
 
     def git_show(self, args, **kw):
+        if args == ["git", "rev-parse", "HEAD"]:
+            return "a" * 40
         if args[:2] == ["git", "show"]:
-            return (self.src / args[2].rsplit("/", 1)[1].replace("gateway_dashboard.html", "dash.html")).read_bytes()
+            name = args[2].rsplit("/", 1)[1].replace("gateway_dashboard.html", "dash.html")
+            if (self.src / name).exists():
+                return (self.src / name).read_bytes()
+            if name == pub.DROPIN.name:
+                return pub.DROPIN.read_bytes()
+            return (HERE / name).read_bytes()
         raise AssertionError(args)
 
 
@@ -72,7 +79,7 @@ class ModuleOnlyChangeRestarts(_Tree):
     def _publish_until_first_gateway_call(self):
         def stop(*a, **k):
             raise RuntimeError("reached the drained publish path")
-        with patch.object(pub.subprocess, "check_output", self.git_show), patch.object(pub, "_http", stop), \
+        with patch.object(pub.subprocess, "check_output", self.git_show), patch.object(pub, "_http", stop), patch.object(pub, "_refuse_core_cgroup"), \
                 patch.dict(os.environ, {"SHIM_ADMIN_TOKEN": "t"}):
             return pub._publish(60, 60)
 
@@ -83,17 +90,18 @@ class ModuleOnlyChangeRestarts(_Tree):
             self._publish_until_first_gateway_call()
         self.assertEqual((self.live / "mod_a.py").read_text(), "A1\n")     # nothing installed before the drain
 
-    def test_everything_identical_is_current_without_restart(self):
+    def test_everything_identical_still_enters_authority_preflight(self):
         (self.src / "mod_a.py").write_text("A1\n")
         (self.live / "mod_a.py").write_text("A1\n")
-        self.assertEqual(self._publish_until_first_gateway_call()["status"], "current")
+        with self.assertRaisesRegex(RuntimeError, "drained publish path"):
+            self._publish_until_first_gateway_call()
 
     def test_uncommitted_module_is_refused(self):
         (self.src / "mod_a.py").write_text("A2\n")
 
         def show(args, **kw):
-            return b"committed A\n" if args[2].endswith("mod_a.py") else self.git_show(args)
-        with patch.object(pub.subprocess, "check_output", show):
+            return b"committed A\n" if len(args) > 2 and args[2].endswith("mod_a.py") else self.git_show(args)
+        with patch.object(pub.subprocess, "check_output", show), patch.object(pub, "_refuse_core_cgroup"):
             with self.assertRaisesRegex(RuntimeError, "mod_a.py source differs from committed HEAD"):
                 pub._publish(60, 60)
 
@@ -124,15 +132,19 @@ class ShimReportsWhatItLoaded(unittest.TestCase):
         G = importlib.util.module_from_spec(h)
         h.loader.exec_module(G)
         with tempfile.TemporaryDirectory(prefix="gw-pubmod-shim-") as td:
-            m = G._fresh_shim(td, 0)
+            m = G._fresh_shim(td, 0, {"SHIM_ADMIN_TOKEN": "cpu-test-token"})
             body = json.loads(asyncio.run(m.gateway_modules(None)).body)
         want = hashlib.sha256((HERE / "gateway_config_schema.py").read_bytes()).hexdigest()
         rec = body["modules"]["gateway_config_schema.py"]
         self.assertEqual((rec["loaded"], rec["sha256"], rec["required"]), (True, want, False))
         self.assertEqual(body["gateway_sha256"], hashlib.sha256((HERE / "keepalive-shim.py").read_bytes()).hexdigest())
+        controls = body["modules"]["experiment_controls.py"]
+        self.assertEqual((controls["loaded"], controls["required"]), (True, True))
+        self.assertEqual(controls["sha256"], hashlib.sha256((HERE / "experiment_controls.py").read_bytes()).hexdigest())
 
     def test_manifest_lists_the_schema(self):
         self.assertIn(("gateway_config_schema.py", "config_schema"), pub.GATEWAY_MODULES)
+        self.assertIn(("experiment_controls.py", "experiment_controls"), pub.GATEWAY_MODULES)
 
 
 if __name__ == "__main__":
