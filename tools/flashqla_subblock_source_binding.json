@@ -1,0 +1,35 @@
+{
+  "schema": "flashqla-subblock-source-binding-v1",
+  "source_commit": "b7ea65b3ee8a60bcb0b7f1a256c0915badc77697",
+  "source_root": "/home/kevin/.local/share/vllm-releases/halo-prefill-global-quota-20261010-b7ea65b3ee-20261010T1943",
+  "source_sha256": {
+    "vllm/v1/core/sched/scheduler.py": "ff386fb21b72fc6e29032ff3da62df1ac55303b972fe4e6765b284e96178363f",
+    "vllm/v1/core/single_type_kv_cache_manager.py": "53c1c728c5470f55c91df8c52a79d321dd86526aa61af157d165d43d7082973d",
+    "vllm/v1/worker/gpu_model_runner.py": "66d0a079c1a3b0b8ec6c9f2db549ab8c3ccdf2d9ae8d7a38dd1141fabe128b83",
+    "vllm/v1/worker/mamba_utils.py": "f63bfad4002b2f83e86fb03c4f6e5f094e154c0e77bec7729608dd5d1cad936b",
+    "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py": "f3c272b11e1b77f7248199aac54b7b98b0c1aef34962773a388f2404bf44b25c",
+    "vllm/model_executor/layers/mamba/ops/causal_conv1d.py": "533287320dda1b5ce41057b28302022b321c4fa6ea053ab71b93fe342adf6da7",
+    "vllm/model_executor/layers/mamba/abstract.py": "ddb02a0d5a0d726b708509656bd5e17765a65907102bf905339690ebcc984249",
+    "vllm/third_party/flash_linear_attention/ops/fused_gdn_prefill_post_conv.py": "590717b2107abc90d72548de06b5d315229eb2775c94614f3f545df11cc2b5df",
+    "vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py": "d439f02ff30fbd024415a8c42fc3aa4856d21bc5a3e2115eec9cb1322d47e804",
+    "tests/kernels/mamba/test_precopy_mamba_align.py": "0bee4df1854b81fddfa3b633ba444e1598aa4c0e29963cd49661e922eb8e6c11",
+    ".deps/FlashQLA-SM70-SM75/flash_qla/ops/gated_delta_rule/legacy/sm_legacy.py": "592b5d7a0f39192ee3652a0628739395db1b3ab03c9941e65297c33ebbf54219",
+    ".deps/FlashQLA-SM70-SM75/flash_qla/ops/gated_delta_rule/legacy/csrc/gdn_forward.cu": "ee0c2f86fa6842d05f887c8a806ce018de9852af7cdb96467d48acf0175b954c",
+    ".deps/FlashQLA-SM70-SM75/tests/test_legacy_sm_gdn.py": "fd1b7934f778d964e4cbaf92ce9827c6491745d1aed747989aba8c8fcb5aee07",
+    ".deps/FlashQLA-SM70-SM75/LICENSE": "d0b7a111f48dc0207c7e057c810ae0e2fdbc807ba654eb669ade998b2cdc3438",
+    "vllm/model_executor/layers/mamba/mamba_utils.py": "ce9845b4a4ef4bc46577a33038ed69d59ceccb52f30e9c5bdaa36e48be3b2ca4",
+    "vllm/model_executor/models/qwen3_5.py": "9785e481adac0fe44899dca988f5e1ce3a323bd63907e84c88e391b5d9ac8854",
+    "vllm/config/cache.py": "fca82f9a7d7fa54668d3f60fb29343c9773bf668a6a43853c670e7fbd9d5d52b",
+    "vllm/engine/arg_utils.py": "b6945a2b8cbe0cb34986a79545d1c79bd0b6acdb3ac0f63d5a14454f3be70708"
+  },
+  "checkpoint_config_sha256": "5cac12087df9690ce133dc9d66b9104c818014fea6b788f2f676359ca06635fc",
+  "gdn_elf_sha256": "369e2b4da67c6bc348c4a39074216fd90cc6c6933ddd6d0ec342a06a48291a8f",
+  "quiet_helper_sha256": "bff9144c7712a22d903f53325a31e6491d870bf2b0abee75b4ba1bc4bd738e91",
+  "measurement_sha256": "9880e767fe003c88bae6b2b228c4bc823028e44e28cc97a958d69d462f3c1a67",
+  "prior_frozen_37c_sha256": "de4c738112a42a2852e1fc1ca8c3889e4488e9550fba8b213dcc195262df1ce0",
+  "licenses": {
+    "vllm": "Apache-2.0, upstream vLLM + weicj attribution preserved",
+    "FlashQLA": "MIT; Copyright (c) 2026 The Qwen team, Alibaba Group."
+  },
+  "proof_level": "read-only source binding; no GPU execution or timing result"
+}
