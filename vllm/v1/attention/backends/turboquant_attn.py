@@ -66,6 +66,7 @@ from vllm.v1.attention.ops.flydsl_turboquant_decode import (
 )
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.ops import tq_gqa_cuda as _gqa_cuda
+from vllm.v1.attention.ops.tq_prefix_batch_plan import homogeneous_prefix_groups
 from vllm.v1.attention.ops.triton_turboquant_decode import (
     _fp8_format_code,
     _tq_full_dequant_kv,
@@ -117,6 +118,9 @@ _TQ_CUDAGRAPH_SPEC_DECODE_SAFE = (
 _TQ_CUDAGRAPH_SPEC_PREFIX_ROWS = (
     os.getenv("VLLM_TURBOQUANT_CUDAGRAPH_SPEC_PREFIX_ROWS", "0") == "1"
 )
+# E06 prototype: default off; batches independent requests' compressed prefix
+# launches only. Existing S2 q_per_seq grouping and raw-current math remain.
+_TQ_BATCH_SPEC_PREFIX = os.getenv("VLLM_TQ_BATCH_SPEC_PREFIX", "0") == "1"
 
 
 def _tq_max_kv_splits(configured_splits: int) -> int:
@@ -1528,6 +1532,62 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         num_reqs = attn_metadata.seq_lens.shape[0]
         output = torch.empty_like(query)
 
+        prefix_states: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        if _TQ_BATCH_SPEC_PREFIX and qsl_cpu is not None:
+            Hq, D = query.shape[1:]
+            Hk = key.shape[1]
+            groups = homogeneous_prefix_groups(
+                qsl, num_reqs=num_reqs, total_rows=query.shape[0],
+                eligible=(
+                    _gqa_cuda.enabled() and query.dtype == torch.float16
+                    and query.device.type == "cuda"
+                    and 1 <= self.max_num_kv_splits <= 128
+                    and kv_cache.dtype == torch.uint8
+                    and kv_cache.device == query.device
+                    and kv_cache.shape[1] >= 16
+                    and kv_cache.shape[2:] == (Hk, 230)
+                    and attn_metadata.block_table.dtype == torch.int32
+                    and attn_metadata.block_table.device == query.device
+                    and attn_metadata.block_table.shape[1] >= 1
+                    and _gqa_cuda.gqa_eligible(
+                        Hq=Hq, Hk=Hk, D=D,
+                        mse_bits=self.tq_config.key_mse_bits,
+                        value_quant_bits=self.tq_config.effective_value_quant_bits,
+                        key_fp8=self.tq_config.key_fp8,
+                        key_packed_size=self.tq_config.key_packed_size,
+                    )
+                ),
+            )
+            for group in groups:
+                q_len = qsl[group[0] + 1] - qsl[group[0]]
+                queries, lengths, tables = [], [], []
+                for i in group:
+                    queries.append(query[qsl[i]:qsl[i + 1]])
+                    length = (attn_metadata.seq_lens[i:i + 1] - q_len).clamp_min(0)
+                    lengths.append(length.to(torch.int32))
+                    tables.append(torch.where(
+                        (length > 0).reshape(1, 1),
+                        attn_metadata.block_table[i:i + 1],
+                        torch.zeros_like(attn_metadata.block_table[i:i + 1]),
+                    ))
+                prefix_out, prefix_lse = _gqa_cuda.tq_gqa_decode_attention_batch(
+                    queries, kv_cache, tables, lengths, Pi, centroids,
+                    self.scale, self.tq_config.norm_correction,
+                    num_splits=self.max_num_kv_splits, PiT=PiT,
+                )
+                for packed_idx, request_idx in enumerate(group):
+                    rows = slice(packed_idx * q_len, (packed_idx + 1) * q_len)
+                    has_prefix = lengths[packed_idx] > 0
+                    # Preserve the singleton path's externally visible zero
+                    # prefix mask, including graph-capture sentinel pages.
+                    po, pl = prefix_out[rows], prefix_lse[rows]
+                    prefix_states[request_idx] = (
+                        torch.where(has_prefix.reshape(1, 1, 1), po,
+                                    torch.zeros_like(po)),
+                        torch.where(has_prefix.reshape(1, 1), pl,
+                                    torch.full_like(pl, float("-inf"))),
+                    )
+
         max_seq = max(attn_metadata.max_seq_len, attn_metadata.max_query_len)
         arange_cache: torch.Tensor | None = getattr(self, "_arange_cache", None)
         if arange_cache is None or arange_cache.shape[0] <= max_seq:
@@ -1563,6 +1623,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 centroids,
                 PiT,
                 arange_cache,
+                prefix_state=prefix_states.get(request_idx),
             )
             if out is None:
                 raise RuntimeError(
@@ -1893,6 +1954,8 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         centroids: torch.Tensor,
         PiT: torch.Tensor | None,
         arange_cache: torch.Tensor,
+        *,
+        prefix_state: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor | None:
         """Merge compressed-prefix attention with raw MTP continuation KV.
 
@@ -1908,6 +1971,17 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         Hk = key_chunk.shape[1]
         if Hk <= 0 or Hq % Hk != 0:
             return None
+
+        if prefix_state is not None:
+            prefix_out, prefix_lse = prefix_state
+            if prefix_out.shape != query.shape or prefix_lse.shape != (q_len, Hq):
+                raise ValueError("E06 prefix rows do not belong to this request")
+            # Keep the raw-current causal merge request-local and retain its
+            # existing output alias. No speculative KV is read from TQ here.
+            return triton_turboquant_spec_continuation_merge(
+                query, key_chunk, value_chunk, prefix_out, prefix_lse,
+                self.scale, output=prefix_out,
+            )
 
         if isinstance(cached_len, int):
             prefix_seq_lens = torch.full(

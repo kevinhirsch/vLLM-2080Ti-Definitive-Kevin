@@ -96,3 +96,68 @@ def tq_gqa_decode_attention(
     lse = lse_buf[:R, :Hq] if lse_buf is not None and lse_buf.shape[0] >= R else torch.empty(R, Hq, dtype=torch.float32, device=query.device)
     _load().decode(q_rot, kv_cache, block_table, seq_lens, centroids, mid, out, lse, QL, QS, G, kv_cache.shape[1], num_splits, scale, 1 if norm_correction else 0)
     return out
+
+
+def tq_gqa_decode_attention_batch(
+    queries: list[torch.Tensor],
+    kv_cache: torch.Tensor,
+    block_tables: list[torch.Tensor],
+    seq_lens: list[torch.Tensor],
+    Pi: torch.Tensor,
+    centroids: torch.Tensor,
+    scale: float,
+    norm_correction: bool,
+    *,
+    num_splits: int = 128,
+    PiT: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """E06: batch only homogeneous prefix launches, preserving rotations.
+
+    Every request uses the original `(query.float() @ PiT).contiguous()`
+    expression before concatenation. No unrotated-query batched GEMM, device
+    scalar read, recurrent state update or raw-current attention is performed.
+    The caller owns zero-prefix masking and request-local continuation merges.
+    This allocates packing/workspaces; it makes no performance claim.
+    """
+    S = len(queries)
+    if S < 2 or len(block_tables) != S or len(seq_lens) != S:
+        raise ValueError("prefix batch requires matching multi-request lists")
+    QL, Hq, D = queries[0].shape
+    Hk = kv_cache.shape[2]
+    device = queries[0].device
+    if (
+        QL < 1 or QL > 4 or D != 256 or Hk <= 0 or Hq % Hk
+        or Hq // Hk > 16 or device.type != "cuda"
+        or kv_cache.dtype != torch.uint8 or kv_cache.device != device
+        or kv_cache.shape[1] < 16 or kv_cache.shape[3] != 230
+        or num_splits < 1 or num_splits > 128
+    ):
+        raise ValueError("unsupported E06 prefix batch layout")
+    nbt = block_tables[0].shape[1]
+    for query, bt, sl in zip(queries, block_tables, seq_lens):
+        if (
+            query.shape != (QL, Hq, D) or query.dtype != torch.float16
+            or query.device != device or bt.shape != (1, nbt) or nbt < 1
+            or bt.dtype != torch.int32 or bt.device != device
+            or sl.shape != (1,) or sl.dtype != torch.int32
+            or sl.device != device
+        ):
+            raise ValueError("inhomogeneous E06 prefix batch")
+    G = Hq // Hk
+    QS = max(1, min(QL, 16 // G))
+    if PiT is None:
+        PiT = Pi.T.contiguous()
+    # Keep arithmetic and per-request GEMM dimensions exactly as before.
+    rotated = [(query.float() @ PiT).contiguous() for query in queries]
+    q_rot = torch.cat(rotated, dim=0)
+    bt = torch.cat(block_tables, dim=0)
+    sl = torch.cat(seq_lens, dim=0)
+    R = S * QL
+    mid = torch.empty(R, Hq, num_splits, D + 1,
+                      dtype=torch.float32, device=device)
+    out = torch.empty(R, Hq, D, dtype=torch.float16, device=device)
+    lse = torch.empty(R, Hq, dtype=torch.float32, device=device)
+    _load().decode(q_rot, kv_cache, bt, sl, centroids, mid, out, lse,
+                   QL, QS, G, kv_cache.shape[1], num_splits, scale,
+                   1 if norm_correction else 0)
+    return out, lse
