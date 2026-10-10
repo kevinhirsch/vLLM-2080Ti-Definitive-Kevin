@@ -1282,10 +1282,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         """Lane K5: pure spec-decode batch on fp16/sm_75 -> conv1d update + ONE fused kernel
         (l2norm, gating, delta-rule state update per MTP position, RMSNormGated) + out_proj.
         Returns False (caller runs the stock path) for anything it does not cover."""
-        if getattr(self, "_k5_dt_bias", None) is None:
-            # fp32 copies made once, on the first (profiling) forward, before any CUDA-graph capture
-            self._k5_dt_bias = self.dt_bias.detach().float().contiguous()
-            self._k5_norm_w = self.norm.weight.detach().float().contiguous()
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):
             return False
@@ -1300,7 +1296,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             or md.num_spec_decodes <= 0
             or sidx is None
             or sidx.dim() != 2
-            or sidx.size(1) > 8
+            or not 1 <= sidx.size(1) <= 8
+            or sidx.size(0) < md.num_spec_decodes
             or not sidx[: md.num_spec_decodes].is_contiguous()
             or md.num_accepted_tokens is None
             or md.spec_query_start_loc is None
@@ -1327,6 +1324,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         n = md.num_actual_tokens
         num_req = md.num_spec_decodes
         qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
+        if (
+            mixed_qkvz.dim() != 2
+            or not 0 < n <= mixed_qkvz.size(0)
+            or mixed_qkvz.size(1) != qkv_size + self.value_dim // self.tp_size
+            or ba.dim() != 2
+            or ba.size(0) != mixed_qkvz.size(0)
+            or ba.size(1) % 2
+            or output.shape != (mixed_qkvz.size(0), self.hidden_size)
+            or output.dtype != mixed_qkvz.dtype
+            or output.device != mixed_qkvz.device
+            or self.activation not in ("silu", "swish")
+        ):
+            return False
         mixed_qkv = mixed_qkvz[:n, :qkv_size]
         z = mixed_qkvz[:n, qkv_size:].reshape(n, -1, self.head_v_dim)
         b, a = self.split_ba(ba)
@@ -1339,6 +1349,32 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
+        if not _k5_gdn.inputs_supported(
+            mixed_qkv=mixed_qkv,
+            a=a[:n],
+            b=b[:n],
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            state_indices=sidx,
+            cu_seqlens=md.spec_query_start_loc,
+            num_accepted=md.num_accepted_tokens,
+            state=ssm_state,
+            z=z,
+            norm_weight=self.norm.weight,
+            conv_state=conv_state,
+            conv_weight=conv_weights,
+            conv_bias=self.conv1d.bias,
+            num_requests=num_req,
+            num_tokens=n,
+            scale=self.head_k_dim**-0.5,
+            eps=self.norm.eps,
+        ):
+            return False
+        if getattr(self, "_k5_dt_bias", None) is None:
+            # Prepare constant fp32 parameters only after the full preflight.
+            # This path is warmed before CUDA-graph capture.
+            self._k5_dt_bias = self.dt_bias.detach().float().contiguous()
+            self._k5_norm_w = self.norm.weight.detach().float().contiguous()
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
             conv_state,
@@ -1351,6 +1387,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             max_query_len=sidx.size(-1),
             null_block_id=PAD_SLOT_ID,
             validate_data=False,
+            guard_bounds=True,
+            state_indices_2d=sidx[:num_req],
+            recurrent_num_slots=ssm_state.size(0),
         )
 
         core_attn_out = torch.zeros(

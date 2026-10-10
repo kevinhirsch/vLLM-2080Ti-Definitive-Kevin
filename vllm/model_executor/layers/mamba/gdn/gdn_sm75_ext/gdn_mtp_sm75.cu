@@ -19,6 +19,8 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp16.h>
 #include <stdint.h>
+#include <cmath>
+#include <limits>
 
 namespace {
 
@@ -70,6 +72,35 @@ struct Strides {
   int64_t mixed_row, a_row, b_row, z_row, state_slot, out_row;
 };
 
+// Reject malformed metadata before reading or writing either recurrent state.
+// The convolution guard applies the same request predicate before its cache
+// update. Negative/null destinations remain skippable; a bad positive slot
+// invalidates the whole request rather than partially committing it.
+__device__ __forceinline__ bool invalid_request(
+    const int* indices, int width, int T, int accepted, int num_slots, int null_id, int* src) {
+  *src = -1;
+  if (T > width || T > kMaxTok || accepted < 1 || accepted > width) return true;
+  const int first = indices[0];
+  *src = indices[accepted - 1];
+  if (first < 0 || first >= num_slots || first == null_id ||
+      *src < 0 || *src >= num_slots || *src == null_id) return true;
+  for (int t = 0; t < width; ++t) {
+    const int dst = indices[t];
+    if (dst >= num_slots && dst != null_id) return true;
+  }
+  return false;
+}
+
+__device__ __forceinline__ void zero_interval(
+    __half* out, int bos, int eos, int num_tokens, int hv, int tid, int64_t row_stride) {
+  const int start = bos < 0 ? 0 : (bos > num_tokens ? num_tokens : bos);
+  const int end = eos < 0 ? 0 : (eos > num_tokens ? num_tokens : eos);
+  for (int64_t i = tid; i < (int64_t)(end - start) * kDimV; i += kThreads) {
+    const int t = i / kDimV, v = i % kDimV;
+    out[(int64_t)(start + t) * row_stride + (int64_t)hv * kDimV + v] = __float2half(0.0f);
+  }
+}
+
 // S: state element type (fp16 or fp32); A_log, dt_bias and the norm weight arrive as fp32
 template <typename S, bool SIGMOID>
 __global__ __launch_bounds__(kThreads, 1) void gdn_mtp_sm75_kernel(
@@ -77,21 +108,27 @@ __global__ __launch_bounds__(kThreads, 1) void gdn_mtp_sm75_kernel(
     const float* __restrict__ a_log, const float* __restrict__ dt_bias, const int* __restrict__ state_indices,
     const int* __restrict__ cu_seqlens, const int* __restrict__ num_accepted, S* __restrict__ state,
     const __half* __restrict__ z, const float* __restrict__ norm_w, __half* __restrict__ out, int H, int HV, int HPK,
-    int width, int null_block_id, float scale, float eps, Strides st) {
+    int width, int num_tokens, int num_slots, int null_block_id, float scale, float eps, Strides st) {
   const int n = blockIdx.x;
   const int hv = blockIdx.y;
   const int tid = threadIdx.x;
   const int lane = tid & 31;
   const int warp = tid >> 5;
   const int bos = cu_seqlens[n];
-  const int T = cu_seqlens[n + 1] - bos;
+  const int eos = cu_seqlens[n + 1];
+  // Clamp even rejection stores: malformed intervals never form OOB pointers.
+  if (bos < 0 || eos < bos || eos > num_tokens) {
+    zero_interval(out, bos, eos, num_tokens, hv, tid, st.out_row);
+    return;
+  }
+  const int T = eos - bos;
   if (T <= 0) return;
 
   const int acc = num_accepted[n];
   int src = -1;
-  if (acc >= 1 && acc <= width) src = state_indices[(int64_t)n * width + acc - 1];
-  if (src < 0 || src == null_block_id || T > kMaxTok) {
-    for (int i = tid; i < T * kDimV; i += kThreads) {
+  if (invalid_request(state_indices + (int64_t)n * width, width, T, acc,
+                      num_slots, null_block_id, &src)) {
+    for (int64_t i = tid; i < (int64_t)T * kDimV; i += kThreads) {
       const int t = i / kDimV, v = i % kDimV;
       out[(int64_t)(bos + t) * st.out_row + (int64_t)hv * kDimV + v] = __float2half(0.0f);
     }
@@ -236,7 +273,7 @@ __global__ __launch_bounds__(kThreads, 1) void gdn_mtp_sm75_v2_kernel(
     const float* __restrict__ a_log, const float* __restrict__ dt_bias, const int* __restrict__ state_indices,
     const int* __restrict__ cu_seqlens, const int* __restrict__ num_accepted, S* __restrict__ state,
     const __half* __restrict__ z, const float* __restrict__ norm_w, __half* __restrict__ out, int H, int HV, int HPK,
-    int width, int null_block_id, float scale, float eps, Strides st) {
+    int width, int num_tokens, int num_slots, int null_block_id, float scale, float eps, Strides st) {
   const int n = blockIdx.x;
   const int hv = blockIdx.y;
   const int tid = threadIdx.x;
@@ -245,14 +282,19 @@ __global__ __launch_bounds__(kThreads, 1) void gdn_mtp_sm75_v2_kernel(
   const int grp = lane >> 3;
   const int seg = lane & 7;
   const int bos = cu_seqlens[n];
-  const int T = cu_seqlens[n + 1] - bos;
+  const int eos = cu_seqlens[n + 1];
+  if (bos < 0 || eos < bos || eos > num_tokens) {
+    zero_interval(out, bos, eos, num_tokens, hv, tid, st.out_row);
+    return;
+  }
+  const int T = eos - bos;
   if (T <= 0) return;
 
   const int acc = num_accepted[n];
   int src = -1;
-  if (acc >= 1 && acc <= width) src = state_indices[(int64_t)n * width + acc - 1];
-  if (src < 0 || src == null_block_id || T > kMaxTok) {
-    for (int i = tid; i < T * kDimV; i += kThreads) {
+  if (invalid_request(state_indices + (int64_t)n * width, width, T, acc,
+                      num_slots, null_block_id, &src)) {
+    for (int64_t i = tid; i < (int64_t)T * kDimV; i += kThreads) {
       const int t = i / kDimV, v = i % kDimV;
       out[(int64_t)(bos + t) * st.out_row + (int64_t)hv * kDimV + v] = __float2half(0.0f);
     }
@@ -398,14 +440,17 @@ __global__ __launch_bounds__(kThreads, 1) void gdn_mtp_sm75_v2_kernel(
 template <typename S, bool SIG>
 void launch_one(int variant, dim3 grid, cudaStream_t s, const __half* mixed, const __half* a, const __half* b,
                 const float* a_log, const float* dt_bias, const int* sidx, const int* cu, const int* nacc, S* state,
-                const __half* z, const float* nw, __half* out, int H, int HV, int hpk, int width, int null_id,
+                const __half* z, const float* nw, __half* out, int H, int HV, int hpk, int width,
+                int num_tokens, int num_slots, int null_id,
                 float scale, float eps, Strides st) {
   if (variant == 1)
     gdn_mtp_sm75_kernel<S, SIG><<<grid, kThreads, 0, s>>>(mixed, a, b, a_log, dt_bias, sidx, cu, nacc, state, z, nw,
-                                                         out, H, HV, hpk, width, null_id, scale, eps, st);
+                                                         out, H, HV, hpk, width, num_tokens, num_slots,
+                                                         null_id, scale, eps, st);
   else
     gdn_mtp_sm75_v2_kernel<S, SIG><<<grid, kThreads, 0, s>>>(mixed, a, b, a_log, dt_bias, sidx, cu, nacc, state, z,
-                                                            nw, out, H, HV, hpk, width, null_id, scale, eps, st);
+                                                            nw, out, H, HV, hpk, width, num_tokens, num_slots,
+                                                            null_id, scale, eps, st);
 }
 
 }  // namespace
@@ -421,16 +466,25 @@ void gdn_mtp_sm75(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, tor
                   torch::Tensor out, double scale, double eps, int64_t null_block_id, bool sigmoid_gate,
                   int64_t variant) {
   TORCH_CHECK(mixed_qkv.is_cuda() && mixed_qkv.scalar_type() == at::kHalf && mixed_qkv.dim() == 2 &&
-              mixed_qkv.stride(1) == 1, "mixed_qkv: CUDA fp16 [L, C], channel-contiguous");
+              mixed_qkv.stride(1) == 1 && mixed_qkv.stride(0) >= mixed_qkv.size(1),
+              "mixed_qkv: CUDA fp16 [L, C], non-overlapping channel-contiguous rows");
+  for (const auto& tensor : {a, b, a_log, dt_bias, state_indices, cu_seqlens,
+                            num_accepted, state, z, norm_w, out}) {
+    TORCH_CHECK(tensor.is_cuda() && tensor.device() == mixed_qkv.device(),
+                "all K5 tensors must be CUDA tensors on the same device");
+  }
+  TORCH_CHECK(variant == 1 || variant == 2, "K5 variant must be 1 or 2");
+  TORCH_CHECK(std::isfinite(scale) && scale > 0 && std::isfinite(eps) && eps > 0,
+              "scale and eps must be finite and positive");
   TORCH_CHECK(a.scalar_type() == at::kHalf && b.scalar_type() == at::kHalf && a.dim() == 2 && b.dim() == 2 &&
               a.stride(1) == 1 && b.stride(1) == 1, "a/b: fp16 [L, HV] with contiguous heads");
   TORCH_CHECK(z.scalar_type() == at::kHalf && z.dim() == 3 && z.size(2) == kDimV && z.stride(2) == 1 &&
               z.stride(1) == kDimV, "z: fp16 [L, HV, 128] with contiguous head rows");
   TORCH_CHECK(out.scalar_type() == at::kHalf && out.dim() == 3 && out.size(2) == kDimV && out.stride(2) == 1 &&
               out.stride(1) == kDimV, "out: fp16 [L, HV, 128] with contiguous head rows");
-  TORCH_CHECK(a_log.scalar_type() == at::kFloat && a_log.is_contiguous(), "A_log: fp32 contiguous");
-  TORCH_CHECK(dt_bias.scalar_type() == at::kFloat && dt_bias.is_contiguous(), "dt_bias: fp32 contiguous");
-  TORCH_CHECK(norm_w.scalar_type() == at::kFloat && norm_w.is_contiguous() && norm_w.numel() == kDimV,
+  TORCH_CHECK(a_log.scalar_type() == at::kFloat && a_log.dim() == 1 && a_log.is_contiguous(), "A_log: fp32 contiguous vector");
+  TORCH_CHECK(dt_bias.scalar_type() == at::kFloat && dt_bias.dim() == 1 && dt_bias.is_contiguous(), "dt_bias: fp32 contiguous vector");
+  TORCH_CHECK(norm_w.scalar_type() == at::kFloat && norm_w.dim() == 1 && norm_w.is_contiguous() && norm_w.numel() == kDimV,
               "norm_w: 128 fp32");
   TORCH_CHECK(state.dim() == 4 && state.size(2) == kDimV && state.size(3) == kDimK && state.stride(3) == 1 &&
               state.stride(2) == kDimK && state.stride(1) == kDimV * kDimK, "state: [slots, HV, 128, 128]");
@@ -440,18 +494,34 @@ void gdn_mtp_sm75(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, tor
               "state: 16-byte aligned slots");
   TORCH_CHECK(state_indices.scalar_type() == at::kInt && state_indices.dim() == 2 && state_indices.is_contiguous(),
               "state_indices: int32 [N, W] contiguous");
-  TORCH_CHECK(cu_seqlens.scalar_type() == at::kInt && cu_seqlens.is_contiguous(), "cu_seqlens: int32");
-  TORCH_CHECK(num_accepted.scalar_type() == at::kInt && num_accepted.is_contiguous(), "num_accepted: int32");
+  TORCH_CHECK(cu_seqlens.scalar_type() == at::kInt && cu_seqlens.dim() == 1 && cu_seqlens.is_contiguous(), "cu_seqlens: int32 vector");
+  TORCH_CHECK(num_accepted.scalar_type() == at::kInt && num_accepted.dim() == 1 && num_accepted.is_contiguous(), "num_accepted: int32 vector");
+  const auto max_int = std::numeric_limits<int>::max();
+  TORCH_CHECK(state_indices.size(0) < max_int && state.size(0) <= max_int &&
+              state.size(1) <= 65535 && mixed_qkv.size(0) <= max_int,
+              "K5 dimensions exceed int32 metadata range");
   const int N = state_indices.size(0);
   const int W = state_indices.size(1);
   TORCH_CHECK(cu_seqlens.numel() >= N + 1 && num_accepted.numel() >= N, "cu_seqlens/num_accepted too short");
   TORCH_CHECK(W >= 1 && W <= kMaxTok, "state_indices width must be 1..8");
   const int HV = state.size(1);
+  TORCH_CHECK(HV > 0 && state.size(0) > 0 && state.stride(0) >= (int64_t)HV * kDimV * kDimK,
+              "state: positive, non-overlapping slots and heads");
   const int64_t kw = mixed_qkv.size(1) - (int64_t)HV * kDimV;
-  TORCH_CHECK(kw > 0 && kw % (2 * kDimK) == 0, "mixed_qkv width inconsistent with state heads");
+  TORCH_CHECK(kw > 0 && kw % (2 * kDimK) == 0 && kw / (2 * kDimK) <= max_int,
+              "mixed_qkv width inconsistent with state heads or int32 range");
   const int H = kw / (2 * kDimK);
   TORCH_CHECK(HV % H == 0, "HV % H");
   TORCH_CHECK(a.size(1) == HV && b.size(1) == HV && z.size(1) == HV && out.size(1) == HV, "head count mismatch");
+  const int L = mixed_qkv.size(0);
+  TORCH_CHECK(a.size(0) == L && b.size(0) == L && z.size(0) == L && out.size(0) == L,
+              "a/b/z/out token counts must match mixed_qkv");
+  TORCH_CHECK(a.stride(0) >= HV && b.stride(0) >= HV &&
+              z.stride(0) >= (int64_t)HV * kDimV && out.stride(0) >= (int64_t)HV * kDimV,
+              "a/b/z/out rows must not overlap");
+  TORCH_CHECK(a_log.numel() == HV && dt_bias.numel() == HV, "A_log/dt_bias head count mismatch");
+  TORCH_CHECK(HV / H == 1 || HV / H == 2 || HV / H == 3 || HV / H == 4 || HV / H == 8,
+              "K5 HV/H ratio unsupported");
   if (N == 0) return;
   const Strides st{mixed_qkv.stride(0), a.stride(0), b.stride(0), z.stride(0), state.stride(0), out.stride(0)};
   const at::cuda::OptionalCUDAGuard guard(mixed_qkv.device());
@@ -467,7 +537,7 @@ void gdn_mtp_sm75(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, tor
   launch_one<S, SIG>(v, grid, s, mp, ap, bp, a_log.data_ptr<float>(), dt_bias.data_ptr<float>(),                  \
                      state_indices.data_ptr<int>(), cu_seqlens.data_ptr<int>(), num_accepted.data_ptr<int>(),      \
                      reinterpret_cast<S*>(state.data_ptr()), zp, norm_w.data_ptr<float>(), op, H, HV, HV / H, W,   \
-                     (int)null_block_id, (float)scale, (float)eps, st)
+                     L, (int)state.size(0), (int)null_block_id, (float)scale, (float)eps, st)
   if (state.scalar_type() == at::kFloat) {
     if (sigmoid_gate) K5_L(float, true); else K5_L(float, false);
   } else {
