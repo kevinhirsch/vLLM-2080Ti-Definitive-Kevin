@@ -28,7 +28,7 @@ deploy/docs/engine-liveness-authority.md):
 The allow-list is DIAG below: a fixed map name -> env vars. Nothing else can be set through this tool. Every change is
 reversible (stage-diag --clear) and recorded. Flags only take effect at the next engine start.
 """
-import argparse, contextlib, fcntl, json, os, re, signal, subprocess, sys, time, urllib.error, urllib.request
+import argparse, contextlib, fcntl, json, math, os, re, signal, subprocess, sys, time, urllib.error, urllib.request
 from experiment_controls import main_pid, runtime_identity, engine_inflight as control_engine_inflight
 from datetime import datetime
 
@@ -571,7 +571,12 @@ def do_restart(a):
     # LV: a planned restart is refused while someone else holds the engine (a window) or a release is in flight (quiesce:
     # a gateway publish is draining). The holder itself passes --hold <lease>.
     mine = getattr(a, "hold", None)
-    blocking = [h for h in active_holds() if h.get("lease") != mine]
+    try:
+        blocking = [h for h in active_holds() if h.get("lease") != mine]
+    except HoldStateError as error:
+        # Unknown ownership is not permission to stage flags, fence or stop.
+        print(json.dumps({"refused": "engine hold state unavailable or invalid", "error": str(error)}))
+        return 3
     if blocking:
         h = blocking[0]
         refused = {"refused": f"{h.get('kind')} hold held by {h.get('by')} until {datetime.fromtimestamp(h['until']).isoformat(timespec='seconds')}: "
@@ -882,12 +887,50 @@ def _holds_locked():
         fh.close()
 
 
+class HoldStateError(RuntimeError):
+    """Ownership metadata is unknown; no authority may treat it as unheld."""
+
+
 def _holds_read():
     try:
-        rows = json.load(open(HOLDS))
-        return rows if isinstance(rows, list) else []
-    except (OSError, ValueError):
-        return []
+        with open(HOLDS) as source:
+            rows = json.load(source)
+    except FileNotFoundError as error:
+        if not os.path.lexists(HOLDS):
+            return []  # Compatibility: no record has ever been created.
+        raise HoldStateError("hold state path is unresolved") from error
+    except (OSError, ValueError) as error:
+        raise HoldStateError("hold state could not be read as JSON") from error
+    if not isinstance(rows, list):
+        raise HoldStateError("hold state must be a list")
+    leases = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise HoldStateError("hold record must be an object")
+        lease, until = row.get("lease"), row.get("until")
+        mode = row.get("mode", "acquire")
+        try:
+            finite_until = isinstance(until, (int, float)) and not isinstance(until, bool) and math.isfinite(until)
+        except OverflowError:
+            finite_until = False
+        if (not isinstance(lease, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", lease)
+                or lease in leases or row.get("kind") not in HOLD_KINDS
+                or not finite_until or until <= 0
+                or mode not in ("acquire", "run", "owned")):
+            raise HoldStateError("hold record ownership or expiry is invalid")
+        if mode in ("run", "owned") and (
+                isinstance(row.get("pid"), bool) or not isinstance(row.get("pid"), int)
+                or row["pid"] <= 0
+                or (row.get("pid_start") is not None and not isinstance(row["pid_start"], str))):
+            raise HoldStateError("hold process owner is invalid")
+        if any(name in row and not isinstance(row[name], str) for name in ("by", "reason")):
+            raise HoldStateError("hold attribution is invalid")
+        try:
+            datetime.fromtimestamp(until)
+        except (OverflowError, OSError, ValueError) as error:
+            raise HoldStateError("hold expiry is outside the timestamp range") from error
+        leases.add(lease)
+    return rows
 
 
 def _holds_write(rows):
@@ -1542,4 +1585,8 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main() or 0)
+    try:
+        sys.exit(main() or 0)
+    except HoldStateError as error:
+        print(json.dumps({"refused": "engine hold state unavailable or invalid", "error": str(error)}))
+        sys.exit(3)
