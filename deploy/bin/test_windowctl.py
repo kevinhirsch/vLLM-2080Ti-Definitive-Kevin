@@ -61,6 +61,11 @@ class World:
         mp.setattr(wc, "restoration_generation", lambda expected: {"ok": True, "completion_tokens": 3})
         actual_drain = wc.revoke_and_drain
         mp.setattr(wc, "revoke_and_drain", lambda state, timeout_s=120: actual_drain(state, timeout_s, sleep=lambda _: None))
+        actual_wait = wc.wait_for_drain
+        def wait(state, timeout_s=120, **kwargs):
+            kwargs["sleep"] = lambda _: None
+            return actual_wait(state, timeout_s, **kwargs)
+        mp.setattr(wc, "wait_for_drain", wait)
         mp.setattr(wc, "xid_lines", lambda: list(self.xids))
         mp.setattr(wc, "timer_state", lambda t: self.timers.get(t, "inactive"))
         mp.setattr(wc, "set_timer", lambda t, on: self.timers.__setitem__(t, "active" if on else "inactive") or True)
@@ -584,6 +589,45 @@ def test_deadman_restores_paused_user_service_after_generation(world, tmp_path, 
     assert json.load(open(w.path("state.json")))["restored"]
 
 
+def test_dead_owner_probe_is_stopped_after_revocation_before_drain(world, tmp_path, monkeypatch):
+    """A direct probe keeps issuing work after owner death; revocation alone cannot drain it."""
+    w = wc.Window(spec(tmp_path, steps=[{"name": "measure", "run": "true"}], wait_s=1))
+    os.makedirs(w.path("steps"), exist_ok=True)
+    w.take_snapshot()
+    events = []
+    ongoing_probe = [True]
+    world.offline = True
+    w.state.update(lease="LEASE1", pid=999999, pid_start="dead", measurement={"phase": "measure"})
+    w.save_state()
+    monkeypatch.setattr(unitrun, "proc_start", lambda pid: None)
+    def http(url, method="GET", payload=None, timeout=8):
+        if url.endswith("/gateway/measurement") and method == "DELETE":
+            events.append("revoke")
+            return {"active": False}
+        return world.http(url, method, payload, timeout)
+    monkeypatch.setattr(wc, "http_json", http)
+    def stop_lane(lane, prefix=None, exclude=()):
+        events.append("stop-probe")
+        assert events[0] == "revoke"
+        assert lane == w.lane and prefix == w.wid
+        assert exclude == (unitrun.unit_name(w.lane, f"{w.wid}-deadman") + ".service",)
+        ongoing_probe[0] = False
+        return ["owned-probe.service"]
+    monkeypatch.setattr(unitrun, "stop_lane", stop_lane)
+    def inflight(engine):
+        events.append("drain")
+        return {"running": 1 if ongoing_probe[0] else 0, "waiting": 0}
+    monkeypatch.setattr(wc, "engine_inflight", inflight)
+    def generation(expected):
+        events.append("generation")
+        assert not ongoing_probe[0]
+        return {"ok": True}
+    monkeypatch.setattr(wc, "restoration_generation", generation)
+    assert wc.deadman(w.path("state.json")) == 0
+    assert events[:5] == ["revoke", "stop-probe", "drain", "drain", "generation"]
+    assert json.load(open(w.path("state.json")))["restored"] and not world.offline
+
+
 def test_missing_explicit_cli_flag_does_not_pass_arm(world, tmp_path):
     (tmp_path / "rel").mkdir()
     s = wc.Window(spec(tmp_path, steps=[{"name": "arm", "boot": {"tree": str(tmp_path / "rel"),
@@ -597,6 +641,7 @@ def test_direct_run_exports_observed_engine_pid_without_scoped_gateway(world, tm
     env = next(u["env"] for u in world.units if u["job"] == "t5-ab-measure")
     identity = json.load(open(env["WINDOW_ENGINE_IDENTITY_FILE"]))
     assert env["WINDOW_ENGINE_PID"] == str(identity["engine_pid"])
+    assert env["WINDOW_NATIVE_MANIFEST"] == str(tmp_path / "results" / "snapshot.json")
     assert "WINDOW_BENCH_TOKEN_FILE" not in env and s["restore"]["ok"]
 
 

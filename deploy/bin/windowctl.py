@@ -321,8 +321,8 @@ def running_root():
         return None
 
 
-def revoke_and_drain(state, timeout_s=120, *, clock=time.monotonic, sleep=time.sleep):
-    """Revoke first, then require two zero gateway+engine samples before any restart."""
+def revoke_measurement(state):
+    """Deny new phase requests and remove its private token before cancelling work."""
     if state.get("measurement"):
         r = http_json(f"{GATEWAY}/gateway/measurement", "DELETE", {"window": state["window"]})
         if r.get("error") or r.get("active") is not False:
@@ -334,6 +334,10 @@ def revoke_and_drain(state, timeout_s=120, *, clock=time.monotonic, sleep=time.s
             os.unlink(token_file)
         except FileNotFoundError:
             pass
+
+
+def wait_for_drain(state, timeout_s=120, *, clock=time.monotonic, sleep=time.sleep):
+    """Require two zero gateway+engine samples; missing metrics cannot qualify."""
     if not state.get("lease"):
         return
     end, zeros = clock() + max(2, timeout_s), 0
@@ -350,6 +354,12 @@ def revoke_and_drain(state, timeout_s=120, *, clock=time.monotonic, sleep=time.s
         if clock() >= end:
             raise WindowAbort("drain-failed", "gateway or engine still busy, or drain metrics unreadable")
         sleep(1)
+
+
+def revoke_and_drain(state, timeout_s=120, *, clock=time.monotonic, sleep=time.sleep):
+    """Revoke first, then require two zero gateway+engine samples before any restart."""
+    revoke_measurement(state)
+    wait_for_drain(state, timeout_s, clock=clock, sleep=sleep)
 
 
 def boot_environment_matches(identity, expected):
@@ -1098,7 +1108,8 @@ class Window:
             identity_file = self.path("steps", f"{st['name']}-engine-identity.json")
             with open(identity_file, "w") as f:
                 json.dump(identity, f, sort_keys=True)
-            env.update(WINDOW_ENGINE_PID=str(identity["engine_pid"]), WINDOW_ENGINE_IDENTITY_FILE=identity_file)
+            env.update(WINDOW_ENGINE_PID=str(identity["engine_pid"]), WINDOW_ENGINE_IDENTITY_FILE=identity_file,
+                       WINDOW_NATIVE_MANIFEST=self.path("snapshot.json"))
         try:
             res = unitrun.run(self.lane, f"{self.wid}-{st['name']}", argv, timeout_s=int(st.get("timeout_s", 1800)), env=env,
                               cwd=rendered.get("cwd"), out=out)
@@ -1324,13 +1335,19 @@ def restore_from(snap, state, spec, log=print, results=None):
         log(f"RESTORE PROBLEM: {msg}")
     lane, wid = state["lane"], state["window"]
     try:
-        revoke_and_drain(state, int(spec.get("wait_s", 90)))
+        revoke_measurement(state)
     except WindowAbort as e:
         bad(e.why)
         state["restored"] = False
         return rep  # keep the offline fence, hold, and dead-man for a later recovery
     # 1. nothing of this window keeps running
     rep["stopped_units"] = unitrun.stop_lane(lane, prefix=wid, exclude=(unitrun.unit_name(lane, f"{wid}-deadman") + ".service",))
+    try:
+        wait_for_drain(state, int(spec.get("wait_s", 90)))
+    except WindowAbort as e:
+        bad(e.why)
+        state["restored"] = False
+        return rep
     # 2. override bytes, verbatim
     want = bytes.fromhex(snap["override_b64"])
     try:
