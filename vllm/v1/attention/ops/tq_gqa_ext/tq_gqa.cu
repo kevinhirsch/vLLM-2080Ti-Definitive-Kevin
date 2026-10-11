@@ -7,6 +7,11 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp16.h>
 #include <stdint.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <set>
 
 #define HD 256
 #define MSE_BYTES 96
@@ -383,6 +388,71 @@ __global__ void tq_gqa_stage2(const float* __restrict__ Mid, const int* __restri
   if (d == 0) Lse[(long)r * Hq + h] = mx + logf(sum);
 }
 
+// Experimental host-only preference. Missing/default keeps the shipped path:
+// no attribute API, logging, device query, or explicit carveout lock. Read the
+// boot environment once; function-local static initialization can synchronize.
+// The percentage is of SM75's 64 KiB maximum shared memory, not its 96 KiB
+// combined L1/shared space. The CUDA driver can override this preference.
+static int tq_stage1_requested_shared_kib() {
+  static const int requested = []() {
+    const char* value = std::getenv("VLLM_TQ_GQA_STAGE1_SHARED_KIB");
+    if (value == nullptr || std::strcmp(value, "default") == 0) return 0;
+    if (std::strcmp(value, "32") == 0) return 32;
+    if (std::strcmp(value, "64") == 0) return 64;
+    TORCH_CHECK(false, "VLLM_TQ_GQA_STAGE1_SHARED_KIB must be absent, default, 32, or 64");
+    return 0;
+  }();
+  return requested;
+}
+
+static void tq_stage1_check_attribute_api(cudaError_t status, const char* operation) {
+  TORCH_CHECK(status == cudaSuccess, "Experimental TQ stage1 preference: ", operation,
+              " failed: ", cudaGetErrorString(status));
+}
+
+static void tq_stage1_configure_shared_preference(int device, cudaStream_t stream) {
+  const int requested_kib = tq_stage1_requested_shared_kib();
+  if (requested_kib == 0) return;
+
+  // Normal serving workers keep one primary context until process exit. An
+  // in-process cudaDeviceReset/context replacement is not supported here.
+  // Boot-fixed request, exact non-templated stage1 symbol, once per device.
+  static std::mutex configure_mutex;
+  static std::set<int> configured_devices;
+  const std::lock_guard<std::mutex> lock(configure_mutex);
+  if (configured_devices.count(device)) return;
+
+  cudaStreamCaptureStatus capture_status;
+  tq_stage1_check_attribute_api(cudaStreamIsCapturing(stream, &capture_status), "cudaStreamIsCapturing");
+  TORCH_CHECK(capture_status == cudaStreamCaptureStatusNone,
+              "Experimental TQ stage1 preference must be configured by an eager warmup before graph capture");
+  int major = 0, minor = 0;
+  tq_stage1_check_attribute_api(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device),
+                               "cudaDeviceGetAttribute(major)");
+  tq_stage1_check_attribute_api(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device),
+                               "cudaDeviceGetAttribute(minor)");
+  TORCH_CHECK(major == 7 && minor == 5, "Experimental TQ stage1 preference is restricted to SM75");
+
+  const int preferred_percent = requested_kib == 32 ? 50 : 100;
+  tq_stage1_check_attribute_api(
+      cudaFuncSetAttribute(tq_gqa_stage1, cudaFuncAttributePreferredSharedMemoryCarveout, preferred_percent),
+      "cudaFuncSetAttribute(tq_gqa_stage1)");
+  cudaFuncAttributes attributes{};
+  tq_stage1_check_attribute_api(cudaFuncGetAttributes(&attributes, tq_gqa_stage1),
+                               "cudaFuncGetAttributes(tq_gqa_stage1)");
+  TORCH_CHECK(attributes.preferredShmemCarveout == preferred_percent,
+              "Experimental TQ stage1 returned a different preference attribute");
+  // This is the stored preference/source invocation, NOT selected physical
+  // partition, occupancy, executed-device dispatch, parity, or speed proof.
+  std::fprintf(stderr,
+      "Experimental TQ stage1 shared preference requested: function=tq_gqa_stage1 device=%d "
+      "requested_shared_kib=%d preferred_percent=%d returned_preference_percent=%d "
+      "binary_version=%d registers=%d static_shared_bytes=%zu physical_partition_unproven=1\n",
+      device, requested_kib, preferred_percent, attributes.preferredShmemCarveout,
+      attributes.binaryVersion, attributes.numRegs, attributes.sharedSizeBytes);
+  configured_devices.insert(device);
+}
+
 void tq_gqa_decode(torch::Tensor q_rot, torch::Tensor kv, torch::Tensor bt, torch::Tensor seq_lens,
                    torch::Tensor cent, torch::Tensor mid, torch::Tensor out, torch::Tensor lse, int64_t QL,
                    int64_t QS, int64_t G, int64_t block_size, int64_t NS, double scale, int64_t norm_corr) {
@@ -392,6 +462,7 @@ void tq_gqa_decode(torch::Tensor q_rot, torch::Tensor kv, torch::Tensor bt, torc
   const size_t kv_elems = (HD * LDV > CH * LDK) ? HD * LDV : CH * LDK;
   const size_t smem = 16 * LDQ * 2 + kv_elems * 2 + 4 * 16 * LDS * 4 + 16 * LDP * 2 + CH * 8 + CH * 4 * 2 + 16 * 4 * 3 + 8 * 4 + 64;
   auto stream = at::cuda::getCurrentCUDAStream();
+  tq_stage1_configure_shared_preference(q_rot.get_device(), stream);
   dim3 grid(S, Hk * NQG, NS);
   tq_gqa_stage1<<<grid, NTHR, smem, stream>>>(
       q_rot.data_ptr<float>(), kv.data_ptr<uint8_t>(), bt.data_ptr<int>(), seq_lens.data_ptr<int>(),
