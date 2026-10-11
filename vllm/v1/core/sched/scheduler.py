@@ -523,6 +523,17 @@ class Scheduler(SchedulerInterface):
         self.mixed_prefill_quota = int(
             os.environ.get("VLLM_SCHED_MIXED_PREFILL_QUOTA", "0")
         )
+        # Protect a ready decoder from lower-priority prompt work while
+        # preserving the configured batch size for equal-priority peers.
+        # Smaller numeric priorities are more urgent. Default off retains
+        # the original quota policy for a same-source A/B control.
+        self.mixed_prefill_priority_only = (
+            os.environ.get("VLLM_SCHED_MIXED_PREFILL_PRIORITY_ONLY", "0") == "1"
+        )
+        if self.mixed_prefill_priority_only and self.policy != SchedulingPolicy.PRIORITY:
+            raise ValueError(
+                "VLLM_SCHED_MIXED_PREFILL_PRIORITY_ONLY requires priority scheduling"
+            )
         if self.mixed_prefill_quota < 0 or (
             self.mixed_prefill_quota
             and self.mixed_prefill_quota < max(1, self.num_prefill_lookahead)
@@ -563,6 +574,13 @@ class Scheduler(SchedulerInterface):
 
     def _runnable_decode_for_quota(self, defer_decode_for_prefill_batch: bool) -> bool:
         """Scheduler-ready running decode, not a waiting first-token request."""
+        return self._runnable_decode_priority(defer_decode_for_prefill_batch) is not None
+
+    def _runnable_decode_priority(
+        self, defer_decode_for_prefill_batch: bool
+    ) -> int | None:
+        """Most urgent scheduler-ready decoder under the quota eligibility rules."""
+        priority = None
         for request in self.running:
             if self._prefill_remaining(request) > 0:
                 continue
@@ -589,8 +607,22 @@ class Scheduler(SchedulerInterface):
                 request.num_tokens_with_spec + request.num_output_placeholders
                 > request.num_computed_tokens
             ):
-                return True
-        return False
+                priority = (
+                    request.priority if priority is None
+                    else min(priority, request.priority)
+                )
+        return priority
+
+    def _request_prefill_budget(
+        self, request: Request, remaining: int | None,
+        protected_priority: int | None,
+    ) -> int | None:
+        if (
+            self.mixed_prefill_priority_only
+            and (protected_priority is None or request.priority <= protected_priority)
+        ):
+            return None
+        return remaining
 
     @staticmethod
     def _prefill_work(request: Request, computed: int, scheduled: int) -> int:
@@ -1051,10 +1083,13 @@ class Scheduler(SchedulerInterface):
                     preempted_reqs.append(healed)
             self._heal_queue.clear()
 
+        protected_decode_priority = (
+            self._runnable_decode_priority(defer_decode_for_prefill_batch)
+            if self.mixed_prefill_quota > 0 else None
+        )
         mixed_prefill_budget = (
             self.mixed_prefill_quota
-            if self.mixed_prefill_quota > 0
-            and self._runnable_decode_for_quota(defer_decode_for_prefill_batch)
+            if protected_decode_priority is not None
             else None
         )
         scheduled_prefill_work: dict[str, int] = {}
@@ -1144,9 +1179,12 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
+            request_prefill_budget = self._request_prefill_budget(
+                request, mixed_prefill_budget, protected_decode_priority,
+            )
             num_new_tokens = self._limit_mixed_prefill(
                 request, request.num_computed_tokens, num_new_tokens,
-                mixed_prefill_budget,
+                request_prefill_budget,
             )
 
             # Make sure the input position does not exceed the max model len.
@@ -1184,7 +1222,7 @@ class Scheduler(SchedulerInterface):
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens,
-                    prefill_chunk_limit=mixed_prefill_budget,
+                    prefill_chunk_limit=request_prefill_budget,
                 )
 
             # Schedule encoder inputs.
@@ -1316,7 +1354,7 @@ class Scheduler(SchedulerInterface):
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
-            if mixed_prefill_budget is not None:
+            if request_prefill_budget is not None:
                 work = self._prefill_work(
                     request, request.num_computed_tokens, num_new_tokens
                 )
@@ -1388,6 +1426,9 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                request_prefill_budget = self._request_prefill_budget(
+                    request, mixed_prefill_budget, protected_decode_priority,
+                )
 
                 request_prefill_remaining = max(
                     request.num_prompt_tokens - request.num_computed_tokens, 0
@@ -1624,7 +1665,7 @@ class Scheduler(SchedulerInterface):
                     assert num_new_tokens > 0
                     num_new_tokens = self._limit_mixed_prefill(
                         request, num_computed_tokens, num_new_tokens,
-                        mixed_prefill_budget,
+                        request_prefill_budget,
                     )
                     if num_new_tokens == 0:
                         # Preserve queue ordering for the next step, while a
@@ -1640,7 +1681,7 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens,
                             num_new_local_computed_tokens,
                             num_external_computed_tokens,
-                            prefill_chunk_limit=mixed_prefill_budget,
+                            prefill_chunk_limit=request_prefill_budget,
                         )
                         if num_new_tokens == 0:
                             break
@@ -1835,7 +1876,7 @@ class Scheduler(SchedulerInterface):
                     request_id
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
-                if mixed_prefill_budget is not None:
+                if request_prefill_budget is not None:
                     work = self._prefill_work(
                         request, num_computed_tokens, num_new_tokens
                     )
