@@ -341,6 +341,9 @@ __global__ void Marlin(
 
   // For larger GEMMs we run multiple batchsize 64 versions in parallel for a
   // better partitioning with less reductions
+#if defined(LP_A8G) || defined(LP_A8E)
+  const int lp_prob_m = prob_m;  // Lane LP: total rows of this launch (prob_m is reset to one m-block below)
+#endif
   int parallel = 1;
   if (prob_m > m_block_size) {
     parallel = prob_m / m_block_size;
@@ -374,6 +377,14 @@ __global__ void Marlin(
   }
 
   int slice_row = 0;
+#ifdef LP_A8G
+  int lp_tile = 0;  // Lane LP: global k-tile index of the tile being consumed by matmul_a8
+  float lp_as[2 * thread_m_blocks];  // act scales of this thread's rows for the current group (prefetched at k == 0)
+#endif
+#ifdef LP_A8E
+  int lp_tile = 0;
+  int lp_sh[2 * thread_m_blocks];  // LP_EMAX - e[row, group] for this thread's rows (prefetched at k == 0)
+#endif
   int slice_col_par = blockIdx.x;
   int slice_col;
   int slice_iters =
@@ -497,6 +508,10 @@ __global__ void Marlin(
   };
 
   init_slice();
+#if defined(LP_A8G) || defined(LP_A8E)
+
+  lp_tile = slice_row;
+#endif
 
   // A sizes/strides
 
@@ -805,6 +820,67 @@ __global__ void Marlin(
     cp_async_fence();
   };
 
+#ifdef LP_PIPE
+  // Lane LP: Turing has no cp.async, so vLLM's sm_75 cp_async* are synchronous LDG->STS copies and every tile's global
+  // latency is exposed between two barriers. LP_PIPE issues the next tile's global loads into registers BEFORE the
+  // current tile's first sub-step MMAs and commits them to shared memory after it (one barrier), hiding the latency.
+  static_assert(b_sh_wr_iters >= 2, "LP_PIPE needs >= 2 register sub-steps per tile");
+  constexpr int lp_nb = b_sh_wr_iters * b_thread_vecs;
+  int4 lp_pa[a_sh_wr_iters];
+  int4 lp_pb[lp_nb];
+  int4 lp_ps, lp_pz;
+  bool lp_has = false, lp_hs = false, lp_hz = false;
+  int lp_pipe = 0;
+  auto lp_fetch_regs = [&](int pipe, int a_off, bool pred) {
+    lp_has = pred;
+    lp_hs = lp_hz = false;
+    lp_pipe = pipe;
+    if (pred) {
+  #pragma unroll
+      for (int i = 0; i < a_sh_wr_iters; i++) {
+        if (a_sh_wr_pred[i]) lp_pa[i] = A[a_gl_rd_delta_i * i + a_gl_rd + a_gl_rd_delta_o * a_off];
+      }
+  #pragma unroll
+      for (int i = 0; i < lp_nb; i++) {
+        constexpr int count = div_ceil(b_sh_stride, threads);
+        int b_gl_idx = b_gl_rd + (i % count) * threads + b_gl_stride * (i / count) * div_ceil(threads, b_sh_stride);
+        lp_pb[i] = B[b_gl_idx];
+      }
+      b_gl_rd += b_gl_rd_delta_o;
+      if constexpr (group_blocks != -1) {
+        if (pipe % div_ceil(group_blocks, thread_k_blocks) == 0) {
+          if (s_sh_wr_pred) { lp_ps = scales_ptr[s_gl_rd]; lp_hs = true; }
+          s_gl_rd += s_gl_rd_delta * s_tb_groups;
+        }
+      }
+      if constexpr (has_zp && group_blocks != -1) {
+        if (pipe % div_ceil(group_blocks, thread_k_blocks) == 0) {
+          if (zp_sh_wr_pred) { lp_pz = zp_ptr[zp_gl_rd]; lp_hz = true; }
+          zp_gl_rd += zp_gl_rd_delta * zp_tb_groups;
+        }
+      }
+    }
+  };
+  auto lp_commit = [&]() {
+    if (lp_has) {
+      int4* sh_a_stage = sh_a + a_sh_stage * lp_pipe;
+  #pragma unroll
+      for (int i = 0; i < a_sh_wr_iters; i++) {
+        if (a_sh_wr_pred[i]) sh_a_stage[a_sh_wr_trans[i]] = lp_pa[i];
+      }
+      int4* sh_b_stage = sh_b + b_sh_stage * lp_pipe;
+  #pragma unroll
+      for (int i = 0; i < lp_nb; i++) sh_b_stage[threads * i + threadIdx.x] = lp_pb[i];
+      if constexpr (group_blocks != -1) {
+        if (lp_hs) (sh_s + s_sh_stage * lp_pipe)[s_sh_wr] = lp_ps;
+      }
+      if constexpr (has_zp && group_blocks != -1) {
+        if (lp_hz) (sh_zp + zp_sh_stage * lp_pipe)[zp_sh_wr] = lp_pz;
+      }
+    }
+  };
+#endif
+
   auto fetch_col_zp_to_shared = [&]() {
     if (zp_sh_wr_pred) {
       cp_async4(&sh_zp[zp_sh_wr], &zp_ptr[zp_gl_rd]);
@@ -1090,6 +1166,29 @@ __global__ void Marlin(
 
   auto matmul_a8 = [&](int k) {
     int k2 = k % 2;
+#ifdef LP_A8G
+    if (k == 0) {
+      const int lp_G = prob_k / (group_blocks * 16);
+      const int lp_grp = (lp_tile * thread_k_blocks) / group_blocks;
+  #pragma unroll
+      for (int r = 0; r < 2 * thread_m_blocks; r++) {
+        int lp_row = par_id * 16 * thread_m_blocks + r * 8 + (threadIdx.x % 32) / 4;
+        lp_as[r] = lp_row < lp_prob_m ? __ldg(&global_scale_ptr[lp_row * lp_G + lp_grp]) : 0.0f;
+      }
+    }
+#endif
+#ifdef LP_A8E
+    if (k == 0) {
+      const int lp_G = prob_k / (group_blocks * 16);
+      const int lp_grp = (lp_tile * thread_k_blocks) / group_blocks;
+      const uint8_t* lp_e_ptr = reinterpret_cast<const uint8_t*>(global_scale_ptr);
+  #pragma unroll
+      for (int r = 0; r < 2 * thread_m_blocks; r++) {
+        int lp_row = par_id * 16 * thread_m_blocks + r * 8 + (threadIdx.x % 32) / 4;
+        lp_sh[r] = LP_EMAX - (lp_row < lp_prob_m ? (int)__ldg(&lp_e_ptr[lp_row * lp_G + lp_grp]) : 0);
+      }
+    }
+#endif
   #pragma unroll
     for (int j = 0; j < 2; j++) {
       FragB frag_b[2];
@@ -1127,6 +1226,35 @@ __global__ void Marlin(
       if constexpr (group_blocks != -1) {
         if (group_blocks == 2 || k == 1) {
           if constexpr (a_type == vllm::kS8) {
+#ifdef LP_A8G
+            // Lane LP: per-(row, 128-K group) activation scales (MX-style int8). frag_c holds fp32 here:
+            // frag_c += float(int32 group partial) * (a_gs[row, grp] * w_scale_fp16[grp, col]).
+            // a_gs was prefetched into lp_as at k == 0 of this tile; int32 -> fp32 via the 2^23 magic add
+            // (exact for |p| < 2^22; a 64-K int8 x int4 partial is <= 127*15*64 = 121,920).
+            static_assert(group_blocks == 8, "LP_A8G supports group size 128 only");
+            float2 lp_ws0 = __half22float2(*reinterpret_cast<half2*>(&frag_s[k2][j * 2][0]));
+            float2 lp_ws1 = __half22float2(*reinterpret_cast<half2*>(&frag_s[k2][j * 2 + 1][0]));
+  #pragma unroll
+            for (int i = 0; i < thread_m_blocks; i++) {
+              float sc00 = lp_as[i * 2] * lp_ws0.x, sc01 = lp_as[i * 2] * lp_ws0.y;
+              float sc10 = lp_as[i * 2 + 1] * lp_ws0.x, sc11 = lp_as[i * 2 + 1] * lp_ws0.y;
+              float sd00 = lp_as[i * 2] * lp_ws1.x, sd01 = lp_as[i * 2] * lp_ws1.y;
+              float sd10 = lp_as[i * 2 + 1] * lp_ws1.x, sd11 = lp_as[i * 2 + 1] * lp_ws1.y;
+              const float scA[4] = {sc00, sc01, sc10, sc11};
+              const float scB[4] = {sd00, sd01, sd10, sd11};
+  #pragma unroll
+              for (int g = 0; g < 4; g++) {
+                int p0 = *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][0][g]);
+                int p1 = *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][1][g]);
+                float f0 = __int_as_float(p0 + 0x4B400000) - 12582912.0f;
+                float f1 = __int_as_float(p1 + 0x4B400000) - 12582912.0f;
+                frag_c[i][j][0][g] = __fmaf_rn(f0, scA[g], frag_c[i][j][0][g]);
+                frag_c[i][j][1][g] = __fmaf_rn(f1, scB[g], frag_c[i][j][1][g]);
+                frag_c_tmp[i][j][0][g] = 0.0f;
+                frag_c_tmp[i][j][1][g] = 0.0f;
+              }
+            }
+#else
             int2 s_vals[2];
             s_vals[0] = {
                 (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2][0])[0],
@@ -1140,6 +1268,9 @@ __global__ void Marlin(
   #pragma unroll
               for (int g = 0; g < 4; g++) {
                 int scale = reinterpret_cast<int*>(&s_vals[0])[g % 2];
+#ifdef LP_A8E
+                scale <<= lp_sh[i * 2 + g / 2];
+#endif
                 *reinterpret_cast<int32_t*>(&frag_c[i][j][0][g]) +=
                     *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][0][g]) *
                     scale;
@@ -1149,12 +1280,16 @@ __global__ void Marlin(
   #pragma unroll
               for (int g = 0; g < 4; g++) {
                 int scale = reinterpret_cast<int*>(&s_vals[1])[g % 2];
+#ifdef LP_A8E
+                scale <<= lp_sh[i * 2 + g / 2];
+#endif
                 *reinterpret_cast<int32_t*>(&frag_c[i][j][1][g]) +=
                     *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][1][g]) *
                     scale;
                 frag_c_tmp[i][j][1][g] = 0.0f;
               }
             }
+#endif
           } else {
             float2 s_vals[2];
             if constexpr (s_type_id != vllm::kFE8M0fnu.id()) {
@@ -1579,14 +1714,25 @@ __global__ void Marlin(
     for (int pipe = 0; pipe < stages;) {
   #pragma unroll
       for (int k = 0; k < b_sh_wr_iters; k++) {
+#ifdef LP_PIPE
+        if (k == b_sh_wr_iters - 1) {
+          lp_commit();       // next tile: registers -> shared, after this tile's sub-step k-1 MMAs
+          __syncthreads();
+        }
+#endif
         fetch_to_registers(k + 1, pipe % stages);
         fetch_scales_to_registers(k + 1, pipe);
         fetch_zp_to_registers(k + 1, pipe);
         if (k == b_sh_wr_iters - 2) {
+#ifdef LP_PIPE
+          lp_fetch_regs((pipe + stages - 1) % stages, pipe, slice_iters >= stages);
+          pipe++;
+#else
           fetch_to_shared((pipe + stages - 1) % stages, pipe,
                           slice_iters >= stages);
           pipe++;
           wait_for_stage();
+#endif
         }
 
         if constexpr (!is_a_8bit) {
@@ -1597,6 +1743,9 @@ __global__ void Marlin(
         }
       }
       slice_iters--;
+#if defined(LP_A8G) || defined(LP_A8E)
+      lp_tile++;
+#endif
       if (slice_iters == 0) {
         break;
       }
@@ -1637,9 +1786,11 @@ __global__ void Marlin(
             for (int g = 0; g < 4; g++) {
               float c_val = frag_c[i][j][0][g];
 
+#ifndef LP_A8G
               if constexpr (a_type == vllm::kS8) {
                 c_val = __int2float_rn(*reinterpret_cast<int32_t*>(&c_val));
               }
+#endif
               float s_val = frag_a_s[i * 2 + g / 2];
               frag_c[i][j][0][g] = c_val * s_val;
             }
@@ -1647,9 +1798,11 @@ __global__ void Marlin(
             for (int g = 0; g < 4; g++) {
               float c_val = frag_c[i][j][1][g];
 
+#ifndef LP_A8G
               if constexpr (a_type == vllm::kS8) {
                 c_val = __int2float_rn(*reinterpret_cast<int32_t*>(&c_val));
               }
+#endif
               float s_val = frag_a_s[i * 2 + g / 2];
               frag_c[i][j][1][g] = c_val * s_val;
             }
@@ -1794,6 +1947,9 @@ __global__ void Marlin(
       }
       is_first_matmul_in_slice = true;
       init_slice();
+#if defined(LP_A8G) || defined(LP_A8E)
+      lp_tile = slice_row;
+#endif
 
       if (slice_iters) {
         a_gl_rd = a_gl_stride * (threadIdx.x / a_gl_rd_delta_o) +
