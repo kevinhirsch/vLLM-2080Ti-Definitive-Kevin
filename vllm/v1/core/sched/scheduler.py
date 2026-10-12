@@ -549,6 +549,33 @@ class Scheduler(SchedulerInterface):
             raise ValueError(
                 "VLLM_SCHED_MIXED_PREFILL_QUOTA requires chunked prefill"
             )
+        # Default-off admission bound before any running decoder is ready.
+        # It covers only positive-priority prompt work; ordinary/urgent
+        # priority <= 0 keeps its configured budget. This is a batch-wide
+        # quota, not a cap multiplied by the number of background requests.
+        self.idle_background_prefill_quota = int(
+            os.environ.get("VLLM_SCHED_IDLE_BACKGROUND_PREFILL_QUOTA", "0")
+        )
+        if self.idle_background_prefill_quota < 0 or (
+            self.idle_background_prefill_quota
+            and self.idle_background_prefill_quota
+            < max(1, self.num_prefill_lookahead)
+        ):
+            raise ValueError(
+                "VLLM_SCHED_IDLE_BACKGROUND_PREFILL_QUOTA must be 0 (off) "
+                "or at least the MTP prefill lookahead"
+            )
+        if self.idle_background_prefill_quota:
+            if self.policy != SchedulingPolicy.PRIORITY:
+                raise ValueError(
+                    "VLLM_SCHED_IDLE_BACKGROUND_PREFILL_QUOTA requires "
+                    "priority scheduling"
+                )
+            if not self.scheduler_config.enable_chunked_prefill:
+                raise ValueError(
+                    "VLLM_SCHED_IDLE_BACKGROUND_PREFILL_QUOTA requires "
+                    "chunked prefill"
+                )
         self._ps_last_t: float = 0.0
         self._ps_last_had_chunk: bool = False
         self._ps_chunk_secs: float = 0.0
@@ -617,12 +644,22 @@ class Scheduler(SchedulerInterface):
         self, request: Request, remaining: int | None,
         protected_priority: int | None,
     ) -> int | None:
+        if protected_priority is None and self.idle_background_prefill_quota:
+            return remaining if request.priority > 0 else None
         if (
             self.mixed_prefill_priority_only
             and (protected_priority is None or request.priority <= protected_priority)
         ):
             return None
         return remaining
+
+    def _batch_prompt_work_budget(self, protected_priority: int | None) -> int | None:
+        # Reuse the existing aggregate charge/refund ledger. Its two modes
+        # are disjoint: a ready decoder uses the original mixed quota;
+        # otherwise positive-priority prefills share the opt-in idle quota.
+        if protected_priority is None:
+            return self.idle_background_prefill_quota or None
+        return self.mixed_prefill_quota or None
 
     @staticmethod
     def _prefill_work(request: Request, computed: int, scheduled: int) -> int:
@@ -1085,12 +1122,13 @@ class Scheduler(SchedulerInterface):
 
         protected_decode_priority = (
             self._runnable_decode_priority(defer_decode_for_prefill_batch)
-            if self.mixed_prefill_quota > 0 else None
+            if (
+                self.mixed_prefill_quota > 0
+                or self.idle_background_prefill_quota > 0
+            ) else None
         )
-        mixed_prefill_budget = (
-            self.mixed_prefill_quota
-            if protected_decode_priority is not None
-            else None
+        mixed_prefill_budget = self._batch_prompt_work_budget(
+            protected_decode_priority
         )
         scheduled_prefill_work: dict[str, int] = {}
 
