@@ -93,7 +93,7 @@ class MarlinLinearKernel(MPLinearKernel):
 
         # Allocate marlin workspace, reusing existing storage on reload.
         self.workspace = marlin_make_workspace_new(
-            device, existing=getattr(self, "workspace", None)
+            device, 2, existing=getattr(self, "workspace", None)
         )
 
         # Default name since marlin requires empty parameter for zp,

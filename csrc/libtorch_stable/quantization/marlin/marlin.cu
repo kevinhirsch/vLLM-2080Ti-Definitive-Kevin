@@ -200,7 +200,7 @@ exec_config_t determine_exec_config(
     const vllm::ScalarType& c_type, const vllm::ScalarType& s_type, int prob_m,
     int prob_n, int prob_k, int thread_m_blocks, bool m_block_size_8,
     int num_bits, int group_size, bool has_zp, bool is_zp_float, int is_a_8bit,
-    int stages, int max_shared_mem, int sms) {
+    int stages, int max_shared_mem, int sms, int ws_blocks_per_sm) {
   exec_config_t exec_cfg = exec_config_t{1, thread_config_t{-1, -1, -1}};
   thread_config_t* thread_configs = thread_m_blocks > 1
                                         ? large_batch_thread_configs
@@ -232,6 +232,13 @@ exec_config_t determine_exec_config(
 
     if (kernel == MarlinDefault) continue;
 
+    // SM75 small-M (decode): 2 pipeline stages + 1 block/SM keep ~16 KB in flight per SM (~9.5 GB/s/SM measured,
+    // the bus allows ~40). Decode tiles need ~25 KB smem and <=108 registers, so 2 blocks fit per SM. Lock offsets
+    // reach blockIdx.x, so only when the workspace holds 2 slots per SM.
+    if (stages == 2 && thread_m_blocks == 1 && ws_blocks_per_sm >= 2 &&
+        is_valid_config(th_config, thread_m_blocks, prob_m, prob_n, prob_k, num_bits, group_size, has_zp,
+                        is_zp_float, is_a_8bit, stages, max_shared_mem / 2 - 1024 - 512))
+      return {2, th_config};
     return {1, th_config};
   }
 
@@ -245,7 +252,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                vllm::ScalarType const& c_type, vllm::ScalarType const& s_type,
                bool has_bias, bool has_zp, int num_groups, int group_size,
                int dev, cudaStream_t stream, int thread_k_init,
-               int thread_n_init, int sms, bool use_atomic_add,
+               int thread_n_init, int sms, int ws_blocks_per_sm, bool use_atomic_add,
                bool use_fp32_reduce, bool is_zp_float) {
   bool is_a_8bit = a_type.size_bits() == 8;
   STD_TORCH_CHECK(prob_m > 0 && prob_n > 0 && prob_k > 0, "Invalid MNK = [",
@@ -334,7 +341,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
       exec_cfg = determine_exec_config(
           a_type, b_type, c_type, s_type, prob_m_split, prob_n, prob_k,
           thread_m_blocks, m_block_size_8, num_bits, group_size, has_zp,
-          is_zp_float, is_a_8bit, stages, max_shared_mem, sms);
+          is_zp_float, is_a_8bit, stages, max_shared_mem, sms, ws_blocks_per_sm);
       thread_tfg = exec_cfg.tb_cfg;
       if (thread_tfg.thread_n != -1) {
         if (prob_n / thread_tfg.thread_n *
@@ -723,7 +730,7 @@ torch::stable::Tensor marlin_gemm(
       size_n, size_k, a.stride(0), workspace.mutable_data_ptr(), a_type, b_type,
       c_type, s_type, has_bias, has_zp, num_groups, group_size, device_index,
       get_current_cuda_stream(device_index), thread_k, thread_n, sms,
-      use_atomic_add, use_fp32_reduce, is_zp_float);
+      static_cast<int>(workspace.numel() / sms), use_atomic_add, use_fp32_reduce, is_zp_float);
 
   return c;
 }
