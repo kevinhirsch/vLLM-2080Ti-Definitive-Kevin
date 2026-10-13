@@ -813,6 +813,11 @@ def split_decodes_and_prefills(
     num_tokens = common_attn_metadata.num_actual_tokens
     query_start_loc = common_attn_metadata.query_start_loc_cpu
 
+    if getattr(common_attn_metadata, "tree_step", False):
+        # E16 tree step: all requests are spec decodes of M rows; M exceeds
+        # the 1 + D threshold on purpose (contract section 3 hazard).
+        return num_reqs, 0, num_tokens, 0
+
     if (
         max_query_len <= decode_threshold
         and (not require_uniform or decode_threshold <= 1)

@@ -939,6 +939,10 @@ class GPUModelRunner(
 
         self.uniform_decode_query_len = 1 + self.num_spec_tokens
 
+        # E16 tree drafting (P2/P8). None = off (byte-identical chain path).
+        # Static tables are built ONCE here, never lazily or under capture.
+        self._init_tree_state()
+
         # Cudagraph dispatcher for runtime cudagraph dispatching.
         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
 
@@ -1174,6 +1178,55 @@ class GPUModelRunner(
         )
         return model_kwargs
 
+    def _init_tree_state(self) -> None:
+        from vllm.v1.spec_decode.tree_spec import resolve_engine_tree_spec
+
+        self.tree_spec = resolve_engine_tree_spec(self.vllm_config)
+        self.tree_tensors = None
+        self.tree_draft_token_ids: torch.Tensor | None = None
+        self._tree_depth_delta_np: np.ndarray | None = None
+        self._tree_depth_delta: torch.Tensor | None = None
+        spec = self.tree_spec
+        if spec is None:
+            return
+        self.tree_tensors = spec.device_tensors(self.device)
+        # rows_depth[r] - r: added to the row-indexed positions (which already
+        # gave the token gather and slot_mapping) to get depth positions.
+        delta = np.asarray(spec.rows_depth, dtype=np.int64) - np.arange(
+            spec.M, dtype=np.int64
+        )
+        self._tree_depth_delta_np = delta
+        self._tree_depth_delta = torch.from_numpy(delta).to(self.device)
+        # [B_tree, M-1] drafts of the step, -1 kept (handed to the P6 sampler).
+        self.tree_draft_token_ids = torch.full(
+            (spec.B_tree, spec.num_drafts), -1, dtype=torch.int64, device=self.device
+        )
+        logger.info("Tree speculation enabled in model runner: %s", spec.describe())
+
+    def _check_tree_step(
+        self, num_reqs: int, num_scheduled_tokens: np.ndarray
+    ) -> None:
+        spec = self.tree_spec
+        assert spec is not None, "SchedulerOutput.tree_step with tree off"
+        assert not self.use_async_scheduling, "tree step needs sync scheduling"
+        assert 1 <= num_reqs <= spec.B_tree, (num_reqs, spec.B_tree)
+        assert bool((num_scheduled_tokens[:num_reqs] == spec.M).all()), (
+            "tree step must schedule exactly M rows per request",
+            num_scheduled_tokens[:num_reqs].tolist(),
+        )
+
+    def _apply_tree_positions(self, num_reqs: int, num_tokens: int) -> None:
+        """Tree step (P2): positions = num_computed + rows_depth[r].
+
+        Called after the token gather and compute_slot_mapping consumed the
+        row-indexed positions (num_computed + r), so input ids and every KV
+        group's slot_mapping stay row-indexed while RoPE sees depth.  M-RoPE
+        (decode text) gets the same offset on all sections; it is applied on
+        the CPU buffer before its H2D copy (see _prepare_inputs)."""
+        assert self._tree_depth_delta is not None
+        qp = self.query_pos.gpu[:num_tokens]
+        self.positions[:num_tokens] += self._tree_depth_delta[qp]
+
     def _may_reorder_batch(self, scheduler_output: "SchedulerOutput") -> None:
         """
         Update the order of requests in the batch based on the attention
@@ -1192,7 +1245,11 @@ class GPUModelRunner(
         if len(self.kv_cache_config.kv_cache_groups) == 0:
             return
 
-        if self.reorder_batch_threshold is not None:
+        if self.reorder_batch_threshold is not None and not getattr(
+            scheduler_output, "tree_step", False
+        ):
+            # A tree step is all decodes (M rows each); reordering is a no-op
+            # and the 1 + D threshold must not classify it (contract 3).
             reorder_batch_to_split_decodes_and_prefills(
                 self.input_batch,
                 scheduler_output,
@@ -2118,10 +2175,21 @@ class GPUModelRunner(
             + self.query_pos.np[: cu_num_tokens[-1]]
         )
 
+        tree_step = getattr(scheduler_output, "tree_step", False)
+        if tree_step:
+            self._check_tree_step(num_reqs, num_scheduled_tokens)
+
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
             self._calc_mrope_positions(scheduler_output)
+            if tree_step:
+                # Same depth offset on every M-RoPE section (decode text).
+                assert self._tree_depth_delta_np is not None
+                n = int(cu_num_tokens[-1])
+                self.mrope_positions.np[:, :n] += self._tree_depth_delta_np[
+                    self.query_pos.np[:n]
+                ]
 
         # Get token indices.
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
@@ -2318,6 +2386,9 @@ class GPUModelRunner(
             self.query_start_loc.gpu[: num_reqs + 1],
             self.positions[:total_num_scheduled_tokens],
         )
+        if tree_step:
+            # After slot_mapping: slots stay row-indexed, RoPE goes to depth.
+            self._apply_tree_positions(num_reqs, total_num_scheduled_tokens)
 
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
@@ -2385,6 +2456,14 @@ class GPUModelRunner(
             )
             logits_indices = spec_decode_metadata.logits_indices
             num_sampled_tokens = num_draft_tokens + 1
+            if tree_step:
+                # [B, M-1] chain-first drafts with -1 kept, for the P6 walk.
+                assert self.tree_draft_token_ids is not None
+                M1 = self.tree_spec.num_drafts
+                assert bool((num_draft_tokens == M1).all())
+                self.tree_draft_token_ids[:num_reqs].copy_(
+                    spec_decode_metadata.draft_token_ids.view(num_reqs, M1)
+                )
             # For DECODE only cuda graph of some attention backends (e.g., GDN).
             self.num_decode_draft_tokens.np[:num_reqs] = num_decode_draft_tokens
             self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
@@ -2421,6 +2500,7 @@ class GPUModelRunner(
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
+        tree_step: bool = False,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         Returns:
@@ -2584,6 +2664,7 @@ class GPUModelRunner(
             positions=self.positions[:num_tokens_padded],
             mm_req_doc_ranges=req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
+            tree_step=tree_step,
         )
 
         if self.dcp_world_size > 1:
@@ -4175,6 +4256,7 @@ class GPUModelRunner(
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
         has_non_spec_rows: bool = False,
+        tree_step: bool = False,
     ) -> tuple[
         CUDAGraphMode,
         BatchDescriptor,
@@ -4184,7 +4266,9 @@ class GPUModelRunner(
     ]:
         uniform_decode = self._is_uniform_decode(
             max_num_scheduled_tokens=max_num_scheduled_tokens,
-            uniform_decode_query_len=self.uniform_decode_query_len,
+            uniform_decode_query_len=(
+                self.tree_spec.M if tree_step else self.uniform_decode_query_len
+            ),
             num_tokens=num_tokens,
             num_reqs=num_reqs,
             force_uniform_decode=force_uniform_decode,
@@ -4214,6 +4298,7 @@ class GPUModelRunner(
                 num_active_loras=num_active_loras,
                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
                 invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
+                tree_step=tree_step,
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
@@ -4512,6 +4597,7 @@ class GPUModelRunner(
                     num_reqs,
                     self.num_spec_tokens,
                 ),
+                tree_step=scheduler_output.tree_step,
             )
 
             logger.debug(
@@ -4626,6 +4712,7 @@ class GPUModelRunner(
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     slot_mappings=slot_mappings_by_group,
+                    tree_step=scheduler_output.tree_step,
                 )
             )
 
@@ -6079,6 +6166,7 @@ class GPUModelRunner(
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         randomize_inputs: bool = False,
+        tree_step: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -6132,6 +6220,11 @@ class GPUModelRunner(
         # routine of FA2 for pure decode, i.e., Flashdecode + an optimization
         # for GQA/MQA.
         max_query_len = self.uniform_decode_query_len if uniform_decode else num_tokens
+        if tree_step:
+            # E16 tree family: uniform decode with M rows per request.
+            assert uniform_decode and self.tree_spec is not None
+            max_query_len = self.tree_spec.M
+            assert num_tokens % max_query_len == 0, (num_tokens, max_query_len)
 
         # Set num_scheduled_tokens based on num_tokens and max_num_seqs
         # for dummy run with LoRA so that the num_reqs collectively
@@ -6191,6 +6284,7 @@ class GPUModelRunner(
                 # `force_num_active_loras` is used for cudagraph capture; because we
                 # need to capture graphs for specific num_active_loras counts
                 force_num_active_loras=num_active_loras,
+                tree_step=tree_step,
             )
         )
 
@@ -6317,6 +6411,7 @@ class GPUModelRunner(
                     ),
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
+                    tree_step=tree_step,
                 )
 
         with self.maybe_dummy_run_with_lora(
@@ -7209,6 +7304,7 @@ class GPUModelRunner(
                 remove_lora=False,
                 num_active_loras=desc.num_active_loras,
                 profile_seq_lens=profile_seq_lens,
+                tree_step=desc.tree,
             )
         if num_warmups > 0:
             # Warmups may use auxiliary streams. Ensure all of their work has
@@ -7230,6 +7326,7 @@ class GPUModelRunner(
                 num_active_loras=desc.num_active_loras,
                 is_graph_capturing=True,
                 profile_seq_lens=profile_seq_lens,
+                tree_step=desc.tree,
             )
 
     def _capture_cudagraphs(
@@ -7465,7 +7562,7 @@ class GPUModelRunner(
         # Trigger cudagraph dispatching keys initialization after
         # resolved cudagraph mode.
         self.cudagraph_dispatcher.initialize_cudagraph_keys(
-            cudagraph_mode, self.uniform_decode_query_len
+            cudagraph_mode, self.uniform_decode_query_len, tree_spec=self.tree_spec
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.

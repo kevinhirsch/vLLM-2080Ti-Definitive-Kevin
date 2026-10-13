@@ -46,6 +46,7 @@ Gating (default OFF):
 from __future__ import annotations
 
 import ast
+import dataclasses
 import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -399,6 +400,65 @@ def decide_tree_step(
         and all_full_drafts
         and 1 <= num_reqs <= spec.B_tree
     )
+
+
+def clamp_tree_spec(
+    spec: TreeSpec | None,
+    max_num_seqs: int,
+    max_cudagraph_capture_size: int | None = None,
+) -> TreeSpec | None:
+    """Apply the contract section 2 clamp (P8).
+
+    ``B_tree <= floor(max_num_seqs * (D + 1) / M)`` keeps every buffer sized by
+    ``max_num_seqs * (1 + D)`` tokens valid on a tree step, and
+    ``B_tree * M <= max_cudagraph_capture_size`` keeps every tree step inside
+    the FULL-graph range.  Returns None (tree off) when no batch size fits.
+    """
+    if spec is None:
+        return None
+    b = min(spec.B_tree, (max_num_seqs * (spec.D + 1)) // spec.M)
+    if max_cudagraph_capture_size:
+        b = min(b, max_cudagraph_capture_size // spec.M)
+    if b < 1:
+        return None
+    if b == spec.B_tree:
+        return spec
+    return dataclasses.replace(spec, B_tree=b)
+
+
+def resolve_engine_tree_spec(
+    vllm_config: Any, environ: dict[str, str] | None = None
+) -> TreeSpec | None:
+    """``resolve_tree_spec`` plus the engine-level checks and the B_tree clamp.
+
+    THE single entry point for the scheduler, the model runner and the
+    dispatcher, so all three agree on ``B_tree``.  Uses the configured
+    ``max_cudagraph_capture_size`` (the value before the runner's
+    multiple-of-(D+1) rounding, which can only lower it; the dispatcher drops
+    any tree size above the final value and such a step simply runs eager).
+    """
+    spec = resolve_tree_spec(vllm_config.speculative_config, environ)
+    if spec is None:
+        return None
+    sched = vllm_config.scheduler_config
+    if getattr(sched, "async_scheduling", False):
+        raise ValueError(
+            "tree speculation requires --no-async-scheduling (draft ids must "
+            "be on the CPU before scheduling)"
+        )
+    max_cap = getattr(vllm_config.compilation_config, "max_cudagraph_capture_size", None)
+    return clamp_tree_spec(spec, sched.max_num_seqs, max_cap)
+
+
+def tree_cudagraph_sizes(spec: TreeSpec | None) -> list[int]:
+    """Token counts of the tree FULL-graph family: ``B * M`` for B = 1..B_tree.
+
+    Kept separate from ``cudagraph_capture_sizes``: the chain list is rounded
+    to multiples of D + 1 (compilation.py adjust_cudagraph_sizes_for_spec_decode)
+    and would turn 7/14/21/28 into 8/16/24/28."""
+    if spec is None:
+        return []
+    return [b * spec.M for b in range(1, spec.B_tree + 1)]
 
 
 def truncate_drafts_to_chain(spec: TreeSpec, drafts: list[int]) -> list[int]:

@@ -304,6 +304,12 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
+    # E16 tree drafting (P8): True iff this step is a tree step (every
+    # scheduled request is a decode carrying M - 1 drafts, chain-first).
+    # Decided only by the scheduler; the runner, metadata builders and the
+    # cudagraph dispatcher read this flag and never re-decide.
+    tree_step: bool = False
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

@@ -45,7 +45,10 @@ class SpecDecodingStats:
         assert num_accepted_tokens <= self.num_spec_tokens
         for i in range(num_accepted_tokens):
             self.num_accepted_tokens_per_pos[i] += 1
-        for i in range(num_draft_tokens):
+        # E16 tree steps carry M - 1 > D drafts (chain-first); per-position
+        # counters cover the chain positions only (cap at D).  Per-depth
+        # rescue counters are P9.
+        for i in range(min(num_draft_tokens, self.num_spec_tokens)):
             self.num_draft_tokens_per_pos[i] += 1
 
 
