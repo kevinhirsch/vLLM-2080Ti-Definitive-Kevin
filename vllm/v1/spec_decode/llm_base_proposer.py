@@ -50,6 +50,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
 )
 from vllm.v1.sample.sampler import _SAMPLING_EPS
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.tree_oracle import get_tree_oracle
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
     _copy_and_expand_eagle_inputs,
@@ -441,6 +442,16 @@ class SpecDecodeBaseProposer:
 
     def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Greedy-sample draft tokens from hidden states."""
+        oracle = get_tree_oracle()
+        if (
+            oracle.value
+            and not self.use_local_argmax_reduction
+            and not self.use_heterogeneous_vocab
+        ):
+            # E16 tree oracle: same logits, same argmax; also keep this depth's top-k.
+            logits = self.model.compute_logits(hidden_states)
+            oracle.capture_logits(logits)
+            return logits.argmax(dim=-1)
         if self.use_local_argmax_reduction:
             return self.model.get_top_tokens(hidden_states)
         if self.use_heterogeneous_vocab:
@@ -490,6 +501,8 @@ class SpecDecodeBaseProposer:
         if self.use_heterogeneous_vocab:
             assert self.vocab_mapping is not None
             logits = self.vocab_mapping.constrain_draft_logits(logits)
+        elif get_tree_oracle().value:
+            get_tree_oracle().capture_logits(logits)
         draft_token_ids, draft_probs = self._sample_from_logits(
             logits, sampling_metadata
         )
@@ -536,6 +549,7 @@ class SpecDecodeBaseProposer:
         self.num_speculative_tokens = num_speculative_tokens
         self._last_draft_probs = None
         batch_size = common_attn_metadata.batch_size()
+        get_tree_oracle().begin_propose()
 
         if self.method in ("eagle3", "dflash"):
             model = self.model

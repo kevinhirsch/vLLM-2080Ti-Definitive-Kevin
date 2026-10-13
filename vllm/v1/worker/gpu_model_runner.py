@@ -192,6 +192,7 @@ from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.spec_decode.tree_oracle import get_tree_oracle
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
@@ -4798,6 +4799,9 @@ class GPUModelRunner(
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
+        tree_oracle = get_tree_oracle()
+        if tree_oracle.enabled:
+            tree_oracle.begin_step()
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -4831,6 +4835,9 @@ class GPUModelRunner(
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
             with record_function_or_nullcontext("gpu_model_runner: draft"):
+                draft_t0 = (
+                    tree_oracle.draft_timer_start() if tree_oracle.timing else None
+                )
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
                     sampled_token_ids,
@@ -4842,6 +4849,9 @@ class GPUModelRunner(
                     spec_decode_common_attn_metadata,
                     slot_mappings,
                 )
+                if tree_oracle.enabled:
+                    tree_oracle.draft_timer_stop(draft_t0)
+                    tree_oracle.finish_propose(list(self.input_batch.req_ids))
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         spec_config = self.speculative_config
@@ -4949,6 +4959,13 @@ class GPUModelRunner(
                 logits,
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
+            )
+        if tree_oracle.enabled:
+            self._tree_oracle_after_bookkeeping(
+                tree_oracle,
+                scheduler_output,
+                req_ids_output_copy,
+                valid_sampled_token_ids,
             )
 
         if draft_after_bookkeeping:
@@ -5222,6 +5239,51 @@ class GPUModelRunner(
         if not draft_probs_rows:
             return None
         return torch.cat(draft_probs_rows, dim=0).contiguous()
+
+    def _tree_oracle_after_bookkeeping(
+        self,
+        tree_oracle,
+        scheduler_output: "SchedulerOutput",
+        req_ids: list[str],
+        valid_sampled_token_ids: list[list[int]],
+    ) -> None:
+        """E16 tree oracle (VLLM_TREE_ORACLE / VLLM_TREE_ORACLE_TIMING): log the
+        verified step joined with its drafts' top-k, and/or the step timing."""
+        try:
+            num_reqs = self.input_batch.num_reqs
+            spec = scheduler_output.scheduled_spec_decode_tokens or {}
+            ctx_np = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+            if tree_oracle.value:
+                meta = {}
+                for req_id in req_ids:
+                    st = self.requests.get(req_id)
+                    sp = getattr(st, "sampling_params", None) if st else None
+                    if sp is None:
+                        continue
+                    meta[req_id] = (
+                        int(st.num_computed_tokens),
+                        float(sp.temperature),
+                        int(sp.top_k),
+                        float(sp.top_p),
+                        getattr(sp, "structured_outputs", None) is not None,
+                    )
+                tree_oracle.on_verified(req_ids, valid_sampled_token_ids, spec, meta)
+            if tree_oracle.timing:
+                total = scheduler_output.total_num_scheduled_tokens
+                uniform = (
+                    num_reqs > 0
+                    and not scheduler_output.scheduled_new_reqs
+                    and len(spec) == num_reqs
+                    and total == sum(1 + len(v) for v in spec.values())
+                )
+                tree_oracle.on_step(
+                    num_reqs,
+                    total,
+                    bool(uniform),
+                    int(ctx_np.max()) if num_reqs else None,
+                )
+        except Exception as e:  # never let the oracle break serving
+            logger.warning_once("tree oracle hook failed: %s", e)
 
     def propose_draft_token_ids(
         self,
