@@ -731,14 +731,16 @@ def test_tree_kernels_warm_up_eagerly_at_init(monkeypatch):
     assert ts.outputs.num_accepted[0].item() == 1  # walk ran: no draft matched
     # a prebuilt extension .so is imported without ninja when fresh
     called = []
-    monkeypatch.setattr(TC, "_EXT", None)
-    monkeypatch.setattr(TC, "_import_prebuilt", lambda bd: called.append(bd) or "MOD")
+    from vllm.v1.spec_decode import tree_commit_loader as TL
+
+    monkeypatch.setattr(TL, "_EXT", None)
+    monkeypatch.setattr(TL, "_import_prebuilt", lambda bd: called.append(bd) or "MOD")
     monkeypatch.setenv("VLLM_TREE_COMMIT_BUILD_DIR", "/nonexistent-prebuilt")
     assert TC._load() == "MOD" and called == ["/nonexistent-prebuilt"]
 
 
 def test_import_prebuilt_requires_matching_stamp(tmp_path):
-    from vllm.v1.spec_decode import tree_commit as TC
+    from vllm.v1.spec_decode import tree_commit_loader as TC
 
     assert TC._import_prebuilt(str(tmp_path)) is None  # nothing there
     (tmp_path / "tree_commit_sm75.so").write_bytes(b"not an elf")
