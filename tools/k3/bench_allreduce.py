@@ -4,9 +4,8 @@
 Launch (spawns its own 2 workers, one per GPU, same wiring as production:
 vllm tp group -> CustomAllreduce (IPC, NVLink) + PyNccl):
 
-  cd /home/kevin/Desktop/wt-k3
-  PYTHONPATH=/home/kevin/Desktop/wt-k3 /home/kevin/Desktop/wt-integrate/.venv/bin/python \
-      tools/k3/bench_allreduce.py [--mode ar|overlap|check|all] [--tokens 16,256,...]
+  bash tools/k3/window.sh <release-root> <out-prefix>   # or directly:
+  PYTHONPATH=<release-root> <release-root>/.venv/bin/python tools/k3/bench_allreduce.py [--mode ar|overlap|check|all] [--tokens 16,256,...]
 
 Needs both GPUs and, for tokens=3632, ~250 MiB (ar) / ~600 MiB (overlap) of
 VRAM per GPU on top of the CUDA context. Do NOT run next to the live engine
@@ -182,9 +181,12 @@ def main():
             os.remove(f)
         except OSError:
             pass
+    # own process group per worker so a timeout kill takes down any helper children too; the explicit --rdv is
+    # appended LAST so it wins over any --rdv in `base`; CUDA_VISIBLE_DEVICES is left untouched (both GPUs needed).
     ps = [
         subprocess.Popen(
-            [sys.executable, __file__, "--worker", str(r), "--rdv", args.rdv] + base
+            [sys.executable, os.path.abspath(__file__)] + base + ["--worker", str(r), "--rdv", args.rdv],
+            start_new_session=True,
         )
         for r in (0, 1)
     ]
@@ -198,7 +200,10 @@ def main():
     for i, p in enumerate(ps):
         if rc[i] is None:
             print(f"TIMEOUT rank {i}: killing", flush=True)
-            p.kill()
+            try:
+                os.killpg(p.pid, 9)
+            except OSError:
+                p.kill()
             rc[i] = 124
     rc = [x or 0 for x in rc]
     for r in (0, 1):

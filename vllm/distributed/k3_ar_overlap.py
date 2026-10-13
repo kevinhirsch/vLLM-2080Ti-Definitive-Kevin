@@ -46,6 +46,18 @@ def _min_tokens() -> int:
     return int(os.environ.get("VLLM_K3_AR_OVERLAP_MIN_TOKENS", "1024"))
 
 
+def chunk_bounds(n: int, k: int) -> list[tuple[int, int]]:
+    """Row ranges [a, b) covering [0, n): 8-row aligned steps (16-byte multiple
+    for the custom all-reduce at fp16 and any hidden size divisible by 8)."""
+    step = ((n + k - 1) // k + 7) // 8 * 8
+    return [(a, min(n, a + step)) for a in range(0, n, step)]
+
+
+def use_plain(n: int, k: int, capturing: bool, ndim: int) -> bool:
+    """True when the original GEMM + all-reduce must be used."""
+    return n < _min_tokens() or n < 8 * k or capturing or ndim != 2
+
+
 def register_layer(name: str, layer: torch.nn.Module) -> None:
     _LAYERS[name] = weakref.ref(layer)
 
@@ -93,12 +105,7 @@ def k3_row_linear_ar_impl(x: torch.Tensor, layer_name: str) -> torch.Tensor:
     bias = None if (layer.tp_rank > 0 or layer.skip_bias_add) else layer.bias
     n = x.shape[0]
     k = _chunks()
-    if (
-        n < _min_tokens()
-        or n < 8 * k
-        or torch.cuda.is_current_stream_capturing()
-        or x.dim() != 2
-    ):
+    if use_plain(n, k, torch.cuda.is_current_stream_capturing(), x.dim()):
         return plain(layer, x, bias)
 
     global _LOGGED
@@ -113,11 +120,7 @@ def k3_row_linear_ar_impl(x: torch.Tensor, layer_name: str) -> torch.Tensor:
     comm = _comm_stream(x.device)
     out_dim = layer.output_size
     out = torch.empty((n, out_dim), dtype=x.dtype, device=x.device)
-    # 8-row aligned chunk boundaries (16-byte multiple for the custom AR)
-    step = ((n + k - 1) // k + 7) // 8 * 8
-    a = 0
-    while a < n:
-        b = min(n, a + step)
+    for a, b in chunk_bounds(n, k):
         part = layer.quant_method.apply(layer, x[a:b], bias)
         ev = torch.cuda.Event()
         ev.record(main)
@@ -125,7 +128,6 @@ def k3_row_linear_ar_impl(x: torch.Tensor, layer_name: str) -> torch.Tensor:
         with torch.cuda.stream(comm):
             part.record_stream(comm)
             all_reduce_into(part, out[a:b], comm)
-        a = b
     main.wait_stream(comm)
     return out
 
