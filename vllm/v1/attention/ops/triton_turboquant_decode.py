@@ -17,6 +17,7 @@ import torch
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops import tq_gqa_cuda as _gqa_cuda
+from vllm.v1.attention.ops import tq_imma_cuda as _imma_cuda
 from vllm.v1.attention.ops.triton_decode_attention import (
     _fwd_kernel_stage2,
 )
@@ -782,6 +783,32 @@ def triton_turboquant_decode_attention(
     block_size = kv_cache.shape[1]
     kv_group_size = Hq // Hk
     device = query.device
+
+    if (
+        _imma_cuda.enabled()
+        and query.dtype == torch.float16
+        and block_table.stride(1) == 1
+        and _imma_cuda.eligible(
+            Hq=Hq, Hk=Hk, D=D, mse_bits=mse_bits, value_quant_bits=value_quant_bits,
+            key_fp8=key_fp8, key_packed_size=key_packed_size, q_per_seq=1, block_size=block_size,
+        )
+    ):
+        # lane K2: INT8 tensor-core (IMMA) decode straight on the TurboQuant codes. A stride-0 block table is the
+        # continuation call (one request's verifier rows, incremental lengths): group its rows so each cached
+        # token is decoded once per kv head for up to 32 // GQA rows.
+        if block_table.stride(0) == 0 and B > 1:
+            ql = max(1, min(B, 32 // kv_group_size))
+            while B % ql:
+                ql -= 1
+        else:
+            ql = 1
+        out, _ = _imma_cuda.tq_imma_decode_attention(
+            query, kv_cache, block_table, seq_lens, centroids, scale, norm_correction,
+            q_per_seq=ql, num_seqs=B // ql, PiT=PiT if PiT is not None else Pi.T.contiguous(),
+            output_buf=output_buf if output_buf is not None and output_buf.dtype == torch.float16 else None,
+            lse_buf=lse_buf,
+        )
+        return out
 
     if (
         _gqa_cuda.enabled()

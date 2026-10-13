@@ -66,6 +66,7 @@ from vllm.v1.attention.ops.flydsl_turboquant_decode import (
 )
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.ops import tq_gqa_cuda as _gqa_cuda
+from vllm.v1.attention.ops import tq_imma_cuda as _imma_cuda
 from vllm.v1.attention.ops.triton_turboquant_decode import (
     _fp8_format_code,
     _tq_full_dequant_kv,
@@ -1538,6 +1539,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             )
             self._arange_cache = arange_cache
 
+        # [FORK][LANE K2] one INT8 tensor-core (IMMA) call computes the compressed-prefix attention of EVERY
+        # request's verifier rows (each cached token decoded once per kv head per request); the per-request raw
+        # current-chunk merge below is unchanged.  Capture-safe: shapes come from host qsl, lengths stay on device.
+        imma_prefix = self._imma_spec_prefix_batched(query, kv_cache, attn_metadata, qsl, num_reqs, centroids)
+
         for request_idx in range(num_reqs):
             q_start = qsl[request_idx]
             q_end = qsl[request_idx + 1]
@@ -1563,6 +1569,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 centroids,
                 PiT,
                 arange_cache,
+                precomputed_prefix=(
+                    (imma_prefix[0][q_start:q_end], imma_prefix[1][q_start:q_end])
+                    if imma_prefix is not None
+                    else None
+                ),
             )
             if out is None:
                 raise RuntimeError(
@@ -1702,7 +1713,15 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             self._arange_cache = _ac
         _arange_cache: torch.Tensor = _ac
 
+        # [FORK][LANE K2] one INT8 tensor-core call for every short continuation (MTP verifier rows) in the batch
+        # instead of one decode call per request.
+        done = self._imma_batched_continuations(
+            query, kv_cache, attn_metadata, qsl, seq_lens_list, num_reqs, PiT, Pi, centroids, output
+        ) if _imma_cuda.enabled() and not self._soa_store else ()
+
         for i in range(num_reqs):
+            if i in done:
+                continue
             q_start = qsl[i]
             q_end = qsl[i + 1]
             q_len = q_end - q_start
@@ -1881,6 +1900,103 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
         return output
 
+    def _imma_batched_continuations(
+        self, query, kv_cache, attn_metadata, qsl, seq_lens_list, num_reqs, PiT, Pi, centroids, output
+    ) -> set[int]:
+        """Lane K2: batch all continuation requests with q_len <= _CONTINUATION_DECODE_THRESHOLD whose rows fit one
+        IMMA CTA (q_len * GQA <= 32) into one tq_imma call per q_len.  Same math as the per-request continuation
+        decode (each row attends to the TQ cache up to its own causal length).  Returns the request ids handled."""
+        if torch.cuda.is_current_stream_capturing():
+            # host-built row lengths cannot be baked into a CUDA graph; captured batches keep the per-request
+            # continuation calls (which dispatch to the same kernel through device-side seq_lens)
+            return set()
+        Hq, D = query.shape[1], query.shape[2]
+        Hk = kv_cache.shape[2]
+        if not _imma_cuda.eligible(
+            Hq=Hq, Hk=Hk, D=D, mse_bits=self.tq_config.key_mse_bits,
+            value_quant_bits=self.tq_config.effective_value_quant_bits, key_fp8=self.tq_config.key_fp8,
+            key_packed_size=self.tq_config.key_packed_size, q_per_seq=1, block_size=kv_cache.shape[1],
+        ) or query.dtype != torch.float16:
+            return set()
+        G = Hq // Hk
+        groups: dict[int, list[int]] = {}
+        for i in range(num_reqs):
+            q_len = qsl[i + 1] - qsl[i]
+            if q_len <= 0 or q_len >= seq_lens_list[i] or q_len > _CONTINUATION_DECODE_THRESHOLD:
+                continue
+            if _SPEC_CONTINUATION_DECODE_FASTPATH and q_len > 1:
+                continue
+            if q_len * G > 32:
+                continue
+            groups.setdefault(q_len, []).append(i)
+        done: set[int] = set()
+        dev = query.device
+        for q_len, reqs in groups.items():
+            n = len(reqs)
+            rows = [r for i in reqs for r in range(qsl[i], qsl[i] + q_len)]
+            lens = [seq_lens_list[i] - q_len + 1 + j for i in reqs for j in range(q_len)]
+            contiguous = rows == list(range(rows[0], rows[0] + len(rows)))
+            host = torch.tensor(lens + reqs + rows, dtype=torch.int32, pin_memory=True)
+            meta = host.to(dev, non_blocking=True)
+            row_lens = meta[: n * q_len]
+            req_idx = meta[n * q_len: n * q_len + n].long()
+            q_rows = query[rows[0]: rows[0] + len(rows)] if contiguous else query.index_select(0, meta[n * q_len + n:].long())
+            bt = attn_metadata.block_table.index_select(0, req_idx)
+            out, _ = _imma_cuda.tq_imma_decode_attention(
+                q_rows, kv_cache, bt, row_lens, centroids, self.scale, self.tq_config.norm_correction,
+                q_per_seq=q_len, num_seqs=n, PiT=PiT if PiT is not None else Pi.T.contiguous(),
+                max_len_hint=max(lens),
+            )
+            if contiguous:
+                output[rows[0]: rows[0] + len(rows)] = out.to(output.dtype)
+            else:
+                output.index_copy_(0, meta[n * q_len + n:].long(), out.to(output.dtype))
+            done.update(reqs)
+        return done
+
+    def _imma_spec_prefix_batched(
+        self, query, kv_cache, attn_metadata, qsl, num_reqs, centroids
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Lane K2: prefix attention (cached TQ tokens only, no causal part) for all requests of a uniform MTP
+        verifier batch in ONE IMMA call.  Returns (out fp16 [N, Hq, D], lse fp32 [N, Hq], natural log) indexed like
+        `query`, or None when not applicable (env off, ragged q_len, ineligible shape).  Rows of requests with no
+        cached prefix get a zero page and length 0 (-inf lse); _spec_continuation_decode_attention masks them."""
+        if not (_imma_cuda.enabled() and _imma_cuda.spec_batch_enabled()) or self._soa_store:
+            return None
+        if num_reqs < 2 or query.dtype != torch.float16 or qsl[0] != 0:
+            return None
+        q_len = qsl[1] - qsl[0]
+        if q_len <= 0 or any(qsl[i + 1] - qsl[i] != q_len for i in range(num_reqs)):
+            return None
+        Hq, D = query.shape[1], query.shape[2]
+        Hk = kv_cache.shape[2]
+        if not _imma_cuda.eligible(
+            Hq=Hq, Hk=Hk, D=D, mse_bits=self.tq_config.key_mse_bits,
+            value_quant_bits=self.tq_config.effective_value_quant_bits, key_fp8=self.tq_config.key_fp8,
+            key_packed_size=self.tq_config.key_packed_size, q_per_seq=q_len, block_size=kv_cache.shape[1],
+        ):
+            return None
+        n_rows = num_reqs * q_len
+        cached = (attn_metadata.seq_lens[:num_reqs] - q_len).clamp_min(0)
+        row_lens = cached.to(torch.int32).reshape(num_reqs, 1).expand(num_reqs, q_len).contiguous().reshape(-1)
+        bt = attn_metadata.block_table[:num_reqs]
+        safe_bt = torch.where((cached > 0).reshape(num_reqs, 1), bt, torch.zeros_like(bt))
+        if safe_bt.dtype != torch.int32:
+            safe_bt = safe_bt.to(torch.int32)
+        out, lse = _imma_cuda.tq_imma_decode_attention(
+            query[:n_rows], kv_cache, safe_bt.contiguous(), row_lens, centroids, self.scale,
+            self.tq_config.norm_correction, q_per_seq=q_len, num_seqs=num_reqs, PiT=self._imma_PiT(query),
+        )
+        return out, lse
+
+    def _imma_PiT(self, query: torch.Tensor) -> torch.Tensor:
+        # only used when VLLM_TQ_IMMA_FUSEDQ=0 (the default fused path rotates in-kernel)
+        pit = getattr(self, "_k2_PiT", None)
+        if pit is None or pit.device != query.device:
+            pit = _build_hadamard(self.head_size, str(query.device))
+            self._k2_PiT = pit
+        return pit
+
     def _spec_continuation_decode_attention(
         self,
         query: torch.Tensor,
@@ -1893,6 +2009,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         centroids: torch.Tensor,
         PiT: torch.Tensor | None,
         arange_cache: torch.Tensor,
+        precomputed_prefix: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor | None:
         """Merge compressed-prefix attention with raw MTP continuation KV.
 
@@ -1938,7 +2055,27 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             )
         prefix_lse = torch.empty(q_len, Hq, dtype=torch.float32, device=query.device)
         prefix_out = torch.empty_like(query)
-        if (
+        if precomputed_prefix is not None:
+            # lane K2: prefix already computed for the whole batch by _imma_spec_prefix_batched
+            # (row slices of one batch buffer; the merge below may write its output into them in place)
+            prefix_out, prefix_lse = precomputed_prefix
+        elif (
+            _imma_cuda.enabled()
+            and query.dtype == torch.float16
+            and _imma_cuda.eligible(
+                Hq=Hq, Hk=Hk, D=D, mse_bits=self.tq_config.key_mse_bits,
+                value_quant_bits=self.tq_config.effective_value_quant_bits, key_fp8=self.tq_config.key_fp8,
+                key_packed_size=self.tq_config.key_packed_size, q_per_seq=q_len, block_size=kv_cache.shape[1],
+            )
+        ):
+            # lane K2: the q_len verifier rows share one cached prefix -> one IMMA CTA group per kv head (every
+            # cached token decoded once, int8 tensor cores for QK and PV).  Row lengths stay on device (capture-safe).
+            _imma_cuda.tq_imma_decode_attention(
+                query, kv_cache, safe_block_table, prefix_seq_lens.to(torch.int32), centroids, self.scale,
+                self.tq_config.norm_correction, q_per_seq=q_len, num_seqs=1,
+                PiT=PiT if PiT is not None else Pi.T.contiguous(), output_buf=prefix_out, lse_buf=prefix_lse,
+            )
+        elif (
             _gqa_cuda.enabled()
             and query.dtype == torch.float16
             and _gqa_cuda.gqa_eligible(
@@ -2050,6 +2187,37 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         device = query.device
         block_size = kv_cache.shape[1]
         BLOCK_D = triton.next_power_of_2(D)
+
+        # [FORK][LANE K2] prefix attention straight on the TQ codes with INT8 tensor cores (no full dequant, no
+        # rotation pass, no fp16 FlashInfer over the prefix); the chunk's own causal part stays on FlashInfer.
+        if (
+            flashinfer_prefix_combine_wrappers is not None
+            and _imma_cuda.prefill_enabled()
+            and query.dtype == torch.float16
+            and not self._soa_store
+            and cached_len > 0
+            and _imma_cuda.eligible(
+                Hq=Hq, Hk=Hk, D=D, mse_bits=self.tq_config.key_mse_bits,
+                value_quant_bits=self.tq_config.effective_value_quant_bits, key_fp8=self.tq_config.key_fp8,
+                key_packed_size=self.tq_config.key_packed_size, q_per_seq=1, block_size=block_size,
+            )
+        ):
+            _, current_wrapper = flashinfer_prefix_combine_wrappers
+            prefix_out, prefix_lse = _imma_cuda.tq_imma_prefill_prefix_attention(
+                query, kv_cache, block_table[:1], cached_len, centroids, self.scale,
+                self.tq_config.norm_correction, layer._tq_PiT,
+            )
+            current_out = torch.empty_like(query)
+            current_lse = torch.empty((q_len, Hq), dtype=torch.float32, device=device)
+            current_out, current_lse = current_wrapper.run(
+                query, key_chunk, val_chunk, out=current_out, lse=current_lse, return_lse=True
+            )
+            logger.info_once("TurboQuant continuation prefix via IMMA (lane K2): cached_len=%s q_len=%s",
+                             cached_len, q_len)
+            # K2 LSE is natural-log, FlashInfer's is base 2: express both in base 2 and merge as such.
+            return _tq_merge_flashinfer_partials(
+                prefix_out, prefix_lse * (1.0 / _LN2), current_out, current_lse, lse_base2=True
+            )
 
         mse_bytes = self._mse_bytes
         val_data_bytes = self._val_data_bytes
