@@ -492,8 +492,9 @@ __global__ void __launch_bounds__(NTHR, 2) tq_imma2_stage1(
   uint32_t* Vraw = Kraw + T * KW;                                      // [T][VW]
   int8_t* Qs = reinterpret_cast<int8_t*>(Vraw + T * VW);               // [MR][256] swizzled
   int8_t* Qs2 = Qs + MR * HD;                                          // [MR][256] low plane (QSPLIT)
-  uint8_t* Ps = reinterpret_cast<uint8_t*>(Qs2 + (QSPLIT ? MR * HD : 0));  // [MR][LDP]
-  float* vs_s = reinterpret_cast<float*>(Ps + MR * LDP);               // [T]
+  uint8_t* Ps = reinterpret_cast<uint8_t*>(Qs2 + (QSPLIT ? MR * HD : 0));  // [MR][LDP] P plane: high byte of X
+  uint8_t* Ps2 = Ps + MR * LDP;                                        // [MR][LDP] P plane: low byte of X
+  float* vs_s = reinterpret_cast<float*>(Ps2 + MR * LDP);              // [T]
   float* vz_s = vs_s + T;                                              // [T]
   float* qs_s = vz_s + T;                                              // [MR]
   float* al_s = qs_s + MR;
@@ -776,18 +777,26 @@ __global__ void __launch_bounds__(NTHR, 2) tq_imma2_stage1(
       }
       l_run = l_run * alpha + psum;
       m_run = m_new;
-      const float inv = amax > 0.f ? 255.f / amax : 0.f;
-      uint32_t w0 = 0, w1 = 0;
+      // a_t = p_t * v_scale_t as a 16-bit fixed-point X = round(a_t * 65535 / amax) split into two u8 planes
+      // (X = 256 * hi + lo).  One u8 plane (8 bits) was NOT enough: v = code * vs + vz with codes in 0..15 makes
+      // sum_t a_t code_t and sum_t p_t vz_t two large terms that cancel (zero-mean V), so the u8 rounding of a_t was
+      // amplified to 2-10% output error (K2 window 2026-10-13 08:11); 16 bits bring it to ~1e-4 (CPU model).
+      const float inv = amax > 0.f ? 65535.f / amax : 0.f;
+      uint32_t w0 = 0, w1 = 0, x0 = 0, x1 = 0;
 #pragma unroll
       for (int k = 0; k < 4; k++) {
-        w0 |= (uint32_t)__float2uint_rn(a[k] * inv) << (8 * k);
-        w1 |= (uint32_t)__float2uint_rn(a[k + 4] * inv) << (8 * k);
+        const uint32_t X0 = min(__float2uint_rn(a[k] * inv), 65535u), X1 = min(__float2uint_rn(a[k + 4] * inv), 65535u);
+        w0 |= (X0 >> 8) << (8 * k);
+        w1 |= (X1 >> 8) << (8 * k);
+        x0 |= (X0 & 255u) << (8 * k);
+        x1 |= (X1 & 255u) << (8 * k);
       }
       if (sr < MR) {
         *reinterpret_cast<uint2*>(Ps + sr * LDP + sub * 8) = make_uint2(w0, w1);
+        *reinterpret_cast<uint2*>(Ps2 + sr * LDP + sub * 8) = make_uint2(x0, x1);
         if (sub == 0) {
           al_s[sr] = alpha;
-          sa_s[sr] = amax * (1.f / 255.f);
+          sa_s[sr] = amax * (1.f / 65535.f);
           zs_s[sr] = zsum;
         }
       }
@@ -804,6 +813,16 @@ __global__ void __launch_bounds__(NTHR, 2) tq_imma2_stage1(
 #pragma unroll
         for (int n = 0; n < 4; n++) C[m][n][0] = C[m][n][1] = 0;
       const uint8_t* Vb = reinterpret_cast<const uint8_t*>(Vraw);
+      // pass 0: high P plane; then C <<= 8; pass 1: low P plane -> C = sum_t X_t code_t (< 2^31: 65535*15*64)
+#pragma unroll
+      for (int pass = 0; pass < 2; pass++) {
+      const uint8_t* Pp = pass ? Ps2 : Ps;
+      if (pass) {
+#pragma unroll
+        for (int m = 0; m < MT; m++)
+#pragma unroll
+          for (int n = 0; n < 4; n++) { C[m][n][0] <<= 8; C[m][n][1] <<= 8; }
+      }
 #pragma unroll
       for (int kk = 0; kk < 4; kk++) {
         const int tb = 16 * kk + 4 * t4;
@@ -819,12 +838,13 @@ __global__ void __launch_bounds__(NTHR, 2) tq_imma2_stage1(
         }
 #pragma unroll
         for (int m = 0; m < MT; m++) {
-          const uint32_t a = *reinterpret_cast<const uint32_t*>(Ps + (m * 8 + g) * LDP + 16 * kk + 4 * t4);
+          const uint32_t a = *reinterpret_cast<const uint32_t*>(Pp + (m * 8 + g) * LDP + 16 * kk + 4 * t4);
           imma_u8(C[m][0], a, bf[0]);
           imma_u8(C[m][1], a, bf[1]);
           imma_u8(C[m][2], a, bf[2]);
           imma_u8(C[m][3], a, bf[3]);
         }
+      }
       }
 #pragma unroll
       for (int m = 0; m < MT; m++) {
@@ -867,7 +887,7 @@ __global__ void __launch_bounds__(NTHR, 2) tq_imma2_stage1(
 
 static inline size_t tq_imma2_smem_bytes(int MT, bool qsplit = false) {
   const int MR = MT * 8;
-  return (size_t)T * KW * 4 + T * VW * 4 + MR * HD * (qsplit ? 2 : 1) + MR * LDP + 2 * T * 4 + 6 * MR * 4;
+  return (size_t)T * KW * 4 + T * VW * 4 + MR * HD * (qsplit ? 2 : 1) + 2 * MR * LDP + 2 * T * 4 + 6 * MR * 4;
 }
 
 // ===================================================================================================================

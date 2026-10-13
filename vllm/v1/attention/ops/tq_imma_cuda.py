@@ -183,6 +183,8 @@ def prefill_splits(Lq: int, Hq: int, Hk: int, C: int) -> int:
 
 
 def prefill_enabled() -> bool:
+    # NOTE (2026-10-13): the prefill kernel still quantizes P*v_scale to ONE u8 plane per 64-token chunk, the defect
+    # fixed in the decode kernel (2-10% output error on zero-mean V, see tq_imma_kernels.cuh). Keep it off.
     return os.getenv("VLLM_TQ_IMMA_PREFILL", "0") == "1"
 
 
