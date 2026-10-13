@@ -99,6 +99,11 @@ class Tensor:
     def contiguous(self):
         return Tensor(self.shape, self.dtype, cuda=self.is_cuda, device=self.device)
 
+    def flatten(self, start=0):
+        start %= self.dim()
+        return Tensor(self.shape[:start] + (math.prod(self.shape[start:]),), self.dtype,
+                      cuda=self.is_cuda, device=self.device)
+
 
 NS = extract(GDN / "gdn_sm75_cuda.py", {"eligible", "inputs_supported"},
              {"torch": DT, "math": math, "_ENABLED": True, "_VARIANT": 2})
@@ -198,6 +203,70 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(conv_calls, [])
         self.assertEqual(layer.dt_bias.copies + layer.norm.weight.copies, 0)
 
+
+    def test_accepted_path_passes_native_parameters_without_derived_state(self):
+        # Regression (2026-10-13 window k5-fused-gdn-aba): the first K5 call runs
+        # inside FULL CUDA-graph capture. Lazily created fp32 copies of dt_bias
+        # and the norm weight were allocated there but their cast was only
+        # recorded, so replays read uninitialised graph-pool memory (evalkit
+        # 0/48, MTP acceptance 2.26 -> 0.135). The accepted path must hand the
+        # model's own parameters to the kernel and create no layer state.
+        d = fixture()
+        md = types.SimpleNamespace(spec_state_indices_tensor=d["state_indices"],
+              spec_sequence_masks=object(), num_prefills=0, num_decodes=0, num_spec_decodes=2,
+              num_actual_tokens=6, num_accepted_tokens=d["num_accepted"],
+              spec_query_start_loc=d["cu_seqlens"])
+        norm = types.SimpleNamespace(activation="silu", norm_before_gate=True,
+                                     group_size=None, weight=d["norm_weight"], eps=1e-6)
+        layer = types.SimpleNamespace(prefix="layer", A_log=d["A_log"], dt_bias=d["dt_bias"],
+              head_k_dim=128, head_v_dim=128, num_k_heads=16, num_v_heads=48, tp_size=2,
+              key_dim=2048, value_dim=6144, hidden_size=5120, activation="silu",
+              gqa_interleaved_layout=False, kv_cache=(d["conv_state"], d["state"]), norm=norm,
+              conv1d=types.SimpleNamespace(weight=Tensor((5120, 1, 4)), bias=None),
+              split_ba=lambda _: (Tensor((8, 24), strides=(96, 1)), Tensor((8, 24), strides=(96, 1))),
+              out_proj=lambda x: (x, None))
+        before = set(vars(layer))
+        calls = {}
+
+        def conv(x, *args, **kwargs):
+            calls["conv"] = kwargs
+            return x
+
+        def gdn_mtp(*args):
+            calls["gdn"] = args
+
+        class Output(Tensor):
+            def copy_(self, other):
+                calls["copied"] = True
+
+        kernel = types.SimpleNamespace(**{k: NS[k] for k in ("eligible", "inputs_supported")},
+                                       enabled=lambda: True, gdn_mtp=gdn_mtp)
+        dt = types.SimpleNamespace(**vars(DT), zeros=lambda shape, **kw: Tensor(shape))
+        namespace = {"torch": dt, "_k5_gdn": kernel,
+            "get_forward_context": lambda: types.SimpleNamespace(attn_metadata={"layer": md}),
+            "GDNAttentionMetadata": types.SimpleNamespace, "is_conv_state_dim_first": lambda: True,
+            "causal_conv1d_update": conv, "PAD_SLOT_ID": -1}
+        method = extract(GDN / "qwen_gdn_linear_attn.py", {"_k5_spec_decode"}, namespace)["_k5_spec_decode"]
+        out = Output((8, 5120))
+        self.assertTrue(method(layer, Tensor((8, 8192)), Tensor((8, 96)), out))
+        self.assertTrue(calls.get("copied"))
+        args = calls["gdn"]
+        self.assertIs(args[4], layer.dt_bias)
+        self.assertIs(args[10], layer.norm.weight)
+        self.assertIs(args[3], layer.A_log)
+        self.assertEqual(set(vars(layer)), before)
+        self.assertEqual(layer.dt_bias.copies + layer.norm.weight.copies, 0)
+        self.assertTrue(calls["conv"]["guard_bounds"])
+
+    def test_kernel_reads_parameters_in_native_dtype(self):
+        source = (GDN / "gdn_sm75_ext/gdn_mtp_sm75.cu").read_text()
+        self.assertNotIn("dt_bias.data_ptr<float>()", source)
+        self.assertNotIn("norm_w.data_ptr<float>()", source)
+        self.assertEqual(source.count("ld_param(dt_bias, hv, dt_f32)"), 2)
+        self.assertEqual(source.count("ld_param(norm_w, v, nw_f32)"), 2)
+        model = (GDN / "qwen_gdn_linear_attn.py").read_text()
+        self.assertNotIn("_k5_dt_bias", model)
+        self.assertNotIn("_k5_norm_w", model)
 
 class DevicePredicateTests(unittest.TestCase):
     @classmethod

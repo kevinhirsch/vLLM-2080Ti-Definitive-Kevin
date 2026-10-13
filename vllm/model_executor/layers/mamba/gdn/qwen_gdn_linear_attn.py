@@ -1370,11 +1370,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             eps=self.norm.eps,
         ):
             return False
-        if getattr(self, "_k5_dt_bias", None) is None:
-            # Prepare constant fp32 parameters only after the full preflight.
-            # This path is warmed before CUDA-graph capture.
-            self._k5_dt_bias = self.dt_bias.detach().float().contiguous()
-            self._k5_norm_w = self.norm.weight.detach().float().contiguous()
+        # No derived parameter copies here: the first call of this path happens
+        # inside FULL CUDA-graph capture (capture warmups carry no spec-decode
+        # metadata), where a lazily created .float() copy is allocated from the
+        # graph pool but its cast kernel is only recorded, never executed. The
+        # kernel reads dt_bias and the norm weight in their own dtype instead.
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
             conv_state,
@@ -1402,13 +1402,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             a[:n],
             b[:n],
             self.A_log,
-            self._k5_dt_bias,
+            self.dt_bias,
             sidx[:num_req],
             md.spec_query_start_loc[: num_req + 1],
             md.num_accepted_tokens[:num_req],
             ssm_state,
             z,
-            self._k5_norm_w,
+            self.norm.weight,
             core_attn_out[:n],
             self.head_k_dim**-0.5,
             self.norm.eps,

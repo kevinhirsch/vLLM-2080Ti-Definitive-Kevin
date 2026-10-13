@@ -168,13 +168,13 @@ def gdn_mtp(
     a: torch.Tensor,  # [L, HV] fp16
     b: torch.Tensor,  # [L, HV] fp16
     A_log: torch.Tensor,  # [HV] fp32
-    dt_bias: torch.Tensor,  # [HV] fp32
+    dt_bias: torch.Tensor,  # [HV] fp16|fp32 (read in its own dtype; no derived copies)
     state_indices: torch.Tensor,  # [N, W] int32
     cu_seqlens: torch.Tensor,  # [N+1] int32
     num_accepted: torch.Tensor,  # [N] int32
     state: torch.Tensor,  # [slots, HV, 128, 128] fp16|fp32, updated in place
     z: torch.Tensor,  # [L, HV, 128] fp16 output gate
-    norm_weight: torch.Tensor,  # [128] fp32
+    norm_weight: torch.Tensor,  # [128] fp16|fp32 (read in its own dtype)
     out: torch.Tensor,  # [L, HV, 128] fp16
     scale: float,
     eps: float,
