@@ -65,6 +65,11 @@ def _import_prebuilt(name: str, build_dir: str, src: str):
 def _load():
     global _EXT
     if _EXT is None:
+        if torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "tree commit extension must be loaded before CUDA graph capture "
+                "(TreeCommit.warmup at runner init)"
+            )
         from torch.utils.cpp_extension import load
 
         src = os.path.join(

@@ -11,10 +11,13 @@ views into one shared page per slot), MTP3 (4 slots per request), replicated Mar
 head slice, mamba align-mode style slot rows (source slot = one of the destinations), random accepted counts,
 graph-padded request rows (-1 slots, accepted=1, cu filled) and token-padded rows.
 
-The K5 layer's FIRST call happens inside torch.cuda.graph capture with capture-time metadata (all requests real,
-all accepted), exactly like the engine (capture warmups carry no spec-decode metadata); the real metadata is then
-written into the same persistent buffers before every replay. This is the configuration that failed in window
-k5-fused-gdn-aba-20261013-075027 (lazy fp32 parameter copies created inside capture were never initialised).
+Graph cases follow the engine's order: eager model warmup (non-K5 GDN path), then the K5 per-layer warmup hook
+(_k5_maybe_warmup, which _forward_cuda_impl runs on its first eager call and must not touch any cache), then the
+layer's first REAL K5 call happens inside torch.cuda.graph capture with capture-time metadata (all requests real,
+all accepted); the real metadata is then written into the same persistent buffers before every replay. Any lazy
+initialisation left inside the K5 path shows up as a capture failure here. Each case runs in a fresh process.
+Diagnostic probes (fresh process each, CUDA_LOG_FILE=stderr, informational, never gate) run one first-time
+operation inside capture with nothing warmed, to name the call that invalidated the 2026-10-13 09:50 captures.
 
 Compares, for every step: the out_proj input (normed core output), the projected output, ALL temporal-state slots,
 ALL conv-state slots. Prints one JSON line per case and a final {"verdict": "PASS"|"FAIL", ...} line.
@@ -105,7 +108,7 @@ def make_layer(p, conv, ssm, tp_rank: int, core_buf: torch.Tensor) -> Q.QwenGate
                      head_k_dim=DK, head_v_dim=DV, key_dim=NK * DK, value_dim=NV * DV, hidden_size=HIDDEN,
                      conv_kernel_size=KW, activation="silu", gqa_interleaved_layout=False,
                      disable_tp_for_ba_proj=True, enable_fused_gdn_decode=False,
-                     enable_packed_recurrent_decode=False, kv_cache=(conv, ssm)).items():
+                     enable_packed_recurrent_decode=False, num_spec=W - 1, kv_cache=(conv, ssm)).items():
         object.__setattr__(L, k, v)
     L.A_log = torch.nn.Parameter(p["A_log"].clone(), requires_grad=False)
     L.dt_bias = torch.nn.Parameter(p["dt_bias"].clone(), requires_grad=False)
@@ -114,7 +117,8 @@ def make_layer(p, conv, ssm, tp_rank: int, core_buf: torch.Tensor) -> Q.QwenGate
     out_w = p["out_w"]
 
     def out_proj(x):
-        core_buf.copy_(x)  # the out_proj input (normed core output); a captured copy under graph replay too
+        if x.shape == core_buf.shape:  # (the K5 warmup runs other token counts)
+            core_buf.copy_(x)  # the out_proj input (normed core output); a captured copy under graph replay too
         return x @ out_w, None
 
     object.__setattr__(L, "out_proj", out_proj)
@@ -205,11 +209,27 @@ def run_case(name, *, state_dtype, param_dtype, tp_rank, ncap, real_n, graph, co
         meta.capture_values(rows)
         qkvz_k.normal_(generator=g)
         ba_k.normal_(generator=g)
+        # Engine order: eager warmups precede capture. (a) the non-K5 model warmup (here: the production GDN
+        # path on scratch caches, which also initialises Triton and cuBLAS like the engine's warmups do);
+        # (b) the K5 per-layer warmup hook that _forward_cuda_impl runs on its first eager call.
+        _, conv_s, ssm_s = make_cache(torch.Generator(device=DEV).manual_seed(seed + 7), state_dtype,
+                                      conv_dim_first)
+        scratch = make_layer(p, conv_s, ssm_s, tp_rank, torch.empty(ntok, ZW, dtype=torch.float16, device=DEV))
+        k5._ENABLED = False
+        prod_forward(scratch, torch.randn(ntok, QKV + ZW, device=DEV).half(), torch.randn(ntok, 2 * NV, device=DEV).half(),
+                     torch.empty(ntok, HIDDEN, dtype=torch.float16, device=DEV))
+        k5._ENABLED = True
+        before = CALLS["k5"]
+        Lk._k5_maybe_warmup()
         torch.cuda.synchronize()
+        if not getattr(Lk, "_k5_warmed", False) or CALLS["k5"] == before:
+            return dict(case=name, ok=False, error="K5 warmup did not run")
+        if not (torch.equal(ssm_k, ssm_r) and torch.equal(conv_k, conv_r)):
+            return dict(case=name, ok=False, error="K5 warmup touched cache state")
         graph_obj = torch.cuda.CUDAGraph()
         before = CALLS["k5"]
         with torch.cuda.graph(graph_obj):
-            k5_forward(Lk, qkvz_k, ba_k, out_k)  # FIRST call of this layer = inside capture (as in the engine)
+            k5_forward(Lk, qkvz_k, ba_k, out_k)  # first REAL K5 call = inside capture (as in the engine)
         if CALLS["k5"] == before:
             return dict(case=name, ok=False, error="K5 path not taken during capture")
         torch.cuda.synchronize()
@@ -274,34 +294,175 @@ def run_case(name, *, state_dtype, param_dtype, tp_rank, ncap, real_n, graph, co
                 conv_dim_first=conv_dim_first, steps=steps, **{k_: float(f"{v_:.3g}") for k_, v_ in worst.items()})
 
 
+CASES = [
+    # name, state, params, rank, ncap, real_n, graph, conv_dim_first
+    ("prod-c1-graph", torch.float32, torch.float16, 1, 1, 1, True, False),
+    ("prod-c1-padded-graph", torch.float32, torch.float16, 1, 2, 1, True, False),
+    ("prod-n3-of-4-graph", torch.float32, torch.float16, 0, 4, 3, True, False),
+    ("prod-n5-of-8-graph-rank0", torch.float32, torch.float16, 0, 8, 5, True, False),
+    ("prod-n3-eager", torch.float32, torch.float16, 1, 3, 3, False, False),
+    ("fp32-params-graph", torch.float32, torch.float32, 1, 4, 2, True, False),
+    ("fp16-state-graph", torch.float16, torch.float16, 1, 4, 3, True, False),
+    ("ds-conv-layout-graph", torch.float32, torch.float16, 1, 4, 4, True, True),
+]
+
+
+def run_one_case(i: int) -> dict:
+    name, sdt, pdt, rank, ncap, real_n, graph, dsf = CASES[i]
+    k5._load()
+    try:
+        return run_case(name, state_dtype=sdt, param_dtype=pdt, tp_rank=rank, ncap=ncap, real_n=real_n,
+                        graph=graph, conv_dim_first=dsf, steps=4, seed=1000 + i)
+    except Exception as e:  # a crash is a FAIL, not a skip
+        import traceback
+
+        return dict(case=name, ok=False, error=f"{type(e).__name__}: {e}", tb=traceback.format_exc()[-3000:])
+
+
+# ---- diagnostic probes: each in a fresh process, ONE first-time operation inside capture, nothing warmed ----
+def _capture(fn):
+    g = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(g):
+        fn()
+    torch.cuda.synchronize()
+    g.replay()
+    torch.cuda.synchronize()
+
+
+def _probe_inputs(ntok=4):
+    g = torch.Generator(device=DEV).manual_seed(5)
+    _, conv, ssm = make_cache(g, torch.float32, False)
+    meta = Meta(ntok // W)
+    meta.load([list(range(1, W + 1))], [W])
+    return conv, ssm, meta
+
+
+def _guarded_conv(conv, ssm, meta, x):
+    from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
+
+    w = torch.randn(QKV, KW, device=DEV).half()
+    return lambda: causal_conv1d_update(
+        x, conv.transpose(-1, -2), w, None, "silu", conv_state_indices=meta.sidx[:, 0],
+        num_accepted_tokens=meta.nacc, query_start_loc=meta.cu, max_query_len=W, null_block_id=PAD,
+        validate_data=False, guard_bounds=True, state_indices_2d=meta.sidx, recurrent_num_slots=ssm.size(0))
+
+
+def run_probe(name: str) -> dict:
+    out = dict(probe=name)
+    try:
+        if name == "gemm-first-in-capture":
+            a = torch.randn(4, ZW, device=DEV).half()
+            b = torch.randn(ZW, HIDDEN, device=DEV).half()
+            _capture(lambda: a @ b)
+        elif name == "triton-first-in-process-guarded-conv-in-capture":
+            conv, ssm, meta = _probe_inputs()
+            x = torch.randn(4, QKV + ZW, device=DEV).half()[:, :QKV]
+            _capture(_guarded_conv(conv, ssm, meta, x))
+        elif name == "triton-warm-then-new-guarded-conv-in-capture":
+            from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
+
+            conv, ssm, meta = _probe_inputs()
+            x = torch.randn(4, QKV + ZW, device=DEV).half()[:, :QKV]
+            w = torch.randn(QKV, KW, device=DEV).half()
+            causal_conv1d_update(x.clone(), conv.transpose(-1, -2).clone(), w, None, "silu",
+                                 conv_state_indices=meta.sidx[:, 0], num_accepted_tokens=meta.nacc,
+                                 query_start_loc=meta.cu, max_query_len=W, null_block_id=PAD)  # unguarded, eager
+            torch.cuda.synchronize()
+            _capture(_guarded_conv(conv, ssm, meta, x))
+        elif name == "k5-ext-load-in-capture":
+            t = torch.zeros(1, device=DEV)
+            k5.capturing = lambda: False  # bypass the loader's own capture guard: probe the raw import
+            _capture(lambda: (t.add_(1), k5._load()))
+        elif name in ("k5-kernel-first-launch-in-capture", "k5-kernel-after-eager-launch-in-capture"):
+            ext = k5._load()
+            conv, ssm, meta = _probe_inputs()
+            mixed = torch.randn(4, QKV, device=DEV).half()
+            a = torch.randn(4, HV, device=DEV).half()
+            b = torch.randn(4, HV, device=DEV).half()
+            z = torch.randn(4, HV, DV, device=DEV).half()
+            o = torch.zeros(4, HV, DV, device=DEV).half()
+            A = torch.randn(HV, device=DEV)
+            dt = torch.randn(HV, device=DEV).half()
+            nw = torch.ones(DV, device=DEV).half()
+            launch = lambda: ext.gdn_mtp(mixed, a, b, A, dt, meta.sidx, meta.cu, meta.nacc, ssm, z, nw, o,
+                                         DK ** -0.5, 1e-6, PAD, False, k5._VARIANT)
+            if name.startswith("k5-kernel-after"):
+                launch()
+                torch.cuda.synchronize()
+            _capture(launch)
+        elif name == "k5-path-first-in-capture-without-any-warmup":
+            # the 10-13 09:50 failure shape: nothing at all ran on the GPU before the K5 layer's first call
+            Q.is_conv_state_dim_first = lambda: False
+            g = torch.Generator(device=DEV).manual_seed(3)
+            p = make_params(g, torch.float16)
+            _, conv, ssm = make_cache(g, torch.float32, False)
+            L = make_layer(p, conv, ssm, 1, torch.empty(4, ZW, dtype=torch.float16, device=DEV))
+            object.__setattr__(L, "_k5_warmed", True)  # bypass the capture guard on purpose
+            meta = Meta(1)
+            meta.capture_values([list(range(1, W + 1))])
+            CTX["md"] = meta.md
+            qkvz = torch.randn(4, QKV + ZW, device=DEV).half()
+            ba = torch.randn(4, 2 * NV, device=DEV).half()
+            out = torch.empty(4, HIDDEN, dtype=torch.float16, device=DEV)
+            k5._ENABLED = True
+            _capture(lambda: k5_forward(L, qkvz, ba, out))
+        else:
+            raise ValueError(name)
+        out["ok"] = True
+    except Exception as e:
+        out.update(ok=False, error=f"{type(e).__name__}: {str(e)[:500]}")
+    return out
+
+
+PROBES = ["gemm-first-in-capture", "triton-first-in-process-guarded-conv-in-capture",
+          "triton-warm-then-new-guarded-conv-in-capture", "k5-ext-load-in-capture",
+          "k5-kernel-first-launch-in-capture", "k5-kernel-after-eager-launch-in-capture",
+          "k5-path-first-in-capture-without-any-warmup"]
+
+
+def _child(args: list[str], extra_env: dict | None = None) -> tuple[dict | None, str]:
+    import os
+    import subprocess
+
+    env = dict(os.environ, **(extra_env or {}))
+    r = subprocess.run([sys.executable, __file__, *args], capture_output=True, text=True, env=env, timeout=600)
+    rows = [ln for ln in r.stdout.splitlines() if ln.startswith("{")]
+    res = json.loads(rows[-1]) if rows else None
+    return res, (r.stderr or "")[-1500:]
+
+
 def main() -> int:
+    argv = sys.argv[1:]
+    if argv[:1] == ["--case"]:
+        r = run_one_case(int(argv[1]))
+        print(json.dumps(r), flush=True)
+        return 0 if r.get("ok") else 1
+    if argv[:1] == ["--probe"]:
+        print(json.dumps(run_probe(argv[1])), flush=True)
+        return 0
     if not torch.cuda.is_available():
         print(json.dumps(dict(test="k5_equiv", verdict="FAIL", error="no CUDA device")))
         return 1
-    k5._load()
-    cases = [
-        # name, state, params, rank, ncap, real_n, graph, conv_dim_first
-        ("prod-c1-graph", torch.float32, torch.float16, 1, 1, 1, True, False),
-        ("prod-c1-padded-graph", torch.float32, torch.float16, 1, 2, 1, True, False),
-        ("prod-n3-of-4-graph", torch.float32, torch.float16, 0, 4, 3, True, False),
-        ("prod-n5-of-8-graph-rank0", torch.float32, torch.float16, 0, 8, 5, True, False),
-        ("prod-n3-eager", torch.float32, torch.float16, 1, 3, 3, False, False),
-        ("fp32-params-graph", torch.float32, torch.float32, 1, 4, 2, True, False),
-        ("fp16-state-graph", torch.float16, torch.float16, 1, 4, 3, True, False),
-        ("ds-conv-layout-graph", torch.float32, torch.float16, 1, 4, 4, True, True),
-    ]
+    k5._load()  # build/stamp check once in the parent; children import the stamped .so
+    if "--no-probes" not in argv:
+        # informational only (never gate): which first-time operation, done inside capture, invalidates it
+        for name in PROBES:
+            res, err = _child(["--probe", name], {"CUDA_LOG_FILE": "stderr"})
+            res = res or dict(probe=name, ok=False, error="probe process died")
+            if not res.get("ok"):
+                res["stderr_tail"] = err[-800:]
+            print(json.dumps(res), flush=True)
     results, ok = [], True
-    for i, (name, sdt, pdt, rank, ncap, real_n, graph, dsf) in enumerate(cases):
-        try:
-            r = run_case(name, state_dtype=sdt, param_dtype=pdt, tp_rank=rank, ncap=ncap, real_n=real_n,
-                         graph=graph, conv_dim_first=dsf, steps=4, seed=1000 + i)
-        except Exception as e:  # a crash is a FAIL, not a skip
-            r = dict(case=name, ok=False, error=f"{type(e).__name__}: {e}")
+    for i, case in enumerate(CASES):
+        r, err = _child(["--case", str(i)])
+        if r is None:
+            r = dict(case=case[0], ok=False, error="case process died", stderr_tail=err[-800:])
         results.append(r)
         ok &= bool(r.get("ok"))
         print(json.dumps(r), flush=True)
     verdict = dict(test="k5_equiv", verdict="PASS" if ok else "FAIL", cases=len(results),
-                   failed=[r["case"] for r in results if not r.get("ok")], k5_calls=CALLS["k5"])
+                   failed=[r["case"] for r in results if not r.get("ok")])
     print(json.dumps(verdict), flush=True)
     return 0 if ok else 1
 

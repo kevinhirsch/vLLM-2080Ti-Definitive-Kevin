@@ -26,44 +26,68 @@ def enabled() -> bool:
     return _ENABLED
 
 
-def _import_prebuilt(name: str, build_dir: str, src: str):
-    """Import a prebuilt ``<build_dir>/<name>.so`` (release prebuild) directly
-    when it is at least as new as its source: no ninja, no compiler at boot.
-    Returns None when there is no usable prebuilt module."""
-    so = os.path.join(build_dir, f"{name}.so")
-    try:
-        if not (os.path.isfile(so) and os.path.getmtime(so) >= os.path.getmtime(src)):
-            return None
-        import importlib.util
+_NAME = "gdn_mtp_sm75"
+_CFLAGS = ["-O3", "-gencode=arch=compute_75,code=sm_75"]
+_SRC = os.path.join(os.path.dirname(__file__), "gdn_sm75_ext", "gdn_mtp_sm75.cu")
 
-        spec = importlib.util.spec_from_file_location(name, so)
-        if spec is None or spec.loader is None:
-            return None
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod
-    except (OSError, ImportError):
-        return None
+
+def capturing() -> bool:
+    # A capture needs an initialised CUDA context; never initialise one (or touch a device) just to ask.
+    return torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing()
+
+
+def _build_dir() -> str:
+    return os.environ.get("VLLM_K5_GDN_BUILD_DIR", os.path.expanduser("~/.cache/vllm-k5-gdn"))
+
+
+def _source_stamp() -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(_SRC, "rb") as f:
+        h.update(f.read())
+    h.update(repr((_CFLAGS, torch.__version__, torch.version.cuda)).encode())
+    return h.hexdigest()
 
 
 def _load():
+    """Load the extension. Prebuilt .so whose stamp matches the source: imported directly (no ninja, no compiler,
+    no torch cpp_extension rebuild check). Otherwise JIT-built once and stamped (release build time).
+
+    Never call this for the first time inside CUDA-graph capture: the layer loads it at init and the K5 warmup
+    launches every kernel eagerly before capture."""
     global _EXT
     if _EXT is None:
-        from torch.utils.cpp_extension import load
+        if capturing():
+            raise RuntimeError("K5 GDN extension must be loaded before CUDA graph capture")
+        bd = _build_dir()
+        so = os.path.join(bd, _NAME + ".so")
+        stamp_path = os.path.join(bd, _NAME + ".stamp")
+        stamp = _source_stamp()
+        try:
+            with open(stamp_path) as f:
+                fresh = f.read().strip() == stamp and os.path.exists(so)
+        except OSError:
+            fresh = False
+        if fresh:
+            import importlib.machinery
+            import importlib.util
 
-        src = os.path.join(os.path.dirname(__file__), "gdn_sm75_ext", "gdn_mtp_sm75.cu")
-        bd = os.environ.get("VLLM_K5_GDN_BUILD_DIR", os.path.expanduser("~/.cache/vllm-k5-gdn"))
-        _EXT = _import_prebuilt("gdn_mtp_sm75", bd, src)
-        if _EXT is not None:
-            return _EXT
-        os.makedirs(bd, exist_ok=True)
-        _EXT = load(
-            name="gdn_mtp_sm75",
-            sources=[src],
-            extra_cuda_cflags=["-O3", "-gencode=arch=compute_75,code=sm_75"],
-            build_directory=bd,
-            verbose=False,
-        )
+            loader = importlib.machinery.ExtensionFileLoader(_NAME, so)
+            spec = importlib.util.spec_from_file_location(_NAME, so, loader=loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            _EXT = mod
+        else:
+            from torch.utils.cpp_extension import load
+
+            os.makedirs(bd, exist_ok=True)
+            _EXT = load(name=_NAME, sources=[_SRC], extra_cuda_cflags=_CFLAGS, build_directory=bd, verbose=False)
+            try:
+                with open(stamp_path, "w") as f:
+                    f.write(stamp + "\n")
+            except OSError:
+                pass
     return _EXT
 
 
@@ -95,7 +119,6 @@ def inputs_supported(
     z: torch.Tensor, norm_weight: torch.Tensor, conv_state: torch.Tensor,
     conv_weight: torch.Tensor, conv_bias: torch.Tensor | None,
     num_requests: int, num_tokens: int, scale: float, eps: float,
-    rows_per_request: int | None = None,
 ) -> bool:
     """Metadata-only preflight, before convolution mutates either cache.
 
@@ -161,9 +184,7 @@ def inputs_supported(
                 and t.numel() >= length and t.is_contiguous()):
             return False
     width = state_indices.size(1)
-    # E16 tree step: M = width + L rows per request (M <= 8); chain: rows <= width.
-    rows = width if rows_per_request is None else rows_per_request
-    if not width <= rows <= 8 or num_tokens > num_requests * rows:
+    if num_tokens > num_requests * width:
         return False
     channels = mixed_qkv.size(1)
     if not (conv_state.dim() == 3 and conv_state.dtype == torch.float16
@@ -211,31 +232,3 @@ def gdn_mtp(
     _load().gdn_mtp(mixed_qkv, a, b, A_log, dt_bias, state_indices, cu_seqlens, num_accepted, state, z,
                     norm_weight, out, float(scale), float(eps), int(null_block_id), bool(sigmoid_gate),
                     int(_VARIANT if variant is None else variant))
-
-
-def gdn_mtp_tree(
-    mixed_qkv: torch.Tensor,  # [L, 2*H*128 + HV*128] fp16, post-conv; every request has M = W + L rows, chain-first
-    a: torch.Tensor,
-    b: torch.Tensor,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    state_indices: torch.Tensor,  # [N, W] int32, W = D + 1 chain slots (unchanged)
-    cu_seqlens: torch.Tensor,  # [N+1] int32, M per request
-    num_accepted: torch.Tensor,
-    state: torch.Tensor,
-    z: torch.Tensor,
-    norm_weight: torch.Tensor,
-    out: torch.Tensor,
-    scale: float,
-    eps: float,
-    null_block_id: int,
-    sigmoid_gate: bool,
-    leaf_rows: tuple[int, ...],  # TreeSpec.leaf_rows (host ints, baked into the launch)
-    leaf_depth: tuple[int, ...],  # TreeSpec.leaf_depth
-    stash: torch.Tensor,  # TreeStash.gdn_view(layer): fp32 [B_tree, L, HV, 258]
-) -> None:
-    """E16 P4a: K5 verify over a chain-plus-leaves tree (v2 kernel).  Chain rows write their slots exactly like
-    gdn_mtp; leaf rows produce outputs from their parent's state and write the leaf stash, never a slot."""
-    _load().gdn_mtp_tree(mixed_qkv, a, b, A_log, dt_bias, state_indices, cu_seqlens, num_accepted, state, z,
-                         norm_weight, out, float(scale), float(eps), int(null_block_id), bool(sigmoid_gate),
-                         [int(x) for x in leaf_rows], [int(x) for x in leaf_depth], stash)
