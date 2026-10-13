@@ -2653,6 +2653,21 @@ class GPUModelRunner(
                         self.mamba_prev_last_scheduled_idx.gpu[:num_reqs_padded]
                     )
 
+            if (
+                envs_gdn_update_check()
+                and not for_cudagraph_capture
+                and isinstance(builder, GDNAttentionMetadataBuilder)
+            ):
+                cached = cached_attn_metadata.get(cache_key)
+                logger.info_once(
+                    "GDN_UPDATE_BT_DIAG gid=%d in_cache=%s keys=%d can_update=%s "
+                    "spec=%r",
+                    kv_cache_gid,
+                    cached is not None,
+                    len(cached_attn_metadata),
+                    None if cached is None else builder.can_update_block_table(cached),
+                    kv_cache_spec,
+                )
             if for_cudagraph_capture:
                 attn_metadata_i = builder.build_for_cudagraph_capture(
                     common_attn_metadata
