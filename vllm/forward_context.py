@@ -56,6 +56,13 @@ class BatchDescriptor:
     (like fused_moe_lora) whose grid size depends on num_active_loras
     to be properly captured.
     """
+    tree: bool = False
+    """
+    E16 tree step (P8): the uniform-decode FULL graph of the tree family
+    (query_len = M rows per request).  Disambiguates equal token counts, e.g.
+    28 tokens = 7 chain requests (query_len D + 1) or 4 tree requests.  False
+    keeps every chain key identical to today.
+    """
 
 
 def _compute_sp_num_tokens(

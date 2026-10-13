@@ -71,6 +71,11 @@ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
+from vllm.v1.spec_decode.tree_spec import (
+    decide_tree_step,
+    resolve_engine_tree_spec,
+    truncate_drafts_to_chain,
+)
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 from vllm.v1.structured_output.utils import strip_speculative_padding
 from vllm.v1.utils import record_function_or_nullcontext
@@ -271,6 +276,11 @@ class Scheduler(SchedulerInterface):
         self.use_eagle_block_drop = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
+        # E16 tree drafting (P8). None = off: every tree branch below is
+        # skipped and scheduling is byte-identical to the chain.
+        self.tree_spec = resolve_engine_tree_spec(vllm_config)
+        if self.tree_spec is not None:
+            logger.info("Tree speculation enabled: %s", self.tree_spec.describe())
         # Positions past the computed tokens that the drafter reads mid-prefill.
         # Eagle-family drafters read 1 ahead, but multi-module MTP reads
         # num_spec_tokens ahead at chunked-prefill boundaries. Determines the
@@ -1093,6 +1103,11 @@ class Scheduler(SchedulerInterface):
             else None
         )
         scheduled_prefill_work: dict[str, int] = {}
+
+        # E16 tree pre-pass (P8): running requests keep their M - 1 drafts
+        # only when this step can be a tree step; otherwise they are cut to
+        # the chain (first D) before num_new_tokens is derived from them.
+        tree_cand = self.tree_spec is not None and self._tree_step_candidate()
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -1920,6 +1935,17 @@ class Scheduler(SchedulerInterface):
             if not defer_prefills:
                 self.prefill_capacity_bound = bool(self.waiting)
 
+        tree_step = False
+        if tree_cand:
+            tree_step, demoted = self._tree_step_post_pass(
+                num_scheduled_tokens,
+                scheduled_spec_decode_tokens,
+                scheduled_running_reqs,
+                bool(scheduled_new_reqs or scheduled_resumed_reqs or preempted_reqs),
+            )
+            token_budget += demoted
+            input_budget += demoted
+
         # [FORK][LANE EF] Decode-row drop telemetry. A running request that
         # is NOT scheduled in a step is removed from the worker's persistent
         # batch; count decode-phase rows left out and the budget left.
@@ -2063,6 +2089,8 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
         )
+        if tree_step:
+            scheduler_output.tree_step = True
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -3096,6 +3124,74 @@ class Scheduler(SchedulerInterface):
         if self.ec_connector is not None:
             self.ec_connector.update_state_after_free(request, input_id)
 
+    # ------------------------------------------------ E16 tree step (P8)
+    def _tree_step_candidate(self) -> bool:
+        """Pre-pass of the tree-step rule (contract section 3).
+
+        A candidate step has 1..B_tree running requests, every one decoding
+        with exactly M - 1 drafts.  When the step is not a candidate, every
+        running request's drafts are truncated to the chain here, so the step
+        is scheduled exactly as today."""
+        spec = self.tree_spec
+        assert spec is not None
+        n_drafts = spec.num_drafts
+        cand = 0 < len(self.running) <= spec.B_tree and all(
+            req.num_computed_tokens >= req.num_prompt_tokens
+            and len(req.spec_token_ids) == n_drafts
+            for req in self.running
+        )
+        if not cand:
+            for req in self.running:
+                if len(req.spec_token_ids) > spec.D:
+                    req.spec_token_ids = truncate_drafts_to_chain(
+                        spec, req.spec_token_ids
+                    )
+        return cand
+
+    def _tree_step_post_pass(
+        self,
+        num_scheduled_tokens: dict[str, int],
+        scheduled_spec_decode_tokens: dict[str, list[int]],
+        scheduled_running_reqs: list[Request],
+        has_new_or_resumed_reqs: bool,
+    ) -> tuple[bool, int]:
+        """Post-pass + demotion (contract section 3, steps 2-3).
+
+        Returns (tree_step, tokens removed by demotion).  Demotion truncates
+        each request's scheduled drafts to D and removes the L extra tokens;
+        the slots already allocated for them are harmless (reused next
+        step)."""
+        spec = self.tree_spec
+        assert spec is not None
+        running_ids = {req.request_id for req in scheduled_running_reqs}
+        all_pure_decode = len(running_ids) == len(num_scheduled_tokens) and all(
+            req.num_computed_tokens >= req.num_prompt_tokens
+            for req in scheduled_running_reqs
+        )
+        all_full_drafts = all(
+            n == spec.M
+            and len(scheduled_spec_decode_tokens.get(req_id, ())) == spec.num_drafts
+            for req_id, n in num_scheduled_tokens.items()
+        )
+        tree_step = decide_tree_step(
+            spec,
+            len(num_scheduled_tokens),
+            all_pure_decode,
+            has_new_or_resumed_reqs,
+            all_full_drafts,
+        )
+        demoted = 0
+        if not tree_step:
+            for req_id, drafts in scheduled_spec_decode_tokens.items():
+                extra = len(drafts) - spec.D
+                if extra > 0:
+                    scheduled_spec_decode_tokens[req_id] = truncate_drafts_to_chain(
+                        spec, drafts
+                    )
+                    num_scheduled_tokens[req_id] -= extra
+                    demoted += extra
+        return tree_step, demoted
+
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
         for req_id, spec_token_ids in zip(
             draft_token_ids.req_ids,
@@ -3111,6 +3207,23 @@ class Scheduler(SchedulerInterface):
                 if request.spec_token_ids:
                     request.spec_token_ids = []
                 continue
+
+            # E16: structured-output and bad-words requests keep only the
+            # chain; they never carry M - 1 drafts, so they force chain steps.
+            if (
+                self.tree_spec is not None
+                and len(spec_token_ids) > self.tree_spec.D
+                and (
+                    self.structured_output_manager.should_advance(request)
+                    or (
+                        request.sampling_params is not None
+                        and request.sampling_params.bad_words_token_ids
+                    )
+                )
+            ):
+                spec_token_ids = truncate_drafts_to_chain(
+                    self.tree_spec, spec_token_ids
+                )
 
             # Add newly generated spec token ids to the request.
             if self.structured_output_manager.should_advance(request):

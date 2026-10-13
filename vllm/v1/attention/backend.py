@@ -469,6 +469,12 @@ class CommonAttentionMetadata:
     at the current decode run's last full-state write. write_pos counts from
     here, so a preemption-resumed request re-anchors past the prompt boundary."""
 
+    tree_step: bool = False
+    """E16 tree step (SchedulerOutput.tree_step): every request is a spec
+    decode with M rows (chain-first).  Builders treat all B requests as
+    decodes (num_decodes = B, num_decode_tokens = B*M) and bypass the
+    reorder_batch_threshold (= 1 + D) split.  Never re-derived."""
+
     _num_computed_tokens_cache: torch.Tensor | None = None
     _token_to_req_indices_cache: torch.Tensor | None = None
 

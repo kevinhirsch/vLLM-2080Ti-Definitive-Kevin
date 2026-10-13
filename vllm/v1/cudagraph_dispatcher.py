@@ -69,6 +69,13 @@ class CudagraphDispatcher:
         # Default cudagraph_mode to NONE until initialize_cudagraph_keys is called
         self.cudagraph_mode = CUDAGraphMode.NONE
 
+        # E16 tree family (P8): set only by initialize_cudagraph_keys(...,
+        # tree_spec=...) from the target model runner; the drafter's own
+        # dispatcher never gets it.
+        self.tree_spec = None
+        self.tree_query_len = 0
+        self.tree_capture_sizes: list[int] = []
+
     def _compute_bs_to_padded_graph_size(self) -> None:
         """Pre-compute the mapping from batch size to padded graph size."""
         max_size = self.compilation_config.max_cudagraph_capture_size
@@ -164,7 +171,10 @@ class CudagraphDispatcher:
         self.cudagraph_keys[runtime_mode].add(batch_descriptor)
 
     def initialize_cudagraph_keys(
-        self, cudagraph_mode: CUDAGraphMode, uniform_decode_query_len: int = 1
+        self,
+        cudagraph_mode: CUDAGraphMode,
+        uniform_decode_query_len: int = 1,
+        tree_spec=None,
     ):
         # This should be called only after attention backend is initialized. So we can
         # get the correct cudagraph mode after backend support is resolved.
@@ -230,7 +240,86 @@ class CudagraphDispatcher:
                     ),
                 )
 
+        if tree_spec is not None:
+            self._initialize_tree_keys(cudagraph_mode, tree_spec, lora_cases)
+
         self.keys_initialized = True
+
+    def _initialize_tree_keys(
+        self, cudagraph_mode: CUDAGraphMode, tree_spec, lora_cases: list[int]
+    ) -> None:
+        """Second uniform-decode FULL family: query_len = M, B = 1..B_tree.
+
+        Its sizes B*M come from the TreeSpec as a separate un-rounded list;
+        they are never merged into cudagraph_capture_sizes (whose entries are
+        rounded to multiples of D + 1) and never pad chain batches."""
+        self.tree_spec = tree_spec
+        self.tree_query_len = tree_spec.M
+        if cudagraph_mode.decode_mode() != CUDAGraphMode.FULL:
+            # No FULL decode graphs at all: tree steps run eager.
+            self.tree_capture_sizes = []
+            return
+        from vllm.v1.spec_decode.tree_spec import tree_cudagraph_sizes
+
+        max_size = self.compilation_config.max_cudagraph_capture_size or 0
+        sizes = tree_cudagraph_sizes(tree_spec)
+        kept = [s for s in sizes if s <= max_size]
+        if kept != sizes:
+            logger.warning(
+                "Tree cudagraph sizes %s exceed max_cudagraph_capture_size %d; "
+                "tree steps above %s run eager.",
+                sizes,
+                max_size,
+                kept[-1] if kept else 0,
+            )
+        self.tree_capture_sizes = kept
+        for size, num_active_loras in product(kept, lora_cases):
+            self.add_cudagraph_key(
+                CUDAGraphMode.FULL,
+                BatchDescriptor(
+                    num_tokens=size,
+                    num_reqs=size // tree_spec.M,
+                    uniform=True,
+                    has_lora=num_active_loras > 0,
+                    num_active_loras=num_active_loras,
+                    tree=True,
+                ),
+            )
+        logger.info(
+            "Tree cudagraph family: query_len=%d sizes=%s", tree_spec.M, kept
+        )
+
+    def _dispatch_tree(
+        self,
+        num_tokens: int,
+        has_lora: bool,
+        num_active_loras: int,
+        allowed_modes: AbstractSet[CUDAGraphMode],
+    ) -> tuple[CUDAGraphMode, BatchDescriptor]:
+        """Tree step: exact B*M key of the tree family, or eager.
+
+        A tree step is never padded into (or out of) the chain family and
+        never replays a PIECEWISE graph keyed by the chain size list."""
+        M = self.tree_query_len
+        assert M > 0 and num_tokens % M == 0, (
+            f"tree step with {num_tokens} tokens is not a multiple of M={M}"
+        )
+        if CUDAGraphMode.FULL in allowed_modes and num_tokens in self.tree_capture_sizes:
+            desc = BatchDescriptor(
+                num_tokens=num_tokens,
+                num_reqs=num_tokens // M,
+                uniform=True,
+                has_lora=has_lora,
+                num_active_loras=num_active_loras,
+                tree=True,
+            )
+            if desc in self.cudagraph_keys[CUDAGraphMode.FULL]:
+                return CUDAGraphMode.FULL, desc
+        assert CUDAGraphMode.NONE in allowed_modes, (
+            f"No tree cudagraph for {num_tokens} tokens and NONE is not in "
+            f"allowed_modes={allowed_modes}"
+        )
+        return CUDAGraphMode.NONE, BatchDescriptor(num_tokens, tree=True)
 
     def dispatch(
         self,
@@ -240,6 +329,7 @@ class CudagraphDispatcher:
         num_active_loras: int = 0,
         valid_modes: AbstractSet[CUDAGraphMode] | None = None,
         invalid_modes: AbstractSet[CUDAGraphMode] | None = None,
+        tree_step: bool = False,
     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
         """
         Given conditions(e.g.,batch descriptor and if using piecewise only),
@@ -259,6 +349,8 @@ class CudagraphDispatcher:
                 valid_modes to compute allowed modes. (e.g., {FULL} for
                 features like cascade attention not supported by full
                 cudagraphs). None means no modes are excluded.
+            tree_step: E16 tree step (SchedulerOutput.tree_step); dispatches
+                to the tree family keyed by query_len M.
         """
         allowed_modes = valid_modes or CUDAGraphMode.valid_runtime_modes()
 
@@ -278,7 +370,7 @@ class CudagraphDispatcher:
             or num_tokens > max_size
             or allowed_modes <= {CUDAGraphMode.NONE}
         ):
-            return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
+            return CUDAGraphMode.NONE, BatchDescriptor(num_tokens, tree=tree_step)
 
         effective_num_active_loras = num_active_loras
         if has_lora and num_active_loras > 0:
@@ -298,6 +390,12 @@ class CudagraphDispatcher:
                     "LoRA config must be set when has_lora is True."
                 )
                 effective_num_active_loras = self.vllm_config.lora_config.max_loras + 1
+
+        if tree_step:
+            assert self.tree_spec is not None, "tree step without a tree family"
+            return self._dispatch_tree(
+                num_tokens, has_lora, effective_num_active_loras, allowed_modes
+            )
 
         normalized_uniform = uniform_decode and self.cudagraph_mode.separate_routine()
         batch_desc = self._create_padded_batch_descriptor(
