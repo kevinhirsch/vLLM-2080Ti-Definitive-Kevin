@@ -1308,3 +1308,217 @@ if current_platform.is_cpu():
 
     causal_conv1d_fn = causal_conv1d_fn_cpu  # type: ignore
     causal_conv1d_update = causal_conv1d_update_cpu  # type: ignore
+
+
+# ---------------------------------------------------------------------------
+# E16 tree drafting: conv1d update, tree variant (P4c)
+# ---------------------------------------------------------------------------
+@triton.jit
+def _causal_conv1d_tree_leaf_kernel(
+    x_ptr,  # chain+leaf rows, token-major: row (b, r) at (b * M + r) * stride_x_token
+    w_ptr,  # (dim, width)
+    bias_ptr,
+    conv_state_ptr,
+    conv_state_indices_ptr,
+    num_accepted_tokens_ptr,
+    leaf_rows_ptr,  # [L] int32 row of each leaf inside a request
+    leaf_parent_ptr,  # [L] int32 chain row that is each leaf's parent
+    o_ptr,  # same layout as x_ptr
+    stash_ptr,  # [B_tree, L, dim] (strides below)
+    dim: tl.constexpr,
+    num_cache_lines,
+    M: tl.constexpr,
+    max_accepted: tl.constexpr,  # D + 1
+    stride_x_token: tl.int64,
+    stride_x_dim: tl.constexpr,
+    stride_w_dim: tl.constexpr,
+    stride_w_width: tl.constexpr,
+    stride_conv_state_seq: tl.constexpr,
+    stride_conv_state_dim: tl.constexpr,
+    stride_conv_state_tok: tl.constexpr,
+    stride_state_indices: tl.constexpr,
+    stride_o_token: tl.int64,
+    stride_o_dim: tl.constexpr,
+    stride_stash_b: tl.constexpr,
+    stride_stash_l: tl.constexpr,
+    null_block_id: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    KERNEL_WIDTH: tl.constexpr,
+    SILU_ACTIVATION: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Leaf rows of a tree verify step.
+
+    Leaf l (row R, parent chain row P) convolves over the K-1 committed inputs
+    that precede row 0 (read from the state at column num_accepted-1, exactly
+    as the chain kernel does), then chain inputs x_0..x_P, then its own input.
+    It must run BEFORE the chain kernel, which rewrites the state in place.
+    Writes the leaf output and stash[b, l] = x_leaf (pre-conv).
+    """
+    idx_seq = tl.program_id(0)
+    idx_leaf = tl.program_id(1)
+    idx_feats = tl.program_id(2) * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_f = idx_feats < dim
+
+    slot = tl.load(conv_state_indices_ptr + idx_seq * stride_state_indices).to(tl.int64)
+    if slot == null_block_id:
+        return
+
+    row = tl.load(leaf_rows_ptr + idx_leaf).to(tl.int64)
+    parent = tl.load(leaf_parent_ptr + idx_leaf).to(tl.int64)
+    tok0 = idx_seq.to(tl.int64) * M
+    o_ptrs = o_ptr + (tok0 + row) * stride_o_token + idx_feats * stride_o_dim
+
+    num_accepted = tl.load(num_accepted_tokens_ptr + idx_seq).to(tl.int64)
+    if (num_accepted < 1) | (num_accepted > max_accepted):
+        # same contract as the chain kernel: invalid row -> zero output
+        tl.store(o_ptrs, tl.zeros((BLOCK_N,), dtype=tl.float32), mask=mask_f)
+        return
+
+    state_base = (
+        conv_state_ptr
+        + slot * stride_conv_state_seq
+        + idx_feats * stride_conv_state_dim
+        + (num_accepted - 1) * stride_conv_state_tok
+    )
+    x_base = x_ptr + idx_feats * stride_x_dim
+    x_leaf = tl.load(x_base + (tok0 + row) * stride_x_token, mask=mask_f, other=0.0)
+    tl.store(
+        stash_ptr + idx_seq * stride_stash_b + idx_leaf * stride_stash_l + idx_feats,
+        x_leaf,
+        mask=mask_f,
+    )
+
+    if HAS_BIAS:
+        acc = tl.load(bias_ptr + idx_feats, mask=mask_f, other=0.0).to(tl.float32)
+    else:
+        acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    w_base = w_ptr + idx_feats * stride_w_dim
+    for i in tl.static_range(KERNEL_WIDTH):
+        # window element i sits at path-sequence index u = (parent + 1) + i,
+        # where the sequence is hist[0..K-2] ++ x_0..x_parent ++ x_leaf.
+        u = parent + 1 + i
+        if i == KERNEL_WIDTH - 1:
+            mx = x_leaf
+        else:
+            is_hist = u < (KERNEL_WIDTH - 1)
+            hist = tl.load(
+                state_base + u * stride_conv_state_tok, mask=mask_f & is_hist, other=0.0
+            )
+            xr = tl.load(
+                x_base + (tok0 + (u - (KERNEL_WIDTH - 1))) * stride_x_token,
+                mask=mask_f & (~is_hist),
+                other=0.0,
+            )
+            mx = tl.where(is_hist, hist, xr)
+        w = tl.load(w_base + i * stride_w_width, mask=mask_f, other=0.0)
+        acc += mx * w
+
+    if SILU_ACTIVATION:
+        acc = acc / (1 + tl.exp(-acc))
+    tl.store(o_ptrs, acc, mask=mask_f)
+
+
+def causal_conv1d_update_tree(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    activation: bool | str | None,
+    conv_state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    tree,
+    stash: torch.Tensor,
+    num_reqs: int,
+    null_block_id: int = NULL_BLOCK_ID,
+    out: torch.Tensor | None = None,
+):
+    """Conv1d update for a tree verify step (E16).
+
+    x: ``[num_reqs * M, dim]`` pre-conv inputs, request-major, chain-first rows
+       ``[x0, c1..cD, leaf_0..leaf_{L-1}]`` (contract section 1).
+    conv_state: unchanged layout/window, ``state_len = (K-1) + D``.
+    conv_state_indices: ``[num_reqs, D+1]``; num_accepted_tokens ``[num_reqs]``.
+    tree: ``TreeTensors`` (needs ``leaf_rows`` / ``leaf_parent_row``).
+    stash: ``stash.conv_view(layer)[:num_reqs]``, ``[num_reqs, L, dim]``, written
+       with each leaf's pre-conv input (the commit kernel's source).
+    out: optional output ``[num_reqs * M, dim]``; default in place on ``x``.
+
+    Chain rows 0..D run the *existing* update kernel on a strided
+    ``[B, dim, D+1]`` view of ``x`` and store only chain inputs in the window
+    (bit-identical to a chain step). Leaf rows are convolved over their
+    parent's path by a separate launch that runs first, because the chain
+    kernel updates the state in place. Returns the output ``[num_reqs*M, dim]``.
+    """
+    assert x.dim() == 2 and x.stride(1) == 1
+    M = int(tree.rows_parent.shape[0])
+    L = int(tree.leaf_rows.shape[0])
+    D = int(tree.chain_rows.shape[0]) - 1
+    assert x.shape[0] == num_reqs * M, (x.shape, num_reqs, M)
+    dim = x.shape[1]
+    if isinstance(activation, bool):
+        activation = "silu" if activation is True else None
+    elif activation is not None:
+        assert activation in ["silu", "swish"]
+    original_dtype = x.dtype
+    x = x.to(conv_state.dtype)
+    if out is None:
+        out = x  # in place, like causal_conv1d_update
+    assert out.shape == x.shape and out.dtype == x.dtype and out.stride(1) == 1
+    num_cache_lines, _, state_len = conv_state.size()
+    width = weight.shape[1]
+    assert state_len >= width - 1 + D
+    assert stash.shape[0] >= num_reqs and stash.shape[1] == L and stash.shape[2] == dim
+
+    if L > 0:
+        BLOCK_N = 256
+        _causal_conv1d_tree_leaf_kernel[(num_reqs, L, triton.cdiv(dim, BLOCK_N))](
+            x,
+            weight,
+            bias,
+            conv_state,
+            conv_state_indices,
+            num_accepted_tokens,
+            tree.leaf_rows,
+            tree.leaf_parent_row,
+            out,
+            stash,
+            dim,
+            num_cache_lines,
+            M,
+            D + 1,
+            x.stride(0),
+            x.stride(1),
+            weight.stride(0),
+            weight.stride(1),
+            conv_state.stride(0),
+            conv_state.stride(1),
+            conv_state.stride(2),
+            conv_state_indices.stride(0),
+            out.stride(0),
+            out.stride(1),
+            stash.stride(0),
+            stash.stride(1),
+            null_block_id,
+            HAS_BIAS=bias is not None,
+            KERNEL_WIDTH=width,
+            SILU_ACTIVATION=activation in ["silu", "swish"],
+            BLOCK_N=BLOCK_N,
+        )
+
+    # Chain rows: existing kernel, strided [B, dim, D+1] views (rows 0..D).
+    x_chain = x.view(num_reqs, M, dim)[:, : D + 1].transpose(1, 2)
+    out_chain = out.view(num_reqs, M, dim)[:, : D + 1].transpose(1, 2)
+    causal_conv1d_update(
+        x_chain,
+        conv_state,
+        weight,
+        bias,
+        activation,
+        conv_state_indices=conv_state_indices,
+        num_accepted_tokens=num_accepted_tokens,
+        null_block_id=null_block_id,
+        out=out_chain,
+    )
+    return out.to(original_dtype)

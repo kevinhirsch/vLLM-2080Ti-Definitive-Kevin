@@ -533,6 +533,7 @@ def _tq_spec_continuation_merge_kernel(
     Prefix_lse_ptr,  # [T, Hq]
     # Final prefix + raw-continuation attention state.
     Out_ptr,  # [T, Hq, D]
+    ANC_ptr,  # [T] int32 ancestor bitmask per row (tree verify), or None
     stride_qt,
     stride_qh,
     stride_qd,
@@ -556,6 +557,7 @@ def _tq_spec_continuation_merge_kernel(
     CHUNK_LEN: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    HAS_ANC: tl.constexpr,
 ):
     """Merge compressed-prefix attention and causal raw current KV.
 
@@ -576,6 +578,12 @@ def _tq_spec_continuation_merge_kernel(
         other=0.0,
     ).to(tl.float32)
 
+    if HAS_ANC:
+        # Tree verify: bit k of the row's ancestor mask says chunk row k is
+        # visible (itself included). Chain-first rows, so a chain row's mask is
+        # exactly the causal prefix mask.
+        anc_row = tl.load(ANC_ptr + row)
+
     # Online softmax state for raw causal attention over s <= row.
     current_max = -float("inf")
     current_sum = 0.0
@@ -584,7 +592,10 @@ def _tq_spec_continuation_merge_kernel(
 
     for start in range(0, CHUNK_LEN, BLOCK_T):
         token_idx = start + token_offsets
-        token_mask = (token_idx < CHUNK_LEN) & (token_idx <= row)
+        if HAS_ANC:
+            token_mask = (token_idx < CHUNK_LEN) & (((anc_row >> token_idx) & 1) != 0)
+        else:
+            token_mask = (token_idx < CHUNK_LEN) & (token_idx <= row)
         kv_offsets = (
             token_idx[:, None] * stride_kt
             + kv_head * stride_kh
@@ -651,6 +662,7 @@ def triton_turboquant_spec_continuation_merge(
     prefix_lse: torch.Tensor,
     scale: float,
     output: torch.Tensor | None = None,
+    anc_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Merge TQ prefix attention with exact causal current-chunk attention.
 
@@ -663,6 +675,10 @@ def triton_turboquant_spec_continuation_merge(
     When ``output`` aliases ``prefix_out`` the input buffer is overwritten
     after it has been read by each independent program. The backend uses that
     form to avoid another graph-captured allocation.
+
+    ``anc_mask`` (E16 tree verify) is an int32 ``[T]`` device tensor: bit k of
+    ``anc_mask[row]`` lets row attend to chunk row k. ``None`` keeps the causal
+    ``k <= row`` mask (byte-identical chain path).
     """
     if query.ndim != 3 or key_chunk.ndim != 3 or value_chunk.ndim != 3:
         raise ValueError("TQ continuation tensors must have shape [T, H, D].")
@@ -690,6 +706,13 @@ def triton_turboquant_spec_continuation_merge(
 
     # A bounded raw-KV tile avoids the excessive register footprint of a
     # [128, D] materialization while still specializing the common T=8 case.
+    if anc_mask is not None:
+        if (
+            anc_mask.dtype != torch.int32
+            or anc_mask.shape != (chunk_len,)
+            or chunk_len > 31
+        ):
+            raise ValueError("TQ tree anc_mask must be int32 [T] with T <= 31.")
     block_t = min(16, triton.next_power_of_2(chunk_len))
     block_d = triton.next_power_of_2(head_dim)
     grid = (chunk_len, num_query_heads)
@@ -700,6 +723,7 @@ def triton_turboquant_spec_continuation_merge(
         prefix_out,
         prefix_lse,
         output,
+        anc_mask,
         query.stride(0),
         query.stride(1),
         query.stride(2),
@@ -723,6 +747,7 @@ def triton_turboquant_spec_continuation_merge(
         CHUNK_LEN=chunk_len,
         BLOCK_T=block_t,
         BLOCK_D=block_d,
+        HAS_ANC=anc_mask is not None,
         num_warps=4,
         num_stages=1,
     )

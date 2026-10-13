@@ -496,6 +496,12 @@ class TurboQuantMetadata(AttentionMetadata):
     flashinfer_first_chunk_wrappers: dict[int, Any] | None = None
     flashinfer_continuation_wrappers: dict[int, Any] | None = None
     flashinfer_prefix_combine_wrappers: dict[int, tuple[Any, Any]] | None = None
+    # E16 tree verify (None / 0 = chain, today's behaviour). ``tree_anc_mask``
+    # is the builder's own TreeTensors.anc_mask (int32 [M], device); set iff the
+    # step is a tree step. A tree step is pure decode and reaches only the
+    # raw-current continuation path.
+    tree_anc_mask: torch.Tensor | None = None
+    tree_rows: int = 0
 
 
 class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
@@ -503,6 +509,8 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
 
     kv_cache_spec: AttentionSpec
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _tree_tensors: Any = None  # E16: TreeTensors when the tree is enabled
+    _tree_rows: int = 0
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
@@ -533,6 +541,14 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
             vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
         )
         self._reserve_workspace()
+        # E16: build the tree tables once, here, never lazily or in capture.
+        from vllm.v1.spec_decode.tree_spec import resolve_tree_spec
+
+        tree_spec = resolve_tree_spec(getattr(vllm_config, "speculative_config", None))
+        self._tree_tensors = (
+            tree_spec.device_tensors(self._device) if tree_spec is not None else None
+        )
+        self._tree_rows = tree_spec.M if tree_spec is not None else 0
 
     def _plan_flashinfer_prefill_wrappers(
         self,
@@ -829,7 +845,7 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
         if (
             _TQ_CUDAGRAPH_SPEC_DECODE_SAFE
             and 1 < attn_metadata.max_query_len <= _CONTINUATION_DECODE_THRESHOLD
-        ):
+        ):  # tree capture: tree_anc_mask (if any) rides along on the metadata
             # Capture the MTP continuation through the raw-current-K/V path.
             # Keep the shared warmup sequence length at one: GDN/Mamba reads
             # the same CommonAttentionMetadata, and changing it to q_len
@@ -852,11 +868,22 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
         # The model runner guarantees decodes come first. Keep short requests
         # still in prefill on the prefill side when that state is available.
         assert self.reorder_batch_threshold is not None
-        num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
-            cam,
-            decode_threshold=self.reorder_batch_threshold,
-            treat_short_extends_as_decodes=cam.is_prefilling is None,
+        tree_step = self._tree_tensors is not None and bool(
+            getattr(cam, "tree_step", False)
         )
+        if tree_step:
+            # Tree steps are pure decode: every request is a spec decode of M
+            # rows; bypass the (1 + D) threshold split (contract section 3).
+            num_decodes = cam.num_reqs
+            num_decode_tokens = cam.num_actual_tokens
+        else:
+            num_decodes, num_prefills, num_decode_tokens, _ = (
+                split_decodes_and_prefills(
+                    cam,
+                    decode_threshold=self.reorder_batch_threshold,
+                    treat_short_extends_as_decodes=cam.is_prefilling is None,
+                )
+            )
         (
             first_chunk_wrapper,
             first_chunk_wrappers,
@@ -883,6 +910,8 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
             flashinfer_first_chunk_wrappers=first_chunk_wrappers,
             flashinfer_continuation_wrappers=continuation_wrappers,
             flashinfer_prefix_combine_wrappers=prefix_combine_wrappers,
+            tree_anc_mask=self._tree_tensors.anc_mask if tree_step else None,
+            tree_rows=self._tree_rows if tree_step else 0,
         )
 
 
@@ -1212,6 +1241,15 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         if _ef_fence_on:
             _ef_fence("tq:pre-attn(kv-store+previous-layers)", _ef_ctx)
 
+        if getattr(attn_metadata, "tree_anc_mask", None) is not None:
+            # Tree steps are pure decode: only the raw-current continuation
+            # path implements the ancestor mask (mixed/prefill/plain-decode
+            # paths are causal).
+            assert _SPEC_CONTINUATION_DECODE_FASTPATH and (
+                attn_metadata.force_spec_decode
+                or num_decode_tokens >= N
+                or num_decodes >= attn_metadata.seq_lens.shape[0]
+            ), "TurboQuant tree step reached a non-pure-decode attention path"
         if attn_metadata.force_spec_decode:
             if (
                 _SPEC_CONTINUATION_DECODE_FASTPATH
@@ -1444,6 +1482,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         This compressed-cache implementation remains available when the
         raw-current continuation fastpath is explicitly disabled.
         """
+        assert getattr(attn_metadata, "tree_anc_mask", None) is None, (
+            "tree verify needs the raw-current continuation fastpath "
+            "(VLLM_TURBOQUANT_SPEC_CONTINUATION_DECODE_FASTPATH=1)"
+        )
         qsl_cpu = attn_metadata.query_start_loc_cpu
         qsl = (
             qsl_cpu.tolist()
@@ -1563,6 +1605,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 centroids,
                 PiT,
                 arange_cache,
+                **self._tree_kwargs(attn_metadata),
             )
             if out is None:
                 raise RuntimeError(
@@ -1881,6 +1924,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
         return output
 
+    @staticmethod
+    def _tree_kwargs(attn_metadata: Any) -> dict[str, Any]:
+        anc = getattr(attn_metadata, "tree_anc_mask", None)
+        return {} if anc is None else {"anc_mask": anc}
+
     def _spec_continuation_decode_attention(
         self,
         query: torch.Tensor,
@@ -1893,8 +1941,13 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         centroids: torch.Tensor,
         PiT: torch.Tensor | None,
         arange_cache: torch.Tensor,
+        anc_mask: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         """Merge compressed-prefix attention with raw MTP continuation KV.
+
+        ``anc_mask`` (E16 tree verify, int32 [q_len]) replaces the causal mask
+        over the raw current chunk with a per-row ancestor bitmask. The
+        compressed prefix is shared by every row, so it is unchanged.
 
         The cache update runs before attention, so reading the current
         speculative tokens from the quantized cache is lossy. Computing the
@@ -2023,6 +2076,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             # matching output row is written, so it doubles as the final
             # output buffer without an additional graph-captured allocation.
             output=prefix_out,
+            **({"anc_mask": anc_mask} if anc_mask is not None else {}),
         )
 
     def _continuation_prefill(
