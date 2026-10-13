@@ -31,6 +31,14 @@ def extract(path, names, namespace):
     return namespace
 
 
+def bind_k5(layer, namespace):
+    """_k5_spec_decode (metadata lookup + E16 tree guard) delegates to _k5_spec_decode_md; bind both."""
+    ns = extract(GDN / "qwen_gdn_linear_attn.py", {"_k5_spec_decode", "_k5_spec_decode_md"}, namespace)
+    layer.tree_stash = None
+    layer._k5_spec_decode_md = types.MethodType(ns["_k5_spec_decode_md"], layer)
+    return ns["_k5_spec_decode"]
+
+
 class Tensor:
     """Only host-visible tensor metadata. No tensor allocation or CUDA methods."""
 
@@ -181,7 +189,7 @@ class PreflightTests(unittest.TestCase):
         md = types.SimpleNamespace(spec_state_indices_tensor=d["state_indices"],
               spec_sequence_masks=object(), num_prefills=0, num_decodes=0, num_spec_decodes=2,
               num_actual_tokens=6, num_accepted_tokens=d["num_accepted"],
-              spec_query_start_loc=d["cu_seqlens"])
+              spec_query_start_loc=d["cu_seqlens"], tree_rows=0)
         layer = types.SimpleNamespace(prefix="layer", A_log=d["A_log"], dt_bias=d["dt_bias"],
               head_k_dim=128, head_v_dim=128, num_k_heads=16, num_v_heads=48, tp_size=2,
               key_dim=2048, value_dim=6144, hidden_size=5120, activation="silu",
@@ -198,7 +206,7 @@ class PreflightTests(unittest.TestCase):
             "get_forward_context": lambda: types.SimpleNamespace(attn_metadata={"layer": md}),
             "GDNAttentionMetadata": types.SimpleNamespace, "is_conv_state_dim_first": lambda: True,
             "causal_conv1d_update": forbidden_conv, "PAD_SLOT_ID": -1}
-        method = extract(GDN / "qwen_gdn_linear_attn.py", {"_k5_spec_decode"}, namespace)["_k5_spec_decode"]
+        method = bind_k5(layer, namespace)
         self.assertFalse(method(layer, Tensor((8, 8192)), Tensor((8, 96)), Tensor((8, 5120))))
         self.assertEqual(conv_calls, [])
         self.assertEqual(layer.dt_bias.copies + layer.norm.weight.copies, 0)
@@ -215,7 +223,7 @@ class PreflightTests(unittest.TestCase):
         md = types.SimpleNamespace(spec_state_indices_tensor=d["state_indices"],
               spec_sequence_masks=object(), num_prefills=0, num_decodes=0, num_spec_decodes=2,
               num_actual_tokens=6, num_accepted_tokens=d["num_accepted"],
-              spec_query_start_loc=d["cu_seqlens"])
+              spec_query_start_loc=d["cu_seqlens"], tree_rows=0)
         norm = types.SimpleNamespace(activation="silu", norm_before_gate=True,
                                      group_size=None, weight=d["norm_weight"], eps=1e-6)
         layer = types.SimpleNamespace(prefix="layer", A_log=d["A_log"], dt_bias=d["dt_bias"],
@@ -225,7 +233,6 @@ class PreflightTests(unittest.TestCase):
               conv1d=types.SimpleNamespace(weight=Tensor((5120, 1, 4)), bias=None),
               split_ba=lambda _: (Tensor((8, 24), strides=(96, 1)), Tensor((8, 24), strides=(96, 1))),
               out_proj=lambda x: (x, None))
-        before = set(vars(layer))
         calls = {}
 
         def conv(x, *args, **kwargs):
@@ -246,7 +253,8 @@ class PreflightTests(unittest.TestCase):
             "get_forward_context": lambda: types.SimpleNamespace(attn_metadata={"layer": md}),
             "GDNAttentionMetadata": types.SimpleNamespace, "is_conv_state_dim_first": lambda: True,
             "causal_conv1d_update": conv, "PAD_SLOT_ID": -1}
-        method = extract(GDN / "qwen_gdn_linear_attn.py", {"_k5_spec_decode"}, namespace)["_k5_spec_decode"]
+        method = bind_k5(layer, namespace)
+        before = set(vars(layer))
         out = Output((8, 5120))
         self.assertTrue(method(layer, Tensor((8, 8192)), Tensor((8, 96)), out))
         self.assertTrue(calls.get("copied"))

@@ -647,6 +647,11 @@ class ChunkGatedDeltaRule(CustomOp):
 
 @PluggableLayer.register("qwen_gated_delta_net_attention")
 class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+    # E16 tree drafting: the runner's TreeStash (allocated once after model load,
+    # before capture; contract §6).  Class default None = no tree; never created
+    # lazily by the layer.
+    tree_stash = None
+
     def get_state_shape(
         self,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
@@ -1288,6 +1293,45 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         md = attn_metadata.get(self.prefix)
         if not isinstance(md, GDNAttentionMetadata):
             return False
+        handled = self._k5_spec_decode_md(md, mixed_qkvz, ba, output)
+        if md.tree_rows and not handled:
+            # The stock GDN path does not understand tree rows (P4b not built):
+            # never fall back silently on a tree step.
+            raise RuntimeError(
+                f"{self.prefix}: E16 tree step needs the K5 tree kernel "
+                "(VLLM_K5_GDN_FUSED=1, VLLM_K5_GDN_VARIANT=2, layer.tree_stash set, "
+                "M <= 8) and the inputs it supports"
+            )
+        return handled
+
+    def _k5_tree_conv(
+        self,
+        mixed_qkv: torch.Tensor,
+        conv_state: torch.Tensor,
+        conv_weights: torch.Tensor,
+        md: GDNAttentionMetadata,
+        num_req: int,
+        recurrent_num_slots: int,
+    ) -> torch.Tensor:
+        """E16 P4c seam: the conv1d update on a tree step (M rows per request,
+        chain-only window store, leaf pre-conv x -> self.tree_stash.conv_view(
+        self.prefix)).  Owned by package P4c (causal_conv1d tree variant)."""
+        raise NotImplementedError(
+            "E16 P4c (conv1d tree variant) is not integrated in this branch"
+        )
+
+    def _k5_spec_decode_md(
+        self,
+        md: GDNAttentionMetadata,
+        mixed_qkvz: torch.Tensor,
+        ba: torch.Tensor,
+        output: torch.Tensor,
+    ) -> bool:
+        tree_rows = md.tree_rows
+        if tree_rows and (
+            self.tree_stash is None or md.tree_spec is None or not 0 < tree_rows <= 8
+        ):
+            return False
         sidx = md.spec_state_indices_tensor
         if (
             md.spec_sequence_masks is None
@@ -1368,6 +1412,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             num_tokens=n,
             scale=self.head_k_dim**-0.5,
             eps=self.norm.eps,
+            rows_per_request=tree_rows or None,
         ):
             return False
         # No derived parameter copies here: the first call of this path happens
@@ -1375,46 +1420,76 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # metadata), where a lazily created .float() copy is allocated from the
         # graph pool but its cast kernel is only recorded, never executed. The
         # kernel reads dt_bias and the norm weight in their own dtype instead.
-        mixed_qkv = causal_conv1d_update(
-            mixed_qkv,
-            conv_state,
-            conv_weights,
-            self.conv1d.bias,
-            self.activation,
-            conv_state_indices=sidx[:, 0][:num_req],
-            num_accepted_tokens=md.num_accepted_tokens,
-            query_start_loc=md.spec_query_start_loc,
-            max_query_len=sidx.size(-1),
-            null_block_id=PAD_SLOT_ID,
-            validate_data=False,
-            guard_bounds=True,
-            state_indices_2d=sidx[:num_req],
-            recurrent_num_slots=ssm_state.size(0),
-        )
+        if tree_rows:
+            mixed_qkv = self._k5_tree_conv(
+                mixed_qkv, conv_state, conv_weights, md, num_req, ssm_state.size(0)
+            )
+        else:
+            mixed_qkv = causal_conv1d_update(
+                mixed_qkv,
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=sidx[:, 0][:num_req],
+                num_accepted_tokens=md.num_accepted_tokens,
+                query_start_loc=md.spec_query_start_loc,
+                max_query_len=sidx.size(-1),
+                null_block_id=PAD_SLOT_ID,
+                validate_data=False,
+                guard_bounds=True,
+                state_indices_2d=sidx[:num_req],
+                recurrent_num_slots=ssm_state.size(0),
+            )
 
         core_attn_out = torch.zeros(
             (mixed_qkvz.size(0), self.num_v_heads // self.tp_size, self.head_v_dim),
             dtype=mixed_qkvz.dtype,
             device=mixed_qkvz.device,
         )
-        _k5_gdn.gdn_mtp(
-            mixed_qkv,
-            a[:n],
-            b[:n],
-            self.A_log,
-            self.dt_bias,
-            sidx[:num_req],
-            md.spec_query_start_loc[: num_req + 1],
-            md.num_accepted_tokens[:num_req],
-            ssm_state,
-            z,
-            self.norm.weight,
-            core_attn_out[:n],
-            self.head_k_dim**-0.5,
-            self.norm.eps,
-            PAD_SLOT_ID,
-            self.norm.activation == "sigmoid",
-        )
+        if tree_rows:
+            # E16 P4a: chain rows exactly as gdn_mtp; leaf outputs from the
+            # parent state in registers + the leaf stash for the commit (P5).
+            _k5_gdn.gdn_mtp_tree(
+                mixed_qkv,
+                a[:n],
+                b[:n],
+                self.A_log,
+                self.dt_bias,
+                sidx[:num_req],
+                md.spec_query_start_loc[: num_req + 1],
+                md.num_accepted_tokens[:num_req],
+                ssm_state,
+                z,
+                self.norm.weight,
+                core_attn_out[:n],
+                self.head_k_dim**-0.5,
+                self.norm.eps,
+                PAD_SLOT_ID,
+                self.norm.activation == "sigmoid",
+                md.tree_spec.leaf_rows,
+                md.tree_spec.leaf_depth,
+                self.tree_stash.gdn_view(self.prefix),
+            )
+        else:
+            _k5_gdn.gdn_mtp(
+                mixed_qkv,
+                a[:n],
+                b[:n],
+                self.A_log,
+                self.dt_bias,
+                sidx[:num_req],
+                md.spec_query_start_loc[: num_req + 1],
+                md.num_accepted_tokens[:num_req],
+                ssm_state,
+                z,
+                self.norm.weight,
+                core_attn_out[:n],
+                self.head_k_dim**-0.5,
+                self.norm.eps,
+                PAD_SLOT_ID,
+                self.norm.activation == "sigmoid",
+            )
         projected_output, _ = self.out_proj(core_attn_out.flatten(-2))
         output.copy_(projected_output)
         return True

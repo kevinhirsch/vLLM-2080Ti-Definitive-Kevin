@@ -1698,6 +1698,16 @@ class GPUModelRunner(
             )
             self._dflash_trace_step = trace_step + 1
 
+        # E16 P5: on a tree step, commit rescued leaves (GDN slot j, conv
+        # column, TQ KV row) BEFORE the mamba postprocess reads slot j.  The
+        # runner sets tree_commit / _tree_step_outputs / _tree_tq_slot_mapping
+        # only when the tree is on (P9); with the tree off nothing runs.
+        tree_commit = getattr(self, "tree_commit", None)
+        if tree_commit is not None and getattr(scheduler_output, "tree_step", False):
+            tree_commit.commit_step(
+                self._tree_step_outputs, self._tree_tq_slot_mapping
+            )
+
         if self.cache_config.mamba_cache_mode == "align":
             # Fused GPU postprocess: state copies + per-request accepted-token
             # update without CPU-GPU sync. The metadata

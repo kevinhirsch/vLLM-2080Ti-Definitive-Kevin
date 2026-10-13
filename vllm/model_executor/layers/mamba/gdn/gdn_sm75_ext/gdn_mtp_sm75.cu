@@ -14,6 +14,15 @@
 //     v' = (v - h k) * sigmoid(b); h += v' k^T; o = h q  (o rounded to fp16 like the Triton store);
 //     state for token t stored to state[state_indices[n, t]] when that index is valid.
 //   - out = fp16( (o * rsqrt(mean(o^2) + eps)) * w * act(z) ),  act = silu or sigmoid.
+//
+// E16 P4a tree-leaf variant (gdn_mtp_tree, v2 layout only; contract results/tree-contract.md §5 P4a, §6):
+//   a request carries M = width + L rows, chain-first [x0, c1..cD, leaf_0..leaf_{L-1}].  Chain rows 0..width-1 run
+//   exactly as above (same instructions, same per-position slot writes).  Leaf l (row leaf_row[l], depth
+//   j = leaf_depth[l] in 1..width-1) takes as input the register state just before chain row j is applied (= the
+//   post-state of its parent row j-1): its output is computed from that state, NO state slot is written, and the
+//   leaf stash [b, l, hv, :] = k (l2-normed, unscaled) | v | decay = exp(g) | beta = sigmoid(b) (fp32, K+V+2) is
+//   written for the commit kernel.  The tree instantiation is a separate template (TREE=true); the chain
+//   instantiation compiles the leaf code away, so the chain path is unchanged.
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -79,14 +88,35 @@ struct Strides {
   int64_t mixed_row, a_row, b_row, z_row, state_slot, out_row;
 };
 
+// Static tree topology, passed by value (baked into the launch, hence into a captured graph; no device tables).
+struct LeafTable {
+  int n;               // L, number of leaves (0 = chain launch)
+  int row[kMaxTok];    // request-local row of leaf l (= width + l, chain-first)
+  int depth[kMaxTok];  // depth j in [1, width-1]; input state = post-state of chain row j-1
+};
+
+constexpr int kStashW = kDimK + kDimV + 2;  // k | v | decay | beta
+
+// This layer's slice of TreeStash.gdn_leaf: [cap_b, L, HV, kStashW] fp32, last dim contiguous.
+struct StashArgs {
+  float* ptr;
+  int64_t sb, sl, sh;  // element strides of b, l, hv
+  int cap_b;           // B_tree (requests beyond it are rejected on the host)
+};
+
 // Reject malformed metadata before reading or writing either recurrent state.
 // The convolution guard applies the same request predicate before its cache
 // update. Negative/null destinations remain skippable; a bad positive slot
 // invalidates the whole request rather than partially committing it.
 __device__ __forceinline__ bool invalid_request(
-    const int* indices, int width, int T, int accepted, int num_slots, int null_id, int* src) {
+    const int* indices, int width, int T, int accepted, int num_slots, int null_id, int* src, int nleaf = 0) {
   *src = -1;
-  if (T > width || T > kMaxTok || accepted < 1 || accepted > width) return true;
+  // Chain launch (nleaf == 0): rows <= slots, as before.  Tree launch: exactly width chain rows + nleaf leaf rows.
+  if (nleaf == 0) {
+    if (T > width || T > kMaxTok || accepted < 1 || accepted > width) return true;
+  } else {
+    if (T != width + nleaf || T > kMaxTok || accepted < 1 || accepted > width) return true;
+  }
   const int first = indices[0];
   *src = indices[accepted - 1];
   if (first < 0 || first >= num_slots || first == null_id ||
@@ -275,14 +305,14 @@ constexpr int kRowsPerPass = kWarps * (32 / kGrp);    // 64
 constexpr int kRowsV2 = kDimV / kRowsPerPass;         // 2 rows per thread
 constexpr int kSegs = kDimK / (kGrp * 4);             // 4 float4 segments per row per lane
 
-template <typename S, bool SIGMOID>
+template <typename S, bool SIGMOID, bool TREE>
 __global__ __launch_bounds__(kThreads, 1) void gdn_mtp_sm75_v2_kernel(
     const __half* __restrict__ mixed_qkv, const __half* __restrict__ a, const __half* __restrict__ b,
     const float* __restrict__ a_log, const void* __restrict__ dt_bias, const int* __restrict__ state_indices,
     const int* __restrict__ cu_seqlens, const int* __restrict__ num_accepted, S* __restrict__ state,
     const __half* __restrict__ z, const void* __restrict__ norm_w, __half* __restrict__ out, int H, int HV, int HPK,
     int width, int num_tokens, int num_slots, int null_block_id, float scale, float eps, Strides st, bool dt_f32,
-    bool nw_f32) {
+    bool nw_f32, LeafTable lt, StashArgs sa) {
   const int n = blockIdx.x;
   const int hv = blockIdx.y;
   const int tid = threadIdx.x;
@@ -302,13 +332,16 @@ __global__ __launch_bounds__(kThreads, 1) void gdn_mtp_sm75_v2_kernel(
   const int acc = num_accepted[n];
   int src = -1;
   if (invalid_request(state_indices + (int64_t)n * width, width, T, acc,
-                      num_slots, null_block_id, &src)) {
+                      num_slots, null_block_id, &src, TREE ? lt.n : 0) ||
+      (TREE && n >= sa.cap_b)) {
     for (int64_t i = tid; i < (int64_t)T * kDimV; i += kThreads) {
       const int t = i / kDimV, v = i % kDimV;
       out[(int64_t)(bos + t) * st.out_row + (int64_t)hv * kDimV + v] = __float2half(0.0f);
     }
     return;
   }
+  // Chain rows; on a tree launch the leaf rows follow them (validated: T == width + lt.n).
+  const int Tc = TREE ? T - lt.n : T;
 
   const int kh = hv / HPK;
   __shared__ __align__(16) float sq[kMaxTok][kDimK];
@@ -368,7 +401,65 @@ __global__ __launch_bounds__(kThreads, 1) void gdn_mtp_sm75_v2_kernel(
   }
   __syncthreads();
 
-  for (int t = 0; t < T; ++t) {
+  if (TREE) {
+    // Leaf stash for the commit: k (l2-normed, unscaled) | v | decay | beta, fp32.  Leaf rows never get a slot.
+    float* sp = sa.ptr + (int64_t)n * sa.sb + (int64_t)hv * sa.sh;
+    for (int i = tid; i < lt.n * kStashW; i += kThreads) {
+      const int l = i / kStashW, c = i - l * kStashW;
+      const int R = lt.row[l];
+      const float val = c < kDimK ? sk[R][c]
+                        : c < kDimK + kDimV ? sv[R][c - kDimK]
+                        : c == kDimK + kDimV ? sdecay[R] : sbeta[R];
+      sp[(int64_t)l * sa.sl + c] = val;
+    }
+  }
+
+  for (int t = 0; t < Tc; ++t) {
+    if (TREE) {
+      // Leaves at depth t: the registers hold the post-state of chain row t-1 (= the leaf's parent).  Output only;
+      // h is not modified, no slot is written.  Same single-pass algebra as the chain rows below.
+      for (int l = 0; l < lt.n; ++l) {
+        if (lt.depth[l] != t) continue;
+        const int R = lt.row[l];
+        float lk[kSegs][4], lq[kSegs][4];
+#pragma unroll
+        for (int m = 0; m < kSegs; ++m) {
+          const float4 k4 = *reinterpret_cast<const float4*>(&sk[R][m * 32 + seg * 4]);
+          const float4 q4 = *reinterpret_cast<const float4*>(&sq[R][m * 32 + seg * 4]);
+          lk[m][0] = k4.x; lk[m][1] = k4.y; lk[m][2] = k4.z; lk[m][3] = k4.w;
+          lq[m][0] = q4.x; lq[m][1] = q4.y; lq[m][2] = q4.z; lq[m][3] = q4.w;
+        }
+        const float ldec = sdecay[R], lbeta = sbeta[R], lkq = skq[R];
+        float lhk[kRowsV2], lhq[kRowsV2];
+#pragma unroll
+        for (int j = 0; j < kRowsV2; ++j) {
+          float s0 = 0.f, s1 = 0.f;
+#pragma unroll
+          for (int m = 0; m < kSegs; ++m)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+              s0 += h[j][m][i] * lk[m][i];
+              s1 += h[j][m][i] * lq[m][i];
+            }
+          lhk[j] = s0;
+          lhq[j] = s1;
+        }
+#pragma unroll
+        for (int o = kGrp / 2; o > 0; o >>= 1)
+#pragma unroll
+          for (int j = 0; j < kRowsV2; ++j) {
+            lhk[j] += __shfl_xor_sync(0xffffffffu, lhk[j], o);
+            lhq[j] += __shfl_xor_sync(0xffffffffu, lhq[j], o);
+          }
+        if (seg == 0) {
+#pragma unroll
+          for (int j = 0; j < kRowsV2; ++j) {
+            const float delta = (sv[R][rows[j]] - ldec * lhk[j]) * lbeta;
+            so[R][rows[j]] = __half2float(__float2half(ldec * lhq[j] + delta * lkq));
+          }
+        }
+      }
+    }
     float kk[kSegs][4], qq[kSegs][4];
 #pragma unroll
     for (int m = 0; m < kSegs; ++m) {
@@ -451,15 +542,24 @@ void launch_one(int variant, dim3 grid, cudaStream_t s, const __half* mixed, con
                 const float* a_log, const void* dt_bias, const int* sidx, const int* cu, const int* nacc, S* state,
                 const __half* z, const void* nw, __half* out, int H, int HV, int hpk, int width,
                 int num_tokens, int num_slots, int null_id,
-                float scale, float eps, Strides st, bool dt_f32, bool nw_f32) {
+                float scale, float eps, Strides st, bool dt_f32, bool nw_f32,
+                const LeafTable* lt = nullptr, const StashArgs* sa = nullptr) {
+  if (lt != nullptr) {  // tree launch (v2 only; checked on the host)
+    gdn_mtp_sm75_v2_kernel<S, SIG, true><<<grid, kThreads, 0, s>>>(mixed, a, b, a_log, dt_bias, sidx, cu, nacc,
+                                                                  state, z, nw, out, H, HV, hpk, width, num_tokens,
+                                                                  num_slots, null_id, scale, eps, st, dt_f32,
+                                                                  nw_f32, *lt, *sa);
+    return;
+  }
   if (variant == 1)
     gdn_mtp_sm75_kernel<S, SIG><<<grid, kThreads, 0, s>>>(mixed, a, b, a_log, dt_bias, sidx, cu, nacc, state, z, nw,
                                                          out, H, HV, hpk, width, num_tokens, num_slots,
                                                          null_id, scale, eps, st, dt_f32, nw_f32);
   else
-    gdn_mtp_sm75_v2_kernel<S, SIG><<<grid, kThreads, 0, s>>>(mixed, a, b, a_log, dt_bias, sidx, cu, nacc, state, z,
-                                                            nw, out, H, HV, hpk, width, num_tokens, num_slots,
-                                                            null_id, scale, eps, st, dt_f32, nw_f32);
+    gdn_mtp_sm75_v2_kernel<S, SIG, false><<<grid, kThreads, 0, s>>>(mixed, a, b, a_log, dt_bias, sidx, cu, nacc,
+                                                                   state, z, nw, out, H, HV, hpk, width,
+                                                                   num_tokens, num_slots, null_id, scale, eps, st,
+                                                                   dt_f32, nw_f32, LeafTable{}, StashArgs{});
 }
 
 }  // namespace
@@ -469,11 +569,11 @@ void launch_one(int variant, dim3 grid, cudaStream_t s, const __half* mixed, con
 // out [L, HV, 128] fp16 (row stride free, head rows contiguous); A_log [HV] fp32; dt_bias [HV], norm_w [128] fp16|fp32;
 // state_indices [N, W] int32; cu_seqlens [N+1]; num_accepted [N] int32.  Only requests 0..N-1 are processed;
 // rows outside their [bos, eos) are untouched.  variant: 1 = 32 lanes/row, 2 = 8 lanes/row single-pass.
-void gdn_mtp_sm75(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_log,
-                  torch::Tensor dt_bias, torch::Tensor state_indices, torch::Tensor cu_seqlens,
-                  torch::Tensor num_accepted, torch::Tensor state, torch::Tensor z, torch::Tensor norm_w,
-                  torch::Tensor out, double scale, double eps, int64_t null_block_id, bool sigmoid_gate,
-                  int64_t variant) {
+static void gdn_mtp_impl(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_log,
+                         torch::Tensor dt_bias, torch::Tensor state_indices, torch::Tensor cu_seqlens,
+                         torch::Tensor num_accepted, torch::Tensor state, torch::Tensor z, torch::Tensor norm_w,
+                         torch::Tensor out, double scale, double eps, int64_t null_block_id, bool sigmoid_gate,
+                         int64_t variant, const LeafTable* lt, StashArgs* sa) {
   TORCH_CHECK(mixed_qkv.is_cuda() && mixed_qkv.scalar_type() == at::kHalf && mixed_qkv.dim() == 2 &&
               mixed_qkv.stride(1) == 1 && mixed_qkv.stride(0) >= mixed_qkv.size(1),
               "mixed_qkv: CUDA fp16 [L, C], non-overlapping channel-contiguous rows");
@@ -533,6 +633,11 @@ void gdn_mtp_sm75(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, tor
   TORCH_CHECK(HV / H == 1 || HV / H == 2 || HV / H == 3 || HV / H == 4 || HV / H == 8,
               "K5 HV/H ratio unsupported");
   if (N == 0) return;
+  if (lt != nullptr) {
+    TORCH_CHECK(variant == 2, "K5 tree launch needs the v2 kernel (VLLM_K5_GDN_VARIANT=2)");
+    TORCH_CHECK(lt->n >= 1 && W + lt->n <= kMaxTok, "K5 tree: needs 1 <= L and M = width + L <= 8 (kMaxTok)");
+    TORCH_CHECK(N <= sa->cap_b, "K5 tree: more requests than the leaf stash holds (B_tree)");
+  }
   const Strides st{mixed_qkv.stride(0), a.stride(0), b.stride(0), z.stride(0), state.stride(0), out.stride(0)};
   const at::cuda::OptionalCUDAGuard guard(mixed_qkv.device());
   cudaStream_t s = at::cuda::getCurrentCUDAStream();
@@ -549,7 +654,8 @@ void gdn_mtp_sm75(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, tor
   launch_one<S, SIG>(v, grid, s, mp, ap, bp, a_log.data_ptr<float>(), dt_bias.data_ptr(),                         \
                      state_indices.data_ptr<int>(), cu_seqlens.data_ptr<int>(), num_accepted.data_ptr<int>(),      \
                      reinterpret_cast<S*>(state.data_ptr()), zp, norm_w.data_ptr(), op, H, HV, HV / H, W,          \
-                     L, (int)state.size(0), (int)null_block_id, (float)scale, (float)eps, st, dt_f32, nw_f32)
+                     L, (int)state.size(0), (int)null_block_id, (float)scale, (float)eps, st, dt_f32, nw_f32,   \
+                     lt, sa)
   if (state.scalar_type() == at::kFloat) {
     if (sigmoid_gate) K5_L(float, true); else K5_L(float, false);
   } else {
@@ -559,4 +665,47 @@ void gdn_mtp_sm75(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, tor
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("gdn_mtp", &gdn_mtp_sm75, "K5 fused GDN post-conv MTP decode (sm_75)"); }
+void gdn_mtp_sm75(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_log,
+                  torch::Tensor dt_bias, torch::Tensor state_indices, torch::Tensor cu_seqlens,
+                  torch::Tensor num_accepted, torch::Tensor state, torch::Tensor z, torch::Tensor norm_w,
+                  torch::Tensor out, double scale, double eps, int64_t null_block_id, bool sigmoid_gate,
+                  int64_t variant) {
+  gdn_mtp_impl(mixed_qkv, a, b, a_log, dt_bias, state_indices, cu_seqlens, num_accepted, state, z, norm_w, out,
+               scale, eps, null_block_id, sigmoid_gate, variant, nullptr, nullptr);
+}
+
+// E16 P4a tree launch.  Same tensors as gdn_mtp, plus: every request has M = W + L rows (cu_seqlens), chain-first;
+// leaf_rows[l] == W + l, leaf_depth[l] in [1, W-1] (TreeSpec.leaf_rows / leaf_depth; host lists, baked into the
+// launch); stash = TreeStash.gdn_view(layer): fp32 [B_tree, L, HV, K+V+2], last dim contiguous, N <= B_tree.
+void gdn_mtp_sm75_tree(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_log,
+                       torch::Tensor dt_bias, torch::Tensor state_indices, torch::Tensor cu_seqlens,
+                       torch::Tensor num_accepted, torch::Tensor state, torch::Tensor z, torch::Tensor norm_w,
+                       torch::Tensor out, double scale, double eps, int64_t null_block_id, bool sigmoid_gate,
+                       std::vector<int64_t> leaf_rows, std::vector<int64_t> leaf_depth, torch::Tensor stash) {
+  TORCH_CHECK(state_indices.dim() == 2, "state_indices: [N, W]");
+  const int64_t W = state_indices.size(1);
+  const int64_t L = (int64_t)leaf_rows.size();
+  TORCH_CHECK(L >= 1 && (int64_t)leaf_depth.size() == L, "K5 tree: leaf_rows/leaf_depth must be equal, non-empty");
+  TORCH_CHECK(W + L <= kMaxTok, "K5 tree: M = width + L must be <= 8 (kMaxTok)");
+  LeafTable lt{};
+  lt.n = (int)L;
+  for (int64_t l = 0; l < L; ++l) {
+    TORCH_CHECK(leaf_rows[l] == W + l, "K5 tree: rows must be chain-first (leaf_rows[l] == width + l)");
+    TORCH_CHECK(leaf_depth[l] >= 1 && leaf_depth[l] <= W - 1, "K5 tree: leaf depth must be in [1, width-1]");
+    lt.row[l] = (int)leaf_rows[l];
+    lt.depth[l] = (int)leaf_depth[l];
+  }
+  TORCH_CHECK(stash.is_cuda() && stash.device() == mixed_qkv.device() && stash.scalar_type() == at::kFloat &&
+              stash.dim() == 4 && stash.size(1) >= L && stash.size(2) == state.size(1) &&
+              stash.size(3) == kStashW && stash.stride(3) == 1,
+              "K5 tree stash: fp32 [B_tree, L, HV, 258] with a contiguous last dim, on the activation device");
+  TORCH_CHECK(stash.size(0) >= 1 && stash.size(0) <= std::numeric_limits<int>::max(), "K5 tree stash: B_tree");
+  StashArgs sa{stash.data_ptr<float>(), stash.stride(0), stash.stride(1), stash.stride(2), (int)stash.size(0)};
+  gdn_mtp_impl(mixed_qkv, a, b, a_log, dt_bias, state_indices, cu_seqlens, num_accepted, state, z, norm_w, out,
+               scale, eps, null_block_id, sigmoid_gate, 2, &lt, &sa);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("gdn_mtp", &gdn_mtp_sm75, "K5 fused GDN post-conv MTP decode (sm_75)");
+  m.def("gdn_mtp_tree", &gdn_mtp_sm75_tree, "K5 fused GDN MTP decode, E16 tree-leaf variant (sm_75)");
+}

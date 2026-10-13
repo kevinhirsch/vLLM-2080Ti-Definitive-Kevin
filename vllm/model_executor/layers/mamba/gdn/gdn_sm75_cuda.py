@@ -72,6 +72,7 @@ def inputs_supported(
     z: torch.Tensor, norm_weight: torch.Tensor, conv_state: torch.Tensor,
     conv_weight: torch.Tensor, conv_bias: torch.Tensor | None,
     num_requests: int, num_tokens: int, scale: float, eps: float,
+    rows_per_request: int | None = None,
 ) -> bool:
     """Metadata-only preflight, before convolution mutates either cache.
 
@@ -137,7 +138,9 @@ def inputs_supported(
                 and t.numel() >= length and t.is_contiguous()):
             return False
     width = state_indices.size(1)
-    if num_tokens > num_requests * width:
+    # E16 tree step: M = width + L rows per request (M <= 8); chain: rows <= width.
+    rows = width if rows_per_request is None else rows_per_request
+    if not width <= rows <= 8 or num_tokens > num_requests * rows:
         return False
     channels = mixed_qkv.size(1)
     if not (conv_state.dim() == 3 and conv_state.dtype == torch.float16
@@ -185,3 +188,31 @@ def gdn_mtp(
     _load().gdn_mtp(mixed_qkv, a, b, A_log, dt_bias, state_indices, cu_seqlens, num_accepted, state, z,
                     norm_weight, out, float(scale), float(eps), int(null_block_id), bool(sigmoid_gate),
                     int(_VARIANT if variant is None else variant))
+
+
+def gdn_mtp_tree(
+    mixed_qkv: torch.Tensor,  # [L, 2*H*128 + HV*128] fp16, post-conv; every request has M = W + L rows, chain-first
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_indices: torch.Tensor,  # [N, W] int32, W = D + 1 chain slots (unchanged)
+    cu_seqlens: torch.Tensor,  # [N+1] int32, M per request
+    num_accepted: torch.Tensor,
+    state: torch.Tensor,
+    z: torch.Tensor,
+    norm_weight: torch.Tensor,
+    out: torch.Tensor,
+    scale: float,
+    eps: float,
+    null_block_id: int,
+    sigmoid_gate: bool,
+    leaf_rows: tuple[int, ...],  # TreeSpec.leaf_rows (host ints, baked into the launch)
+    leaf_depth: tuple[int, ...],  # TreeSpec.leaf_depth
+    stash: torch.Tensor,  # TreeStash.gdn_view(layer): fp32 [B_tree, L, HV, 258]
+) -> None:
+    """E16 P4a: K5 verify over a chain-plus-leaves tree (v2 kernel).  Chain rows write their slots exactly like
+    gdn_mtp; leaf rows produce outputs from their parent's state and write the leaf stash, never a slot."""
+    _load().gdn_mtp_tree(mixed_qkv, a, b, A_log, dt_bias, state_indices, cu_seqlens, num_accepted, state, z,
+                         norm_weight, out, float(scale), float(eps), int(null_block_id), bool(sigmoid_gate),
+                         [int(x) for x in leaf_rows], [int(x) for x in leaf_depth], stash)

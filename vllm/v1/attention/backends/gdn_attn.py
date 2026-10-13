@@ -23,6 +23,7 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.spec_decode.tree_spec import TreeSpec, TreeTensors, resolve_tree_spec
 from vllm.v1.worker.gpu.spec_decode.utils import get_trace_limit
 
 
@@ -80,6 +81,17 @@ class GDNAttentionMetadata:
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
 
+    # E16 tree step (contract §5 P4a): the builder's TreeTensors (built once at
+    # init) and M rows per request; None / 0 on every chain step.  On a tree
+    # step spec_query_start_loc = M*arange(B+1), num_spec_decode_tokens = B*M,
+    # spec_state_indices_tensor stays [B, D+1] and num_accepted_tokens keeps its
+    # chain meaning (<= D+1).
+    tree: TreeTensors | None = None
+    tree_rows: int = 0
+    # Host-side static topology (leaf rows/depths are baked into the K5 launch
+    # as host ints; reading TreeTensors on the host would sync / break capture).
+    tree_spec: TreeSpec | None = None
+
 
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
     kv_cache_spec: MambaSpec
@@ -113,6 +125,28 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.num_spec = 0
         self.use_spec_decode: bool = self.num_spec > 0
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
+        # E16: None = tree off = every line below behaves as before.  The
+        # device tables are built here, once, never inside graph capture.
+        self.tree_spec = (
+            resolve_tree_spec(self.speculative_config) if self.use_spec_decode else None
+        )
+        self.tree_tensors: TreeTensors | None = (
+            self.tree_spec.device_tensors(device) if self.tree_spec is not None else None
+        )
+        if self.tree_spec is not None:
+            from vllm.model_executor.layers.mamba.gdn import gdn_sm75_cuda as _k5
+
+            # Tree rows are only understood by the K5 tree kernel (no Triton
+            # tree variant, P4b); its shared arrays hold kMaxTok = 8 rows.
+            if not (_k5.enabled() and _k5._VARIANT == 2):
+                raise ValueError(
+                    "speculative_token_tree needs VLLM_K5_GDN_FUSED=1 and "
+                    "VLLM_K5_GDN_VARIANT=2 (the GDN tree verifier is K5-only)"
+                )
+            if self.tree_spec.M > 8:
+                raise ValueError(
+                    f"speculative_token_tree: M={self.tree_spec.M} > 8 (K5 kMaxTok)"
+                )
 
         self.use_full_cuda_graph: bool = (
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
@@ -220,6 +254,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         fast_build: bool = False,
     ) -> GDNAttentionMetadata:
         m = common_attn_metadata
+        # E16: the scheduler's decision, carried by CommonAttentionMetadata
+        # (P2/P8).  Never re-decided here.
+        tree_step = self.tree_spec is not None and bool(getattr(m, "tree_step", False))
 
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
@@ -295,8 +332,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 num_decode_tokens = 0
 
             if num_prefills == 0 and num_decodes == 0:
+                rows = self.tree_spec.M if tree_step else self.num_spec + 1
                 spec_token_size = min(
-                    num_spec_decodes * (self.num_spec + 1),
+                    num_spec_decodes * rows,
                     query_start_loc_cpu[-1].item(),
                 )
                 spec_token_indx = torch.arange(
@@ -436,8 +474,19 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         # metadata below is indexed by request.
         batch_size = m.num_reqs
 
+        if tree_step:
+            # Only pure-decode steps are tree steps (contract §3).  The commit
+            # (P5) reads this step's slots from the persistent buffer below,
+            # so a tree step always takes the buffered branch.
+            assert (
+                num_prefills == 0
+                and num_decodes == 0
+                and 0 < num_spec_decodes <= self.tree_spec.B_tree
+                and num_spec_decode_tokens <= self.decode_cudagraph_max_bs
+            ), (num_prefills, num_decodes, num_spec_decodes, num_spec_decode_tokens)
+
         if (
-            self.use_full_cuda_graph
+            (self.use_full_cuda_graph or tree_step)
             and num_prefills == 0
             and num_decodes == 0
             and num_spec_decodes <= self.decode_cudagraph_max_bs
@@ -531,6 +580,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
         )
+        if tree_step:
+            attn_metadata.tree = self.tree_tensors
+            attn_metadata.tree_rows = self.tree_spec.M
+            attn_metadata.tree_spec = self.tree_spec
         trace_limit = get_trace_limit("VLLM_DFLASH_TRACE_STEPS")
         if (
             trace_limit > self._dflash_trace_step
@@ -639,6 +692,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         )
 
         num_accepted_tokens = torch.diff(m.query_start_loc)
+        if self.tree_spec is not None and getattr(m, "tree_step", False):
+            # Tree capture: M rows per request, but accepted counts index the
+            # D+1 chain slots (capture-time values only; replay reads the
+            # persistent buffer).
+            num_accepted_tokens = num_accepted_tokens.clamp(max=self.num_spec + 1)
         num_decode_draft_tokens_cpu = torch.diff(m.query_start_loc_cpu).sub_(1)
         assert num_decode_draft_tokens_cpu.shape == num_accepted_tokens.shape
 
