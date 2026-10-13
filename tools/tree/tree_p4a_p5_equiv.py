@@ -3,7 +3,8 @@
 
 P4a, the K5 tree-leaf kernel (gdn_mtp_tree), at production per-TP-rank shapes (TP=2: H=8, HV=24, K=V=128,
 fp32 temporal state, fp16 activations, fp16 dt_bias / norm weight, D=3 so W=4 slots per request):
-  * FIRST call inside torch.cuda.graph capture with capture-time metadata (as in the engine), then the real
+  * engine order (P9): one eager padding-only warmup launch, then the FIRST real call inside torch.cuda.graph
+    capture with capture-time metadata (as in the engine), then the real
     metadata is written into the same persistent buffers and the graph is replayed;
   * trees: production M=7 (one rank-1 leaf per depth), M=8 (two leaves at depths 1 and 2), M=5 (one leaf at 2);
   * real requests 1..4 inside a 4-request graph (graph-padded requests: cu filled, slots -1, accepted 1),
@@ -152,13 +153,21 @@ def case_p4a(name, spec: TreeSpec, n_real: int, seed: int):
     perm.remove(0)
     perm.insert(0, 0)
     rows = [perm[i * W:(i + 1) * W] for i in range(NCAP)]
+    # Engine order (P9 runner init: layer.tree_warmup): one eager padding-only launch before any capture
+    # (extension load + lazy CUDA module load happen here, never inside capture); writes nothing.
+    inp.load([], [], 0)
+    pre_warm = inp.state.clone()
+    inp.tree_call(view)
+    torch.cuda.synchronize()
+    if not torch.equal(inp.state, pre_warm):
+        return dict(case=name, ok=False, error="padding-only warmup wrote state")
     # capture-time metadata: all requests real, all accepted (what build_for_cudagraph_capture produces)
     inp.load(rows, [W] * NCAP, NCAP)
     state_cap = inp.state.clone()
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        inp.tree_call(view)  # FIRST call of the tree kernel = inside capture
+        inp.tree_call(view)  # FIRST real call of the tree kernel = inside capture (after the warmup)
     torch.cuda.synchronize()
     if not torch.equal(inp.state, state_cap):
         return dict(case=name, ok=False, error="capture mutated state")
@@ -238,6 +247,7 @@ def case_p5(name, spec: TreeSpec, n_real: int, rescue: list[int], seed: int, NG=
     tq = [torch.randint(0, 256, (nblocks, 16, 2, sb), generator=g, device=DEV, dtype=torch.uint8).transpose(1, 2)
           for _ in range(NT)]
     tc = TreeCommit(spec, stash, layers[::-1], tq, DEV)  # tables built here, before capture
+    tc.warmup()  # engine order (P9 runner init): eager load + one fully masked launch, before capture
     rescue_buf = torch.full((NCAP,), -1, dtype=torch.int32, device=DEV)
     sm_buf = torch.full((NCAP * M,), -1, dtype=torch.int64, device=DEV)
     torch.cuda.synchronize()
@@ -246,7 +256,7 @@ def case_p5(name, spec: TreeSpec, n_real: int, rescue: list[int], seed: int, NG=
     pre_tq = [kv.clone() for kv in tq]
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        tc.commit(rescue_buf, sm_buf, n_real)  # FIRST call of the commit = inside capture (rescue all -1 here)
+        tc.commit(rescue_buf, sm_buf, n_real)  # FIRST real call of the commit = inside capture (after warmup)
     torch.cuda.synchronize()
     sm = torch.randperm(nblocks * 16, generator=torch.Generator().manual_seed(seed + 2))[: NCAP * M]
     sm_buf.copy_(sm.to(DEV))

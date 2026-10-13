@@ -732,21 +732,18 @@ def test_tree_kernels_warm_up_eagerly_at_init(monkeypatch):
     # a prebuilt extension .so is imported without ninja when fresh
     called = []
     monkeypatch.setattr(TC, "_EXT", None)
-    monkeypatch.setattr(TC, "_import_prebuilt", lambda n, bd, src: called.append(n) or "MOD")
-    assert TC._load() == "MOD" and called == ["tree_commit_sm75"]
+    monkeypatch.setattr(TC, "_import_prebuilt", lambda bd: called.append(bd) or "MOD")
+    monkeypatch.setenv("VLLM_TREE_COMMIT_BUILD_DIR", "/nonexistent-prebuilt")
+    assert TC._load() == "MOD" and called == ["/nonexistent-prebuilt"]
 
 
-def test_import_prebuilt_requires_fresh_so(tmp_path):
-    import os
-
+def test_import_prebuilt_requires_matching_stamp(tmp_path):
     from vllm.v1.spec_decode import tree_commit as TC
 
-    src = tmp_path / "x.cu"
-    src.write_text("//")
-    assert TC._import_prebuilt("nope", str(tmp_path), str(src)) is None  # no .so
-    so = tmp_path / "nope.so"
-    so.write_bytes(b"not an elf")
-    os.utime(so, (1, 1))  # older than the source: stale
-    assert TC._import_prebuilt("nope", str(tmp_path), str(src)) is None
-    os.utime(so, None)
-    assert TC._import_prebuilt("nope", str(tmp_path), str(src)) is None  # bad ELF
+    assert TC._import_prebuilt(str(tmp_path)) is None  # nothing there
+    (tmp_path / "tree_commit_sm75.so").write_bytes(b"not an elf")
+    (tmp_path / "tree_commit_sm75.stamp").write_text("stale\n")
+    assert TC._import_prebuilt(str(tmp_path)) is None  # stamp mismatch: no import
+    (tmp_path / "tree_commit_sm75.stamp").write_text(TC._source_stamp() + "\n")
+    with pytest.raises(ImportError):  # matching stamp: imported (bad ELF here)
+        TC._import_prebuilt(str(tmp_path))

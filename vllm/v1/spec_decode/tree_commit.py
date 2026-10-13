@@ -42,55 +42,75 @@ _VDIM = 128
 _PAD_SLOT_ID = -1
 
 
-def _import_prebuilt(name: str, build_dir: str, src: str):
-    """Import a prebuilt ``<build_dir>/<name>.so`` (release prebuild) directly
-    when it is at least as new as its source: no ninja, no compiler at boot.
-    Returns None when there is no usable prebuilt module."""
-    so = os.path.join(build_dir, f"{name}.so")
-    try:
-        if not (os.path.isfile(so) and os.path.getmtime(so) >= os.path.getmtime(src)):
-            return None
-        import importlib.util
+_NAME = "tree_commit_sm75"
+_CFLAGS = ["-O3", "-gencode=arch=compute_75,code=sm_75"]
+_SRC = os.path.join(os.path.dirname(__file__), "tree_commit_ext", "tree_commit_sm75.cu")
 
-        spec = importlib.util.spec_from_file_location(name, so)
-        if spec is None or spec.loader is None:
-            return None
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod
-    except (OSError, ImportError):
+
+def _capturing() -> bool:
+    return torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing()
+
+
+def _source_stamp() -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(_SRC, "rb") as f:
+        h.update(f.read())
+    h.update(repr((_CFLAGS, torch.__version__, torch.version.cuda)).encode())
+    return h.hexdigest()
+
+
+def _import_prebuilt(build_dir: str):
+    """The release-prebuilt ``<dir>/tree_commit_sm75.so`` when its stamp
+    matches this source (same pattern as K5's loader): imported directly, no
+    ninja / torch rebuild check at boot.  None otherwise."""
+    so = os.path.join(build_dir, _NAME + ".so")
+    try:
+        with open(os.path.join(build_dir, _NAME + ".stamp")) as f:
+            if f.read().strip() != _source_stamp() or not os.path.exists(so):
+                return None
+    except OSError:
         return None
+    import importlib.machinery
+    import importlib.util
+
+    loader = importlib.machinery.ExtensionFileLoader(_NAME, so)
+    spec = importlib.util.spec_from_file_location(_NAME, so, loader=loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
 
 
 def _load():
+    """Load the commit extension: stamped prebuilt import, else JIT build +
+    stamp (release build time).  Never first inside CUDA-graph capture:
+    TreeCommit.warmup loads and launches it at runner init."""
     global _EXT
     if _EXT is None:
-        if torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing():
+        if _capturing():
             raise RuntimeError(
                 "tree commit extension must be loaded before CUDA graph capture "
                 "(TreeCommit.warmup at runner init)"
             )
-        from torch.utils.cpp_extension import load
-
-        src = os.path.join(
-            os.path.dirname(__file__), "tree_commit_ext", "tree_commit_sm75.cu"
-        )
         bd = os.environ.get(
             "VLLM_TREE_COMMIT_BUILD_DIR", os.path.expanduser("~/.cache/vllm-tree-commit")
         )
-        _EXT = _import_prebuilt("tree_commit_sm75", bd, src)
-        if _EXT is not None:
-            return _EXT
-        os.makedirs(bd, exist_ok=True)
-        _EXT = load(
-            name="tree_commit_sm75",
-            sources=[src],
-            extra_cuda_cflags=["-O3", "-gencode=arch=compute_75,code=sm_75"],
-            build_directory=bd,
-            verbose=False,
-        )
-    return _EXT
+        _EXT = _import_prebuilt(bd)
+        if _EXT is None:
+            from torch.utils.cpp_extension import load
 
+            os.makedirs(bd, exist_ok=True)
+            _EXT = load(
+                name=_NAME, sources=[_SRC], extra_cuda_cflags=_CFLAGS,
+                build_directory=bd, verbose=False,
+            )
+            try:
+                with open(os.path.join(bd, _NAME + ".stamp"), "w") as f:
+                    f.write(_source_stamp() + "\n")
+            except OSError:
+                pass
+    return _EXT
 
 @dataclass
 class GDNCommitLayer:

@@ -1366,14 +1366,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if not getattr(self, "_k5_warmed", False) and _k5_gdn.capturing():
             # First K5 launch inside graph capture would lazy-load kernels there. The eager
             # warmup (_k5_maybe_warmup) must have run; otherwise keep the stock path.
-            if md.tree_rows:
+            if getattr(md, "tree_rows", 0):
                 # E16: no stock tree path; the runner's tree_warmup + the layer's
                 # K5 warmup must both precede a tree-family capture.
                 raise RuntimeError(f"{self.prefix}: E16 tree capture before the K5 warmup")
             logger.warning_once("K5 GDN: capture before warmup; using the stock GDN path")
             return False
         handled = self._k5_spec_decode_md(md, mixed_qkvz, ba, output)
-        if md.tree_rows and not handled:
+        if getattr(md, "tree_rows", 0) and not handled:
             # The stock GDN path does not understand tree rows (P4b not built):
             # never fall back silently on a tree step.
             raise RuntimeError(
@@ -1424,32 +1424,23 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         return mixed_qkv
 
     def tree_warmup(self, tree, spec) -> None:
-        """E16 P9: eager first launch of this layer's tree kernels (P4c conv
-        tree update + K5 ``gdn_mtp_tree``) at init, never on the first call
-        inside CUDA-graph capture (lazy extension load / Triton compile /
-        first-launch setup invalidate a capture; HACKATHON-RULES 08:4x).
-        Same dtypes, strides and constexprs as the runtime launch; every slot
-        is PAD_SLOT_ID, so no state, conv window or stash row is written."""
+        """E16 P9: eager first launches of this layer's tree kernels (P4c conv
+        tree update + K5 ``gdn_mtp_tree``) at init, for every tree batch size
+        B = 1..B_tree (Triton integer specialisations), never first inside
+        CUDA-graph capture (lazy extension load / Triton compile / lazy module
+        load invalidate a capture; HACKATHON-RULES 08:4x).  Same dtypes,
+        strides and constexprs as the runtime launch; every slot is
+        PAD_SLOT_ID, so no state, conv window or stash row is written."""
         if self.tree_stash is None or not _k5_gdn.enabled():
             return
         dev = self.A_log.device
-        if dev.type != "cuda":
+        if dev.type != "cuda" or _k5_gdn.capturing():
             return
         _k5_gdn._load()
         M, W = spec.M, spec.D + 1
         qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
         hv = self.num_v_heads // self.tp_size
         dtype = self.conv1d.weight.dtype
-        mixed_qkvz = torch.zeros(
-            M, qkv_size + self.value_dim // self.tp_size, dtype=dtype, device=dev
-        )
-        mixed_qkv = mixed_qkvz[:, :qkv_size]
-        z = mixed_qkvz[:, qkv_size:].reshape(M, -1, self.head_v_dim)
-        ba = torch.zeros(M, 2 * hv, dtype=dtype, device=dev)
-        b, a = ba.chunk(2, dim=-1)
-        sidx = torch.full((1, W), PAD_SLOT_ID, dtype=torch.int32, device=dev)
-        nacc = torch.ones(1, dtype=torch.int32, device=dev)
-        cu = torch.tensor([0, M], dtype=torch.int32, device=dev)
         conv_state = (
             self.kv_cache[0]
             if is_conv_state_dim_first()
@@ -1458,41 +1449,53 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
-        causal_conv1d_update_tree(
-            mixed_qkv,
-            conv_state,
-            conv_weights,
-            self.conv1d.bias,
-            self.activation,
-            conv_state_indices=sidx[:, 0],
-            num_accepted_tokens=nacc,
-            tree=tree,
-            stash=self.tree_stash.conv_view(self.prefix)[:1],
-            num_reqs=1,
-            null_block_id=PAD_SLOT_ID,
-        )
-        out = torch.zeros(M, hv, self.head_v_dim, dtype=dtype, device=dev)
-        _k5_gdn.gdn_mtp_tree(
-            mixed_qkv,
-            a,
-            b,
-            self.A_log,
-            self.dt_bias,
-            sidx,
-            cu,
-            nacc,
-            self.kv_cache[1],
-            z,
-            self.norm.weight,
-            out,
-            self.head_k_dim**-0.5,
-            self.norm.eps,
-            PAD_SLOT_ID,
-            self.norm.activation == "sigmoid",
-            spec.leaf_rows,
-            spec.leaf_depth,
-            self.tree_stash.gdn_view(self.prefix),
-        )
+        for nreq in range(1, spec.B_tree + 1):
+            n = nreq * M
+            mixed_qkvz = torch.zeros(
+                n, qkv_size + self.value_dim // self.tp_size, dtype=dtype, device=dev
+            )
+            mixed_qkv = mixed_qkvz[:, :qkv_size]
+            z = mixed_qkvz[:, qkv_size:].reshape(n, -1, self.head_v_dim)
+            ba = torch.zeros(n, 2 * hv, dtype=dtype, device=dev)
+            b, a = ba.chunk(2, dim=-1)
+            sidx = torch.full((nreq, W), PAD_SLOT_ID, dtype=torch.int32, device=dev)
+            nacc = torch.ones(nreq, dtype=torch.int32, device=dev)
+            cu = (torch.arange(nreq + 1, dtype=torch.int32, device=dev) * M).contiguous()
+            causal_conv1d_update_tree(
+                mixed_qkv,
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=sidx[:, 0],
+                num_accepted_tokens=nacc,
+                tree=tree,
+                stash=self.tree_stash.conv_view(self.prefix)[:nreq],
+                num_reqs=nreq,
+                null_block_id=PAD_SLOT_ID,
+            )
+            out = torch.zeros(n, hv, self.head_v_dim, dtype=dtype, device=dev)
+            _k5_gdn.gdn_mtp_tree(
+                mixed_qkv,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                sidx,
+                cu,
+                nacc,
+                self.kv_cache[1],
+                z,
+                self.norm.weight,
+                out,
+                self.head_k_dim**-0.5,
+                self.norm.eps,
+                PAD_SLOT_ID,
+                self.norm.activation == "sigmoid",
+                spec.leaf_rows,
+                spec.leaf_depth,
+                self.tree_stash.gdn_view(self.prefix),
+            )
 
     def _k5_spec_decode_md(
         self,
@@ -1501,7 +1504,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         ba: torch.Tensor,
         output: torch.Tensor,
     ) -> bool:
-        tree_rows = md.tree_rows
+        tree_rows = getattr(md, "tree_rows", 0)
         if tree_rows and (
             self.tree_stash is None or md.tree_spec is None or not 0 < tree_rows <= 8
         ):
