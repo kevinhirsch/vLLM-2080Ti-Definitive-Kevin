@@ -34,6 +34,11 @@
 
 #include "libtorch_stable/torch_utils.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
   static_assert(std::is_same<scalar_t, half>::value ||          \
                     std::is_same<scalar_t, nv_bfloat16>::value, \
@@ -251,6 +256,69 @@ exec_config_t determine_exec_config(
   return exec_cfg;
 }
 
+// LP-MARLINCFG (2026-10-13): opt-in per-shape thread-config table for M > 16 (thread_m_blocks > 1), read from
+// VLLM_MARLIN_CFG on every call (getenv + string compare; host cost << one launch). Unset or empty = the upstream
+// dispatch below, unchanged. Why: upstream picks the first valid entry of large_batch_thread_configs (64x256, 256
+// threads) for every M > 16 with no register or architecture criterion; on SM75 (2 stages, no cp.async) every
+// thread_m_blocks == 4 variant sits at REG 255 with 32-40 B stack spill, while thread_m_blocks == 3 variants do not
+// spill and 128-thread ones can run 2 blocks/SM. Which is fastest per shape is measured (shape_bench_cfg.py) and the
+// winning table is passed in by the engine env.
+// Grammar: rules separated by ';', each "N,K,MLO,MHI:TK,TN,TH,MB,BPS,PAR"
+//   N, K      = prob_n, prob_k to match (0 = any); MLO..MHI = inclusive range of the call's total prob_m
+//   TK,TN,TH  = thread_k, thread_n, threads (must be an instantiated, valid config, else upstream is used)
+//   MB        = max thread_m_blocks (2..4; rows per m-slice = 16 * MB; upstream = 4)
+//   BPS       = 1 or 2 blocks per SM (2 only if co-resident, the workspace has 2 slots/SM and C_tmp fits)
+//   PAR       = max m-slices per launch (0 = upstream: 16, or 128 when n <= 4096)
+// First matching rule wins. VLLM_MARLIN_CFG_DEBUG=1 prints every launch decision to stderr.
+typedef struct {
+  int n, k, m_lo, m_hi;
+  int thread_k, thread_n, threads;
+  int max_m_blocks, blocks_per_sm, max_par;
+} cfg_rule_t;
+
+static const std::vector<cfg_rule_t>& marlin_cfg_rules() {
+  static thread_local std::string cached("\x01");
+  static thread_local std::vector<cfg_rule_t> rules;
+  const char* env = getenv("VLLM_MARLIN_CFG");
+  std::string cur = env ? std::string(env) : std::string();
+  if (cur == cached) return rules;
+  cached = cur;
+  rules.clear();
+  size_t pos = 0;
+  while (pos <= cur.size()) {
+    size_t end = cur.find(';', pos);
+    if (end == std::string::npos) end = cur.size();
+    std::string item = cur.substr(pos, end - pos);
+    pos = end + 1;
+    if (item.find_first_not_of(" \t") == std::string::npos) continue;
+    cfg_rule_t r;
+    char tail = 0;
+    int got = sscanf(item.c_str(), " %d , %d , %d , %d : %d , %d , %d , %d , %d , %d %c", &r.n, &r.k, &r.m_lo,
+                     &r.m_hi, &r.thread_k, &r.thread_n, &r.threads, &r.max_m_blocks, &r.blocks_per_sm,
+                     &r.max_par, &tail);
+    if (got != 10 || r.max_m_blocks < 2 || r.max_m_blocks > 4 || r.blocks_per_sm < 1 || r.blocks_per_sm > 2 ||
+        r.max_par < 0 || r.m_lo > r.m_hi) {
+      fprintf(stderr, "[marlin-cfg] ignoring malformed VLLM_MARLIN_CFG rule '%s'\n", item.c_str());
+      continue;
+    }
+    rules.push_back(r);
+  }
+  return rules;
+}
+
+static const cfg_rule_t* match_cfg_rule(int prob_m, int prob_n, int prob_k) {
+  const auto& rules = marlin_cfg_rules();
+  for (const auto& r : rules)
+    if ((r.n == 0 || r.n == prob_n) && (r.k == 0 || r.k == prob_k) && prob_m >= r.m_lo && prob_m <= r.m_hi)
+      return &r;
+  return nullptr;
+}
+
+static bool marlin_cfg_debug() {
+  const char* d = getenv("VLLM_MARLIN_CFG_DEBUG");
+  return d && d[0] == '1';
+}
+
 void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                void* a_s, void* b_s, void* g_s, void* zp, int prob_m,
                int prob_n, int prob_k, int lda, void* workspace,
@@ -315,12 +383,24 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
         "Marlin W4A16 on other devices).");
   }
 
+  // LP-MARLINCFG: optional per-shape override (see marlin_cfg_rules); nullptr = upstream dispatch.
+  const cfg_rule_t* rule = nullptr;
+  if (thread_k_init == -1 && thread_n_init == -1 && prob_m > 16 && !is_a_8bit)
+    rule = match_cfg_rule(prob_m, prob_n, prob_k);
+  // C_tmp (fp32 reduce buffer) holds sms * min(round16(M), 64) * max_thread_n floats (marlin_gemm below); a block
+  // uses tb_m * tb_n of it at slot locks_off < blocks.
+  const int c_tmp_per_sm = min(div_ceil(prob_m, 16) * 16, 64) * max_thread_n;
+  const bool cfg_debug = marlin_cfg_debug();
+
   int max_par = 16;
   if (prob_n <= 4096) max_par = 16 * 8;
+  if (rule && rule->max_par > 0) max_par = rule->max_par;
   int max_shared_mem_new = max_shared_mem;
   int rest_m = prob_m;
-  int max_thread_m_blocks = 4;
+  int max_thread_m_blocks = rule ? rule->max_m_blocks : 4;
   while (rest_m) {
+    // Each launch starts from the full budget (a 2-blocks/SM launch must not shrink the next one's).
+    max_shared_mem_new = max_shared_mem;
     int par_count = rest_m / (max_thread_m_blocks * 16);
     if (par_count > max_par) par_count = max_par;
     int prob_m_split =
@@ -349,7 +429,33 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
           thread_m_blocks, m_block_size_8, num_bits, group_size, has_zp,
           is_zp_float, is_a_8bit, stages, max_shared_mem, sms, ws_blocks_per_sm);
       thread_tfg = exec_cfg.tb_cfg;
-      if (thread_tfg.thread_n != -1) {
+      bool forced = false;
+      if (rule && thread_m_blocks > 1) {
+        thread_config_t fc{rule->thread_k, rule->thread_n, rule->threads};
+        int fgroup_blocks = group_size == -1 ? -1 : group_size / 16;
+        if (is_valid_config(fc, thread_m_blocks, prob_m_split, prob_n, prob_k, num_bits, group_size, has_zp,
+                            is_zp_float, is_a_8bit, stages, max_shared_mem - 512)) {
+          auto fkernel = get_marlin_kernel(a_type, b_type, c_type, s_type, thread_m_blocks, fc.thread_n / 16,
+                                           fc.thread_k / 16, m_block_size_8, has_zp, fgroup_blocks,
+                                           fc.num_threads, is_zp_float, stages);
+          if (fkernel != MarlinDefault) {
+            int bps = 1;
+            if (rule->blocks_per_sm >= 2 && ws_blocks_per_sm >= 2 &&
+                2 * 16 * thread_m_blocks * fc.thread_n <= c_tmp_per_sm &&
+                is_valid_config(fc, thread_m_blocks, prob_m_split, prob_n, prob_k, num_bits, group_size, has_zp,
+                                is_zp_float, is_a_8bit, stages, max_shared_mem / 2 - 1024 - 512)) {
+              int resident = 0, smem2 = max_shared_mem / 2 - 1024;
+              cudaFuncSetAttribute(fkernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem2);
+              cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident, fkernel, fc.num_threads, smem2);
+              if (resident >= 2) bps = 2;
+            }
+            exec_cfg = {bps, fc};
+            thread_tfg = fc;
+            forced = true;
+          }
+        }
+      }
+      if (!forced && thread_tfg.thread_n != -1) {
         if (prob_n / thread_tfg.thread_n *
                 div_ceil(prob_m_split, thread_m_blocks * 16) * 4 <=
             sms) {
@@ -410,6 +516,11 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
 
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          max_shared_mem_new);
+    if (cfg_debug)
+      fprintf(stderr,
+              "[marlin-cfg] m=%d n=%d k=%d split=%d mb=%d cfg=%d,%d,%d bps=%d par=%d rule=%d\n",
+              prob_m, prob_n, prob_k, prob_m_split, thread_m_blocks, thread_k, thread_n, num_threads,
+              exec_cfg.blocks_per_sm, max_par, rule ? 1 : 0);
 
     bool part_use_atomic_add =
         use_atomic_add && div_ceil(prob_m_split, 64) * prob_n <= 2048;
