@@ -113,6 +113,8 @@ JIT_DIRS = [".deps/tq_gqa_build", ".deps/FlashQLA-SM70-SM75/.torch_extensions_vl
 DEFAULT_WATCH_TIMERS = ["vllm-qwen27b-watchdog.timer"]
 VAR_RE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 STEP_KINDS = ("run", "script", "boot", "engine", "sleep")
+# a window holds the gateway offline, so a step calling it for a local model gets 503 + Retry-After until it times out
+GATEWAY_CALL = re.compile(r"(?:127\.0\.0\.1|localhost|10\.0\.1\.225):8000\b")
 WATCHDOG_TIMER = "vllm-qwen27b-watchdog.timer"   # its service Wants= the engine: a tick STARTS a stopped engine
 CODE_FILES = ("windowctl.py", "unitrun.py", "gpuguard.py", "release.py", "release_ab_probe.py", "gateway-offline.py", "mini_yaml.py")
 BUILTINS = ("RESULTS", "WINDOW", "LANE", "STEP", "PROD_ROOT")
@@ -429,6 +431,14 @@ def validate(spec):
             continue
         if "engine" in st and st["engine"] not in ("stop", "start"):
             errs.append(f"step {name}: engine must be stop|start")
+        if ("run" in st or "script" in st) and not st.get("uses_gateway"):
+            # the step's command, its env and every script it names (the W8X bench called :8000 from inside its .sh)
+            texts = [json.dumps(st.get("run") or st.get("script")), json.dumps(st.get("env") or {})]
+            texts += [open(f, errors="replace").read() for f in re.findall(r"/[^\s'\";|&<>()\[\],]+\.(?:sh|py)\b", texts[0])
+                      if os.path.isfile(f)]
+            if any(GATEWAY_CALL.search(t) for t in texts):
+                errs.append(f"step {name}: calls the gateway on :8000, which answers 503 for local models while the window "
+                            "holds it offline; call the engine on :8001 directly, or set uses_gateway: true")
         if "boot" in st:
             b = st["boot"]
             if not isinstance(b, dict) or len([k for k in ("release", "tree", "default") if k in b]) != 1:
@@ -878,7 +888,9 @@ class Window:
                 snap = self.path("steps", f"{st['name']}.{len(found)}.{os.path.basename(tok)[:-3]}.snap.sh")
                 if not self.dry:
                     shutil.copy2(tok, snap)
-                    os.chmod(snap, 0o444)
+                    # read-only AND executable: swap() may put the snapshot in command position ("/x.sh args", no bash);
+                    # 0o444 made that rc=126 Permission denied (W8X bench step, 2026-10-13 03:56)
+                    os.chmod(snap, 0o555)
                 found[tok] = snap
         if not found:
             return cmd, {}

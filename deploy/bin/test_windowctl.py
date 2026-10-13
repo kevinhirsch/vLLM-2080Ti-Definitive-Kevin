@@ -675,3 +675,28 @@ def test_live_tools_refuse_mutations_from_a_test_run():
                  [sys.executable, os.path.join(HERE, "release.py"), "rollback", "--reason", "from a test run"]):
         r = sp.run(argv, capture_output=True, text=True, env=env, timeout=60)
         assert r.returncode in (2, 4) and "test run" in (r.stdout + r.stderr), (argv[1], r.stdout, r.stderr)
+
+
+def test_a_script_run_directly_without_bash_runs_from_an_executable_snapshot(world, tmp_path):
+    """03:56 2026-10-13: W8X's bench step "/path/x.sh args" failed rc=126 (Permission denied) because the snapshot was
+    0o444 and the rewritten command executes it directly. Snapshots are read-only AND executable."""
+    (tmp_path / "rel").mkdir()
+    sh = tmp_path / "lane" / "w.sh"
+    sh.parent.mkdir()
+    sh.write_text(f"#!/bin/bash\necho ran $1 > {tmp_path}/w.out\n")
+    sh.chmod(0o755)
+    s = wc.Window(spec(tmp_path, steps=[{"name": "a", "run": f"{sh} X"}])).run()
+    assert s["status"] == "ok" and (tmp_path / "w.out").read_text().strip() == "ran X"
+    snap = s["steps"][0]["script_snapshots"][str(sh)]
+    assert os.access(snap, os.X_OK) and not os.access(snap, os.W_OK)
+
+
+def test_validate_refuses_a_step_that_calls_the_offline_gateway(tmp_path):
+    """04:00 2026-10-13: W8X's bench script called :8000 with a local alias; the window holds the gateway offline, so
+    every call got 503 + Retry-After. validate refuses it before the engine stops; uses_gateway: true opts out."""
+    sh = tmp_path / "bench.sh"
+    sh.write_text("curl -s http://127.0.0.1:8000/v1/chat/completions -d @req.json\n")
+    with pytest.raises(wc.SpecError, match="calls the gateway on :8000"):
+        wc.validate(spec(tmp_path, steps=[{"name": "a", "run": f"bash {sh} 3"}]))
+    assert wc.validate(spec(tmp_path, steps=[{"name": "a", "run": f"bash {sh}", "uses_gateway": True}]))
+    assert wc.validate(spec(tmp_path, steps=[{"name": "a", "run": "curl -s http://127.0.0.1:8001/health"}]))
