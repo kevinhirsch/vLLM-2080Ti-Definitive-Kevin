@@ -468,6 +468,15 @@ class SpeculativeConfig:
     in parallel rather than sequentially. This can improve performance but
     requires the speculative model be trained to support parallel drafting.
     Only compatible with EAGLE and draft model methods."""
+    speculative_token_tree: str | None = None
+    """Tree speculation (E16, MTP only, default off). Upstream rank-path syntax,
+    e.g. "[(0,),(1,),(0,0),(0,1),(0,0,0),(0,0,1)]" = chain of depth
+    num_speculative_tokens plus a rank-1 leaf at every depth; "1" is shorthand
+    for that shape. Phase 1 supports chain + leaves only. Env VLLM_SPEC_TREE
+    overrides. See vllm/v1/spec_decode/tree_spec.py."""
+    speculative_tree_max_batch: int | None = None
+    """B_tree: a step is a tree step only if it is pure decode with at most
+    this many requests (default 4). Env VLLM_SPEC_TREE_BMAX overrides."""
 
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
@@ -1807,6 +1816,12 @@ class SpeculativeConfig:
             self.draft_model_config.verify_with_parallel_config(
                 self.draft_parallel_config
             )
+
+        if self.speculative_token_tree is not None:
+            # Validates syntax/shape/method early; None (default) is a no-op.
+            from vllm.v1.spec_decode.tree_spec import resolve_tree_spec
+
+            resolve_tree_spec(self, environ={})
 
         if self.use_heterogeneous_vocab and not self.uses_draft_model():
             raise ValueError(
