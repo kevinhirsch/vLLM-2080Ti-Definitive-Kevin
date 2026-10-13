@@ -1892,10 +1892,22 @@ class MambaManager(SingleTypeKVCacheManager):
                     self.last_state_block_idx[request_id] = (
                         prev_block_len - 1 - self.num_speculative_blocks
                     )
-                elif prev_block_len > 0:
+                elif prev_block_len > 0 and not (
+                    has_partial_hit and partial_hit[0] == prev_block_len - 1
+                ):
                     # When a new request hits the prefix cache, the last block
                     # saves the hit state.
                     self.last_state_block_idx[request_id] = prev_block_len - 1
+                else:
+                    # [FORK][LANE CR] A sub-block (partial) hit resumes IN PLACE:
+                    # its hit column is CoW'd below into a private block that IS
+                    # the running state column (a chunk starting mid-block never
+                    # leaves its block). Recording it as the "last state block"
+                    # made remove_skipped_blocks free the live running block one
+                    # step later while the worker's append-only block table kept
+                    # using it -> the next allocation (another request's state,
+                    # a CoW or tail-publish copy) overwrote a live GDN state.
+                    self.last_state_block_idx.pop(request_id, None)
 
                 num_skipped_blocks = (
                     num_required_blocks - self.num_speculative_blocks - 1
