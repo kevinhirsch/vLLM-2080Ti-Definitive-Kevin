@@ -194,7 +194,7 @@ class PreflightTests(unittest.TestCase):
         def forbidden_conv(*args, **kwargs):
             conv_calls.append(kwargs)
             raise AssertionError("unsupported contract reached convolution")
-        namespace = {"torch": DT, "_k5_gdn": types.SimpleNamespace(**{k: NS[k] for k in ("eligible", "inputs_supported")}),
+        namespace = {"torch": DT, "_k5_gdn": types.SimpleNamespace(**{k: NS[k] for k in ("eligible", "inputs_supported")}, capturing=lambda: False),
             "get_forward_context": lambda: types.SimpleNamespace(attn_metadata={"layer": md}),
             "GDNAttentionMetadata": types.SimpleNamespace, "is_conv_state_dim_first": lambda: True,
             "causal_conv1d_update": forbidden_conv, "PAD_SLOT_ID": -1}
@@ -240,7 +240,7 @@ class PreflightTests(unittest.TestCase):
                 calls["copied"] = True
 
         kernel = types.SimpleNamespace(**{k: NS[k] for k in ("eligible", "inputs_supported")},
-                                       enabled=lambda: True, gdn_mtp=gdn_mtp)
+                                       enabled=lambda: True, gdn_mtp=gdn_mtp, capturing=lambda: False)
         dt = types.SimpleNamespace(**vars(DT), zeros=lambda shape, **kw: Tensor(shape))
         namespace = {"torch": dt, "_k5_gdn": kernel,
             "get_forward_context": lambda: types.SimpleNamespace(attn_metadata={"layer": md}),
@@ -267,6 +267,84 @@ class PreflightTests(unittest.TestCase):
         model = (GDN / "qwen_gdn_linear_attn.py").read_text()
         self.assertNotIn("_k5_dt_bias", model)
         self.assertNotIn("_k5_norm_w", model)
+
+    def _warmup_env(self, capturing=False):
+        d = fixture()
+        calls = []
+
+        class Meta(types.SimpleNamespace):
+            pass
+
+        def full(shape, value, **kw):
+            t = Tensor(shape, "i32")
+            t.value = value
+            return t
+
+        dt = types.SimpleNamespace(**{**vars(DT), "bool": "b"},
+                                   zeros=lambda *shape, **kw: Tensor(shape[0] if isinstance(shape[0], tuple) else shape),
+                                   ones=lambda *shape, **kw: Tensor(shape), empty=lambda *shape, **kw: Tensor(shape),
+                                   full=full)
+        dt.Tensor = Tensor
+        kernel = types.SimpleNamespace(capturing=lambda: capturing, _load=lambda: calls.append("load"))
+        layer = types.SimpleNamespace(key_dim=2048, value_dim=6144, tp_size=2, num_v_heads=48, hidden_size=5120,
+              disable_tp_for_ba_proj=True, num_spec=3, conv1d=types.SimpleNamespace(weight=Tensor((5120, 1, 4))),
+              kv_cache=(d["conv_state"], d["state"]))
+        layer._k5_spec_decode = lambda qkvz, ba, out, md=None: calls.append((qkvz.shape, ba.shape, out.shape, md))
+        namespace = {"torch": dt, "_k5_gdn": kernel, "GDNAttentionMetadata": Meta, "PAD_SLOT_ID": -1}
+        method = extract(GDN / "qwen_gdn_linear_attn.py", {"_k5_maybe_warmup"}, namespace)["_k5_maybe_warmup"]
+        return layer, method, calls
+
+    def test_warmup_runs_padding_only_spec_batches_once(self):
+        layer, warm, calls = self._warmup_env()
+        warm(layer)
+        self.assertTrue(layer._k5_warmed)
+        runs = [c for c in calls if c != "load"]
+        self.assertEqual([c[3].num_spec_decodes for c in runs], [1, 2, 4, 16])
+        for qkvz_shape, ba_shape, out_shape, md in runs:
+            n = md.num_spec_decodes * 4
+            self.assertEqual((qkvz_shape, ba_shape, out_shape), ((n, 8192), (n, 96), (n, 5120)))
+            self.assertEqual(md.spec_state_indices_tensor.value, -1)  # every slot padding: no cache touched
+            self.assertEqual(md.spec_state_indices_tensor.shape, (md.num_spec_decodes, 4))
+            self.assertEqual((md.num_prefills, md.num_decodes, md.num_actual_tokens), (0, 0, n))
+        warm(layer)
+        self.assertEqual(len([c for c in calls if c != "load"]), 4)
+
+    def test_warmup_waits_for_bound_caches_and_never_runs_in_capture(self):
+        layer, warm, calls = self._warmup_env()
+        layer.kv_cache = (Tensor((0,)), Tensor((0,)))
+        warm(layer)
+        self.assertFalse(getattr(layer, "_k5_warmed", False))
+        layer, warm, calls = self._warmup_env(capturing=True)
+        warm(layer)
+        self.assertFalse(getattr(layer, "_k5_warmed", False))
+        self.assertEqual(calls, [])
+
+    def test_capture_before_warmup_falls_back_before_any_launch(self):
+        d = fixture()
+        md = types.SimpleNamespace(spec_state_indices_tensor=d["state_indices"],
+              spec_sequence_masks=object(), num_prefills=0, num_decodes=0, num_spec_decodes=2,
+              num_actual_tokens=6, num_accepted_tokens=d["num_accepted"], spec_query_start_loc=d["cu_seqlens"])
+        def forbidden(*a, **k):
+            raise AssertionError("launched during capture before warmup")
+        kernel = types.SimpleNamespace(**{k: NS[k] for k in ("eligible", "inputs_supported")},
+                                       capturing=lambda: True, gdn_mtp=forbidden)
+        namespace = {"torch": DT, "_k5_gdn": kernel, "get_forward_context": None,
+                     "GDNAttentionMetadata": types.SimpleNamespace, "is_conv_state_dim_first": lambda: True,
+                     "causal_conv1d_update": forbidden, "PAD_SLOT_ID": -1,
+                     "logger": types.SimpleNamespace(warning_once=lambda *a: None)}
+        method = extract(GDN / "qwen_gdn_linear_attn.py", {"_k5_spec_decode"}, namespace)["_k5_spec_decode"]
+        layer = types.SimpleNamespace(prefix="layer")
+        self.assertFalse(method(layer, Tensor((8, 8192)), Tensor((8, 96)), Tensor((8, 5120)), md=md))
+
+    def test_loader_imports_stamped_prebuilt_without_ninja_and_refuses_capture(self):
+        source = (GDN / "gdn_sm75_cuda.py").read_text()
+        body = source[source.index("def _load():"):source.index("def eligible(")]
+        self.assertIn("ExtensionFileLoader", body)
+        self.assertLess(body.index("if capturing():"), body.index("from torch.utils.cpp_extension import load"))
+        self.assertLess(body.index("if fresh:"), body.index("from torch.utils.cpp_extension import load"))
+        model = (GDN / "qwen_gdn_linear_attn.py").read_text()
+        init = model[model.index('logger.info_once("GDN decode kernel: %s"'):]
+        self.assertIn("_k5_gdn._load()", init[:400])
 
 class DevicePredicateTests(unittest.TestCase):
     @classmethod

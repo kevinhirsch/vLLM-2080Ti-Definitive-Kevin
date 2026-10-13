@@ -805,6 +805,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         self.enable_fused_gdn_decode = self.gdn_decode_kernel == "cuda"
         logger.info_once("GDN decode kernel: %s", self.gdn_decode_kernel)
+        if _k5_gdn.enabled():
+            # K5: import the extension at model init (CPU only), never first inside graph capture.
+            _k5_gdn._load()
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -1208,8 +1211,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
         ba, _ = self.in_proj_ba(hidden_states)
 
-        if _k5_gdn.enabled() and self._k5_spec_decode(mixed_qkvz, ba, output):
-            return
+        if _k5_gdn.enabled():
+            if not getattr(self, "_k5_warmed", False):
+                self._k5_maybe_warmup()
+            if self._k5_spec_decode(mixed_qkvz, ba, output):
+                return
 
         use_fused_gdn_decode = (
             self.enable_fused_gdn_decode
@@ -1273,20 +1279,88 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         output.copy_(self._output_projection(core_attn_out, z))
 
+    def _k5_maybe_warmup(self) -> None:
+        """Lane K5: eager warmup, once per layer, before any CUDA-graph capture.
+
+        vLLM's capture warmups run eagerly but carry no spec-decode metadata, so the first
+        real K5 call would otherwise happen inside capture (extension import, lazy CUDA module
+        load of the fused kernel, first compile/load of the guarded conv1d Triton
+        specialisation). This runs the real K5 path on spec-decode-shaped metadata whose rows
+        are all padding (slots -1, zero-length queries): every kernel launches with the
+        production strides/specialisations against the bound caches, and no cache entry is
+        read or written. Batch sizes 1/2/4/16 cover Triton's integer specialisations
+        (==1, %16) of the batch and token counts."""
+        if getattr(self, "_k5_warmed", False) or _k5_gdn.capturing():
+            return
+        kv = getattr(self, "kv_cache", None)
+        try:
+            ssm_state = kv[1]
+        except (TypeError, IndexError, KeyError):
+            return
+        if not (
+            isinstance(ssm_state, torch.Tensor)
+            and ssm_state.dim() == 4
+            and ssm_state.numel() > 0
+            and ssm_state.is_cuda
+        ):
+            return  # caches not bound yet (profile run): try again on the next eager call
+        width = int(getattr(self, "num_spec", 0) or 0) + 1
+        if width < 2:
+            self._k5_warmed = True  # no spec decode: K5 never runs
+            return
+        dev = ssm_state.device
+        act_dtype = self.conv1d.weight.dtype
+        qkvz_w = (self.key_dim * 2 + self.value_dim * 2) // self.tp_size
+        ba_heads = self.num_v_heads if (
+            self.disable_tp_for_ba_proj and self.tp_size > 1
+        ) else self.num_v_heads // self.tp_size
+        _k5_gdn._load()
+        for nreq in (1, 2, 4, 16):
+            n = nreq * width
+            md = GDNAttentionMetadata(
+                num_prefills=0,
+                num_prefill_tokens=0,
+                num_decodes=0,
+                num_decode_tokens=0,
+                num_spec_decodes=nreq,
+                num_spec_decode_tokens=n,
+                num_actual_tokens=n,
+                spec_query_start_loc=torch.zeros(nreq + 1, dtype=torch.int32, device=dev),
+                spec_state_indices_tensor=torch.full(
+                    (nreq, width), PAD_SLOT_ID, dtype=torch.int32, device=dev
+                ),
+                spec_sequence_masks=torch.zeros(nreq, dtype=torch.bool, device=dev),
+                num_accepted_tokens=torch.ones(nreq, dtype=torch.int32, device=dev),
+            )
+            self._k5_spec_decode(
+                torch.zeros(n, qkvz_w, dtype=act_dtype, device=dev),
+                torch.zeros(n, 2 * ba_heads, dtype=act_dtype, device=dev),
+                torch.empty(n, self.hidden_size, dtype=act_dtype, device=dev),
+                md=md,
+            )
+        self._k5_warmed = True
+
     def _k5_spec_decode(
         self,
         mixed_qkvz: torch.Tensor,
         ba: torch.Tensor,
         output: torch.Tensor,
+        md: "GDNAttentionMetadata | None" = None,
     ) -> bool:
         """Lane K5: pure spec-decode batch on fp16/sm_75 -> conv1d update + ONE fused kernel
         (l2norm, gating, delta-rule state update per MTP position, RMSNormGated) + out_proj.
         Returns False (caller runs the stock path) for anything it does not cover."""
-        attn_metadata = get_forward_context().attn_metadata
-        if not isinstance(attn_metadata, dict):
-            return False
-        md = attn_metadata.get(self.prefix)
+        if md is None:
+            attn_metadata = get_forward_context().attn_metadata
+            if not isinstance(attn_metadata, dict):
+                return False
+            md = attn_metadata.get(self.prefix)
         if not isinstance(md, GDNAttentionMetadata):
+            return False
+        if not getattr(self, "_k5_warmed", False) and _k5_gdn.capturing():
+            # First K5 launch inside graph capture would lazy-load kernels there. The eager
+            # warmup (_k5_maybe_warmup) must have run; otherwise keep the stock path.
+            logger.warning_once("K5 GDN: capture before warmup; using the stock GDN path")
             return False
         sidx = md.spec_state_indices_tensor
         if (

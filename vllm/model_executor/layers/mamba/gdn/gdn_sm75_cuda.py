@@ -26,21 +26,68 @@ def enabled() -> bool:
     return _ENABLED
 
 
+_NAME = "gdn_mtp_sm75"
+_CFLAGS = ["-O3", "-gencode=arch=compute_75,code=sm_75"]
+_SRC = os.path.join(os.path.dirname(__file__), "gdn_sm75_ext", "gdn_mtp_sm75.cu")
+
+
+def capturing() -> bool:
+    # A capture needs an initialised CUDA context; never initialise one (or touch a device) just to ask.
+    return torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing()
+
+
+def _build_dir() -> str:
+    return os.environ.get("VLLM_K5_GDN_BUILD_DIR", os.path.expanduser("~/.cache/vllm-k5-gdn"))
+
+
+def _source_stamp() -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(_SRC, "rb") as f:
+        h.update(f.read())
+    h.update(repr((_CFLAGS, torch.__version__, torch.version.cuda)).encode())
+    return h.hexdigest()
+
+
 def _load():
+    """Load the extension. Prebuilt .so whose stamp matches the source: imported directly (no ninja, no compiler,
+    no torch cpp_extension rebuild check). Otherwise JIT-built once and stamped (release build time).
+
+    Never call this for the first time inside CUDA-graph capture: the layer loads it at init and the K5 warmup
+    launches every kernel eagerly before capture."""
     global _EXT
     if _EXT is None:
-        from torch.utils.cpp_extension import load
+        if capturing():
+            raise RuntimeError("K5 GDN extension must be loaded before CUDA graph capture")
+        bd = _build_dir()
+        so = os.path.join(bd, _NAME + ".so")
+        stamp_path = os.path.join(bd, _NAME + ".stamp")
+        stamp = _source_stamp()
+        try:
+            with open(stamp_path) as f:
+                fresh = f.read().strip() == stamp and os.path.exists(so)
+        except OSError:
+            fresh = False
+        if fresh:
+            import importlib.machinery
+            import importlib.util
 
-        src = os.path.join(os.path.dirname(__file__), "gdn_sm75_ext", "gdn_mtp_sm75.cu")
-        bd = os.environ.get("VLLM_K5_GDN_BUILD_DIR", os.path.expanduser("~/.cache/vllm-k5-gdn"))
-        os.makedirs(bd, exist_ok=True)
-        _EXT = load(
-            name="gdn_mtp_sm75",
-            sources=[src],
-            extra_cuda_cflags=["-O3", "-gencode=arch=compute_75,code=sm_75"],
-            build_directory=bd,
-            verbose=False,
-        )
+            loader = importlib.machinery.ExtensionFileLoader(_NAME, so)
+            spec = importlib.util.spec_from_file_location(_NAME, so, loader=loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            _EXT = mod
+        else:
+            from torch.utils.cpp_extension import load
+
+            os.makedirs(bd, exist_ok=True)
+            _EXT = load(name=_NAME, sources=[_SRC], extra_cuda_cflags=_CFLAGS, build_directory=bd, verbose=False)
+            try:
+                with open(stamp_path, "w") as f:
+                    f.write(stamp + "\n")
+            except OSError:
+                pass
     return _EXT
 
 
