@@ -22,7 +22,8 @@ template <int MT, bool SP, bool QF>
 static void launch2(dim3 grid, size_t smem, cudaStream_t st, const int8_t* q8, const float* qs, const uint8_t* kv,
                     const int* bt, const int* rl, float* mid, long sq8r, long sq8h, long scb, long scp, long sch,
                     long sbt, long smr, long smh, long sms, int QL, int G, int bs, int NS, float scale, float cscale,
-                    int nc, int nbt, uint32_t lo, uint32_t hi, const __half* qh, long sqhr, long sqhh) {
+                    int nc, int nbt, uint32_t lo, uint32_t hi, const __half* qh, long sqhr, long sqhh, uint32_t rlo,
+                    uint32_t rhi) {
   static int attr_dev = -1;
   int dev;
   cudaGetDevice(&dev);
@@ -32,7 +33,7 @@ static void launch2(dim3 grid, size_t smem, cudaStream_t st, const int8_t* q8, c
   }
   tq_imma2_stage1<MT, SP, QF><<<grid, NTHR, smem, st>>>(q8, qs, kv, bt, rl, mid, sq8r, sq8h, scb, scp, sch, sbt, smr,
                                                          smh, sms, QL, G, bs, NS, scale, cscale, nc, nbt, lo, hi, qh,
-                                                         sqhr, sqhh);
+                                                         sqhr, sqhh, rlo, rhi);
 }
 
 // q_rot [S*QL, Hq, D] fp32 (rotated, contiguous); kv [nb, bs, Hk, slot] u8 (any B/N/H strides); bt [S or expanded, nbt]
@@ -41,7 +42,7 @@ static void launch2(dim3 grid, size_t smem, cudaStream_t st, const int8_t* q8, c
 void tq_imma_decode(torch::Tensor q_rot, torch::Tensor kv, torch::Tensor bt, torch::Tensor row_lens, torch::Tensor q8,
                     torch::Tensor qs, torch::Tensor mid, torch::Tensor out, torch::Tensor lse, int64_t S, int64_t QL,
                     int64_t NS, double scale, double cscale, int64_t norm_corr, int64_t lut_lo, int64_t lut_hi,
-                    int64_t qsplit) {
+                    int64_t qsplit, int64_t rlut_lo, int64_t rlut_hi) {
   // q_rot may instead be the UN-rotated fp16 query: the kernel then does the Hadamard rotation + int8 quantization
   // itself (no cuBLAS rotation, no quant kernel)
   const bool fused = q_rot.scalar_type() == at::kHalf;
@@ -75,7 +76,7 @@ void tq_imma_decode(torch::Tensor q_rot, torch::Tensor kv, torch::Tensor bt, tor
                    bt.data_ptr<int>(), row_lens.data_ptr<int>(), mid.data_ptr<float>(), (long)Hq * qh, qh,             \
                    kv.stride(0), kv.stride(1), kv.stride(2), bt.stride(0), mid.stride(0), mid.stride(1), mid.stride(2), \
                    (int)QL, G, (int)kv.size(1), (int)NS, (float)scale, (float)cscale, (int)norm_corr, (int)bt.size(1),  \
-                   (uint32_t)lut_lo, (uint32_t)lut_hi, qhp, sqhr, sqhh);
+                   (uint32_t)lut_lo, (uint32_t)lut_hi, qhp, sqhr, sqhh, (uint32_t)rlut_lo, (uint32_t)rlut_hi);
   if (sp) {
     switch (MT) { case 1: L2(1, true); break; case 2: L2(2, true); break; case 3: L2(3, true); break; default: L2(4, true); }
   } else {

@@ -484,7 +484,12 @@ __global__ void __launch_bounds__(NTHR, 2) tq_imma2_stage1(
     const int* __restrict__ BT, const int* __restrict__ RL, float* __restrict__ Mid, long sq8r, long sq8h,
     long scb, long scp, long sch, long sbt, long smr, long smh, long sms, int QL, int G, int bs, int NS,
     float attn_scale, float cscale, int norm_corr, int nbt, uint32_t lut_lo, uint32_t lut_hi,
-    const __half* __restrict__ Qh = nullptr, long sqhr = 0, long sqhh = 0) {
+    const __half* __restrict__ Qh = nullptr, long sqhr = 0, long sqhh = 0, uint32_t rlut_lo = 0u, uint32_t rlut_hi = 0u) {
+  // K residual plane (VLLM_TQ_IMMA_KRES): level_i = lut_i + rlut_i / 254 matches the centroid ratios to <= 2e-4
+  // (int8 LUT alone: 0.26%, which bounded rel_max at ~7e-3 on needle-like rows, window 2026-10-13 10:04).
+  // The residual is applied to the high Q plane only (q_lo * r / 254^2 is negligible) and accumulated into acc2,
+  // which is already scaled by 1/254.
+  const bool kres = (rlut_lo | rlut_hi) != 0u;
   constexpr int MR = MT * 8;
   static_assert(MR * 8 * 4 <= 8 * KW * 4, "score tile must fit in the warp's raw-K rows");
   extern __shared__ __align__(16) unsigned char smem[];
@@ -680,7 +685,7 @@ __global__ void __launch_bounds__(NTHR, 2) tq_imma2_stage1(
       int acc[MT][2], acc2[MT][2];
 #pragma unroll
       for (int m = 0; m < MT; m++) acc[m][0] = acc[m][1] = acc2[m][0] = acc2[m][1] = 0;
-      int ss = 0;
+      int ss = 0, sx = 0, sr2 = 0;
 #pragma unroll
       for (int sq = 0; sq < 4; sq++) {
         const int wi = 6 * sq + 3 * (t4 >> 1) + (t4 & 1);
@@ -697,6 +702,21 @@ __global__ void __launch_bounds__(NTHR, 2) tq_imma2_stage1(
         ss = __dp4a((int)b.y, (int)b.y, ss);
         ss = __dp4a((int)b.z, (int)b.z, ss);
         ss = __dp4a((int)b.w, (int)b.w, ss);
+        uint4 br = make_uint4(0u, 0u, 0u, 0u);
+        if (kres) {
+          br.x = __byte_perm(rlut_lo, rlut_hi, sa & 0xFFFFu);
+          br.y = __byte_perm(rlut_lo, rlut_hi, sa >> 16);
+          br.z = __byte_perm(rlut_lo, rlut_hi, sb & 0xFFFFu);
+          br.w = __byte_perm(rlut_lo, rlut_hi, sb >> 16);
+          sx = __dp4a((int)b.x, (int)br.x, sx);
+          sx = __dp4a((int)b.y, (int)br.y, sx);
+          sx = __dp4a((int)b.z, (int)br.z, sx);
+          sx = __dp4a((int)b.w, (int)br.w, sx);
+          sr2 = __dp4a((int)br.x, (int)br.x, sr2);
+          sr2 = __dp4a((int)br.y, (int)br.y, sr2);
+          sr2 = __dp4a((int)br.z, (int)br.z, sr2);
+          sr2 = __dp4a((int)br.w, (int)br.w, sr2);
+        }
 #pragma unroll
         for (int m = 0; m < MT; m++) {
           const uint4 a = *reinterpret_cast<const uint4*>(Qs + kq_off(m * 8 + g, 4 * sq + t4));
@@ -711,12 +731,26 @@ __global__ void __launch_bounds__(NTHR, 2) tq_imma2_stage1(
             imma_s8(acc2[m], a2.z, b.z);
             imma_s8(acc2[m], a2.w, b.w);
           }
+          if (kres) {
+            imma_s8(acc2[m], a.x, br.x);
+            imma_s8(acc2[m], a.y, br.y);
+            imma_s8(acc2[m], a.z, br.z);
+            imma_s8(acc2[m], a.w, br.w);
+          }
         }
       }
       ss += __shfl_xor_sync(0xffffffffu, ss, 1);
       ss += __shfl_xor_sync(0xffffffffu, ss, 2);
+      float ssf = (float)ss;
+      if (kres) {  // ||lut + r/254||^2 = ss + 2 sx / 254 + sr2 / 254^2
+        sx += __shfl_xor_sync(0xffffffffu, sx, 1);
+        sx += __shfl_xor_sync(0xffffffffu, sx, 2);
+        sr2 += __shfl_xor_sync(0xffffffffu, sr2, 1);
+        sr2 += __shfl_xor_sync(0xffffffffu, sr2, 2);
+        ssf += (float)sx * (2.f / 254.f) + (float)sr2 * (1.f / (254.f * 254.f));
+      }
       const float nrm = __half2float(__ushort_as_half((unsigned short)Krow[24]));
-      const float fg = (ss > 0) ? nrm * attn_scale * (norm_corr ? rsqrtf((float)ss) : cscale) : 0.f;
+      const float fg = (ssf > 0.f) ? nrm * attn_scale * (norm_corr ? rsqrtf(ssf) : cscale) : 0.f;
       const float f0 = __shfl_sync(0xffffffffu, fg, 8 * t4), f1 = __shfl_sync(0xffffffffu, fg, 8 * t4 + 4);
       __syncwarp();  // every lane is done reading this warp's raw-K rows: reuse them as the score tile
       float* St = reinterpret_cast<float*>(Kraw + warp * 8 * KW);  // [MR][8]
@@ -724,8 +758,8 @@ __global__ void __launch_bounds__(NTHR, 2) tq_imma2_stage1(
       for (int m = 0; m < MT; m++) {
         const float qsc = qs_s[m * 8 + g];
         *reinterpret_cast<float2*>(St + (m * 8 + g) * 8 + 2 * t4) =
-            make_float2(((float)acc[m][0] + (QSPLIT ? (float)acc2[m][0] * (1.f / 254.f) : 0.f)) * qsc * f0,
-                        ((float)acc[m][1] + (QSPLIT ? (float)acc2[m][1] * (1.f / 254.f) : 0.f)) * qsc * f1);
+            make_float2(((float)acc[m][0] + (float)acc2[m][0] * (1.f / 254.f)) * qsc * f0,
+                        ((float)acc[m][1] + (float)acc2[m][1] * (1.f / 254.f)) * qsc * f1);
       }
     }
     TQP(3);

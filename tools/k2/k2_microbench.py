@@ -78,9 +78,16 @@ def main():
             def imma_batch():
                 c.imma_batched()
 
-            r = {"ctx": ctx, "B": B, "rows": B * ql}
+            r = {"ctx": ctx, "B": B, "rows": B * ql, "kres": os.environ.get("VLLM_TQ_IMMA_KRES", "1")}
             for name, fn in (("gqa", gqa), ("imma_req", imma_req), ("imma_batch", imma_batch)):
                 r[name] = graph_time(fn, reps)
+            if os.environ.get("K2_BENCH_KRES_AB", "1") == "1":
+                # speed cost of the K residual plane: same arms captured with VLLM_TQ_IMMA_KRES=0 (args baked at capture)
+                prev = os.environ.get("VLLM_TQ_IMMA_KRES", "1")
+                os.environ["VLLM_TQ_IMMA_KRES"] = "0"
+                r["imma_req_nokres"] = graph_time(imma_req, reps)
+                r["imma_batch_nokres"] = graph_time(imma_batch, reps)
+                os.environ["VLLM_TQ_IMMA_KRES"] = prev
             g = r["gqa"]["ms"]
             r["x_req"] = round(g / r["imma_req"]["ms"], 2)
             r["x_batch"] = round(g / r["imma_batch"]["ms"], 2)

@@ -96,6 +96,24 @@ def default_splits(S: int, Hk: int, max_len_hint: int | None = None) -> int:
     return min(ns, 128)
 
 
+@functools.lru_cache(maxsize=8)
+def residual_lut(centroids: tuple[float, ...], norm_correction: bool) -> tuple[int, int, float]:
+    """K residual plane: r_i = round((c_i / s - n_i) * 254) in int8, so n_i + r_i / 254 matches the centroid ratios to
+    ~2e-4 (vs 0.26% for the int8 LUT alone). Returns (rlut_lo, rlut_hi, max_rel_err_after)."""
+    lo, hi, s, _ = int8_lut(centroids, norm_correction)
+    n = [((lo | (hi << 32)) >> (8 * i)) & 0xFF for i in range(8)]
+    n = [v - 256 if v > 127 else v for v in n]
+    r = [max(-127, min(127, round((c / s - v) * 254))) for c, v in zip(centroids, n)]
+    err = max(abs((v + x / 254) * s - c) / abs(c) for v, x, c in zip(n, r, centroids))
+    b = [x & 0xFF for x in r]
+    return (b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24), b[4] | (b[5] << 8) | (b[6] << 16) | (b[7] << 24), err)
+
+
+def kres_enabled() -> bool:
+    # second (residual) int8 K plane on the high Q plane: rel_max ~7e-3 -> ~2e-4 at ~+1 IMMA per QK fragment
+    return os.getenv("VLLM_TQ_IMMA_KRES", "1") == "1"
+
+
 _LUT_CACHE: dict = {}
 
 
@@ -110,7 +128,8 @@ def _lut_for(centroids: torch.Tensor, norm_correction: bool):
             vals = get_centroids(256, 3).tolist()
         else:
             vals = centroids.float().cpu().tolist()
-        v = int8_lut(tuple(float(x) for x in vals), bool(norm_correction))
+        t = tuple(float(x) for x in vals)
+        v = int8_lut(t, bool(norm_correction)) + residual_lut(t, bool(norm_correction))[:2]
         _LUT_CACHE[key] = v
     return v
 
@@ -165,10 +184,12 @@ def tq_imma_decode_attention(
     mid = torch.empty(R, Hq, ns, D + 8, dtype=torch.float32, device=dev)
     out = output_buf[:R, :Hq, :D] if output_buf is not None else torch.empty(R, Hq, D, dtype=torch.float16, device=dev)
     lse = lse_buf[:R, :Hq] if lse_buf is not None else torch.empty(R, Hq, dtype=torch.float32, device=dev)
-    lo, hi, cscale, _ = _lut_for(centroids, norm_correction)
+    lo, hi, cscale, _, rlo, rhi = _lut_for(centroids, norm_correction)
+    if not kres_enabled():
+        rlo = rhi = 0
     rl = row_lens if (row_lens.dtype == torch.int32 and row_lens.is_contiguous()) else row_lens.to(torch.int32).contiguous()
     _load().decode(q_rot, kv_cache, block_table, rl, q8, qs, mid, out, lse, S, q_per_seq, ns, scale, cscale,
-                   1 if norm_correction else 0, lo, hi, 1 if qsplit_enabled() else 0)
+                   1 if norm_correction else 0, lo, hi, 1 if qsplit_enabled() else 0, rlo, rhi)
     return out, lse
 
 
@@ -211,7 +232,7 @@ def tq_imma_prefill_prefix_attention(
     out = torch.empty(Lq, Hq, D, dtype=torch.float16, device=dev)
     lse = torch.empty(Lq, Hq, dtype=torch.float32, device=dev)
     mid = torch.empty(Lq, Hq, ns, D + 8, dtype=torch.float32, device=dev) if ns > 1 else lse
-    lo, hi, cscale, _ = _lut_for(centroids, norm_correction)
+    lo, hi, cscale, _, _, _ = _lut_for(centroids, norm_correction)
     bt = block_table_row.reshape(-1)
     if bt.dtype != torch.int32 or bt.stride(0) != 1:
         bt = bt.to(torch.int32).contiguous()
