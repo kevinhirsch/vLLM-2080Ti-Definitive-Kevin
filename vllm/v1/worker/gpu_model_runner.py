@@ -498,6 +498,39 @@ class ExecuteModelState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
 
 
+
+def envs_gdn_update_check() -> bool:
+    return os.environ.get("VLLM_GDN_UPDATE_BT_CHECK", "0") == "1"
+
+
+def _snapshot_tensors(md: Any) -> dict[str, Any]:
+    import dataclasses as _dc
+
+    return {
+        f.name: (v.clone() if isinstance(v, torch.Tensor) else v)
+        for f in _dc.fields(md)
+        for v in (getattr(md, f.name),)
+    }
+
+
+def _check_gdn_update_block_table(fast: dict[str, Any], full: Any) -> None:
+    """Debug (VLLM_GDN_UPDATE_BT_CHECK=1): the GDN block-table fast path must equal a full
+    build. Compares every tensor/scalar field over the live (unpadded) rows."""
+    import dataclasses as _dc
+
+    bad = []
+    for f in _dc.fields(full):
+        a, b = fast[f.name], getattr(full, f.name)
+        if isinstance(b, torch.Tensor) or isinstance(a, torch.Tensor):
+            if a is None or b is None or a.shape != b.shape or not torch.equal(a, b):
+                bad.append(f.name)
+        elif a != b:
+            bad.append(f.name)
+    if bad:
+        logger.error("GDN_UPDATE_BT_CHECK mismatch in %s", bad)
+    else:
+        logger.info_once("GDN_UPDATE_BT_CHECK fast path == full build")
+
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
@@ -2627,12 +2660,34 @@ class GPUModelRunner(
             elif (
                 cache_key in cached_attn_metadata
                 and builder.supports_update_block_table
-            ):
-                attn_metadata_i = builder.update_block_table(
-                    cached_attn_metadata[cache_key],
-                    common_attn_metadata.block_table_tensor,
-                    common_attn_metadata.slot_mapping,
+                and (
+                    not isinstance(builder, GDNAttentionMetadataBuilder)
+                    or builder.can_update_block_table(cached_attn_metadata[cache_key])
                 )
+            ):
+                if isinstance(builder, GDNAttentionMetadataBuilder):
+                    attn_metadata_i = builder.update_block_table(
+                        cached_attn_metadata[cache_key],
+                        common_attn_metadata.block_table_tensor,
+                        common_attn_metadata.slot_mapping,
+                        seq_lens=common_attn_metadata.seq_lens,
+                    )
+                    if envs_gdn_update_check():
+                        # snapshot first: build() rewrites the same persistent buffers
+                        _check_gdn_update_block_table(
+                            _snapshot_tensors(attn_metadata_i),
+                            builder.build(
+                                common_prefix_len=cascade_attn_prefix_len,
+                                common_attn_metadata=common_attn_metadata,
+                                **extra_attn_metadata_args,
+                            ),
+                        )
+                else:
+                    attn_metadata_i = builder.update_block_table(
+                        cached_attn_metadata[cache_key],
+                        common_attn_metadata.block_table_tensor,
+                        common_attn_metadata.slot_mapping,
+                    )
             else:
                 attn_metadata_i = builder.build(
                     common_prefix_len=cascade_attn_prefix_len,

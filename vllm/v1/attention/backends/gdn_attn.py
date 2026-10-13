@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Backend for GatedDeltaNet attention."""
 
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import torch
@@ -552,6 +553,65 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             )
             self._dflash_trace_step += 1
         return attn_metadata
+
+    # Hybrid models put the GDN layers in several KV-cache groups that share one MambaSpec;
+    # per step only the block table differs between them. In steady FULL-graph decode the
+    # runner can reuse the first group's metadata and redo just the state-slot lookup
+    # (saves ~0.5 ms of host time per extra group per step).
+    supports_update_block_table: bool = True
+
+    def can_update_block_table(self, metadata: GDNAttentionMetadata) -> bool:
+        if not self.use_full_cuda_graph or metadata.num_prefills != 0:
+            return False
+        if metadata.num_decodes == 0 and metadata.num_spec_decodes > 0:
+            return (
+                metadata.num_spec_decodes <= self.decode_cudagraph_max_bs
+                and metadata.num_spec_decode_tokens <= self.decode_cudagraph_max_bs
+                and metadata.spec_state_indices_tensor is not None
+            )
+        if metadata.num_spec_decodes == 0 and metadata.num_decodes > 0:
+            return (
+                metadata.num_decodes <= self.decode_cudagraph_max_bs
+                and metadata.spec_sequence_masks is None
+                and metadata.non_spec_state_indices_tensor is not None
+            )
+        return False
+
+    def update_block_table(  # type: ignore[override]
+        self,
+        metadata: GDNAttentionMetadata,
+        blk_table: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        seq_lens: torch.Tensor | None = None,
+    ) -> GDNAttentionMetadata:
+        assert seq_lens is not None and self.can_update_block_table(metadata)
+        block_table_tensor = mamba_get_block_table_tensor(
+            blk_table,
+            seq_lens,
+            self.kv_cache_spec,
+            self.vllm_config.cache_config.mamba_cache_mode,
+        )
+        if metadata.num_spec_decodes > 0:
+            # Pure spec-decode batch: the spec requests are the leading rows (padding is
+            # always at the back), same rows build() selects with the CPU mask.
+            n = metadata.num_spec_decodes
+            batch_size = metadata.spec_state_indices_tensor.shape[0]
+            self.spec_state_indices_tensor[:n].copy_(
+                block_table_tensor[:n, : self.num_spec + 1], non_blocking=True
+            )
+            spec_state_indices_tensor = self.spec_state_indices_tensor[:batch_size]
+            spec_state_indices_tensor[n:].fill_(PAD_SLOT_ID)
+            return replace(metadata, spec_state_indices_tensor=spec_state_indices_tensor)
+        n = metadata.num_decodes
+        batch_size = metadata.non_spec_state_indices_tensor.shape[0]
+        self.non_spec_state_indices_tensor[:n].copy_(
+            block_table_tensor[:n, 0], non_blocking=True
+        )
+        non_spec_state_indices_tensor = self.non_spec_state_indices_tensor[:batch_size]
+        non_spec_state_indices_tensor[n:].fill_(PAD_SLOT_ID)
+        return replace(
+            metadata, non_spec_state_indices_tensor=non_spec_state_indices_tensor
+        )
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
