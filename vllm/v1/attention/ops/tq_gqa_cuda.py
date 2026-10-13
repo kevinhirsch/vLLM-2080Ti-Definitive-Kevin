@@ -14,10 +14,17 @@ import torch
 
 _EXT = None
 _ENABLED = os.getenv("VLLM_TQ_GQA_CUDA", "0") == "1"
+# lane E04 (2026-10-13): compact shared-memory layout for stage 1 (21600 B instead of 28192 B per CTA) so THREE CTAs
+# are resident per SM instead of two. Same arithmetic, same order -> bit-identical results. Boot-fixed (read once).
+_C3 = os.getenv("VLLM_TQ_GQA_C3", "0") == "1"
 
 
 def enabled() -> bool:
     return _ENABLED
+
+
+def c3_enabled() -> bool:
+    return _C3
 
 
 def num_splits() -> int:
@@ -94,5 +101,6 @@ def tq_gqa_decode_attention(
         mid = torch.empty(R, Hq, num_splits, D + 1, dtype=torch.float32, device=query.device)
     out = output_buf[:R, :Hq, :D] if output_buf is not None and output_buf.shape[0] >= R else torch.empty(R, Hq, D, dtype=query.dtype, device=query.device)
     lse = lse_buf[:R, :Hq] if lse_buf is not None and lse_buf.shape[0] >= R else torch.empty(R, Hq, dtype=torch.float32, device=query.device)
-    _load().decode(q_rot, kv_cache, block_table, seq_lens, centroids, mid, out, lse, QL, QS, G, kv_cache.shape[1], num_splits, scale, 1 if norm_correction else 0)
+    fn = _load().decode_c3 if _C3 else _load().decode
+    fn(q_rot, kv_cache, block_table, seq_lens, centroids, mid, out, lse, QL, QS, G, kv_cache.shape[1], num_splits, scale, 1 if norm_correction else 0)
     return out
