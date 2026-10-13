@@ -227,6 +227,7 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
             w_s_param_name="weight_scale",
             w_zp_param_name="weight_zero_point",
         )
+        self.kernel._lp_prefix = self.layer_name  # Lane LP: prefix-scoped W8X / W4A8
 
     # Checkpoints are serialized in compressed-tensors format, which is
     # different from the format the kernel may want. Handle repacking here.

@@ -77,8 +77,21 @@ class MarlinLinearKernel(MPLinearKernel):
         c = self.config
         is_a_8bit = c.act_type is not None and c.act_type.itemsize == 1
 
+        from vllm.model_executor.layers.quantization.utils import lp_w4a8g
+
+        self._lp_g8 = bool(
+            is_a_8bit
+            and lp_w4a8g.enabled()
+            and c.weight_type == scalar_types.uint4
+            and c.zero_points
+            and c.group_size == 128
+            and c.partition_weight_shape[0] % 128 == 0
+        )
         if is_a_8bit:
-            assert c.weight_type == scalar_types.uint4b8, (
+            # Lane LP: the s8 x u4 (zero-point, AWQ-style) kernels are compiled
+            # (generate_kernels.py "AWQ-INT4 with INT8 activation", sm75 too):
+            # int4 - zp lands exactly in int8 [-15, 15] via sub_zp_and_dequant.
+            assert c.weight_type in (scalar_types.uint4b8, scalar_types.uint4), (
                 "W8A8 is not supported by marlin kernel."
             )
 
@@ -90,6 +103,11 @@ class MarlinLinearKernel(MPLinearKernel):
 
         size_k, size_n = c.partition_weight_shape
         padded_n, padded_k = marlin_padded_nk(size_n, size_k, c.group_size)
+        if self._lp_g8 and (padded_n, padded_k) != (size_n, size_k):
+            self._lp_g8 = False  # LP W4A8G: tile-aligned shapes only; fall back to stock W4A8
+        self._lp_mode, self._lp_emax, self._lp_wglob = lp_w4a8g.mode(), lp_w4a8g.emax(), 1.0
+        if self._lp_g8:
+            lp_w4a8g.load_ext(self._lp_mode, self._lp_emax)  # JIT load (cached build) before graph capture
 
         # Allocate marlin workspace, reusing existing storage on reload.
         self.workspace = marlin_make_workspace_new(
@@ -138,7 +156,16 @@ class MarlinLinearKernel(MPLinearKernel):
             else:
                 num_groups = c.partition_weight_shape[0] // c.group_size
 
-            if c.act_type == torch.int8 and num_groups > 1:
+            if c.act_type == torch.int8 and num_groups > 1 and self._lp_g8:
+                # Lane LP W4A8G. mode g: keep the real fp16 group scales (kernel applies
+                # a_scale[row, group] * w_scale[group, col] per int32 group partial).
+                # mode e: stock-style int16 levels (fewer levels keep the int32 headroom
+                # when the kernel shifts them left by EMAX - e[row, group]).
+                if lp_w4a8g.mode() == "e":
+                    x.data, wglob = lp_w4a8g.process_scales_e(x.data, lp_w4a8g.level())
+                    self._lp_wglob = wglob
+                layer.input_global_scale = None
+            elif c.act_type == torch.int8 and num_groups > 1:
                 x.data, input_global_scale = marlin_act_int8_process_scales(x.data)
                 layer.register_parameter(
                     "input_global_scale",
@@ -184,6 +211,25 @@ class MarlinLinearKernel(MPLinearKernel):
                 marlin_pad_dim(layer.bias, size_n, padded_n)
             )
 
+        # Lane LP W8X: large-M prefill on int8 IMMA (CUTLASS W8A8) from a just-in-time int8 expansion of these Marlin
+        # tensors; decode keeps Marlin W4A16. Only s_ch [1, N] fp32 is new memory.
+        from vllm.model_executor.layers.quantization.utils import lp_w8x
+
+        self._lp_w8x = None
+        if (
+            lp_w8x.enabled()
+            and not is_a_8bit
+            and c.zero_points
+            and c.weight_type == scalar_types.uint4
+            and c.group_size == 128
+            and (padded_n, padded_k) == (size_n, size_k)
+            and size_n % 64 == 0
+            and lp_w8x.allowed(getattr(self, "_lp_prefix", None))
+        ):
+            w_q, w_s, w_zp = self._get_weight_params(layer)
+            self._lp_w8x = lp_w8x.W8XState(w_q, w_s, w_zp, size_k, size_n).s_ch
+            self._lp_w8x_min_m = lp_w8x.min_m()
+
     def apply_weights(
         self,
         layer: torch.nn.Module,
@@ -192,6 +238,26 @@ class MarlinLinearKernel(MPLinearKernel):
     ) -> torch.Tensor:
         c = self.config
         w_q, w_s, w_zp = self._get_weight_params(layer)
+        if getattr(self, "_lp_w8x", None) is not None:
+            x2 = x.reshape(-1, x.shape[-1])
+            out = torch.ops.lp.w4_prefill_gemm(
+                x2, w_q, w_s, w_zp, self._lp_w8x, self.workspace,
+                c.partition_weight_shape[0], c.partition_weight_shape[1], self._lp_w8x_min_m,
+            )
+            if bias is not None:
+                out = out + bias
+            return out.reshape(x.shape[:-1] + (c.partition_weight_shape[1],))
+        if getattr(self, "_lp_g8", False):
+            x2 = x.reshape(-1, x.shape[-1])
+            if x2.stride(-1) != 1 or x2.stride(0) % 16 != 0:
+                x2 = x2.contiguous()
+            out = torch.ops.lp.w4a8g_gemm(
+                x2, w_q, w_s, w_zp, self.workspace, c.partition_weight_shape[1],
+                self._lp_wglob, self._lp_emax, self._lp_mode,
+            )
+            if bias is not None:
+                out = out + bias
+            return out.reshape(x.shape[:-1] + (c.partition_weight_shape[1],))
         return apply_gptq_marlin_linear(
             input=x,
             weight=w_q,
