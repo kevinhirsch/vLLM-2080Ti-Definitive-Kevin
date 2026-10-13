@@ -700,3 +700,28 @@ def test_validate_refuses_a_step_that_calls_the_offline_gateway(tmp_path):
         wc.validate(spec(tmp_path, steps=[{"name": "a", "run": f"bash {sh} 3"}]))
     assert wc.validate(spec(tmp_path, steps=[{"name": "a", "run": f"bash {sh}", "uses_gateway": True}]))
     assert wc.validate(spec(tmp_path, steps=[{"name": "a", "run": "curl -s http://127.0.0.1:8001/health"}]))
+
+
+def test_a_promotion_that_shrinks_the_kv_pool_restores_against_the_promoted_pool(world, tmp_path, monkeypatch):
+    """04:36 2026-10-13: W8X's promotion legitimately shrinks the pool (922k -> 906k). The restore floor was max()'d
+    with the window-start pool, so without a widened kv_pool_tolerance the restore booted twice and reported bad."""
+    relroot = tmp_path / "releases"
+    (relroot / "r1" / "vllm").mkdir(parents=True)
+    (relroot / "r1" / "vllm" / "_C.abi3.so").write_bytes(b"release-C")
+    monkeypatch.setattr(wc, "release_mod", lambda: FakeRelease(relroot))
+    booted = {"root": str(world.root)}
+    monkeypatch.setattr(wc, "running_root", lambda: booted["root"])
+    orig = world.unit_run
+
+    def run(*a, **k):
+        res = orig(*a, **k)
+        if "boot-rel" in a[1] or "restore" in a[1]:
+            booted["root"] = os.path.realpath(relroot / "r1")
+        return res
+    monkeypatch.setattr(unitrun, "run", run)
+    world.pools = [922000] + [906000] * 6                              # window start, then the promoted release
+    sp = spec(tmp_path, promote={"release": "r1"}, steps=[{"name": "rel", "boot": {"release": "r1"}}])
+    s = wc.Window(sp).run()
+    r = s["restore"]
+    assert s["status"] == "ok" and r["ok"], r["problems"]
+    assert r["kv_pool_expected"] == 906000 and "restore_boot_2" not in r

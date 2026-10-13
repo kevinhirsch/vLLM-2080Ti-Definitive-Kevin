@@ -996,6 +996,12 @@ class Window:
             self.snapshot["prod_root"] = os.path.realpath(root)
             self.snapshot["so"] = so_hashes(self.snapshot["prod_root"])
             self.snapshot["jit_backup"] = {}
+            # the restore floor becomes the pool the promoted release booted with in this window: W8X (2026-10-13)
+            # shrank it 922k -> 906k by design, and max() with the window-start pool made the restore boot twice and fail
+            pools = [b["kv_pool"] for b in self.summary["boots"] if b.get("healthy") and b.get("kv_pool")
+                     and b.get("running_root") and os.path.realpath(b["running_root"]) == self.snapshot["prod_root"]]
+            if pools:
+                self.snapshot["kv_pool"] = pools[-1]
             self.state["boots"] = max(1, self.state.get("boots", 0))     # the restore boot puts the new default live
         for f in p.get("files") or []:
             f = os.path.expanduser(f)
