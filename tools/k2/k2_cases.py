@@ -69,7 +69,7 @@ class Case:
         self.query = (torch.randn(R, HQ, D, device=dev, generator=self._gen) * 1.0).half()
         if regime in ("needle", "mixed"):
             # half the query heads point at one cached key each (peaky softmax, like retrieval heads)
-            ref_k = self.dequant_prefix_all()
+            ref_k = self.dequant_prefix_all(exact=True)
             for i in range(B):
                 for h in range(0, HQ, 2):
                     t = int(torch.randint(0, self.cached[i], (1,), generator=g))
@@ -90,8 +90,38 @@ class Case:
         return kk.half(), vv.half()
 
     # ---------------------------------------------------------------- reference (exact w.r.t. the stored codes)
+    # 2026-10-13 (window k2-imma-kres-strict): the reference used to be the production full-dequant kernel, which
+    # writes K/V in fp16. Its rounding moves needle-row logits by up to ~1e-2 (LSE 8.8e-3, out rel 1.2e-3 vs fp64 in a
+    # CPU model) and tq_gqa shares that fp16 rounding, so the gate measured "rounds like fp16" instead of "is right".
+    # The reference is now an EXACT decode of the cache bytes (3-bit codes -> centroids, norm correction, fp16 norm;
+    # 4-bit V codes * fp16 scale + fp16 zero) in fp64, and the attention is computed in fp64.
+
+    def _records(self, i: int) -> torch.Tensor:
+        L = self.cached[i]
+        pos = torch.arange(L, device=self.dev)
+        pages = self.block_table[i, pos // BS].long()
+        return self.kv[pages, pos % BS]                                              # [L, Hk, SLOT] u8
+
+    def dequant_prefix_exact(self, i: int):
+        """Exact fp64 decode: K in the ROTATED basis (norm-corrected), V.  [Hk, L, D] float64."""
+        rec = self._records(i).to(torch.int64)
+        L = rec.shape[0]
+        kb = rec[..., :MSE_BYTES].reshape(L, HK, D // 8, 3)
+        w24 = kb[..., 0] | (kb[..., 1] << 8) | (kb[..., 2] << 16)
+        codes = torch.stack([(w24 >> (3 * j)) & 7 for j in range(8)], -1).reshape(L, HK, D)
+        c = self.cent.double()[codes]
+        def u16(lo):
+            v = rec[..., lo] | (rec[..., lo + 1] << 8)
+            return torch.where(v > 32767, v - 65536, v).to(torch.int16).view(torch.float16).double()
+        norm = u16(MSE_BYTES)
+        K = c / c.norm(dim=-1, keepdim=True) * norm[..., None]
+        vb = rec[..., KPS:KPS + VAL_BYTES]
+        vc = torch.stack([vb & 15, vb >> 4], -1).reshape(L, HK, D).double()
+        V = vc * u16(KPS + VAL_BYTES)[..., None] + u16(KPS + VAL_BYTES + 2)[..., None]
+        return K.transpose(0, 1).contiguous(), V.transpose(0, 1).contiguous()
+
     def dequant_prefix(self, i: int):
-        """Production full-dequant kernel: K in the ROTATED basis (fp16, norm-corrected), V fp16.  [Hk, L, D]."""
+        """Production full-dequant kernel (fp16 output): kept only as the secondary 'ref16' comparison.  [Hk, L, D]."""
         L = self.cached[i]
         K = torch.empty(1, HK, L, D, dtype=torch.float16, device=self.dev)
         V = torch.empty(1, HK, L, D, dtype=torch.float16, device=self.dev)
@@ -103,34 +133,37 @@ class Case:
             MSE_BITS=MSE_BITS, KEY_FP8=0, BLOCK_D=D, NORM_CORRECTION=1, FP8_FORMAT=0, num_warps=4)
         return K[0], V[0]
 
-    def dequant_prefix_all(self):
-        return [self.dequant_prefix(i) for i in range(self.B)]
+    def dequant_prefix_all(self, exact: bool = True):
+        return [self.dequant_prefix_exact(i) if exact else self.dequant_prefix(i) for i in range(self.B)]
 
-    def reference(self, with_current: bool):
-        """fp32 attention. Prefix only (with_current=False): out/lse of every verifier row over the cached tokens.
+    def reference(self, with_current: bool, exact: bool = True, return_pmax: bool = False):
+        """Attention in fp64 over the decoded cache (exact decode by default; exact=False = fp16 production dequant).
+        Prefix only (with_current=False): out/lse of every verifier row over the cached tokens.
         Full (True): prefix + the raw current chunk, causal inside the chunk (what the verifier must compute)."""
-        refs = self._ref_k or self.dequant_prefix_all()
+        refs = self._ref_k if (exact and self._ref_k is not None) else self.dequant_prefix_all(exact)
         G, ql = HQ // HK, self.q_len
-        outs, lses = [], []
+        outs, lses, pmaxs = [], [], []
         for i in range(self.B):
-            K, V = refs[i]
-            q = self.query[i * ql:(i + 1) * ql].float() @ self.H                    # rotated query [ql, Hq, D]
-            Kh = K.float().repeat_interleave(G, 0)                                   # [Hq, L, D]
-            Vh = V.float().repeat_interleave(G, 0)
-            s = torch.einsum("rhd,hld->hrl", q, Kh) * SCALE                          # [Hq, ql, L]
-            vals = Vh
+            K, V = (x.double() for x in refs[i])                                     # [Hk, L, D]
+            q = (self.query[i * ql:(i + 1) * ql].double() @ self.H.double()).reshape(ql, HK, G, D)
+            s = torch.einsum("rkgd,kld->kgrl", q, K) * SCALE                         # [Hk, G, ql, L]
+            vals = V.unsqueeze(1).expand(HK, G, *V.shape[1:])                        # [Hk, G, L, D]
             if with_current:
-                kc = (self.key_cur[i * ql:(i + 1) * ql].float() @ self.H).repeat_interleave(G, 1)  # [ql, Hq, D]
-                vc = self.val_cur[i * ql:(i + 1) * ql].float().repeat_interleave(G, 1)
-                sc = torch.einsum("rhd,chd->hrc", q, kc) * SCALE                     # [Hq, ql, ql]
+                kc = (self.key_cur[i * ql:(i + 1) * ql].double() @ self.H.double())    # [ql, Hk, D]
+                vc = self.val_cur[i * ql:(i + 1) * ql].double()
+                sc = torch.einsum("rkgd,ckd->kgrc", q, kc) * SCALE                   # [Hk, G, ql, ql]
                 causal = torch.ones(ql, ql, device=self.dev, dtype=torch.bool).tril()
                 sc = sc.masked_fill(~causal, float("-inf"))
                 s = torch.cat([s, sc], -1)
-                vals = torch.cat([Vh, vc.transpose(0, 1)], 1)                        # [Hq, L+ql, D]
-            lse = torch.logsumexp(s, -1)                                             # [Hq, ql]
-            o = torch.einsum("hrl,hld->rhd", torch.softmax(s, -1), vals)
-            outs.append(o)
-            lses.append(lse.transpose(0, 1))
+                vals = torch.cat([vals, vc.permute(1, 0, 2).unsqueeze(1).expand(HK, G, ql, D)], 2)
+            lse = torch.logsumexp(s, -1)                                             # [Hk, G, ql]
+            pr = torch.softmax(s, -1)
+            o = torch.einsum("kgrl,kgld->rkgd", pr, vals).reshape(ql, HQ, D)
+            outs.append(o.float())
+            lses.append(lse.permute(2, 0, 1).reshape(ql, HQ).float())
+            pmaxs.append(pr.max(-1).values.permute(2, 0, 1).reshape(ql, HQ).float())
+        if return_pmax:
+            return torch.cat(outs), torch.cat(lses), torch.cat(pmaxs)
         return torch.cat(outs), torch.cat(lses)
 
     # ---------------------------------------------------------------- production-shaped calls

@@ -1,7 +1,8 @@
 """Lane K2 (L83) GPU numerics gate for the IMMA TurboQuant verifier-prefix kernel (run INSIDE a GPU window).
 
 Checks, on a real k3v4_nc cache written by the production store kernel (per-rank TP=2 shapes, block 3568, 4 rows):
-  1. prefix out/lse of tq_imma (per-request and batched) vs the exact fp32 reference over the dequantized codes,
+  1. prefix out/lse of tq_imma (per-request and batched) vs the exact reference: fp64 decode of the cache bytes and fp64
+     attention (2026-10-13: was the fp16 production dequant, whose rounding tq_gqa shares; see k2_cases.py),
      next to tq_gqa (today's production path) on the same data;
   2. the full verifier output (prefix merged with the raw current chunk by the production merge kernel) for
      imma vs gqa vs reference -> proves the LSE convention matches the merge;
@@ -57,9 +58,27 @@ def emit(**kw):
     print(json.dumps(kw), flush=True)
 
 
+def worst(name, o, ref, lse, rlse, pmax, others):
+    """Dump the worst (row, head) by relative error and its worst element, with the other kernels at that spot."""
+    o = o.float()
+    e = (o - ref).norm(dim=-1) / ref.norm(dim=-1).clamp_min(1e-12)
+    r, h = divmod(int(e.argmax().item()), e.shape[1])
+    d = int((o[r, h] - ref[r, h]).abs().argmax().item())
+    rec = {"kernel": name, "row": r, "head": h, "dim": d, "rel": float(f"{e[r, h].item():.3g}"),
+           "ref_norm": float(f"{ref[r, h].norm().item():.4g}"), "ref_mean_norm": float(f"{ref.norm(dim=-1).mean().item():.4g}"),
+           "ref": float(ref[r, h, d].item()), "val": float(o[r, h, d].item()), "pmax": float(f"{pmax[r, h].item():.4g}"),
+           "lse_ref": float(rlse[r, h].item()), "lse": float(lse[r, h].item())}
+    for k, (oo, ll) in others.items():
+        oo = oo.float()
+        rec[k + "_val"] = float(oo[r, h, d].item())
+        rec[k + "_rel"] = float(f"{((oo[r, h] - ref[r, h]).norm() / ref[r, h].norm()).item():.3g}")
+        rec[k + "_lse"] = float(ll[r, h].item())
+    return rec
+
+
 def check_case(B, ctx, regime):
     c = Case(B, ctx, regime=regime, seed=B + ctx)
-    ref_o, ref_l = c.reference(with_current=False)
+    ref_o, ref_l, ref_p = c.reference(with_current=False, return_pmax=True)   # exact fp64 decode of the cache
     gq = [c.gqa_prefix(i) for i in range(B)]
     go, gl = torch.cat([x[0] for x in gq]), torch.cat([x[1] for x in gq])
     im = [c.imma_prefix(i) for i in range(B)]
@@ -70,6 +89,13 @@ def check_case(B, ctx, regime):
     emit(check="prefix", B=B, ctx=ctx, regime=regime, gqa=dg, imma_req=di, imma_batch=db,
          ok=gate("imma_req", di, dg) & gate("imma_batch", db, dg),
          batch_vs_req_maxabs=float(f"{(bo.float() - io.float()).abs().max().item():.3g}"))
+    # diagnostics (not gated): worst spots, and both kernels vs the old fp16 production-dequant reference
+    emit(check="worst_prefix", B=B, ctx=ctx, regime=regime,
+         imma=worst("imma_batch", bo, ref_o, bl, ref_l, ref_p, {"gqa": (go, gl)}),
+         gqa=worst("gqa", go, ref_o, gl, ref_l, ref_p, {"imma": (bo, bl)}))
+    r16_o, r16_l = c.reference(with_current=False, exact=False)
+    emit(check="vs_ref16_info", B=B, ctx=ctx, regime=regime, gqa=err(go, r16_o, gl, r16_l), imma=err(bo, r16_o, bl, r16_l),
+         ref16_vs_exact=err(r16_o, ref_o, r16_l, ref_l))
     # full verifier output through the production merge kernel
     ref_full, _ = c.reference(with_current=True)
     ql = c.q_len
