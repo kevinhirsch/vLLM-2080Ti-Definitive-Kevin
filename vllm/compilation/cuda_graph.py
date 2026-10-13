@@ -176,9 +176,21 @@ def _clone_tensor_tree(obj: Any, memo: dict[int, Any] | None = None) -> Any:
     return None
 
 
-def _copy_tensor_tree(src: Any, dst: Any) -> None:
+def _copy_tensor_tree(
+    src: Any, dst: Any, seen: dict[tuple[int, int], tuple[Any, Any]] | None = None
+) -> None:
     if dst is None:
         return
+    # Layers of one KV-cache group share one metadata object (live and captured alike, the
+    # capture clone is memoized), so the per-layer dict repeats the same (src, dst) pair
+    # once per layer. Copying is idempotent: walk each pair once per refresh. The map holds
+    # the objects so their ids cannot be reused within the refresh.
+    if seen is None:
+        seen = {}
+    pair = (id(src), id(dst))
+    if pair in seen:
+        return
+    seen[pair] = (src, dst)
     if isinstance(src, torch.Tensor) and isinstance(dst, torch.Tensor):
         # At batch>1 the live forward-context tensor can be a VIEW aliasing the captured
         # static buffer (same storage, overlapping elements); torch raises on overlapping
@@ -234,7 +246,7 @@ def _copy_tensor_tree(src: Any, dst: Any) -> None:
     if isinstance(src, Mapping) and isinstance(dst, Mapping):
         for key, dst_value in dst.items():
             if key in src:
-                _copy_tensor_tree(src[key], dst_value)
+                _copy_tensor_tree(src[key], dst_value, seen)
         return
     if (
         isinstance(src, Sequence)
@@ -243,7 +255,7 @@ def _copy_tensor_tree(src: Any, dst: Any) -> None:
         and not isinstance(dst, (str, bytes, bytearray))
     ):
         for src_value, dst_value in zip(src, dst):
-            _copy_tensor_tree(src_value, dst_value)
+            _copy_tensor_tree(src_value, dst_value, seen)
 
 
 def _capture_forward_context_tensors() -> dict[str, Any]:
@@ -262,18 +274,16 @@ def _refresh_captured_forward_context_tensors(captured: Any) -> None:
     if not captured:
         return
     forward_context = get_forward_context()
-    _copy_tensor_tree(forward_context.attn_metadata, captured.get("attn_metadata"))
-    _copy_tensor_tree(forward_context.slot_mapping, captured.get("slot_mapping"))
-    _copy_tensor_tree(
-        forward_context.batch_descriptor,
-        captured.get("batch_descriptor"),
-    )
-    _copy_tensor_tree(forward_context.ubatch_slices, captured.get("ubatch_slices"))
-    _copy_tensor_tree(forward_context.dp_metadata, captured.get("dp_metadata"))
-    _copy_tensor_tree(
-        forward_context.additional_kwargs,
-        captured.get("additional_kwargs"),
-    )
+    seen: dict[tuple[int, int], tuple[Any, Any]] = {}
+    for key in (
+        "attn_metadata",
+        "slot_mapping",
+        "batch_descriptor",
+        "ubatch_slices",
+        "dp_metadata",
+        "additional_kwargs",
+    ):
+        _copy_tensor_tree(getattr(forward_context, key), captured.get(key), seen)
 
 
 class CUDAGraphWrapper:
