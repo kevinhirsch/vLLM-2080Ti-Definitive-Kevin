@@ -1539,6 +1539,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             )
             self._arange_cache = arange_cache
 
+        # [FORK][LANE K2] one INT8 tensor-core (IMMA) call computes the compressed-prefix attention of EVERY
+        # request's verifier rows (each cached token decoded once per kv head per request); the per-request raw
+        # current-chunk merge below is unchanged.  Capture-safe: shapes come from host qsl, lengths stay on device.
+        imma_prefix = self._imma_spec_prefix_batched(query, kv_cache, attn_metadata, qsl, num_reqs, centroids)
+
         for request_idx in range(num_reqs):
             q_start = qsl[request_idx]
             q_end = qsl[request_idx + 1]
@@ -1564,6 +1569,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 centroids,
                 PiT,
                 arange_cache,
+                precomputed_prefix=(
+                    (imma_prefix[0][q_start:q_end], imma_prefix[1][q_start:q_end])
+                    if imma_prefix is not None
+                    else None
+                ),
             )
             if out is None:
                 raise RuntimeError(
@@ -1944,6 +1954,49 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             done.update(reqs)
         return done
 
+    def _imma_spec_prefix_batched(
+        self, query, kv_cache, attn_metadata, qsl, num_reqs, centroids
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Lane K2: prefix attention (cached TQ tokens only, no causal part) for all requests of a uniform MTP
+        verifier batch in ONE IMMA call.  Returns (out fp16 [N, Hq, D], lse fp32 [N, Hq], natural log) indexed like
+        `query`, or None when not applicable (env off, ragged q_len, ineligible shape).  Rows of requests with no
+        cached prefix get a zero page and length 0 (-inf lse); _spec_continuation_decode_attention masks them."""
+        if not (_imma_cuda.enabled() and _imma_cuda.spec_batch_enabled()) or self._soa_store:
+            return None
+        if num_reqs < 2 or query.dtype != torch.float16 or qsl[0] != 0:
+            return None
+        q_len = qsl[1] - qsl[0]
+        if q_len <= 0 or any(qsl[i + 1] - qsl[i] != q_len for i in range(num_reqs)):
+            return None
+        Hq, D = query.shape[1], query.shape[2]
+        Hk = kv_cache.shape[2]
+        if not _imma_cuda.eligible(
+            Hq=Hq, Hk=Hk, D=D, mse_bits=self.tq_config.key_mse_bits,
+            value_quant_bits=self.tq_config.effective_value_quant_bits, key_fp8=self.tq_config.key_fp8,
+            key_packed_size=self.tq_config.key_packed_size, q_per_seq=q_len, block_size=kv_cache.shape[1],
+        ):
+            return None
+        n_rows = num_reqs * q_len
+        cached = (attn_metadata.seq_lens[:num_reqs] - q_len).clamp_min(0)
+        row_lens = cached.to(torch.int32).reshape(num_reqs, 1).expand(num_reqs, q_len).contiguous().reshape(-1)
+        bt = attn_metadata.block_table[:num_reqs]
+        safe_bt = torch.where((cached > 0).reshape(num_reqs, 1), bt, torch.zeros_like(bt))
+        if safe_bt.dtype != torch.int32:
+            safe_bt = safe_bt.to(torch.int32)
+        out, lse = _imma_cuda.tq_imma_decode_attention(
+            query[:n_rows], kv_cache, safe_bt.contiguous(), row_lens, centroids, self.scale,
+            self.tq_config.norm_correction, q_per_seq=q_len, num_seqs=num_reqs, PiT=self._imma_PiT(query),
+        )
+        return out, lse
+
+    def _imma_PiT(self, query: torch.Tensor) -> torch.Tensor:
+        # only used when VLLM_TQ_IMMA_FUSEDQ=0 (the default fused path rotates in-kernel)
+        pit = getattr(self, "_k2_PiT", None)
+        if pit is None or pit.device != query.device:
+            pit = _build_hadamard(self.head_size, str(query.device))
+            self._k2_PiT = pit
+        return pit
+
     def _spec_continuation_decode_attention(
         self,
         query: torch.Tensor,
@@ -1956,6 +2009,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         centroids: torch.Tensor,
         PiT: torch.Tensor | None,
         arange_cache: torch.Tensor,
+        precomputed_prefix: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor | None:
         """Merge compressed-prefix attention with raw MTP continuation KV.
 
@@ -2001,7 +2055,27 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             )
         prefix_lse = torch.empty(q_len, Hq, dtype=torch.float32, device=query.device)
         prefix_out = torch.empty_like(query)
-        if (
+        if precomputed_prefix is not None:
+            # lane K2: prefix already computed for the whole batch by _imma_spec_prefix_batched
+            # (row slices of one batch buffer; the merge below may write its output into them in place)
+            prefix_out, prefix_lse = precomputed_prefix
+        elif (
+            _imma_cuda.enabled()
+            and query.dtype == torch.float16
+            and _imma_cuda.eligible(
+                Hq=Hq, Hk=Hk, D=D, mse_bits=self.tq_config.key_mse_bits,
+                value_quant_bits=self.tq_config.effective_value_quant_bits, key_fp8=self.tq_config.key_fp8,
+                key_packed_size=self.tq_config.key_packed_size, q_per_seq=q_len, block_size=kv_cache.shape[1],
+            )
+        ):
+            # lane K2: the q_len verifier rows share one cached prefix -> one IMMA CTA group per kv head (every
+            # cached token decoded once, int8 tensor cores for QK and PV).  Row lengths stay on device (capture-safe).
+            _imma_cuda.tq_imma_decode_attention(
+                query, kv_cache, safe_block_table, prefix_seq_lens.to(torch.int32), centroids, self.scale,
+                self.tq_config.norm_correction, q_per_seq=q_len, num_seqs=1,
+                PiT=PiT if PiT is not None else Pi.T.contiguous(), output_buf=prefix_out, lse_buf=prefix_lse,
+            )
+        elif (
             _gqa_cuda.enabled()
             and query.dtype == torch.float16
             and _gqa_cuda.gqa_eligible(

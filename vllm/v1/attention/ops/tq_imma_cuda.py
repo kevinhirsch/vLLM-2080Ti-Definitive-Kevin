@@ -115,6 +115,11 @@ def _lut_for(centroids: torch.Tensor, norm_correction: bool):
     return v
 
 
+def spec_batch_enabled() -> bool:
+    # one IMMA call for the compressed prefix of every request in a uniform MTP verifier batch (raw-current path)
+    return os.getenv("VLLM_TQ_IMMA_SPEC_BATCH", "1") == "1"
+
+
 def fusedq_enabled() -> bool:
     # in-kernel Hadamard rotation + int8 quantization of the fp16 query (saves a cuBLAS GEMM + a launch per call)
     return os.getenv("VLLM_TQ_IMMA_FUSEDQ", "1") == "1"
