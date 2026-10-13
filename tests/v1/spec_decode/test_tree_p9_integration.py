@@ -749,3 +749,82 @@ def test_import_prebuilt_requires_matching_stamp(tmp_path):
     (tmp_path / "tree_commit_sm75.stamp").write_text(TC._source_stamp() + "\n")
     with pytest.raises(ImportError):  # matching stamp: imported (bad ELF here)
         TC._import_prebuilt(str(tmp_path))
+
+
+# ------------------------------------------------- tree capture metadata (window 13:27)
+class _StopAfterMetadata(Exception):
+    pass
+
+
+@pytest.mark.parametrize("capturing", [False, True], ids=["eager-warmup", "capture"])
+def test_tree_dummy_run_metadata_is_m_row_spec_decode(monkeypatch, capturing):
+    """Regression for the tree-aba boot failure (AssertionError (0, 4, 0, 0) at the
+    GDN builder's tree assert inside capture_model): the tree family's dummy runs
+    -- the NONE-mode warmups before capture AND the capture itself -- must hand
+    the GDN builder M rows per request with M-1 drafts each, classified as spec
+    decodes, whatever the stale per-step draft buffer holds.  Drives the real
+    _dummy_run -> _build_attention_metadata -> _build_attn_group_metadata with a
+    real GDNAttentionMetadataBuilder.build / build_for_cudagraph_capture."""
+    from vllm.config import CUDAGraphMode
+    from vllm.v1.worker import gpu_model_runner as GMR
+
+    runner = _runner(monkeypatch)
+    gdn = P45._builder(SPEC, monkeypatch, full_graph=True)
+    seen = []
+    orig_build = type(gdn).build
+
+    def build(self, *a, **kw):
+        md = orig_build(self, *a, **kw)
+        seen.append(md)
+        return md
+
+    monkeypatch.setattr(type(gdn), "build", build)
+    groups = list(runner._attn_group_iterator())
+    assert groups
+    for g in groups:
+        monkeypatch.setattr(g, "get_metadata_builder", lambda ubid=0: gdn)
+    # spec decode on (the extra GDN args are only passed with a spec config)
+    monkeypatch.setattr(
+        runner, "speculative_config", SimpleNamespace(use_eagle=lambda: False), raising=False
+    )
+    # stale per-step draft buffer, exactly what broke the boot
+    runner.num_decode_draft_tokens.np[:] = -1
+    runner.num_decode_draft_tokens.copy_to_gpu()
+    orig_bam = runner._build_attention_metadata
+
+    def bam(*a, **kw):
+        assert kw["tree_step"] is True
+        out = orig_bam(*a, **kw)
+        raise _StopAfterMetadata(kw)
+
+    monkeypatch.setattr(runner, "_build_attention_metadata", bam)
+    monkeypatch.setattr(
+        runner, "_determine_batch_execution_and_padding",
+        lambda **kw: (
+            CUDAGraphMode.FULL if capturing else CUDAGraphMode.NONE,
+            GMR.BatchDescriptor(num_tokens=kw["num_tokens"], num_reqs=kw["num_reqs"],
+                                uniform=True, tree=True),
+            False, None, None,
+        ),
+    )
+    B = 2
+    with pytest.raises(_StopAfterMetadata) as ex:
+        runner._dummy_run(
+            B * M,
+            cudagraph_runtime_mode=CUDAGraphMode.FULL if capturing else CUDAGraphMode.NONE,
+            force_attention=True,
+            uniform_decode=True,
+            skip_eplb=True,
+            remove_lora=False,
+            is_graph_capturing=capturing,
+            tree_step=True,
+        )
+    kw = ex.value.args[0]
+    assert kw["for_cudagraph_capture"] is True and kw["max_query_len"] == M
+    assert seen, "GDN builder never called"
+    md = seen[-1]
+    assert (md.num_prefills, md.num_decodes, md.num_spec_decodes) == (0, 0, B)
+    assert md.num_spec_decode_tokens == B * M
+    assert md.tree_rows == M and md.tree_spec is SPEC
+    assert md.spec_query_start_loc.tolist() == [M * i for i in range(B + 1)]
+    assert int(md.num_accepted_tokens.max()) <= D + 1

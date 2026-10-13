@@ -6636,9 +6636,15 @@ class GPUModelRunner(
                     # FULL replay reads capture-time metadata buffers. Re-stage them
                     # from the zeroed dummy block tables instead of retaining state
                     # indices from the previous real batch.
+                    # E16: a tree dummy run exists only to warm up / capture the
+                    # tree FULL family; its eager (NONE-mode) warmups must see the
+                    # same capture metadata (M rows = 1 + (M-1) drafts per request,
+                    # derived from query_start_loc), not the stale per-step draft
+                    # buffer, which classifies the rows as plain decodes.
                     for_cudagraph_capture=(
                         is_graph_capturing
                         or cudagraph_runtime_mode == CUDAGraphMode.FULL
+                        or tree_step
                     ),
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
