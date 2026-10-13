@@ -64,6 +64,17 @@ GDN_BUILD_TEST_CASES = {
         expected_num_prefill_tokens=0,
         expected_num_spec_decodes=2,
     ),
+    # Padded (CUDA graph) sequences trail the spec decodes (vllm#58763)
+    "pure_spec_decode_with_padding": GDNBuildTestCase(
+        seq_lens=[50, 30, 16],
+        query_lens=[3, 3, 0],
+        num_decode_draft_tokens=[2, 2, -1],
+        num_speculative_tokens=2,
+        expected_num_decodes=0,
+        expected_num_prefills=0,
+        expected_num_prefill_tokens=0,
+        expected_num_spec_decodes=2,
+    ),
     # No speculative config at all — standard decode path
     "pure_regular_decode": GDNBuildTestCase(
         seq_lens=[40, 30, 20],
@@ -131,8 +142,9 @@ def _create_gdn_builder(
         model_name="Qwen/Qwen3.5-0.8B",
         block_size=BLOCK_SIZE,
     )
-    if full_cuda_graph:
-        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+    vllm_config.compilation_config.cudagraph_mode = (
+        CUDAGraphMode.FULL_AND_PIECEWISE if full_cuda_graph else CUDAGraphMode.NONE
+    )
     if num_speculative_tokens > 0:
         vllm_config.speculative_config = SpeculativeConfig(
             method="ngram",
@@ -182,6 +194,8 @@ def test_gdn_build_classification(test_case: GDNBuildTestCase):
     assert meta.num_prefills == test_case.expected_num_prefills
     assert meta.num_prefill_tokens == test_case.expected_num_prefill_tokens
     assert meta.num_spec_decodes == test_case.expected_num_spec_decodes
+    if meta.spec_state_indices_tensor is not None:
+        assert len(meta.spec_state_indices_tensor) == meta.num_spec_decodes
 
 
 def test_has_initial_state_after_reclassification():
@@ -221,3 +235,52 @@ def test_full_cudagraph_spec_metadata_uses_request_count():
     assert meta.spec_query_start_loc.shape == (batch.batch_size + 1,)
     assert meta.num_accepted_tokens is not None
     assert meta.num_accepted_tokens.shape == (batch.batch_size,)
+
+
+@pytest.mark.parametrize(
+    "num_spec,seq_lens,query_lens,drafts",
+    [
+        (3, [80, 96], [4, 4], [3, 3]),  # pure spec decode
+        (3, [80, 96, 16], [4, 4, 0], [3, 3, -1]),  # pure spec decode + padding
+        (0, [80, 96, 40], [1, 1, 1], None),  # pure non-spec decode
+    ],
+    ids=["spec", "spec_padded", "non_spec"],
+)
+def test_update_block_table_matches_full_build(num_spec, seq_lens, query_lens, drafts):
+    """Second hybrid KV-cache group: reusing the first group's metadata and redoing
+    only the state-slot lookup must equal a full build for that group."""
+    import dataclasses
+    from copy import copy
+
+    group0 = _create_gdn_builder(num_speculative_tokens=num_spec, full_cuda_graph=True)
+    group1 = _create_gdn_builder(num_speculative_tokens=num_spec, full_cuda_graph=True)
+    batch = BatchSpec(seq_lens=seq_lens, query_lens=query_lens)
+    common0 = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
+    common1 = copy(common0)
+    common1.block_table_tensor = common0.block_table_tensor + 1000  # distinct group slots
+    kwargs: dict = {}
+    if drafts is not None:
+        kwargs["num_decode_draft_tokens_cpu"] = torch.tensor(drafts, dtype=torch.int32)
+        kwargs["num_accepted_tokens"] = torch.tensor(
+            [2] * len(drafts), dtype=torch.int32, device=DEVICE
+        )
+    meta0 = group0.build(common_prefix_len=0, common_attn_metadata=common0, **kwargs)
+    assert group1.can_update_block_table(meta0)
+    fast = group1.update_block_table(
+        meta0,
+        common1.block_table_tensor,
+        common1.slot_mapping,
+        seq_lens=common1.seq_lens,
+    )
+    fast = {
+        f.name: (v.clone() if isinstance(v, torch.Tensor) else v)
+        for f in dataclasses.fields(fast)
+        for v in (getattr(fast, f.name),)
+    }
+    full = group1.build(common_prefix_len=0, common_attn_metadata=common1, **kwargs)
+    for f in dataclasses.fields(full):
+        a, b = fast[f.name], getattr(full, f.name)
+        if isinstance(b, torch.Tensor):
+            assert isinstance(a, torch.Tensor) and torch.equal(a, b), f.name
+        else:
+            assert a == b, f.name
