@@ -29,6 +29,11 @@ class SpecDecodingStats:
     num_accepted_tokens: int = 0
     num_accepted_tokens_per_pos: list[int] = field(default_factory=list)
     num_draft_tokens_per_pos: list[int] = field(default_factory=list)
+    # E16 tree drafting (P9): request-steps verified as a tree, and how many
+    # of them were rescued by a leaf at depth d (index d-1).  Empty / zero
+    # with the tree off.
+    num_tree_drafts: int = 0
+    num_rescued_per_depth: list[int] = field(default_factory=list)
 
     @classmethod
     def new(cls, num_spec_tokens: int) -> "SpecDecodingStats":
@@ -46,10 +51,42 @@ class SpecDecodingStats:
         for i in range(num_accepted_tokens):
             self.num_accepted_tokens_per_pos[i] += 1
         # E16 tree steps carry M - 1 > D drafts (chain-first); per-position
-        # counters cover the chain positions only (cap at D).  Per-depth
-        # rescue counters are P9.
+        # counters cover the chain positions only (cap at D).
         for i in range(min(num_draft_tokens, self.num_spec_tokens)):
             self.num_draft_tokens_per_pos[i] += 1
+
+    def observe_tree(self, rescue_depth: int) -> None:
+        """One request-step verified as a tree; rescue_depth = depth d
+        (1..D) of the accepted leaf, 0 if the walk took no leaf."""
+        if not self.num_rescued_per_depth:
+            self.num_rescued_per_depth = [0] * self.num_spec_tokens
+        self.num_tree_drafts += 1
+        if rescue_depth > 0:
+            self.num_rescued_per_depth[rescue_depth - 1] += 1
+
+
+def tree_rescue_depth(
+    drafts: list[int], generated: list[int], num_accepted: int
+) -> int:
+    """Depth of the rescue leaf a tree step accepted (0 = none).
+
+    drafts are chain-first ``[c_1..c_D, leaves..]``; the walk emits
+    ``c_1..c_{j-1}, s_j, bonus`` on a rescue at depth j, i.e. the last
+    accepted draft differs from the chain draft at its depth."""
+    j = num_accepted
+    if j <= 0 or j > len(generated) or j > len(drafts):
+        return 0
+    return j if generated[j - 1] != drafts[j - 1] else 0
+
+
+def _tree_configured(speculative_config: SpeculativeConfig | None) -> bool:
+    """True when E16 tree speculation is configured (env or config)."""
+    try:
+        from vllm.v1.spec_decode.tree_spec import resolve_tree_spec
+
+        return resolve_tree_spec(speculative_config) is not None
+    except Exception:
+        return False
 
 
 class SpecDecodingLogging:
@@ -72,6 +109,8 @@ class SpecDecodingLogging:
         self.num_draft_tokens: list[int] = []
         self.num_accepted_tokens: list[int] = []
         self.accepted_tokens_per_pos_lists: list[list[int]] = []
+        self.num_tree_drafts: list[int] = []
+        self.rescued_per_depth_lists: list[list[int]] = []
         self.last_log_time = time.monotonic()
 
     def observe(self, spec_decoding_stats: SpecDecodingStats):
@@ -81,6 +120,11 @@ class SpecDecodingLogging:
         self.accepted_tokens_per_pos_lists.append(
             spec_decoding_stats.num_accepted_tokens_per_pos
         )
+        if spec_decoding_stats.num_tree_drafts:
+            self.num_tree_drafts.append(spec_decoding_stats.num_tree_drafts)
+            self.rescued_per_depth_lists.append(
+                spec_decoding_stats.num_rescued_per_depth
+            )
 
     def log(self, log_fn=logger.info):
         if not self.num_drafts:
@@ -137,6 +181,19 @@ class SpecDecodingLogging:
             rates_str,
             draft_acceptance_rate,
         )
+        if self.num_tree_drafts:
+            # E16: logged only when tree steps happened (tree off: no line).
+            num_tree = int(np.sum(self.num_tree_drafts))
+            rescued = np.sum(np.array(self.rescued_per_depth_lists), axis=0)
+            log_fn(
+                "SpecDecoding tree: tree steps %d (%.1f%% of drafts), "
+                "rescued %d (%.3f per tree step), per-depth rescue rate: %s",
+                num_tree,
+                100.0 * num_tree / num_drafts,
+                int(rescued.sum()),
+                rescued.sum() / num_tree,
+                ", ".join(f"{r / num_tree:.3f}" for r in rescued),
+            )
         self.reset()
 
     def _log_diffusion(
@@ -265,6 +322,29 @@ class SpecDecodingProm:
                 ]
                 for idx, lv in per_engine_labelvalues.items()
             }
+            # E16 tree drafting (P9): registered only when a tree is
+            # configured, so the tree-off metric set is unchanged.
+            if _tree_configured(speculative_config):
+                self.counter_spec_decode_num_tree_drafts = create_metric_per_engine(
+                    self._counter_cls(
+                        name="vllm:spec_decode_num_tree_drafts",
+                        documentation="Drafts verified as a token tree (E16).",
+                        labelnames=labelnames,
+                    ),
+                    per_engine_labelvalues,
+                )
+                rescue_counter = self._counter_cls(
+                    name="vllm:spec_decode_num_rescued_per_depth",
+                    documentation="Tree drafts rescued by a leaf at this depth.",
+                    labelnames=labelnames + ["depth"],
+                )
+                self.counter_spec_decode_num_rescued_per_depth = {
+                    idx: [
+                        rescue_counter.labels(*lv, str(d + 1))
+                        for d in range(num_spec_tokens)
+                    ]
+                    for idx, lv in per_engine_labelvalues.items()
+                }
 
     def observe(self, spec_decoding_stats: SpecDecodingStats, engine_idx: int = 0):
         if not self.spec_decoding_enabled:
@@ -282,3 +362,13 @@ class SpecDecodingProm:
             self.counter_spec_decode_num_accepted_tokens_per_pos.get(engine_idx, [])
         ):
             counter.inc(spec_decoding_stats.num_accepted_tokens_per_pos[pos])
+        if spec_decoding_stats.num_tree_drafts and hasattr(
+            self, "counter_spec_decode_num_tree_drafts"
+        ):
+            self.counter_spec_decode_num_tree_drafts[engine_idx].inc(
+                spec_decoding_stats.num_tree_drafts
+            )
+            for d, counter in enumerate(
+                self.counter_spec_decode_num_rescued_per_depth.get(engine_idx, [])
+            ):
+                counter.inc(spec_decoding_stats.num_rescued_per_depth[d])

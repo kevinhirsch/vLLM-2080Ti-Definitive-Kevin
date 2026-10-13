@@ -200,7 +200,7 @@ from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesPropose
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-from vllm.v1.spec_decode.tree_spec import resolve_tree_spec
+from vllm.v1.spec_decode.tree_spec import resolve_engine_tree_spec
 from vllm.v1.spec_decode.ngram_proposer_gpu import (
     NgramProposerGPU,
     copy_num_valid_draft_tokens,
@@ -532,6 +532,14 @@ def _check_gdn_update_block_table(fast: dict[str, Any], full: Any) -> None:
     else:
         logger.info_once("GDN_UPDATE_BT_CHECK fast path == full build")
 
+
+def _tree_name_key(name: str) -> tuple:
+    """Natural sort key for layer names (model.layers.10 after .9)."""
+    import re
+
+    return tuple(int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name))
+
+
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
@@ -748,7 +756,9 @@ class GPUModelRunner(
         if self.speculative_config:
             self.num_spec_tokens = self.speculative_config.num_speculative_tokens
             self.prev_num_spec_tokens = self.num_spec_tokens
-            _tree = resolve_tree_spec(self.speculative_config)
+            # P9: the engine spec (clamped B_tree; None when nothing fits),
+            # so the drafter width always agrees with the scheduler's rule.
+            _tree = resolve_engine_tree_spec(self.vllm_config)
             self.num_draft_slots = (
                 _tree.num_drafts if _tree is not None else self.num_spec_tokens
             )
@@ -1194,6 +1204,16 @@ class GPUModelRunner(
         self.tree_draft_token_ids: torch.Tensor | None = None
         self._tree_depth_delta_np: np.ndarray | None = None
         self._tree_depth_delta: torch.Tensor | None = None
+        # P9 runtime objects (None with the tree off).  The sampler is built
+        # here; the stash and the commit need the model layers and the KV
+        # caches, so _init_tree_runtime builds them in initialize_kv_cache
+        # (before any CUDA-graph capture, including the profiling capture).
+        self.tree_sampler = None
+        self.tree_stash = None
+        self.tree_commit = None
+        self._tree_step_outputs = None
+        self._tree_tq_slot_mapping: torch.Tensor | None = None
+        self._tree_tq_gid: int | None = None
         spec = self.tree_spec
         if spec is None:
             return
@@ -1209,7 +1229,111 @@ class GPUModelRunner(
         self.tree_draft_token_ids = torch.full(
             (spec.B_tree, spec.num_drafts), -1, dtype=torch.int64, device=self.device
         )
+        from vllm.v1.spec_decode.tree_sampler import TreeSampler
+
+        # Persistent [B_tree, ..] TreeStepOutputs buffers are built here, once.
+        self.tree_sampler = TreeSampler(self.sampler, spec, self.device)
         logger.info("Tree speculation enabled in model runner: %s", spec.describe())
+
+    def _tree_gdn_layers(self) -> dict[str, Any]:
+        """Target-model GDN layers by prefix, in model (layer-name) order."""
+        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+            QwenGatedDeltaNetAttention,
+        )
+
+        ctx = self.compilation_config.static_forward_context
+        names = [
+            n for n, m in ctx.items() if isinstance(m, QwenGatedDeltaNetAttention)
+        ]
+        names.sort(key=_tree_name_key)
+        return {n: ctx[n] for n in names}
+
+    def _init_tree_runtime(self) -> None:
+        """P9: TreeStash (once) + layer.tree_stash, and TreeCommit (on every
+        KV-cache (re)initialization, since it captures cache addresses).
+        Runs at the end of initialize_kv_cache: after model load and KV
+        allocation, before every CUDA-graph capture (contract §6, K5 rule)."""
+        spec = self.tree_spec
+        if spec is None:
+            return
+        from vllm.model_executor.layers.mamba.mamba_utils import (
+            is_conv_state_dim_first,
+        )
+        from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
+        from vllm.v1.attention.backends.turboquant_attn import (
+            TurboQuantAttentionBackend,
+        )
+        from vllm.v1.spec_decode.tree_commit import GDNCommitLayer, TreeCommit
+        from vllm.v1.spec_decode.tree_spec import TreeStash
+
+        gdn = self._tree_gdn_layers()
+        if not gdn:
+            raise ValueError("speculative_token_tree: the model has no GDN layers")
+        first = next(iter(gdn.values()))
+        conv_dtype = first.kv_cache[0].dtype
+        if self.tree_stash is None:
+            self.tree_stash = TreeStash.allocate(
+                spec,
+                list(gdn),
+                first.num_v_heads // first.tp_size,
+                first.head_k_dim,
+                first.head_v_dim,
+                first.conv1d.weight.size(0),
+                conv_dtype,
+                self.device,
+            )
+        for layer in gdn.values():
+            # Instance attribute; the class default stays None (tree off).
+            layer.tree_stash = self.tree_stash
+
+        # Per-layer persistent state-index buffer = the GDN builder of the
+        # layer's KV-cache group; TQ target layers and their (single) group.
+        draft_names = set(
+            getattr(getattr(self, "drafter", None), "_draft_attn_layer_names", ())
+            or ()
+        )
+        idx_buf: dict[str, torch.Tensor] = {}
+        tq_gids: set[int] = set()
+        tq_names: list[str] = []
+        for group in self._attn_group_iterator():
+            builder = group.get_metadata_builder()
+            for name in group.layer_names:
+                if isinstance(builder, GDNAttentionMetadataBuilder):
+                    idx_buf[name] = builder.spec_state_indices_tensor
+                elif (
+                    group.backend is TurboQuantAttentionBackend
+                    and name not in draft_names
+                ):
+                    tq_gids.add(group.kv_cache_group_id)
+                    tq_names.append(name)
+        if len(tq_gids) != 1:
+            raise ValueError(
+                "tree commit needs exactly one TurboQuant KV-cache group for the "
+                f"target attention layers, got {sorted(tq_gids)}"
+            )
+        dim_first = is_conv_state_dim_first()
+        layers = []
+        for name, layer in gdn.items():
+            conv = layer.kv_cache[0] if dim_first else layer.kv_cache[0].transpose(-1, -2)
+            layers.append(GDNCommitLayer(name, layer.kv_cache[1], conv, idx_buf[name]))
+        ctx = self.compilation_config.static_forward_context
+        tq_names.sort(key=_tree_name_key)
+        tq_caches = [ctx[n].kv_cache for n in tq_names]
+        self.tree_commit = TreeCommit(spec, self.tree_stash, layers, tq_caches, self.device)
+        self._tree_tq_gid = next(iter(tq_gids))
+        # Eager first launch of every tree kernel, before any capture.
+        first.tree_warmup(self.tree_tensors, spec)
+        self.tree_commit.warmup()
+        if self.tree_sampler is not None:
+            self.tree_sampler.warmup()
+        if torch.device(self.device).type == "cuda":
+            torch.cuda.synchronize(self.device)
+        logger.info(
+            "Tree runtime: stash for %d GDN layers, commit over %d GDN + %d TQ layers",
+            len(gdn),
+            len(layers),
+            len(tq_caches),
+        )
 
     def _check_tree_step(
         self, num_reqs: int, num_scheduled_tokens: np.ndarray
@@ -3905,9 +4029,15 @@ class GPUModelRunner(
         self,
         logits: torch.Tensor | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
+        tree_step: bool = False,
+        tree_opt_out_reqs: Sequence[int] = (),
     ) -> SamplerOutput:
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
+        if tree_step:
+            return self._sample_tree(
+                logits, spec_decode_metadata, sampling_metadata, tree_opt_out_reqs
+            )
         # Update output token ids with tokens sampled in last step
         # if async scheduling and required by current sampling params.
         self.input_batch.update_async_output_token_ids()
@@ -3931,6 +4061,41 @@ class GPUModelRunner(
             sampling_metadata,
         )
         return sampler_output
+
+    def _sample_tree(
+        self,
+        logits: torch.Tensor | None,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        sampling_metadata,
+        opt_out_reqs: Sequence[int],
+    ) -> SamplerOutput:
+        """E16 P9: a tree step samples every verify row and walks the tree
+        (P6).  The TreeStepOutputs feed the commit (P5, in
+        _update_states_after_model_execute) and the drafter chain view (P7)."""
+        assert self.tree_sampler is not None and self.tree_spec is not None
+        assert spec_decode_metadata is not None and logits is not None
+        assert not self.use_async_scheduling
+        num_reqs = self.input_batch.num_reqs
+        assert self.tree_draft_token_ids is not None
+        sampler_output, tree_outputs = self.tree_sampler(
+            logits,
+            self.tree_draft_token_ids[:num_reqs],
+            sampling_metadata,
+            opt_out_reqs=opt_out_reqs,
+        )
+        self._tree_step_outputs = tree_outputs
+        return sampler_output
+
+    def _tree_opt_out_reqs(
+        self, grammar_output: "GrammarOutput | None"
+    ) -> list[int]:
+        """Batch indices of structured-output requests (chain-only leaves)."""
+        if grammar_output is None:
+            return []
+        idx = self.input_batch.req_id_to_index
+        return [
+            idx[r] for r in grammar_output.structured_output_request_ids if r in idx
+        ]
 
     def _bookkeeping_sync(
         self,
@@ -4706,6 +4871,13 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
             )
 
+            if scheduler_output.tree_step and self.tree_commit is not None:
+                # E16 P5/P9: the commit copies TQ KV rows by this step's
+                # row-indexed slots of the target attention group.
+                assert slot_mappings_by_group is not None
+                assert self._tree_tq_gid is not None
+                self._tree_tq_slot_mapping = slot_mappings_by_group[self._tree_tq_gid]
+
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
@@ -4910,8 +5082,17 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
+        tree_step = self.tree_spec is not None and scheduler_output.tree_step
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            if tree_step:
+                sampler_output = self._sample(
+                    logits,
+                    spec_decode_metadata,
+                    tree_step=True,
+                    tree_opt_out_reqs=self._tree_opt_out_reqs(grammar_output),
+                )
+            else:
+                sampler_output = self._sample(logits, spec_decode_metadata)
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -7878,6 +8059,10 @@ class GPUModelRunner(
                 kernel_block_sizes,
                 kv_cache_allocation_context=kv_cache_allocation_context,
             )
+
+        # E16 P9: stash + commit (tree off: tree_spec is None, no-op).
+        if self.tree_spec is not None:
+            self._init_tree_runtime()
 
         if self.speculative_config and self._is_drafter_rank() and (
             self.speculative_config.uses_extract_hidden_states()

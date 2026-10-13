@@ -26,6 +26,26 @@ def enabled() -> bool:
     return _ENABLED
 
 
+def _import_prebuilt(name: str, build_dir: str, src: str):
+    """Import a prebuilt ``<build_dir>/<name>.so`` (release prebuild) directly
+    when it is at least as new as its source: no ninja, no compiler at boot.
+    Returns None when there is no usable prebuilt module."""
+    so = os.path.join(build_dir, f"{name}.so")
+    try:
+        if not (os.path.isfile(so) and os.path.getmtime(so) >= os.path.getmtime(src)):
+            return None
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(name, so)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except (OSError, ImportError):
+        return None
+
+
 def _load():
     global _EXT
     if _EXT is None:
@@ -33,6 +53,9 @@ def _load():
 
         src = os.path.join(os.path.dirname(__file__), "gdn_sm75_ext", "gdn_mtp_sm75.cu")
         bd = os.environ.get("VLLM_K5_GDN_BUILD_DIR", os.path.expanduser("~/.cache/vllm-k5-gdn"))
+        _EXT = _import_prebuilt("gdn_mtp_sm75", bd, src)
+        if _EXT is not None:
+            return _EXT
         os.makedirs(bd, exist_ok=True)
         _EXT = load(
             name="gdn_mtp_sm75",

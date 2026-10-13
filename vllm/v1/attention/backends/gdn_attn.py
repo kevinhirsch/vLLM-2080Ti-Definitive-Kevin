@@ -23,7 +23,11 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
-from vllm.v1.spec_decode.tree_spec import TreeSpec, TreeTensors, resolve_tree_spec
+from vllm.v1.spec_decode.tree_spec import (
+    TreeSpec,
+    TreeTensors,
+    resolve_engine_tree_spec,
+)
 from vllm.v1.worker.gpu.spec_decode.utils import get_trace_limit
 
 
@@ -127,8 +131,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
         # E16: None = tree off = every line below behaves as before.  The
         # device tables are built here, once, never inside graph capture.
+        # P9: the engine spec (clamped B_tree), shared with the scheduler,
+        # the runner and the dispatcher.
         self.tree_spec = (
-            resolve_tree_spec(self.speculative_config) if self.use_spec_decode else None
+            resolve_engine_tree_spec(vllm_config) if self.use_spec_decode else None
         )
         self.tree_tensors: TreeTensors | None = (
             self.tree_spec.device_tensors(device) if self.tree_spec is not None else None

@@ -43,6 +43,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
+    causal_conv1d_update_tree,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
@@ -1315,9 +1316,104 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     ) -> torch.Tensor:
         """E16 P4c seam: the conv1d update on a tree step (M rows per request,
         chain-only window store, leaf pre-conv x -> self.tree_stash.conv_view(
-        self.prefix)).  Owned by package P4c (causal_conv1d tree variant)."""
-        raise NotImplementedError(
-            "E16 P4c (conv1d tree variant) is not integrated in this branch"
+        self.prefix)).  P9: P4c's ``causal_conv1d_update_tree``; stash layout
+        per contract §11 (``conv_leaf_x[layer, b, l, :]`` = the leaf's pre-conv
+        x, model dtype).  Chain rows run the unchanged chain kernel, so the
+        stored window holds chain inputs only (same columns as a chain step).
+        In place on ``mixed_qkv`` (like the chain path); returns it."""
+        M = md.tree_rows
+        tree = md.tree
+        assert tree is not None and M > 0 and self.tree_stash is not None
+        rows = num_req * M
+        # Tree steps are exact-size (B*M) uniform decodes: no padded rows.
+        assert mixed_qkv.size(0) == rows, (mixed_qkv.shape, num_req, M)
+        sidx = md.spec_state_indices_tensor
+        stash = self.tree_stash.conv_view(self.prefix)
+        assert num_req <= stash.size(0), (num_req, stash.shape)
+        causal_conv1d_update_tree(
+            mixed_qkv,
+            conv_state,
+            conv_weights,
+            self.conv1d.bias,
+            self.activation,
+            conv_state_indices=sidx[:num_req, 0],
+            num_accepted_tokens=md.num_accepted_tokens[:num_req],
+            tree=tree,
+            stash=stash[:num_req],
+            num_reqs=num_req,
+            null_block_id=PAD_SLOT_ID,
+        )
+        return mixed_qkv
+
+    def tree_warmup(self, tree, spec) -> None:
+        """E16 P9: eager first launch of this layer's tree kernels (P4c conv
+        tree update + K5 ``gdn_mtp_tree``) at init, never on the first call
+        inside CUDA-graph capture (lazy extension load / Triton compile /
+        first-launch setup invalidate a capture; HACKATHON-RULES 08:4x).
+        Same dtypes, strides and constexprs as the runtime launch; every slot
+        is PAD_SLOT_ID, so no state, conv window or stash row is written."""
+        if self.tree_stash is None or not _k5_gdn.enabled():
+            return
+        dev = self.A_log.device
+        if dev.type != "cuda":
+            return
+        _k5_gdn._load()
+        M, W = spec.M, spec.D + 1
+        qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
+        hv = self.num_v_heads // self.tp_size
+        dtype = self.conv1d.weight.dtype
+        mixed_qkvz = torch.zeros(
+            M, qkv_size + self.value_dim // self.tp_size, dtype=dtype, device=dev
+        )
+        mixed_qkv = mixed_qkvz[:, :qkv_size]
+        z = mixed_qkvz[:, qkv_size:].reshape(M, -1, self.head_v_dim)
+        ba = torch.zeros(M, 2 * hv, dtype=dtype, device=dev)
+        b, a = ba.chunk(2, dim=-1)
+        sidx = torch.full((1, W), PAD_SLOT_ID, dtype=torch.int32, device=dev)
+        nacc = torch.ones(1, dtype=torch.int32, device=dev)
+        cu = torch.tensor([0, M], dtype=torch.int32, device=dev)
+        conv_state = (
+            self.kv_cache[0]
+            if is_conv_state_dim_first()
+            else self.kv_cache[0].transpose(-1, -2)
+        )
+        conv_weights = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
+        causal_conv1d_update_tree(
+            mixed_qkv,
+            conv_state,
+            conv_weights,
+            self.conv1d.bias,
+            self.activation,
+            conv_state_indices=sidx[:, 0],
+            num_accepted_tokens=nacc,
+            tree=tree,
+            stash=self.tree_stash.conv_view(self.prefix)[:1],
+            num_reqs=1,
+            null_block_id=PAD_SLOT_ID,
+        )
+        out = torch.zeros(M, hv, self.head_v_dim, dtype=dtype, device=dev)
+        _k5_gdn.gdn_mtp_tree(
+            mixed_qkv,
+            a,
+            b,
+            self.A_log,
+            self.dt_bias,
+            sidx,
+            cu,
+            nacc,
+            self.kv_cache[1],
+            z,
+            self.norm.weight,
+            out,
+            self.head_k_dim**-0.5,
+            self.norm.eps,
+            PAD_SLOT_ID,
+            self.norm.activation == "sigmoid",
+            spec.leaf_rows,
+            spec.leaf_depth,
+            self.tree_stash.gdn_view(self.prefix),
         )
 
     def _k5_spec_decode_md(

@@ -350,6 +350,14 @@ class TreeSampler(nn.Module):
         )
         self._y = torch.zeros(Bmax * M, dtype=torch.int64, device=dev)
 
+    def warmup(self) -> None:
+        """Compile/launch the walk kernel once at init (never lazily on the
+        first tree step).  Writes only the persistent output buffers."""
+        M = self.spec.M
+        y = torch.zeros((1, M), dtype=torch.int64, device=self.device)
+        drafts = torch.full((1, M - 1), -1, dtype=torch.int64, device=self.device)
+        tree_walk(self.spec, drafts, y, self._leaf_rows, self._leaf_depth, self.outputs)
+
     # ---------------------------------------------------------------- utils
     def _draft_lists(
         self, sampling_metadata: SamplingMetadata, drafts: torch.Tensor

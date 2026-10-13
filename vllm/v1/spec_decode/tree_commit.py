@@ -42,6 +42,26 @@ _VDIM = 128
 _PAD_SLOT_ID = -1
 
 
+def _import_prebuilt(name: str, build_dir: str, src: str):
+    """Import a prebuilt ``<build_dir>/<name>.so`` (release prebuild) directly
+    when it is at least as new as its source: no ninja, no compiler at boot.
+    Returns None when there is no usable prebuilt module."""
+    so = os.path.join(build_dir, f"{name}.so")
+    try:
+        if not (os.path.isfile(so) and os.path.getmtime(so) >= os.path.getmtime(src)):
+            return None
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(name, so)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except (OSError, ImportError):
+        return None
+
+
 def _load():
     global _EXT
     if _EXT is None:
@@ -53,6 +73,9 @@ def _load():
         bd = os.environ.get(
             "VLLM_TREE_COMMIT_BUILD_DIR", os.path.expanduser("~/.cache/vllm-tree-commit")
         )
+        _EXT = _import_prebuilt("tree_commit_sm75", bd, src)
+        if _EXT is not None:
+            return _EXT
         os.makedirs(bd, exist_ok=True)
         _EXT = load(
             name="tree_commit_sm75",
@@ -181,6 +204,20 @@ class TreeCommit:
         self.tq_tab = torch.tensor(tq_rows, dtype=torch.int64).reshape(-1, 6).to(device)
         self._keep = (order, list(tq_kv_caches))  # tensors referenced by the tables
         self.leaf_depth = [int(d) for d in spec.leaf_depth]
+        # Warmup inputs (all requests masked: rescue_leaf = -1, no write).
+        self._warm_rescue = torch.full((spec.B_tree,), -1, dtype=torch.int32, device=device)
+        self._warm_slots = torch.full(
+            (spec.B_tree * spec.M,), _PAD_SLOT_ID, dtype=torch.int64, device=device
+        )
+
+    def warmup(self) -> None:
+        """Load the extension and run one fully masked launch, eagerly, at
+        init: the first call must never happen inside CUDA-graph capture
+        (extension JIT load / first-launch setup invalidate the capture)."""
+        if torch.device(self.gdn_tab.device).type != "cuda":
+            return  # CPU (tests): no extension
+        _load()
+        self.commit(self._warm_rescue, self._warm_slots, self.spec.B_tree)
 
     def commit(
         self, rescue_leaf: torch.Tensor, tq_slot_mapping: torch.Tensor, num_reqs: int

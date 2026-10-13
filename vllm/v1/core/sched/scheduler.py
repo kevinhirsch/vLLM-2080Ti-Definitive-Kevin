@@ -70,7 +70,7 @@ from vllm.v1.metrics.stats import (
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
-from vllm.v1.spec_decode.metrics import SpecDecodingStats
+from vllm.v1.spec_decode.metrics import SpecDecodingStats, tree_rescue_depth
 from vllm.v1.spec_decode.tree_spec import (
     decide_tree_step,
     resolve_engine_tree_spec,
@@ -2694,6 +2694,13 @@ class Scheduler(SchedulerInterface):
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
                 )
+                if spec_decoding_stats is not None and scheduler_output.tree_step:
+                    # E16 P9: per-depth rescue counters (tree steps only).
+                    spec_decoding_stats.observe_tree(
+                        tree_rescue_depth(
+                            scheduled_spec_token_ids, generated_token_ids, num_accepted
+                        )
+                    )
                 if request.spec_decode_metrics is not None:
                     # Exclude grammar-invalidated drafts from the proposed
                     # count, mirroring make_spec_decoding_stats; the accepted

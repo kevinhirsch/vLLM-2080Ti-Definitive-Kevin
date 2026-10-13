@@ -58,7 +58,7 @@ from vllm.v1.spec_decode.tree_drafter import (
     tree_leaf_ranks_by_depth,
     tree_leaf_tokens,
 )
-from vllm.v1.spec_decode.tree_spec import TreeStepOutputs, resolve_tree_spec
+from vllm.v1.spec_decode.tree_spec import TreeStepOutputs, resolve_engine_tree_spec
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
     _copy_and_expand_eagle_inputs,
@@ -101,7 +101,8 @@ class SpecDecodeBaseProposer:
         self.eplb_state: EplbState | None = None
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
         # E16 tree drafting (None = off = today's chain drafter, unchanged).
-        self.tree_spec = resolve_tree_spec(self.speculative_config)
+        # P9: the engine spec (clamped B_tree; None when nothing fits).
+        self.tree_spec = resolve_engine_tree_spec(vllm_config)
         self._tree_leaf_ranks = (
             tree_leaf_ranks_by_depth(self.tree_spec) if self.tree_spec else {}
         )
