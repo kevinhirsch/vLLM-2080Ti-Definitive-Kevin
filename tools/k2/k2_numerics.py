@@ -28,6 +28,7 @@ from vllm.v1.attention.ops.triton_turboquant_decode import triton_turboquant_spe
 # gates: K2's 2026-10-03 microbench measured imma rel mean 2-9e-4, max <= 6e-3, |dLSE| <= 2.3e-3 (int8 LUT ratio
 # error 0.26% is the floor). Gate with margin, and never more than 3x worse than tq_gqa on the same data.
 REL_MEAN, REL_MAX, LSE_MAX = 2e-3, 2e-2, 2e-2
+GQA_FACTOR, ABS_MAX_FLOOR = 3.0, 5e-3   # rel_max must also be <= max(GQA_FACTOR * tq_gqa rel_max, ABS_MAX_FLOOR)
 results, ok = [], True
 
 
@@ -46,7 +47,7 @@ def gate(name, d, ref_d=None):
     good = (not d["nan"] and d["rel_mean"] <= REL_MEAN and d["rel_max"] <= REL_MAX
             and d.get("lse_max", 0.0) <= LSE_MAX)
     if ref_d is not None:
-        good = good and d["rel_max"] <= max(3 * ref_d["rel_max"], 5e-3)
+        good = good and d["rel_max"] <= max(GQA_FACTOR * ref_d["rel_max"], ABS_MAX_FLOOR)
     ok = ok and good
     return good
 
@@ -144,7 +145,20 @@ def check_empty_and_graph(c: Case):
 
 
 def main():
+    global REL_MEAN, REL_MAX, LSE_MAX, GQA_FACTOR, ABS_MAX_FLOOR
+    import argparse
+    ap = argparse.ArgumentParser(description="K2 numerics gate (defaults = the strict gate)")
+    ap.add_argument("--rel-mean", type=float, default=REL_MEAN)
+    ap.add_argument("--rel-max", type=float, default=REL_MAX, help="absolute cap on rel_max")
+    ap.add_argument("--lse-max", type=float, default=LSE_MAX)
+    ap.add_argument("--gqa-factor", type=float, default=GQA_FACTOR)
+    ap.add_argument("--abs-max-floor", type=float, default=ABS_MAX_FLOOR,
+                    help="rel_max <= max(gqa_factor * tq_gqa rel_max, this)")
+    a = ap.parse_args()
+    REL_MEAN, REL_MAX, LSE_MAX, GQA_FACTOR, ABS_MAX_FLOOR = a.rel_mean, a.rel_max, a.lse_max, a.gqa_factor, a.abs_max_floor
     torch.manual_seed(0)
+    emit(check="gates", rel_mean=REL_MEAN, rel_max=REL_MAX, lse_max=LSE_MAX, gqa_factor=GQA_FACTOR,
+         abs_max_floor=ABS_MAX_FLOOR)
     emit(check="env", gpu=torch.cuda.get_device_name(0), cap=list(torch.cuda.get_device_capability(0)),
          fusedq=os.environ.get("VLLM_TQ_IMMA_FUSEDQ", "1"), qsplit=os.environ.get("VLLM_TQ_IMMA_QSPLIT", "1"))
     last = None
