@@ -237,8 +237,14 @@ exec_config_t determine_exec_config(
     // reach blockIdx.x, so only when the workspace holds 2 slots per SM.
     if (stages == 2 && thread_m_blocks == 1 && ws_blocks_per_sm >= 2 &&
         is_valid_config(th_config, thread_m_blocks, prob_m, prob_n, prob_k, num_bits, group_size, has_zp,
-                        is_zp_float, is_a_8bit, stages, max_shared_mem / 2 - 1024 - 512))
-      return {2, th_config};
+                        is_zp_float, is_a_8bit, stages, max_shared_mem / 2 - 1024 - 512)) {
+      // Only when two blocks are really co-resident (registers + smem of THIS kernel variant): a doubled grid
+      // that runs in two waves is slower (zero-point 9-16 row decode at 164 registers: 0.81-0.99x measured).
+      int resident = 0, smem2 = max_shared_mem / 2 - 1024;
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem2);
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident, kernel, th_config.num_threads, smem2);
+      if (resident >= 2) return {2, th_config};
+    }
     return {1, th_config};
   }
 

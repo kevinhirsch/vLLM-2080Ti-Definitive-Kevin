@@ -37,6 +37,6 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
                                    // with a separate quantization scale
           const bool is_zp_float   // is zero point of float16 type?
           >
-__global__ void Marlin(MARLIN_KERNEL_PARAMS);
+__global__ void __launch_bounds__(threads, (thread_m_blocks == 1 && threads == 256) ? 2 : 1) Marlin(MARLIN_KERNEL_PARAMS);
 
 }
