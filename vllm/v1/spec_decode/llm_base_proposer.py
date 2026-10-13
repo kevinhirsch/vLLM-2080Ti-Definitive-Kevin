@@ -50,6 +50,15 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
 )
 from vllm.v1.sample.sampler import _SAMPLING_EPS
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.tree_drafter import (
+    TreeChainView,
+    TreeChainViewBuffers,
+    assemble_tree_drafts,
+    tree_chain_view,
+    tree_leaf_ranks_by_depth,
+    tree_leaf_tokens,
+)
+from vllm.v1.spec_decode.tree_spec import TreeStepOutputs, resolve_tree_spec
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
     _copy_and_expand_eagle_inputs,
@@ -91,6 +100,16 @@ class SpecDecodeBaseProposer:
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         self.eplb_state: EplbState | None = None
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
+        # E16 tree drafting (None = off = today's chain drafter, unchanged).
+        self.tree_spec = resolve_tree_spec(self.speculative_config)
+        self._tree_leaf_ranks = (
+            tree_leaf_ranks_by_depth(self.tree_spec) if self.tree_spec else {}
+        )
+        self._tree_cv_buffers: TreeChainViewBuffers | None = (
+            TreeChainViewBuffers(self.tree_spec, self.tree_spec.B_tree, device)
+            if self.tree_spec
+            else None
+        )
 
         # We need to get the hidden size from the draft model config because
         # the draft model's hidden size can be different from the target model's
@@ -148,7 +167,11 @@ class SpecDecodeBaseProposer:
         _eagle_prepare_inputs_padded.register_warmup(max_batch_size=self.max_batch_size)
         _eagle_prepare_next_token_padded.register_warmup(
             vocab_size=vllm_config.model_config.get_vocab_size(),
-            num_sampled_tokens_per_req=self.num_speculative_tokens + 1,
+            num_sampled_tokens_per_req=(
+                self.tree_spec.M
+                if self.tree_spec is not None
+                else self.num_speculative_tokens + 1
+            ),
             max_batch_size=self.max_batch_size,
         )
         if self.needs_extra_input_slots:
@@ -510,6 +533,60 @@ class SpecDecodeBaseProposer:
             )
         return draft_token_ids, draft_probs
 
+    def _sample_draft_tokens_tree(
+        self,
+        hidden_states: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        tree_leaves: dict[int, torch.Tensor] | None,
+        depth: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """``_sample_draft_tokens`` plus, on a tree drafter, the depth-``depth``
+        leaves (topk of the same logits with the chain token masked), stored
+        in ``tree_leaves[depth]``.  With ``tree_leaves=None`` this IS
+        ``_sample_draft_tokens`` (tree off: unchanged)."""
+        if tree_leaves is None or depth not in self._tree_leaf_ranks:
+            return self._sample_draft_tokens(hidden_states, sampling_metadata)
+        # resolve_tree_spec rejects local-argmax reduction; heterogeneous
+        # vocab would need the leaves remapped too.
+        assert not self.use_local_argmax_reduction
+        assert not self.use_heterogeneous_vocab
+        logits = self.model.compute_logits(hidden_states)
+        if self._enable_probabilistic_draft_probs and not sampling_metadata.all_greedy:
+            chain, draft_probs = self._sample_from_logits(
+                logits.clone(), sampling_metadata
+            )
+        else:
+            # Same op as _greedy_sample: the chain stays bit-identical.
+            chain, draft_probs = logits.argmax(dim=-1), None
+        tree_leaves[depth] = tree_leaf_tokens(
+            logits, chain, self._tree_leaf_ranks[depth]
+        )
+        return chain, draft_probs
+
+    def prepare_inputs_tree_chain_view(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        tree_outputs: TreeStepOutputs,
+        valid_sampled_tokens_count: torch.Tensor,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+    ) -> TreeChainView:
+        """Tree-step replacement for ``prepare_inputs_padded`` + target
+        slicing: the accepted path as a D+1-row chain (see tree_drafter)."""
+        assert self.tree_spec is not None and self._tree_cv_buffers is not None
+        assert not self.needs_extra_input_slots, "tree needs the padded MTP path"
+        return tree_chain_view(
+            self.tree_spec,
+            common_attn_metadata,
+            tree_outputs.chain_view_rows,
+            valid_sampled_tokens_count,
+            target_token_ids,
+            target_positions,
+            target_hidden_states,
+            self._tree_cv_buffers,
+        )
+
     def take_last_draft_probs(self) -> torch.Tensor | None:
         return self._last_draft_probs
 
@@ -536,6 +613,16 @@ class SpecDecodeBaseProposer:
         self.num_speculative_tokens = num_speculative_tokens
         self._last_draft_probs = None
         batch_size = common_attn_metadata.batch_size()
+        # Tree drafter: emit [B, M-1] (chain + leaves).  Over B_tree requests
+        # the leaves are -1 (skipped topk); the scheduler chain-steps anyway.
+        tree_on = (
+            self.tree_spec is not None
+            and num_speculative_tokens == self.tree_spec.D
+            and not self.parallel_drafting
+        )
+        tree_leaves: dict[int, torch.Tensor] | None = (
+            {} if tree_on and batch_size <= self.tree_spec.B_tree else None
+        )
 
         if self.method in ("eagle3", "dflash"):
             model = self.model
@@ -631,13 +718,19 @@ class SpecDecodeBaseProposer:
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
-            draft_token_ids, draft_probs = self._sample_draft_tokens(
-                sample_hidden_states, sampling_metadata
+            draft_token_ids, draft_probs = self._sample_draft_tokens_tree(
+                sample_hidden_states, sampling_metadata, tree_leaves, 1
             )
             if draft_probs is not None:
                 self._last_draft_probs = draft_probs.view(
                     -1, self.num_speculative_tokens, draft_probs.shape[-1]
                 ).contiguous()
+            if tree_on:
+                return assemble_tree_drafts(
+                    self.tree_spec,
+                    draft_token_ids.view(-1, self.num_speculative_tokens),
+                    tree_leaves,
+                )
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
         if self.uses_mrope:
@@ -652,8 +745,8 @@ class SpecDecodeBaseProposer:
             # (which read via _get_positions) use the correct values.
             self.positions[:batch_size] = positions
 
-        draft_token_ids, draft_probs = self._sample_draft_tokens(
-            sample_hidden_states, sampling_metadata
+        draft_token_ids, draft_probs = self._sample_draft_tokens_tree(
+            sample_hidden_states, sampling_metadata, tree_leaves, 1
         )
         draft_probs_list = None if draft_probs is None else [draft_probs]
 
@@ -763,8 +856,11 @@ class SpecDecodeBaseProposer:
                     last_hidden_states, hidden_states = ret_hidden_states
 
             hidden_states = hidden_states[:batch_size]
-            draft_token_ids, draft_probs = self._sample_draft_tokens(
-                last_hidden_states[:batch_size], sampling_metadata
+            draft_token_ids, draft_probs = self._sample_draft_tokens_tree(
+                last_hidden_states[:batch_size],
+                sampling_metadata,
+                tree_leaves,
+                token_index + 2,
             )
             if draft_probs is not None:
                 assert draft_probs_list is not None
@@ -775,6 +871,9 @@ class SpecDecodeBaseProposer:
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
         if draft_probs_list is not None:
             self._last_draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
+        if tree_on:
+            # [batch_size, M - 1]: chain first, then leaves in leaf order.
+            return assemble_tree_drafts(self.tree_spec, draft_token_ids, tree_leaves)
         return draft_token_ids
 
     def _update_positions_dependent_metadata(

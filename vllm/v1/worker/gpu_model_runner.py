@@ -200,6 +200,7 @@ from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesPropose
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.tree_spec import resolve_tree_spec
 from vllm.v1.spec_decode.ngram_proposer_gpu import (
     NgramProposerGPU,
     copy_num_valid_draft_tokens,
@@ -740,10 +741,17 @@ class GPUModelRunner(
 
         self.num_spec_tokens = 0
         self.prev_num_spec_tokens = 0
+        # E16 P7: drafts per request the drafter emits (M - 1 with a tree
+        # drafter, else D).  Topology only; B_tree / tree_spec are P2/P8's.
+        self.num_draft_slots = 0
         self.valid_sampled_token_count_gpu: torch.Tensor | None = None
         if self.speculative_config:
             self.num_spec_tokens = self.speculative_config.num_speculative_tokens
             self.prev_num_spec_tokens = self.num_spec_tokens
+            _tree = resolve_tree_spec(self.speculative_config)
+            self.num_draft_slots = (
+                _tree.num_drafts if _tree is not None else self.num_spec_tokens
+            )
             draft_config = self.speculative_config.draft_model_config
             if draft_config is not None and draft_config.max_model_len is not None:
                 self.effective_drafter_max_model_len = draft_config.max_model_len
@@ -1003,7 +1011,7 @@ class GPUModelRunner(
             self.num_accepted_tokens_event = torch.Event()
             self.draft_token_ids_copy_stream = torch.cuda.Stream()
             self.draft_token_ids_cpu = torch.empty(
-                (self.max_num_reqs, self.num_spec_tokens),
+                (self.max_num_reqs, self.num_draft_slots),
                 dtype=torch.int64,
                 device="cpu",
                 pin_memory=PIN_MEMORY,
@@ -5026,6 +5034,23 @@ class GPUModelRunner(
                 self._draft_token_ids = torch.zeros(
                     1, device=self.device, dtype=torch.int32
                 ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
+                if self.num_draft_slots > self.num_spec_tokens:
+                    # Tree drafter width M-1: zero chain, -1 (opt-out) leaves.
+                    self._draft_token_ids = torch.cat(
+                        [
+                            self._draft_token_ids,
+                            torch.full(
+                                (
+                                    len(self.input_batch.req_ids),
+                                    self.num_draft_slots - self.num_spec_tokens,
+                                ),
+                                -1,
+                                device=self.device,
+                                dtype=torch.int32,
+                            ),
+                        ],
+                        dim=1,
+                    )
                 self._draft_probs = None
                 self._draft_prob_req_ids = None
                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
@@ -5548,6 +5573,31 @@ class GPUModelRunner(
                         )
                     else:
                         target_hidden_states = hidden_states[token_indices]
+                elif (
+                    getattr(scheduler_output, "tree_step", False)
+                    and getattr(self, "_tree_step_outputs", None) is not None
+                ):
+                    # E16 P7: after a tree step the drafter sees the accepted
+                    # path as a D+1-row chain (tokens / positions / hidden
+                    # gathered by chain_view_rows, KV slots base+0..D).
+                    assert not self.use_aux_hidden_state_outputs
+                    total_num_tokens = int(
+                        common_attn_metadata.query_start_loc_cpu[-1].item()
+                    )
+                    cv = self.drafter.prepare_inputs_tree_chain_view(
+                        common_attn_metadata,
+                        self._tree_step_outputs,
+                        valid_sampled_tokens_count,
+                        self.input_ids.gpu[:total_num_tokens],
+                        self._get_positions(total_num_tokens),
+                        hidden_states[:total_num_tokens],
+                    )
+                    common_attn_metadata = cv.common_attn_metadata
+                    token_indices_to_sample = cv.token_indices_to_sample
+                    num_rejected_tokens_gpu = cv.num_rejected_tokens_gpu
+                    target_token_ids = cv.target_token_ids
+                    target_positions = cv.target_positions
+                    target_hidden_states = cv.target_hidden_states
                 else:
                     (
                         common_attn_metadata,
