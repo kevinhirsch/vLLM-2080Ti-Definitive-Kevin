@@ -247,6 +247,14 @@ def get_quantized(model_dir: str, name: str, weight: torch.Tensor, logger=None) 
     return tensors
 
 
+def load_cached(model_dir: str, name: str):
+    """Cached quantized tensors for ``name`` or None (never computes)."""
+    from safetensors.torch import load_file
+
+    path = _cache_path(model_dir, name, _src_stamp(model_dir))
+    return load_file(path) if os.path.exists(path) else None
+
+
 def wrap_weights(
     weights: Iterable[tuple[str, torch.Tensor]], model_dir: str, logger=None
 ) -> Iterator[tuple[str, torch.Tensor]]:

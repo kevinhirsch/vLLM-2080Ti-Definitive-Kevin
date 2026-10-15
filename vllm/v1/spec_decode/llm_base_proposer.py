@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import os
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, Any, cast
 
@@ -264,6 +265,8 @@ class SpecDecodeBaseProposer:
             and self.speculative_config.draft_sample_method == "probabilistic"
         )
         self._last_draft_probs: torch.Tensor | None = None
+        # FR1: opt-in reduced-vocab MTP draft head (VLLM_MTP_DRAFT_VOCAB); built in load_model.
+        self._draft_vocab_head = None
 
         self._slot_mapping_buffer = torch.zeros(
             self.max_positions, dtype=torch.int64, device=device
@@ -441,6 +444,8 @@ class SpecDecodeBaseProposer:
 
     def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Greedy-sample draft tokens from hidden states."""
+        if self._draft_vocab_head is not None:
+            return self._draft_vocab_head.greedy(hidden_states)
         if self.use_local_argmax_reduction:
             return self.model.get_top_tokens(hidden_states)
         if self.use_heterogeneous_vocab:
@@ -1406,6 +1411,7 @@ class SpecDecodeBaseProposer:
 
         self._maybe_share_embeddings(target_language_model)
         self._maybe_share_lm_head(target_language_model)
+        self._maybe_init_draft_vocab(target_language_model)
 
         if (
             self.parallel_drafting
@@ -1421,6 +1427,57 @@ class SpecDecodeBaseProposer:
                 )
             else:
                 self.parallel_drafting_hidden_state_tensor.copy_(flat_mask)
+
+    def _maybe_init_draft_vocab(self, target_language_model: nn.Module) -> None:
+        """FR1: reduced-vocab greedy draft head. Any failure leaves the full-vocab path."""
+        from vllm.v1.spec_decode import draft_vocab
+
+        if not draft_vocab.enabled():
+            return
+        path = os.environ[draft_vocab.ENV_PATH]
+        sc = self.speculative_config
+        if (
+            sc.method != "mtp"
+            or self._enable_probabilistic_draft_probs
+            or self.use_heterogeneous_vocab
+            or self.parallel_drafting
+        ):
+            logger.warning(
+                "VLLM_MTP_DRAFT_VOCAB ignored: needs greedy MTP drafting "
+                "(method=%s probabilistic=%s)", sc.method, self._enable_probabilistic_draft_probs,
+            )
+            return
+        lm_head = getattr(target_language_model, "lm_head", None)
+        if lm_head is None or not hasattr(lm_head, "quant_method"):
+            logger.warning("VLLM_MTP_DRAFT_VOCAB ignored: target has no lm_head")
+            return
+        try:
+            mc = self.vllm_config.model_config
+            hidden = mc.get_hidden_size()
+            vocab = mc.get_vocab_size()
+            dtype = mc.dtype
+            quant_config = getattr(self.model, "quant_config", None) or self.vllm_config.quant_config
+            from vllm.config import set_current_vllm_config
+
+            with set_current_vllm_config(self.vllm_config):
+                head = draft_vocab.build_draft_vocab_head(
+                    path, lm_head, quant_config, mc.model, hidden, vocab, dtype,
+                    self.device, logger,
+                )
+            if head is None:
+                return
+            if os.environ.get(draft_vocab.ENV_SELFCHECK, "1") != "0":
+                ok = draft_vocab.selfcheck(
+                    head,
+                    lambda h: self.model.compute_logits(h),
+                    hidden, dtype, self.device, logger,
+                )
+                if not ok:
+                    logger.error("draft vocab selfcheck FAILED: keeping the full-vocab draft head")
+                    return
+            self._draft_vocab_head = head
+        except Exception:
+            logger.exception("draft vocab head build failed: keeping the full-vocab draft head")
 
     def _maybe_share_embeddings(self, target_language_model: nn.Module) -> None:
         """
