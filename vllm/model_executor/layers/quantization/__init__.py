@@ -14,6 +14,7 @@ logger = init_logger(__name__)
 
 QuantizationMethods = Literal[
     "awq",
+    "gguf",
     "auto_awq",
     "fp8",
     "fbgemm_fp8",
@@ -139,6 +140,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .fbgemm_fp8 import FBGEMMFp8Config
     from .fp8 import Fp8Config
     from .fp_quant import FPQuantConfig
+    from .gguf import GGUFConfig
     from .humming import HummingConfig
     from .inc import INCConfig
     from .modelopt import (
@@ -157,6 +159,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "awq_marlin": AutoAWQConfig,
         "auto_awq": AutoAWQConfig,
         "fp8": Fp8Config,
+        "gguf": GGUFConfig,
         "fbgemm_fp8": FBGEMMFp8Config,
         "fp_quant": FPQuantConfig,
         "modelopt": ModelOptFp8Config,
