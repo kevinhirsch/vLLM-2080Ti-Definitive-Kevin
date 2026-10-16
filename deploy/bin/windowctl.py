@@ -107,6 +107,13 @@ MARKER = os.environ.get("WINDOWCTL_MARKER", f"{BASE}/window-active.json")
 GATEWAY = os.environ.get("GATEWAY", "http://127.0.0.1:8000")
 ENGINE = os.environ.get("ENGINE_URL", "http://127.0.0.1:8001")
 ENGINE_UNIT = os.environ.get("ENGINE_UNIT", "vllm-qwen27b")
+# Kevin 2026-10-16 (after a window crash-looped production down 09:54-10:10): engine test windows run overnight only,
+# and a window that cannot boot gives up after 2 failed boots and restores production at once.
+OVERNIGHT_HOURS = (1, 6)                      # local time [01:00, 06:00)
+MAX_FAILED_BOOTS = int(os.environ.get("WINDOWCTL_MAX_FAILED_BOOTS", "2"))
+GPU_FREE_MIB = int(os.environ.get("WINDOWCTL_GPU_FREE_MIB", "1024"))   # per-GPU used memory that counts as released
+GPU_FREE_WAIT_S = float(os.environ.get("WINDOWCTL_GPU_FREE_WAIT_S", "120"))
+_now, _sleep = time.time, time.sleep          # the boot watch loop's clock (tests substitute a fake one)
 LEGACY_ROOT = f"{HOME}/Desktop/wt-integrate"
 RELEASES = os.environ.get("VLLM_RELEASES_ROOT", f"{HOME}/.local/share/vllm-releases")
 JIT_DIRS = [".deps/tq_gqa_build", ".deps/FlashQLA-SM70-SM75/.torch_extensions_vllm_flashqla_legacy"]
@@ -248,6 +255,63 @@ def wait_health(budget_s, poll_s=4.0, clock=time.time, sleep=time.sleep):
             return True, round(clock() - t0, 1)
         sleep(poll_s)
     return engine_health() == 200, round(clock() - t0, 1)
+
+
+def overnight_ok(now=None):
+    """True inside the overnight window (01:00-06:00 local). WINDOWCTL_ALLOW_DAYTIME=1 overrides, for a run Kevin
+    approved explicitly at that moment (never set it in a spec or a daemon)."""
+    if os.environ.get("WINDOWCTL_ALLOW_DAYTIME") == "1":
+        return True
+    h = time.localtime(now if now is not None else time.time()).tm_hour
+    return OVERNIGHT_HOURS[0] <= h < OVERNIGHT_HOURS[1]
+
+
+def seconds_until_overnight_end(now=None):
+    if os.environ.get("WINDOWCTL_ALLOW_DAYTIME") == "1":
+        return float("inf")
+    now = now if now is not None else time.time()
+    lt = time.localtime(now)
+    end = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, OVERNIGHT_HOURS[1], 0, 0, 0, 0, -1))
+    return max(0.0, end - now)
+
+
+def engine_restarts():
+    """systemd's automatic-restart counter for the engine unit: +1 every time a start crashed and systemd retried."""
+    try:
+        out = subprocess.run(["systemctl", "show", ENGINE_UNIT, "-p", "NRestarts", "--value"], capture_output=True,
+                             text=True, timeout=20).stdout.strip()
+        return int(out)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def gpu_mem_used_mib():
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=30)
+        return [int(x) for x in r.stdout.split()] if r.returncode == 0 and r.stdout.strip() else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def wait_gpu_free(budget_s=None, max_used_mib=None, poll_s=2.0, clock=time.time, sleep=time.sleep):
+    """Wait until every GPU has released the stopped engine's memory (2026-10-16 09:54: a boot 2 s after the stop found
+    1.91 GiB free on GPU 0, OOMed, and every retry crash-looped). Returns (ok, waited_s, last_used_mib)."""
+    budget_s = GPU_FREE_WAIT_S if budget_s is None else budget_s
+    max_used_mib = GPU_FREE_MIB if max_used_mib is None else max_used_mib
+    t0 = clock()
+    while True:
+        used = gpu_mem_used_mib()
+        if used is not None and all(u <= max_used_mib for u in used):
+            return True, round(clock() - t0, 1), used
+        if clock() - t0 >= budget_s:
+            return False, round(clock() - t0, 1), used
+        sleep(poll_s)
+
+
+def stop_engine_and_wait_gpu(lane, job, out):
+    unitrun.run(lane, job, ["sudo", "-n", "systemctl", "stop", ENGINE_UNIT], timeout_s=240, out=out)
+    return wait_gpu_free()
 
 
 def spend_usd():
@@ -756,6 +820,8 @@ class Window:
             raise WindowAbort("aborted-remote", f"remote valve unhealthy while local was offline: {why}")
         if time.time() - self.t0 > self.max_s:
             raise WindowAbort("budget", f"window budget max_s={self.max_s:.0f} spent")
+        if not self.dry and not overnight_ok():
+            raise WindowAbort("overnight-end", "06:00 reached: engine test windows run overnight only (Kevin 2026-10-16)")
         sp = spend_usd()
         if sp is not None and sp >= float(self.spec.get("spend_pause_usd", 20)):
             raise WindowAbort("paused-spend", f"gateway spend ${sp:.2f} reached the pause threshold ${self.spec.get('spend_pause_usd', 20)}")
@@ -785,14 +851,48 @@ class Window:
         self.gpu_gate(f"boot {label}")
         gpuguard.set_busy(self.by, f"{self.wid} boot {label}", ttl_s=timeout_s + 300, window=self.wid, phase="boot")
         t_boot = time.time()
+        # stop first and wait for the GPUs to release the old engine's memory, THEN start (09:54 OOM root cause)
+        gpu_ok, gpu_wait_s, gpu_used = stop_engine_and_wait_gpu(self.lane, f"{self.wid}-prestop-{label}",
+                                                                self.path("steps", f"prestop-{label}.log"))
+        self.state["engine_stopped"] = True
+        self.save_state()
+        if not gpu_ok:
+            self.log(f"boot {label}: GPU memory not released after {gpu_wait_s} s (used MiB {gpu_used}); booting anyway")
+        r0 = engine_restarts()
         res = unitrun.run(self.lane, f"{self.wid}-boot-{label}",
                           restart_argv(self.by, f"window {self.wid} boot {label}", self.state.get("hold")),
-                          timeout_s=timeout_s, out=self.path("steps", f"boot-{label}.log"))
-        ok, waited = wait_health(max(30.0, timeout_s - (time.time() - t_boot)))
+                          timeout_s=timeout_s, out=self.path("steps", f"boot-{label}.log"), wait=False)
+        ok, failed, why = False, 0, "timeout"
+        t_watch = _now()
+        while _now() - t_watch < max(30.0, timeout_s):
+            if engine_health() == 200:
+                ok, why = True, ""
+                break
+            r = engine_restarts()
+            if r0 is not None and r is not None:
+                failed = max(failed, r - r0)
+            if failed >= MAX_FAILED_BOOTS:
+                why = f"{failed} failed boots (engine crash-restarts)"
+                break
+            if res.get("unit") and not unitrun.is_active(res["unit"]) and engine_health() != 200:
+                failed = max(failed, 1)
+                why = "the restart actuator gave up (engine never healthy)"
+                break
+            _sleep(4.0)
+        if not ok:
+            # end the crash loop now: stop the actuator job and the engine; the window aborts and restore boots prod
+            if res.get("unit"):
+                unitrun.stop(res["unit"])
+            unitrun.run(self.lane, f"{self.wid}-giveup-{label}", ["sudo", "-n", "systemctl", "stop", ENGINE_UNIT],
+                        timeout_s=240, out=self.path("steps", f"giveup-{label}.log"))
+        else:
+            self.state["engine_stopped"] = False
+            self.save_state()
         gpuguard.set_busy(self.by, f"{self.wid} window", ttl_s=self.max_s + 1800, window=self.wid, phase="window")
         boot = {"label": label, "unit": res.get("unit"), "actuator_rc": res.get("rc"), "healthy": ok,
-                "boot_s": round(time.time() - t_boot, 1), "kv_pool": gpuguard.kv_pool_since(t_boot - 5),
-                "running_root": running_root()}
+                "boot_s": round(time.time() - t_boot, 1), "kv_pool": gpuguard.kv_pool_since(t_boot - 5) if ok else None,
+                "running_root": running_root() if ok else None, "failed_boots": failed, "gpu_free_wait_s": gpu_wait_s,
+                "why": why}
         self.summary["boots"].append(boot)
         self.log(f"boot {label}: healthy={ok} in {boot['boot_s']} s, KV pool {boot['kv_pool']}, root {boot['running_root']}")
         return boot
@@ -846,7 +946,8 @@ class Window:
         boot = self.restart_engine(label, int(b.get("timeout_s", 1200)))
         boot["override_lines"] = lines
         if not boot["healthy"]:
-            return {"rc": 1, "error": "boot not healthy", "boot": boot}
+            # Kevin 2026-10-16: a window that cannot boot gives up and restores production at once (never on_fail=continue)
+            raise WindowAbort("boot-failed", f"boot {label} not healthy ({boot['why']}); giving up, restoring production")
         return {"rc": 0, "boot": boot}
 
     def step_engine(self, st):
@@ -1033,6 +1134,13 @@ class Window:
         try:
             for sg in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
                 prev[sg] = signal.signal(sg, _raise_terminated)
+            if not self.dry and not overnight_ok():
+                self.summary.update(status="refused", why="outside the overnight window 01:00-06:00 (Kevin 2026-10-16)")
+                self.log("REFUSED: outside the overnight window 01:00-06:00")
+                return self.summary
+            if not self.dry:      # never run past 06:00: the window budget ends there
+                self.max_s = min(self.max_s, max(60.0, seconds_until_overnight_end() - (time.time() - self.t0)))
+                self.state["deadline"] = self.t0 + self.max_s
             problems = self.preflight()
             if problems and not self.dry:
                 self.summary.update(status="refused", why=problems)
@@ -1174,6 +1282,8 @@ def restore_from(snap, state, spec, log=print, results=None):
             ok_gpu, foreign = gpuguard.wait_no_foreign(float(spec.get("gpu_gate_wait_s", 300)) * 2)
             if not ok_gpu:
                 rep.setdefault("foreign_at_restore", []).append(gpuguard.describe(foreign))
+            stop_engine_and_wait_gpu(lane, f"{wid}-restore-prestop-{attempt}",
+                                     os.path.join(results or "/tmp", "steps", f"restore-prestop-{attempt}.log"))
             t_boot = time.time()
             gpuguard.set_busy(state.get("by") or lane, f"{wid} restore boot", ttl_s=1800, window=wid, phase="boot")
             res = unitrun.run(lane, f"{wid}-restore-{attempt}",

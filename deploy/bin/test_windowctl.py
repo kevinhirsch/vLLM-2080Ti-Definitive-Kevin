@@ -59,12 +59,32 @@ class World:
         mp.setattr(gpuguard, "wait_no_foreign", lambda *a, **k: (not self.foreign, list(self.foreign)))
         mp.setattr(unitrun, "run", self.unit_run)
         mp.setattr(unitrun, "stop_lane", lambda lane, prefix=None, exclude=(): [])
+        self.restarts = 0                 # systemd NRestarts of the engine unit
+        self.crash_boots = 0              # >0: the next actuator start crash-loops (NRestarts climbs, never healthy)
+        self.crashing = False
+        self.gpu_waits = []
+        self.stopped_units = []
+        self.overnight = True
+        mp.setattr(wc, "overnight_ok", lambda now=None: self.overnight)
+        mp.setattr(wc, "seconds_until_overnight_end", lambda now=None: float("inf"))
+        mp.setattr(wc, "engine_restarts", self.nrestarts)
+        mp.setattr(wc, "wait_gpu_free", lambda *a, **k: self.gpu_waits.append(1) or (True, 0.0, [10, 10]))
+        mp.setattr(unitrun, "stop", lambda unit: self.stopped_units.append(unit) or True)
+        self.clock = [1000.0]
+        mp.setattr(wc, "_now", lambda: self.clock[0])
+        mp.setattr(wc, "_sleep", lambda sec: self.clock.__setitem__(0, self.clock[0] + sec))
+        mp.setattr(unitrun, "is_active", lambda unit: True)   # the actuator job runs until it is stopped
         self.cap = {"remote_configured": True, "remote_usable": True, "remote_budget_ok": True, "remote_dead_for_s": 0,
                     "mode": "local+remote", "mode_changes": []}
         self.holds = []
         self.hold_supported = False
         mp.setattr(wc, "actuator_hold", self.hold)
         mp.setattr(unitrun, "owner_of_pid", lambda pid, at=None: {"unit": "k2-bench.service", "lane": "k2"} if pid == 777 else None)
+
+    def nrestarts(self):
+        if self.crashing:                 # every poll during a crash loop sees one more systemd auto-restart
+            self.restarts += 1
+        return self.restarts
 
     def hold(self, *args, timeout=60):
         self.holds.append(args)
@@ -97,6 +117,12 @@ class World:
         self.units.append({"lane": lane, "job": job, "cmd": cmd, "env": env})
         if any("engine-actuator.py" in c for c in cmd):
             self.actuator_calls.append({"cmd": cmd, "override": self.override.read_bytes()})
+            self.crashing = False
+            if self.crash_boots:
+                self.crash_boots -= 1
+                self.crashing = True
+                self.health = None
+                return {"unit": unitrun.unit_name(lane, job), "rc": None, "result": "started"}
             self.health = 200
             return {"unit": unitrun.unit_name(lane, job), "rc": 0, "result": "success"}
         if cmd[:3] == ["sudo", "-n", "systemctl"]:
@@ -725,3 +751,49 @@ def test_a_promotion_that_shrinks_the_kv_pool_restores_against_the_promoted_pool
     r = s["restore"]
     assert s["status"] == "ok" and r["ok"], r["problems"]
     assert r["kv_pool_expected"] == 906000 and "restore_boot_2" not in r
+
+
+# ---------------------------------------------------------------- Kevin 2026-10-16: overnight only, give up after 2 failed boots
+
+def test_window_is_refused_outside_the_overnight_hours(world, tmp_path):
+    world.overnight = False
+    s = wc.Window(spec(tmp_path)).run()
+    assert s["status"] == "refused" and "overnight" in s["why"]
+    assert world.actuator_calls == [] and not world.offline
+
+
+def test_a_crash_looping_boot_gives_up_after_two_failed_boots_and_restores_production(world, tmp_path):
+    world.crash_boots = 1                  # the arm's boot crash-loops; the restore boot is fine
+    sp = spec(tmp_path)
+    sp["steps"][2]["on_fail"] = "continue"  # even "continue" must not keep a dead engine: the window gives up
+    s = wc.Window(sp).run()
+    assert s["status"] == "boot-failed", s.get("why")
+    arm = next(b for b in s["boots"] if b["label"] == "arm")
+    assert arm["healthy"] is False and arm["failed_boots"] >= wc.MAX_FAILED_BOOTS
+    assert any("arm" in u for u in world.stopped_units)          # the stuck actuator job was stopped
+    assert not (tmp_path / "results" / "m.txt").exists()          # later steps never ran
+    assert s["restore"]["ok"] and world.health == 200             # production restored at once
+    assert len(world.actuator_calls) == 2                         # one failed arm boot + one restore boot, no retries
+
+
+def test_every_boot_waits_for_the_gpus_to_release_memory_first(world, tmp_path):
+    s = wc.Window(spec(tmp_path)).run()
+    assert s["status"] == "ok", s.get("why")
+    assert len(world.gpu_waits) == len(world.actuator_calls) == 2  # arm boot + restore boot
+    stops = [u for u in world.units if u["cmd"][:4] == ["sudo", "-n", "systemctl", "stop"]]
+    assert len(stops) >= 2
+
+
+def test_reaching_six_am_aborts_between_steps_and_restores(world, tmp_path):
+    w = wc.Window(spec(tmp_path))
+    orig = w.check_between_steps
+    calls = {"n": 0}
+    def flip():
+        calls["n"] += 1
+        if calls["n"] == 3:
+            world.overnight = False
+        return orig()
+    w.check_between_steps = flip
+    s = w.run()
+    assert s["status"] == "overnight-end", s.get("why")
+    assert s["restore"]["ok"]
