@@ -13,6 +13,7 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
+from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
@@ -108,8 +109,8 @@ class QSAIndexer(nn.Module):
         super().__init__()
         if vllm_config.cache_config is None:
             raise ValueError("QSA requires a paged KV cache")
-        if vllm_config.model_config.dtype != torch.bfloat16:
-            raise NotImplementedError("Qwen4Exp QSA currently requires BF16")
+        if vllm_config.model_config.dtype not in (torch.bfloat16, torch.float16):
+            raise NotImplementedError("Qwen4Exp QSA requires BF16 or FP16")
 
         self.layer_id = int(layer_id)
         self.index_n_heads = int(config.indexer_n_heads)
@@ -153,9 +154,14 @@ class QSAIndexer(nn.Module):
             "bf16"
         )
         if self.indexer_kv_dtype == "fp8":
+            if not current_platform.has_device_capability(89):
+                raise NotImplementedError(
+                    "the fp8 QSA indexer cache needs SM89+; use indexer_kv_dtype "
+                    "'bf16' (= the 16-bit model dtype) on this GPU"
+                )
             indexer_dtype = torch.float8_e4m3fn
         elif self.indexer_kv_dtype == "bf16":
-            indexer_dtype = torch.bfloat16
+            indexer_dtype = vllm_config.model_config.dtype
         else:
             raise NotImplementedError(
                 f"indexer_kv_dtype={self.indexer_kv_dtype!r} is not supported "
@@ -164,7 +170,7 @@ class QSAIndexer(nn.Module):
         self.indexer_dtype = indexer_dtype
         self.raw_key_cache = QSAKeyStateCache(
             head_size=self.index_head_dim,
-            dtype=torch.bfloat16,
+            dtype=vllm_config.model_config.dtype,
             cache_rope_positions=vllm_config.model_config.uses_mrope,
             prefix=f"{cache_prefix}raw_key_cache",
             cache_config=cache_config,
@@ -319,14 +325,11 @@ class QSAIndexer(nn.Module):
                 ),
             )
         else:
-            # Unfused reference path
-            from flashinfer.norm import gemma_rmsnorm
-
+            # Unfused reference path. FlashInfer is not built for SM75, so use
+            # the fp32 native Gemma RMSNorm (same math: x * rsqrt(ms) * (1 + w)).
             q = projected_q.reshape(-1, self.index_n_heads, self.index_head_dim)
-            q = gemma_rmsnorm(
-                q.reshape(-1, self.index_head_dim),
-                self.q_layernorm.weight,
-                self.q_layernorm.variance_epsilon,
+            q = self.q_layernorm.forward_native(
+                q.reshape(-1, self.index_head_dim)
             ).reshape_as(q)
             q = apply_qsa_rope(self.rotary_emb, positions, q)
             q = q.to(self.indexer_dtype)

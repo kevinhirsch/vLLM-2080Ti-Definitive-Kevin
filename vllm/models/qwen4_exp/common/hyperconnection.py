@@ -29,7 +29,7 @@ Typical usage inside a transformer decoder layer::
     hidden_states = self.mlp_hc.combine(hidden_states, residual)
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn.functional as F
@@ -45,7 +45,7 @@ class HyperConnectionConfig:
 
     hc_count: int = 4
     hidden_size: int = 64
-    params_dtype: torch.dtype = torch.bfloat16
+    params_dtype: torch.dtype = field(default_factory=torch.get_default_dtype)
     mtp_hc: bool = False
     hc_lowrank: int = 16
     rms_norm_eps: float = 1e-6
