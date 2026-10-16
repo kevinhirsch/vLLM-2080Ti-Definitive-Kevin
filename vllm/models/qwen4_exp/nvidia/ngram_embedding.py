@@ -175,6 +175,11 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
             return Qwen4ExpPLEFp8EmbeddingMethod()
         if quant_config is None:
             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+        # Checkpoint formats that keep the table outside the model (GGUF: an
+        # IQ4_NL table gathered on the host) provide their own method.
+        ple_method = getattr(quant_config, "get_qwen4exp_ple_method", None)
+        if ple_method is not None:
+            return ple_method(prefix) or Qwen4ExpPLEUnquantizedEmbeddingMethod()
         if isinstance(quant_config, ModelOptMixedPrecisionConfig):
             if quant_config._resolve_quant_algo(prefix) == "FP8":
                 return Qwen4ExpPLEFp8EmbeddingMethod()
@@ -700,7 +705,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         engram_config = get_current_vllm_config().engram_config
-        embedding_cls = (
+        embedding_cls = getattr(embedding_quant_method, "embedding_cls", None) or (
             Qwen4ExpPLEPinnedHostEmbedding
             if engram_config is not None and engram_config.cpu_offload
             else Qwen4ExpPLEDeviceEmbedding
