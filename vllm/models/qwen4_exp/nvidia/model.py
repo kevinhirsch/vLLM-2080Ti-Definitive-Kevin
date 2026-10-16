@@ -397,7 +397,20 @@ class Qwen4ExpModel(nn.Module):
             if layer_type == "full_attention"
             and getattr(config, "indexer_n_heads", None) is not None
         )
-        self.embed_tokens = VocabParallelEmbedding(self.vocab_size, config.hidden_size)
+        # Only formats whose packs quantize the token embedding (GGUF) get a
+        # quantized embedding method; every other config keeps it unquantized.
+        quant_config = vllm_config.quant_config
+        embed_quant = (
+            quant_config
+            if quant_config is not None and quant_config.get_name() == "gguf"
+            else None
+        )
+        self.embed_tokens = VocabParallelEmbedding(
+            self.vocab_size,
+            config.hidden_size,
+            quant_config=embed_quant,
+            prefix=maybe_prefix(prefix, "embed_tokens"),
+        )
 
         def get_layer(prefix: str) -> Qwen4ExpDecoderLayer:
             layer_idx = extract_layer_index(prefix)
@@ -674,6 +687,7 @@ class Qwen4ExpForCausalLM(
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
+            quant_config=self.quant_config,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
