@@ -397,12 +397,19 @@ def _prefill_logits(
     logits = torch.empty(
         (num_queries, logits_width), dtype=torch.float32, device=q.device
     )
-    # tuned on GB300
-    if k_cache.dtype == torch.float8_e4m3fn:
-        TILE_R, STAGES, num_warps = 32, 2, 8
+    if not current_platform.has_device_capability(80):
+        # Turing (sm75): 64 KiB smem/block. Measured on Quadro RTX 8000
+        # (Triton 3.7): TILE_R=32 needs 80-96 KiB for any BLOCK_N (the fp32
+        # [BLOCK_N, TILE_R*heads] score tile is staged through smem for the
+        # head reduction); TILE_R=16/BLOCK_N=32 compiles at 48 KiB with 72
+        # registers and no spills, the largest zero-spill profile that fits.
+        TILE_R, BLOCK_N, STAGES, num_warps = 16, 32, 2, 8
+    elif k_cache.dtype == torch.float8_e4m3fn:
+        # tuned on GB300
+        TILE_R, BLOCK_N, STAGES, num_warps = 32, 64, 2, 8
     else:
-        TILE_R, STAGES, num_warps = 64, 2, 4
-    BLOCK_N = 64
+        # tuned on GB300
+        TILE_R, BLOCK_N, STAGES, num_warps = 64, 64, 2, 4
     K_TILES = 16
     grid = (
         page_table.shape[0],

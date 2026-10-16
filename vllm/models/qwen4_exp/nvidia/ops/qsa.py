@@ -4,12 +4,15 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import torch
 
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     TritonWarmupTensor,
     triton_scalar_specialization_rep,
 )
+from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
 
@@ -411,6 +414,12 @@ def _compress_qsa_groups_kernel(
     )
 
 
+@lru_cache(maxsize=1)
+def _is_pre_ampere() -> bool:
+    """True on CUDA GPUs below compute capability 8.0 (64 KiB smem/block)."""
+    return bool(current_platform.is_cuda() and not current_platform.has_device_capability(80))
+
+
 def _select_config(
     num_rows: int, num_kv_heads: int, use_prefill_config: bool, num_columns: int
 ) -> tuple[int, int, int, int]:
@@ -440,6 +449,16 @@ def _select_config(
         BLOCK_N, target_splits, num_warps = 64, 4, 2
     else:
         BLOCK_N, target_splits, num_warps = 64, 1, 2
+    if _is_pre_ampere():
+        # Turing (sm75) has 64 KiB of shared memory per block. With
+        # HEAD_DIM=256 and num_stages=2 the 64- and 32-column K/V tiles do not
+        # fit (Triton OutOfResources at compile). A 16-column tile with four
+        # warps launches (thecyberdevl/vllm-flashnext-turing 0004, measured on
+        # RTX 8000); fewer splits keep the merge kernel's BLOCK_SPLITS x
+        # HEAD_DIM fp32 reduce under Turing's 255-register budget.
+        BLOCK_N = 16
+        num_warps = 4
+        target_splits = min(target_splits, 16)
     num_tiles = triton.cdiv(num_columns, BLOCK_N)
     # Never more splits than tiles, never empty.
     num_splits = min(target_splits, num_tiles)
