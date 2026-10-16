@@ -94,7 +94,7 @@ class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
         params_dtype: torch.dtype,
         padding_size: int,
         prefix: str,
-        quant_config: QuantizationConfig | None,
+        quant_config: QuantizationConfig | None = None,
         embedding_method: "Qwen4ExpPLEEmbeddingMethod",
         num_ngram_heads: int = 1,
         max_total_tokens: int = 0,
