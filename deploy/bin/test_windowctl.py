@@ -859,3 +859,28 @@ def test_a_step_never_runs_past_the_window_deadline(world, tmp_path, monkeypatch
     assert out["status"] == "ok", out.get("why")
     assert 60 <= seen["t5-ab-long"] <= 600  # capped at what is left of the 600 s budget
     assert seen["t5-ab-short"] == 30  # a step that fits keeps its own timeout
+
+
+def test_bench_marker_wraps_timing_steps_only(world, tmp_path, monkeypatch):
+    """2026-10-17: a 27B profile ladder called its tool directly (not run_arm.sh) and ran with no BENCH marker, so lane
+    compiles kept running under a timing step. windowctl now writes WINDOWCTL_BENCH_FILE around every run step unless
+    the step says "timing": false, and always removes it afterwards."""
+    (tmp_path / "rel").mkdir()
+    bench = tmp_path / "BENCH"
+    monkeypatch.setenv("WINDOWCTL_BENCH_FILE", str(bench))
+    seen = {}
+    real = world.unit_run
+
+    def run(lane, job, cmd, timeout_s=None, **kw):
+        seen[job] = bench.exists()
+        return real(lane, job, cmd, timeout_s=timeout_s, **kw)
+    monkeypatch.setattr(unitrun, "run", run)
+    s = spec(tmp_path, steps=[
+        {"name": "measure", "run": "true"},
+        {"name": "gate", "run": "true", "timing": False},
+    ])
+    out = wc.Window(s).run()
+    assert out["status"] == "ok", out.get("why")
+    assert seen["t5-ab-measure"] is True
+    assert seen["t5-ab-gate"] is False
+    assert not bench.exists()

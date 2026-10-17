@@ -1051,8 +1051,23 @@ class Window:
         if left < timeout_s:
             self.log(f"step {st['name']}: timeout {timeout_s} s capped at the window's remaining {max(60, left)} s")
             timeout_s = max(60, left)
-        res = unitrun.run(self.lane, f"{self.wid}-{st['name']}", argv, timeout_s=timeout_s, env=env,
-                          cwd=rendered.get("cwd"), out=out)
+        # Timing marker (WINDOWCTL_BENCH_FILE, set by the lane's window launcher): present while a run step measures, so
+        # lanes start nothing heavy. Every run step counts as timing unless it declares "timing": false (smoke gates,
+        # ABI checks, CPU compares). Covers steps that bypass run_arm.sh (2026-10-17: a 27B profile ladder ran unmarked).
+        bench = os.environ.get("WINDOWCTL_BENCH_FILE", "")
+        timed = bool(bench) and st.get("timing", True) is not False
+        if timed:
+            with open(bench, "w") as fh:
+                fh.write(f"{self.wid} {st['name']} {time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n")
+        try:
+            res = unitrun.run(self.lane, f"{self.wid}-{st['name']}", argv, timeout_s=timeout_s, env=env,
+                              cwd=rendered.get("cwd"), out=out)
+        finally:
+            if timed:
+                try:
+                    os.remove(bench)
+                except FileNotFoundError:
+                    pass
         missing = [p for p in (rendered.get("outputs") or []) if not os.path.exists(p)]
         res["missing_outputs"] = missing
         if snaps:
