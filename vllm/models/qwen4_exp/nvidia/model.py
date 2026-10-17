@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen4Exp model."""
 
+import contextlib
 from collections.abc import Iterable
 from itertools import islice
 
 import torch
 from torch import nn
+from torch.autograd import profiler as _torch_profiler
 
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
@@ -81,6 +83,17 @@ from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .ple_layer import Qwen4ExpPLELayer
 from .qsa import Qwen4ExpQSAAttention, finalize_qsa_kv_cache_scales
 from .hyperconnection import convert_hc_weights_w8
+
+
+def _profile_scope(component: str):
+    """An ``nm9:<component>`` scope while a torch profiler runs, else a no-op (a ~20 ns flag read).
+
+    tools/qwen4exp/latency_map.py files every generic kernel launched inside the scope (cuBLAS/cutlass and EXL3
+    GEMVs, copies, top-k gating) under that component, instead of guessing from the kernel name. Serving and
+    CUDA-graph capture run with no profiler active, so they never open a scope."""
+    if _torch_profiler._is_profiler_enabled:
+        return torch.profiler.record_function("nm9:" + component)
+    return contextlib.nullcontext()
 
 
 def without_modelopt_fp4(
@@ -298,36 +311,42 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
             if input_ids is None or query_start_loc is None or ngram_context is None:
                 raise RuntimeError("PLE inputs were not prepared")
-            hidden_states = hidden_states + self.ple(
-                hidden_states,
-                input_ids,
-                query_start_loc,
-                ngram_context,
-            )
+            with _profile_scope("ple_ngram"):
+                hidden_states = hidden_states + self.ple(
+                    hidden_states,
+                    input_ids,
+                    query_start_loc,
+                    ngram_context,
+                )
 
         # Fuse a pending combine with this HC module's mix when possible.
-        if prev_block_output is not None:
-            hidden_states, block_input, injection = attn_hc.combine_and_mix(
-                hidden_states, prev_block_output, prev_injection
-            )
-        else:
-            hidden_states, block_input, injection = attn_hc.mix(hidden_states)
+        with _profile_scope("hyperconn"):
+            if prev_block_output is not None:
+                hidden_states, block_input, injection = attn_hc.combine_and_mix(
+                    hidden_states, prev_block_output, prev_injection
+                )
+            else:
+                hidden_states, block_input, injection = attn_hc.mix(hidden_states)
 
         if self.layer_type == "linear_attention":
-            attn_out = self.linear_attn(hidden_states=block_input)
+            with _profile_scope("gdn"):
+                attn_out = self.linear_attn(hidden_states=block_input)
         elif self.layer_type == "full_attention":
-            attn_out = self.self_attn(
-                hidden_states=block_input,
-                positions=positions,
-            )
+            with _profile_scope("qsa_attention"):
+                attn_out = self.self_attn(
+                    hidden_states=block_input,
+                    positions=positions,
+                )
         else:
             raise ValueError("Invalid layer_type")
 
         mlp_hc = self.mlp_hyper_connection
-        hidden_states, block_input, injection = mlp_hc.combine_and_mix(
-            hidden_states, attn_out, injection
-        )
-        mlp_out = self.mlp(block_input)
+        with _profile_scope("hyperconn"):
+            hidden_states, block_input, injection = mlp_hc.combine_and_mix(
+                hidden_states, attn_out, injection
+            )
+        with _profile_scope("moe_experts"):
+            mlp_out = self.mlp(block_input)
         return hidden_states, mlp_out, injection
 
 
@@ -588,9 +607,10 @@ class Qwen4ExpModel(nn.Module):
         # the sampled single stream and the materialized multi-stream state.
         final_mixer = self.hyper_connection_mixer
         assert final_mixer is not None
-        multi_hidden, sample_hidden_states, _ = final_mixer.combine_and_mix(
-            hidden_states, block_output, injection
-        )
+        with _profile_scope("hyperconn"):
+            multi_hidden, sample_hidden_states, _ = final_mixer.combine_and_mix(
+                hidden_states, block_output, injection
+            )
         if self._mtp_hidden_buffer is not None:
             # Capture the pre-final-mixer multi-stream hidden state
             # [T, hc_count*H] for the MTP drafter (zero extra compute:
@@ -854,7 +874,8 @@ class Qwen4ExpForCausalLM(
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        return self.logits_processor(self.lm_head, hidden_states)
+        with _profile_scope("lm_head"):
+            return self.logits_processor(self.lm_head, hidden_states)
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return self.model._mtp_hidden_buffer
