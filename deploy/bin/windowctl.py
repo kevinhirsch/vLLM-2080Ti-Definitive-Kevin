@@ -131,6 +131,17 @@ class SpecError(Exception):
     pass
 
 
+# Disk floor (review 2026-10-17: root at 91-94% while lanes download models). Measured 2026-10-17: a window writes
+# 10-420 MB (ramp/KLD .. map with traces) plus up to ~1.1 GB of fresh vLLM compile + Triton cache; the floor is 2x
+# that. Below it the window cannot write its caches, and the restore boot itself may fail. Checked before the window
+# opens and between steps (abort = restore while there is still room). Spec override: disk_floor_gb.
+DISK_FLOOR_GB = float(os.environ.get("WINDOWCTL_DISK_FLOOR_GB", "3"))
+
+
+def free_gb(path=None):
+    return shutil.disk_usage(path or os.path.expanduser("~")).free / 2**30
+
+
 class WindowAbort(Exception):
     def __init__(self, status, why):
         super().__init__(why)
@@ -697,6 +708,11 @@ class Window:
         busy = gpuguard.busy_state()
         if busy.get("busy") and busy.get("window") != self.wid:
             problems.append(f"GPU busy signal held by {busy.get('by')} ({busy.get('reason')})")
+        floor = float(spec.get("disk_floor_gb", DISK_FLOOR_GB))
+        free = free_gb()
+        if free < floor:
+            problems.append(f"only {free:.1f} GB free on the home filesystem (< {floor:g} GB): a window needs room for "
+                            "its caches and logs, and the restore boot needs some too")
         return problems
 
     def take_snapshot(self):
@@ -835,6 +851,11 @@ class Window:
             raise WindowAbort("budget", f"window budget max_s={self.max_s:.0f} spent")
         if not self.dry and not overnight_ok():
             raise WindowAbort("overnight-end", "06:00 reached: engine test windows run overnight only (Kevin 2026-10-16)")
+        floor = float(self.spec.get("disk_floor_gb", DISK_FLOOR_GB))
+        free = free_gb()
+        if not self.dry and free < floor:
+            raise WindowAbort("disk-low", f"{free:.1f} GB free on the home filesystem (< {floor:g} GB): restoring "
+                                          "production while there is still room")
         sp = spend_usd()
         if sp is not None and sp >= float(self.spec.get("spend_pause_usd", 20)):
             raise WindowAbort("paused-spend", f"gateway spend ${sp:.2f} reached the pause threshold ${self.spec.get('spend_pause_usd', 20)}")

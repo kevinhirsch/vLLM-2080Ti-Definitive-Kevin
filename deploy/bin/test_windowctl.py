@@ -293,6 +293,30 @@ def test_spend_crossing_the_pause_threshold_mid_window_pauses_and_restores(world
     assert world.lease_closed == ["LEASE1"]
 
 
+def test_refused_when_the_disk_is_below_the_floor(world, tmp_path, monkeypatch):
+    """Review 2026-10-17: root at 91-94% while lanes download models. A window that cannot write its caches fails,
+    and so can the restore boot: refuse before the engine stops."""
+    monkeypatch.setattr(wc, "free_gb", lambda path=None: 1.2)
+    s = wc.Window(spec(tmp_path)).run()
+    assert s["status"] == "refused" and any("GB free" in p for p in s["why"])
+    assert not world.units
+    monkeypatch.setattr(wc, "free_gb", lambda path=None: 2.0)
+    s = wc.Window(spec(tmp_path, results=str(tmp_path / "r2"), disk_floor_gb=1.5)).run()  # spec override
+    assert s["status"] != "refused" or not any("GB free" in p for p in s["why"])
+
+
+def test_disk_running_low_mid_window_aborts_and_restores(world, tmp_path, monkeypatch):
+    (tmp_path / "rel").mkdir()
+    calls = {"n": 0}
+
+    def free(path=None):  # another lane's download fills the disk after the window opened
+        calls["n"] += 1
+        return 40.0 if calls["n"] <= 2 else 2.5
+    monkeypatch.setattr(wc, "free_gb", free)
+    s = wc.Window(spec(tmp_path)).run()
+    assert s["status"] == "disk-low" and s["restore"]["ok"]
+
+
 def test_new_xid_aborts_and_is_attributed_to_its_unit(world, tmp_path, monkeypatch):
     (tmp_path / "rel").mkdir()
     orig = world.unit_run
