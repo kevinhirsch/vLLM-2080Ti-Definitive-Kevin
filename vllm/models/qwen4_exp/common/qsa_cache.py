@@ -728,13 +728,17 @@ class QSAStateBackend(AttentionBackend):
     """Key-only dummy backend for out-of-band QSA side-cache operations."""
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16, torch.float16]
-    # fp8 entries allow the optional e4m3 compressed indexer cache.
+    # fp8 entries allow the optional e4m3 compressed indexer cache. "int8"
+    # is accepted for validation only: the side caches take their dtype
+    # explicitly from the indexer (model dtype) and stay fp16/bf16 when the
+    # main cache is int8.
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
         "bfloat16",
         "float16",
         "fp8",
         "fp8_e4m3",
+        "int8",
     ]
 
     @staticmethod

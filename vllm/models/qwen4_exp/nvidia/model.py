@@ -79,7 +79,7 @@ from ..config import Qwen4ExpConfig
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .ple_layer import Qwen4ExpPLELayer
-from .qsa import Qwen4ExpQSAAttention
+from .qsa import Qwen4ExpQSAAttention, finalize_qsa_kv_cache_scales
 
 
 def without_modelopt_fp4(
@@ -639,6 +639,9 @@ class Qwen4ExpModel(nn.Module):
             weights,
             mapper=mapper,
         )
+        # int8 main cache only: turn the loaded fp8 k/v scales into the int8
+        # storage scales (no-op for fp16/bf16 caches).
+        finalize_qsa_kv_cache_scales(self)
         return loaded
 
 

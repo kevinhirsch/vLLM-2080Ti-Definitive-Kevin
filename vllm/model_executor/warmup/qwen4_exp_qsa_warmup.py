@@ -82,6 +82,8 @@ def qwen4_exp_qsa_triton_warmup(worker: "Worker") -> None:
         block_table_for(owner.layer_name),
         num_query_heads=owner.num_heads,
         selection_width=indexer.output_width,
+        # int8 caches hold codes; Q and the upcast tiles use the model dtype.
+        query_dtype=owner.attn_dtype,
     )
     logger.info(
         "Warmed up Qwen4Exp QSA sparse attention kernels: %s.",

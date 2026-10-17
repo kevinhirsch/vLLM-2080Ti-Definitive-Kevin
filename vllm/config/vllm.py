@@ -3159,6 +3159,24 @@ class VllmConfig:
         return self
 
     @model_validator(mode="after")
+    def validate_int8_kv_cache_model_family(self) -> "VllmConfig":
+        """``--kv-cache-dtype int8`` is implemented only by the Qwen4Exp QSA
+        main cache (per-layer checkpoint scales, dequantized inside the QSA
+        Triton kernel). Every other attention backend lists explicit cache
+        dtypes and would reject it later with a less specific message; the
+        draft model, when present, must be the matching MTP head."""
+        if self.model_config is None or self.cache_config.cache_dtype != "int8":
+            return self
+        architectures = tuple(self.model_config.architectures or ())
+        if not any(arch.startswith("Qwen4Exp") for arch in architectures):
+            raise ValueError(
+                "--kv-cache-dtype int8 is only supported for the Qwen4Exp "
+                f"model family (got architectures={list(architectures)}). "
+                "Use 'auto', 'float16' or 'bfloat16' instead."
+            )
+        return self
+
+    @model_validator(mode="after")
     def validate_mamba_block_size(self) -> "VllmConfig":
         if self.model_config is None:
             return self

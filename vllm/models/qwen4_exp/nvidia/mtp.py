@@ -57,6 +57,7 @@ from .model import (
     Qwen4ExpMixtureOfExperts,
     Qwen4ExpSparseMoeBlock,
 )
+from .qsa import finalize_qsa_kv_cache_scales
 
 
 def _remap_ignored_layers(
@@ -360,7 +361,10 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             self,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(weights, mapper=mapper)
+        loaded = loader.load_weights(weights, mapper=mapper)
+        # Draft QSA layers own their own int8 main-cache scales.
+        finalize_qsa_kv_cache_scales(self)
+        return loaded
 
 
 class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):

@@ -14,6 +14,7 @@ from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import (
     set_default_quant_scales,
 )
@@ -50,12 +51,54 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from ..common.qsa_cache import QSAForwardMetadata
+from ..common.qsa_int8 import (
+    INT8_KV_FALLBACK_SCALE,
+    int8_kv_scale_from_fp8_scale,
+)
 from . import model
 from .indexer_qsa import QSAIndexer
 
 
 _QSA_DTYPES = (torch.bfloat16, torch.float16)
-_QSA_KV_CACHE_DTYPES = ("auto", "bfloat16", "float16")
+# "int8": per-layer symmetric int8 main cache (thecyberdevl 0026), dequantized
+# inside the QSA Triton kernel; the side caches stay in the model dtype.
+_QSA_KV_CACHE_DTYPES = ("auto", "bfloat16", "float16", "int8")
+
+logger = init_logger(__name__)
+
+# Opt-in K/V amax recorder for checkpoints that carry no k_scale/v_scale (EXL3
+# packs): run once with a 16-bit cache and VLLM_QWEN4_QSA_KV_AMAX_DUMP=<path>; each
+# rank writes <path>.rank<N>.json at exit, and tools/qwen4exp/kvscales_from_amax.py
+# turns those into model-kvscales.safetensors for --kv-cache-dtype int8.
+_KV_AMAX_DUMP = __import__("os").environ.get("VLLM_QWEN4_QSA_KV_AMAX_DUMP", "")
+_KV_AMAX_OWNERS: list = []
+
+
+def _dump_kv_amax() -> None:
+    import json
+    import os
+
+    if not _KV_AMAX_OWNERS:
+        return
+    try:
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        rank = get_tensor_model_parallel_rank()
+    except Exception:  # noqa: BLE001
+        rank = 0
+    table = {
+        owner.layer_name: [float(owner._kv_amax[0]), float(owner._kv_amax[1])]
+        for owner in _KV_AMAX_OWNERS
+        if owner._kv_amax is not None
+    }
+    path = f"{_KV_AMAX_DUMP}.rank{rank}.json"
+    with open(path, "w") as fh:
+        json.dump(table, fh, indent=1, sort_keys=True)
+    logger.info("QSA K/V amax for %d layers written to %s", len(table), path)
+
+
+if _KV_AMAX_DUMP:
+    __import__("atexit").register(_dump_kv_amax)
 
 
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -75,6 +118,7 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
         "auto",
         "bfloat16",
         "float16",
+        "int8",
     ]
 
     @staticmethod
@@ -122,8 +166,9 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             )
         if self.kv_cache_dtype not in _QSA_KV_CACHE_DTYPES:
             raise NotImplementedError(
-                "Qwen4Exp QSA requires an unquantized 16-bit main KV cache"
+                "Qwen4Exp QSA requires a 16-bit or --kv-cache-dtype int8 main KV cache"
             )
+        self.kv_int8 = self.kv_cache_dtype == "int8"
         self.supports_quant_query_input = False
 
     def forward_qsa(
@@ -159,7 +204,16 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         logical_indices = topk_buffer[:num_tokens]
         token_to_req = token_to_req[:num_tokens]
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
-        if key_cache.dtype != query.dtype or query.dtype not in _QSA_DTYPES:
+        k_scale = v_scale = 1.0
+        if query.dtype not in _QSA_DTYPES:
+            raise NotImplementedError("Qwen4Exp QSA requires a BF16/FP16 query")
+        if self.kv_int8:
+            if key_cache.dtype != torch.int8:
+                raise NotImplementedError(
+                    "Qwen4Exp QSA int8 mode requires an INT8 main KV cache"
+                )
+            k_scale, v_scale = layer.qsa_int8_scales()
+        elif key_cache.dtype != query.dtype:
             raise NotImplementedError("Qwen4Exp QSA requires matching BF16/FP16 Q/K/V")
 
         from .ops.qsa import qsa_sparse_paged_attention
@@ -173,6 +227,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             token_to_req,
             use_prefill_config,
             output[:num_tokens],
+            k_scale,
+            v_scale,
         )
         return output
 
@@ -201,7 +257,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             raise NotImplementedError("Qwen4Exp QSA requires a BF16 or FP16 model")
         if cache_config.cache_dtype not in _QSA_KV_CACHE_DTYPES:
             raise NotImplementedError(
-                "Qwen4Exp QSA requires an unquantized 16-bit main KV cache"
+                "Qwen4Exp QSA requires a 16-bit or --kv-cache-dtype int8 main KV cache"
             )
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
             raise NotImplementedError("Qwen4Exp QSA does not support KV quantization")
@@ -301,10 +357,24 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, model_config
         )
-        if self.kv_cache_torch_dtype != model_config.dtype:
+        # Q (and the kernel's upcast K/V operands) always use the model dtype.
+        self.attn_dtype = model_config.dtype
+        self.kv_int8 = self.kv_cache_dtype == "int8"
+        if self.kv_int8:
+            if self.kv_cache_torch_dtype != torch.int8:
+                raise RuntimeError("int8 KV cache resolved to a non-int8 dtype")
+        elif self.kv_cache_torch_dtype != model_config.dtype:
             raise NotImplementedError(
-                "Qwen4Exp QSA requires the KV cache dtype to equal the model dtype"
+                "Qwen4Exp QSA requires the KV cache dtype to equal the model dtype "
+                "(or --kv-cache-dtype int8)"
             )
+        # int8 storage scales, derived once from the loaded fp8-contract
+        # _k_scale/_v_scale buffers (finalize_kv_cache_scales).
+        self._int8_scales: tuple[float, float] | None = None
+        # device-side running amax of the stored K and V rows (opt-in recorder)
+        self._kv_amax: torch.Tensor | None = None
+        if _KV_AMAX_DUMP and not self.kv_int8:
+            _KV_AMAX_OWNERS.append(self)
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
         set_default_quant_scales(self, register_buffer=True)
@@ -354,6 +424,52 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
 
+    def finalize_kv_cache_scales(self) -> tuple[float, float]:
+        """Derive the int8 storage scales from the loaded fp8 scales (thecyberdevl 0026).
+
+        Checkpoint ``k_scale``/``v_scale`` follow the fp8 contract ``s = max_abs / 448``;
+        the int8 cache stores ``round(x / s_int8)`` with ``s_int8 = s * 448 / 127``.
+        A buffer still at its 1.0 default means the loader left it alone: the
+        layer's scale is then read from ``model-kvscales.safetensors``, and only if
+        that fails does the fixed fallback (|x| <= 32 assumed) apply, logged.
+        Called once after weight loading; the values are host constants passed to
+        the Triton kernels (``_run_qsa`` runs outside CUDA-graph capture).
+        """
+        if self._int8_scales is not None:
+            return self._int8_scales
+        scales: list[float] = []
+        for side in ("k", "v"):
+            fp8_scale = float(getattr(self, f"_{side}_scale").item())
+            if fp8_scale == 1.0 or not fp8_scale > 0.0:
+                file_scale = _kv_scale_from_checkpoint_file(self.layer_name, side)
+                if file_scale is not None and file_scale > 0.0:
+                    fp8_scale = file_scale
+            if fp8_scale == 1.0 or not fp8_scale > 0.0:
+                logger.warning(
+                    "%s: no checkpoint %s_scale; int8 KV cache uses the fixed "
+                    "fallback scale %.6f",
+                    self.layer_name,
+                    side,
+                    INT8_KV_FALLBACK_SCALE,
+                )
+                scales.append(INT8_KV_FALLBACK_SCALE)
+            else:
+                scales.append(int8_kv_scale_from_fp8_scale(fp8_scale))
+        self._int8_scales = (scales[0], scales[1])
+        logger.info(
+            "%s: int8 KV cache scales k=%.6f v=%.6f",
+            self.layer_name,
+            scales[0],
+            scales[1],
+        )
+        return self._int8_scales
+
+    def qsa_int8_scales(self) -> tuple[float, float]:
+        """(k_scale, v_scale) of the int8 main cache; finalizes lazily."""
+        if self._int8_scales is None:
+            return self.finalize_kv_cache_scales()
+        return self._int8_scales
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         return FullAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
@@ -399,13 +515,41 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         if selected.shape != (num_tokens, self.indexer.packed_output_width):
             raise RuntimeError("QSA indexer returned an invalid selection shape")
         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
-        impl.do_kv_cache_update(
-            self,
-            key,
-            value,
-            self.kv_cache,
-            main_metadata.slot_mapping,
-        )
+        if self.kv_int8:
+            # The cached rows are the same post-rotary keys the fp16 path stores.
+            from .ops.qsa import qsa_quantize_store_kv
+
+            k_scale, v_scale = self.qsa_int8_scales()
+            key_cache, value_cache = self.kv_cache.transpose(1, 2).split(
+                self.head_dim, dim=-1
+            )
+            qsa_quantize_store_kv(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                main_metadata.slot_mapping,
+                k_scale,
+                v_scale,
+            )
+        else:
+            impl.do_kv_cache_update(
+                self,
+                key,
+                value,
+                self.kv_cache,
+                main_metadata.slot_mapping,
+            )
+            if _KV_AMAX_DUMP and num_tokens:
+                cur = torch.stack(
+                    (
+                        key[:num_tokens].abs().amax().float(),
+                        value[:num_tokens].abs().amax().float(),
+                    )
+                )
+                self._kv_amax = (
+                    cur if self._kv_amax is None else torch.maximum(self._kv_amax, cur)
+                )
         impl.forward_qsa(
             self,
             query,
@@ -447,8 +591,59 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         return output
 
 
+def finalize_qsa_kv_cache_scales(module: nn.Module) -> None:
+    """Derive int8 cache scales for every QSA owner under ``module`` (no-op for 16-bit)."""
+    for submodule in module.modules():
+        if isinstance(submodule, Qwen4ExpQSAAttention) and submodule.kv_int8:
+            submodule.finalize_kv_cache_scales()
+
+
+_KV_SCALE_FILE_CACHE: dict = {}
+
+
+def _kv_scale_from_checkpoint_file(layer_name: str, side: str):
+    """Per-layer fp8 K/V scale from <model>/model-kvscales.safetensors, or None."""
+    import os
+    import re
+
+    m = re.search(r"layers\.(\d+)\.", layer_name)
+    if m is None:
+        return None
+    try:
+        from vllm.config import get_current_vllm_config
+
+        model_dir = get_current_vllm_config().model_config.model
+    except Exception:  # noqa: BLE001
+        return None
+    path = os.path.join(model_dir, "model-kvscales.safetensors")
+    if not os.path.isfile(path):
+        return None
+    table = _KV_SCALE_FILE_CACHE.get(path)
+    if table is None:
+        table = {}
+        try:
+            from safetensors import safe_open
+
+            with safe_open(path, framework="pt", device="cpu") as f:
+                for k in f.keys():
+                    table[k] = float(f.get_tensor(k).float().reshape(-1)[0].item())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("could not read %s: %s", path, exc)
+        _KV_SCALE_FILE_CACHE[path] = table
+    i = m.group(1)
+    for key in (
+        f"model.language_model.layers.{i}.self_attn.{side}_scale",
+        f"language_model.model.layers.{i}.self_attn.{side}_scale",
+        f"model.layers.{i}.self_attn.{side}_scale",
+    ):
+        if key in table:
+            return table[key]
+    return None
+
+
 __all__ = [
     "QSAIndexer",
+    "finalize_qsa_kv_cache_scales",
     "Qwen4ExpQSAAttention",
     "Qwen4ExpQSAFlashAttentionBackend",
     "Qwen4ExpQSAFlashAttentionImpl",
