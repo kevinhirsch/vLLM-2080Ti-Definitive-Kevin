@@ -48,23 +48,32 @@ def _filler(a, i):
 def stream_one(base, model, i, a):
     pad = _filler(a, i)
     body = {"model": model, "prompt": f"{pad}\nWrite a detailed technical essay about {TOPICS[i % len(TOPICS)]} "
-            f"(variant {i}).\n\n", "max_tokens": a.tokens, "temperature": 0.0, "ignore_eos": True, "stream": True}
+            f"(variant {i}).\n\n", "max_tokens": a.tokens, "temperature": 0.0, "ignore_eos": True, "stream": True,
+            "stream_options": {"include_usage": True}}
     req = urllib.request.Request(base + "/v1/completions", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
     t0 = time.perf_counter()
     ttft = None
-    n = 0
+    chunks = 0
+    usage_tokens = None
     with urllib.request.urlopen(req, timeout=a.request_timeout_s) as r:
         for line in r:
             line = line.strip()
             if not line.startswith(b"data:") or line == b"data: [DONE]":
                 continue
-            ch = json.loads(line[5:])["choices"][0]
-            if ch.get("text"):
+            msg = json.loads(line[5:])
+            if msg.get("usage"):
+                usage_tokens = msg["usage"].get("completion_tokens")
+            if not msg.get("choices"):
+                continue
+            if msg["choices"][0].get("text"):
                 if ttft is None:
                     ttft = time.perf_counter() - t0
-                n += 1
-    return {"ttft": ttft, "tokens": n, "decode_s": time.perf_counter() - t0 - (ttft or 0)}
+                chunks += 1
+    # The server's own completion count, not the SSE chunk count. A busy API server coalesces several tokens into
+    # one chunk (W2c fp16-state ramp: every C5+ point read as "short output" at 64 free lanes, no preemption).
+    n = usage_tokens if usage_tokens is not None else chunks
+    return {"ttft": ttft, "tokens": n, "chunks": chunks, "decode_s": time.perf_counter() - t0 - (ttft or 0)}
 
 
 def measure(base, model, c, a):
