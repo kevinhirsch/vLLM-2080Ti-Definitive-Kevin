@@ -23,6 +23,8 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 HC_W8_GROUP = 64
+# Kill switch for the one-token GEMV path below (0: every M uses the tiled GEMM).
+_GEMV = __import__("os").environ.get("VLLM_QWEN4_HC_W8_GEMV", "1") != "0"
 
 # Only what varies at runtime: M (the token count; specializing it on divisibility by 16 compiled a new variant per
 # batch-size class mid-serving, W2j saw 4) and x's alignment (x may be a view at any offset). N, K and the strides
@@ -81,6 +83,99 @@ def _w8a16_gemm_kernel(
         acc,
         mask=m_ok[:, None] & n_ok[None, :],
     )
+
+
+# One-token path (M <= _GEMV_MAX_M: decode at low concurrency). W2o traced the GEMM above at ~110 us per call at C1
+# whatever the projection (3.4 MB, ~30 GB/s, 21.7 ms per token over 192 calls, against ~3.5 ms for cuBLAS on the
+# same matrices in F16). Here each program reads [BLOCK_N, GROUP] weight tiles whose rows are GROUP contiguous int8
+# (K is the contiguous axis in memory and of the tile), reduces with tl.sum instead of a 16-row tl.dot, and splits K
+# only by divisors of the group count, so no K mask stops the loads from vectorizing.
+_GEMV_MAX_M = 4
+_GEMV_BLOCK_N = 32
+
+
+@triton.jit(do_not_specialize=_W8_NO_SPECIALIZE)
+def _w8a16_gemv_kernel(
+    x_ptr,
+    q_ptr,
+    s_ptr,
+    out_ptr,
+    M,
+    N,
+    K,
+    stride_xm,
+    stride_qn,
+    stride_sn,
+    stride_os,
+    stride_om,
+    GROUP: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    M_ROWS: tl.constexpr,
+    K_PER_SPLIT: tl.constexpr,
+) -> None:
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, GROUP)
+    rm = tl.arange(0, M_ROWS)
+    n_ok = rn < N
+    m_ok = rm < M
+    acc = tl.zeros((M_ROWS, BLOCK_N), dtype=tl.float32)
+    k_start = pid_k * K_PER_SPLIT
+    for kk in range(0, K_PER_SPLIT, GROUP):
+        k = k_start + kk
+        q = tl.load(q_ptr + rn[:, None] * stride_qn + (k + rk)[None, :], mask=n_ok[:, None], other=0)
+        x = tl.load(x_ptr + rm[:, None] * stride_xm + (k + rk)[None, :], mask=m_ok[:, None], other=0.0)
+        sc = tl.load(s_ptr + rn * stride_sn + k // GROUP, mask=n_ok, other=0.0).to(tl.float32)
+        part = tl.sum(x.to(tl.float32)[:, None, :] * q.to(tl.float32)[None, :, :], axis=2)  # [M_ROWS, BLOCK_N]
+        acc += part * sc[None, :]
+    tl.store(
+        out_ptr + pid_k * stride_os + rm[:, None] * stride_om + rn[None, :],
+        acc,
+        mask=m_ok[:, None] & n_ok[None, :],
+    )
+
+
+def _gemv_rows(m: int) -> int:
+    """The M_ROWS bucket (a constexpr) for m <= _GEMV_MAX_M tokens: 1, 2 or 4."""
+    return 1 if m <= 1 else (2 if m <= 2 else 4)
+
+
+def _gemv_split(n: int, k: int, group: int) -> int:
+    """The smallest divisor of the group count that gives about two programs per SM (68 on a 2080 Ti); every split
+    then covers whole groups, so the kernel needs no K mask. The choice depends on the shape only, not on M."""
+    groups = k // group
+    programs = triton.cdiv(n, _GEMV_BLOCK_N)
+    for split in range(1, groups + 1):
+        if groups % split == 0 and programs * split >= 136:
+            return split
+    return groups
+
+
+def _launch_gemv(x2: torch.Tensor, q: torch.Tensor, s: torch.Tensor, group: int, split: int, rows: int) -> torch.Tensor:
+    m, k = x2.shape
+    n = q.shape[0]
+    partial = torch.empty((split, m, n), dtype=torch.float32, device=x2.device)
+    _w8a16_gemv_kernel[(triton.cdiv(n, _GEMV_BLOCK_N), split)](
+        x2,
+        q,
+        s,
+        partial,
+        m,
+        n,
+        k,
+        x2.stride(0),
+        q.stride(0),
+        s.stride(0),
+        partial.stride(0),
+        partial.stride(1),
+        GROUP=group,
+        BLOCK_N=_GEMV_BLOCK_N,
+        M_ROWS=rows,
+        K_PER_SPLIT=(k // group) // split * group,
+        num_warps=4,
+    )
+    return partial
 
 
 def quantize_w8_groupwise(
@@ -166,7 +261,13 @@ def _warm_up(x2: torch.Tensor, q: torch.Tensor, s: torch.Tensor, group: int) -> 
             continue
         seen.add(k_per_split)
         _launch(probe, q, s, group, sp)
-    return len(seen)
+    launches = len(seen)
+    if _GEMV and k % group == 0:
+        gsplit = _gemv_split(n, k, group)
+        for rows in (1, 2, 4):  # every M_ROWS bucket _gemv_rows returns
+            _launch_gemv(x2.new_zeros((rows, k)), q, s, group, gsplit, rows)
+            launches += 1
+    return launches
 
 
 def _w8a16_linear_impl(x: torch.Tensor, q: torch.Tensor, s: torch.Tensor, group: int) -> torch.Tensor:
@@ -178,8 +279,12 @@ def _w8a16_linear_impl(x: torch.Tensor, q: torch.Tensor, s: torch.Tensor, group:
     n = q.shape[0]
     assert q.shape == (n, k) and s.shape == (n, k // group)
     _warm_up(x2, q, s, group)
-    split = _split_k(m, n, k, _BLOCK_M, _BLOCK_N, group)
-    partial = _launch(x2, q, s, group, split)
+    if _GEMV and m <= _GEMV_MAX_M:
+        partial = _launch_gemv(x2, q, s, group, _gemv_split(n, k, group), _gemv_rows(m))
+        split = partial.shape[0]
+    else:
+        split = _split_k(m, n, k, _BLOCK_M, _BLOCK_N, group)
+        partial = _launch(x2, q, s, group, split)
     y = partial[0] if split == 1 else partial.sum(dim=0)  # deterministic reduction
     return y.to(x.dtype).reshape(*lead, n)
 
