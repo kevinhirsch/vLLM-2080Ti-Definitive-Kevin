@@ -171,6 +171,33 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         self.kv_int8 = self.kv_cache_dtype == "int8"
         self.supports_quant_query_input = False
 
+    def do_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        # FlashAttentionImpl.do_kv_cache_update calls the reshape_and_cache_flash that
+        # flash_attn.py imports only when flash-attn is available, which it never is on
+        # SM75. On Turing the first K/V write hit a NameError, right after the profile
+        # run. The scatter is vLLM's own cache kernel, the one fa_utils binds on CUDA, so
+        # call it directly with the same (B, H, N, 2D) -> 2 x (B, N, H, D) views.
+        from vllm._custom_ops import reshape_and_cache_flash
+
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        reshape_and_cache_flash(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            self.kv_cache_dtype,
+            layer._k_scale,
+            layer._v_scale,
+        )
+
     def forward_qsa(
         self,
         layer: torch.nn.Module,
