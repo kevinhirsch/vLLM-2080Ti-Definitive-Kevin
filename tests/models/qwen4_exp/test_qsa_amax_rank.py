@@ -18,6 +18,8 @@ class _Owner:
     def __init__(self, name, k, v):
         self.layer_name = name
         self._kv_amax = torch.tensor([k, v])
+        self._kv_amax_rows = torch.tensor(1)
+        self._kv_amax_nonfinite = torch.tensor(0)
 
 
 @pytest.fixture
@@ -38,7 +40,7 @@ def test_rank_taken_at_registration_survives_group_teardown(recorder, monkeypatc
     Q._kv_amax_register(_Owner("model.language_model.layers.7.self_attn.attn", 8.0, 2.0))
     monkeypatch.setattr(dist, "get_tensor_model_parallel_rank", _groups_destroyed)  # what atexit sees
     Q._dump_kv_amax()
-    assert sorted(p.name for p in recorder.iterdir()) == ["kvamax.rank1.json"]
+    assert sorted(p.name for p in recorder.glob("kvamax.rank*.json")) == ["kvamax.rank1.json"]  # what kvscales globs
     table = json.loads((recorder / "kvamax.rank1.json").read_text())
     assert table == {"model.language_model.layers.3.self_attn.attn": [12.5, 3.25],
                      "model.language_model.layers.7.self_attn.attn": [8.0, 2.0]}
@@ -48,7 +50,7 @@ def test_no_tp_group_at_registration_writes_rank0(recorder, monkeypatch):
     monkeypatch.setattr(dist, "get_tensor_model_parallel_rank", _groups_destroyed)
     Q._kv_amax_register(_Owner("model.language_model.layers.3.self_attn.attn", 1.0, 1.0))
     Q._dump_kv_amax()
-    assert [p.name for p in recorder.iterdir()] == ["kvamax.rank0.json"]
+    assert [p.name for p in recorder.glob("kvamax.rank*.json")] == ["kvamax.rank0.json"]
 
 
 def test_owner_without_samples_is_left_out(recorder, monkeypatch):
@@ -81,12 +83,42 @@ def test_capture_time_eager_call_is_not_recorded(monkeypatch):
     assert owner._kv_amax.tolist() == [6.0, 0.5]
 
 
-def test_nan_from_a_real_step_still_propagates():
+def test_nonfinite_stored_rows_are_counted_not_folded():
     owner = _Owner("model.language_model.layers.3.self_attn.attn", 0.0, 0.0)
     owner._kv_amax = None
     Q._kv_amax_record(owner, torch.ones(2, 1, 4), torch.ones(2, 1, 4), 2)
-    Q._kv_amax_record(owner, torch.full((2, 1, 4), float("nan")), torch.ones(2, 1, 4), 2)
-    assert torch.isnan(owner._kv_amax[0]) and owner._kv_amax[1] == 1.0
+    bad_k = torch.ones(2, 1, 4)
+    bad_k[1, 0, 2] = float("nan")
+    Q._kv_amax_record(owner, bad_k * 3, torch.ones(2, 1, 4) * 2, 2)
+    # row 0 is finite (K 3, V 2) and folds in; row 1 has a NaN and is only counted
+    assert owner._kv_amax.tolist() == [3.0, 2.0]
+    assert int(owner._kv_amax_nonfinite) == 1 and int(owner._kv_amax_rows) == 4
+
+
+def test_rows_without_a_cache_slot_are_ignored():
+    """Dummy runs map every row to PAD_SLOT_ID (-1); padded rows of a real batch too."""
+    owner = _Owner("model.language_model.layers.3.self_attn.attn", 0.0, 0.0)
+    owner._kv_amax = None
+    garbage = torch.full((4, 1, 8), float("nan"))
+    garbage[:, :, :] = 6.0e4  # a finite garbage value, as uninitialized fp16 memory can hold
+    Q._kv_amax_record(owner, garbage, garbage, 4, torch.full((4,), -1, dtype=torch.int64))
+    assert owner._kv_amax.tolist() == [0.0, 0.0] and int(owner._kv_amax_rows) == 0
+    k = torch.tensor([[[1.0, -5.0]], [[9e4, 9e4]], [[2.0, 0.5]]])
+    v = torch.tensor([[[0.5, 0.25]], [[9e4, 9e4]], [[1.5, 0.1]]])
+    Q._kv_amax_record(owner, k, v, 3, torch.tensor([17, -1, 18]))  # row 1 is a padded row
+    assert owner._kv_amax.tolist() == [5.0, 1.5] and int(owner._kv_amax_rows) == 2
+
+
+def test_dump_writes_stats_beside_the_amax_table(recorder, monkeypatch):
+    monkeypatch.setattr(dist, "get_tensor_model_parallel_rank", lambda: 1)
+    owner = _Owner("model.language_model.layers.7.self_attn.attn", 0.0, 0.0)
+    owner._kv_amax = None
+    Q._kv_amax_register(owner)
+    Q._kv_amax_record(owner, torch.ones(3, 1, 4) * 2, torch.ones(3, 1, 4), 3, torch.tensor([1, 2, -1]))
+    Q._dump_kv_amax()
+    assert sorted(p.name for p in recorder.iterdir()) == ["kvamax-stats.rank1.json", "kvamax.rank1.json"]
+    assert json.loads((recorder / "kvamax-stats.rank1.json").read_text()) == {
+        "model.language_model.layers.7.self_attn.attn": {"rows": 2, "nonfinite_rows": 0}}
 
 
 def test_scale_builder_refuses_nan_in_any_rank_file(tmp_path):

@@ -45,5 +45,12 @@ for i, (k_amax, v_amax) in sorted(merged.items()):
 out = os.path.join(model_dir, "model-kvscales.safetensors")
 save_file(tensors, out)
 print(f"{len(merged)} layers from {len(files)} rank file(s) -> {out}")
+stats = sorted(glob.glob(f"{prefix}-stats.rank*.json"))  # the recorder's per-rank row counts, when present
+if stats:
+    rows = bad = 0
+    for path in stats:
+        for v in json.load(open(path)).values():
+            rows, bad = rows + v["rows"], bad + v["nonfinite_rows"]
+    print(f"recorder: {rows} stored rows folded over {len(stats)} rank(s), {bad} non-finite rows skipped")
 for i, (k_amax, v_amax) in sorted(merged.items()):
     print(f"  layer {i:2d}: |K| <= {k_amax:8.3f}  |V| <= {v_amax:8.3f}")

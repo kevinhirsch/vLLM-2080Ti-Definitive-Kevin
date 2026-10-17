@@ -93,24 +93,45 @@ def _kv_amax_register(owner) -> None:
     _KV_AMAX_OWNERS.append(owner)
 
 
-def _kv_amax_record(owner, key: torch.Tensor, value: torch.Tensor, num_tokens: int) -> None:
-    """Fold this step's |K| and |V| maxima into owner._kv_amax.
+def _kv_amax_record(
+    owner,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    num_tokens: int,
+    slot_mapping: torch.Tensor | None = None,
+) -> None:
+    """Fold this step's |K| and |V| maxima over the rows the cache stores into owner._kv_amax.
 
-    Skipped while a breakable CUDA graph is being captured: add_eager runs the op
-    once at capture time on static buffers that the recorded (not executed) segment
-    before it never wrote, so K/V hold garbage there (every layer read NaN on both
-    ranks in NM-9 W2l, 2026-10-17). A NaN from a real step still propagates, so
-    kvscales_from_amax.py refuses it loudly.
+    Only rows with a cache slot count (slot_mapping >= 0): every dummy run (warm-up, graph-capture
+    warm-up, DP padding) maps all rows to PAD_SLOT_ID, and so do the padded rows of a real batch, so
+    the amax covers exactly what the int8 cache must hold. Skipped while a breakable CUDA graph is
+    being captured (add_eager runs the op once on buffers no kernel has written). A non-finite row
+    is counted (owner._kv_amax_nonfinite), not folded: NM-9 W2l and W2n read NaN in every layer
+    with the capture skip alone, and the count shows whether any stored row was non-finite.
     """
     if not num_tokens or BreakableCUDAGraphCapture.is_active():
         return
-    cur = torch.stack(
-        (
-            key[:num_tokens].abs().amax().float(),
-            value[:num_tokens].abs().amax().float(),
-        )
-    )
-    owner._kv_amax = cur if owner._kv_amax is None else torch.maximum(owner._kv_amax, cur)
+    rows = key[:num_tokens].reshape(num_tokens, -1)
+    k = rows.abs().amax(dim=1).float()
+    v = value[:num_tokens].reshape(num_tokens, -1).abs().amax(dim=1).float()
+    if slot_mapping is None:
+        stored = torch.ones_like(k, dtype=torch.bool)
+    else:
+        stored = slot_mapping.reshape(-1)[:num_tokens] >= 0
+    finite = torch.isfinite(k) & torch.isfinite(v)
+    use = stored & finite
+    zero = k.new_zeros(())
+    cur = torch.stack((torch.where(use, k, zero).amax(), torch.where(use, v, zero).amax()))
+    nonfinite = (stored & ~finite).sum()
+    n_stored = stored.sum()
+    if owner._kv_amax is None:
+        owner._kv_amax = cur
+        owner._kv_amax_nonfinite = nonfinite
+        owner._kv_amax_rows = n_stored
+    else:
+        owner._kv_amax = torch.maximum(owner._kv_amax, cur)
+        owner._kv_amax_nonfinite = owner._kv_amax_nonfinite + nonfinite
+        owner._kv_amax_rows = owner._kv_amax_rows + n_stored
 
 
 def kv_amax_reset() -> None:
@@ -137,7 +158,22 @@ def _dump_kv_amax() -> None:
     path = f"{_KV_AMAX_DUMP}.rank{rank}.json"
     with open(path, "w") as fh:
         json.dump(table, fh, indent=1, sort_keys=True)
-    logger.info("QSA K/V amax for %d layers written to %s", len(table), path)
+    # beside the amax table (not matching <prefix>.rank*.json): rows folded and non-finite rows skipped
+    stats = {
+        owner.layer_name: {
+            "rows": int(owner._kv_amax_rows),
+            "nonfinite_rows": int(owner._kv_amax_nonfinite),
+        }
+        for owner in _KV_AMAX_OWNERS
+        if owner._kv_amax is not None
+    }
+    with open(f"{_KV_AMAX_DUMP}-stats.rank{rank}.json", "w") as fh:
+        json.dump(stats, fh, indent=1, sort_keys=True)
+    bad = sum(v["nonfinite_rows"] for v in stats.values())
+    logger.info(
+        "QSA K/V amax for %d layers written to %s (%d non-finite stored rows skipped)",
+        len(table), path, bad,
+    )
 
 
 if _KV_AMAX_DUMP:
@@ -443,6 +479,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self._int8_scales: tuple[float, float] | None = None
         # device-side running amax of the stored K and V rows (opt-in recorder)
         self._kv_amax: torch.Tensor | None = None
+        self._kv_amax_nonfinite: torch.Tensor | None = None
+        self._kv_amax_rows: torch.Tensor | None = None
         if _KV_AMAX_DUMP and not self.kv_int8:
             _kv_amax_register(self)
         self.kv_sharing_target_layer_name = None
@@ -611,7 +649,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 main_metadata.slot_mapping,
             )
             if _KV_AMAX_DUMP:
-                _kv_amax_record(self, key, value, num_tokens)
+                _kv_amax_record(self, key, value, num_tokens, main_metadata.slot_mapping)
         impl.forward_qsa(
             self,
             query,
