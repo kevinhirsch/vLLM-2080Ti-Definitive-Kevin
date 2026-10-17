@@ -28,7 +28,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture, eager_break_during_capture
 from vllm.logger import init_logger
 from vllm.model_executor.utils import set_weight_attrs
 
@@ -38,6 +38,10 @@ logger = init_logger(__name__)
 
 IQ4_NL = 20
 IQ4_NL_BLOCK = (32, 18)  # elements, bytes
+
+# A finished future: start_prefetch's inline gather (during breakable-graph capture) leaves nothing to wait for.
+_DONE: concurrent.futures.Future = concurrent.futures.Future()
+_DONE.set_result(None)
 
 
 class HostRowGather:
@@ -265,7 +269,15 @@ class Qwen4ExpPLEHostEmbedding(Qwen4ExpPLEEmbedding):
             ready.record(self._stream)
         ngram_ids.record_stream(self._stream)
         self._pending_tokens = num_tokens
-        self._pending = self._executor.submit(self._gather_and_upload, n_rows, num_tokens, ready)
+        if BreakableCUDAGraphCapture.is_active():
+            # This call is an eager break between two captured segments. Capture runs in global mode, so the gather
+            # thread's CUDA calls (event sync, side-stream upload and decode) during the next segment's capture
+            # invalidated it (W2b: cudaErrorStreamCaptureInvalidated, first seen at layer 2's HC mix). Gather inline
+            # while capturing. Replays run this break with no capture active and keep the overlapped thread.
+            self._gather_and_upload(n_rows, num_tokens, ready)
+            self._pending = _DONE
+        else:
+            self._pending = self._executor.submit(self._gather_and_upload, n_rows, num_tokens, ready)
 
     @eager_break_during_capture
     def _finalize(self, output: torch.Tensor) -> None:
