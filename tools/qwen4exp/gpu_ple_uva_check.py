@@ -19,6 +19,28 @@ import sys
 import time
 
 
+def _host_register_attrs(device: int) -> dict:
+    """cudaDeviceGetAttribute for the host-registration capabilities that decide the table's pin mode."""
+    import ctypes
+
+    attrs = {"HostRegisterSupported": 99, "HostRegisterReadOnlySupported": 113,
+             "PageableMemoryAccess": 88, "CanUseHostPointerForRegisteredMem": 91}
+    for name in ("libcudart.so.13", "libcudart.so.12", "libcudart.so"):
+        try:
+            lib = ctypes.CDLL(name)
+            break
+        except OSError:
+            lib = None
+    if lib is None:
+        return {"error": "libcudart not found"}
+    out = {}
+    for key, attr in attrs.items():
+        v = ctypes.c_int(-1)
+        err = lib.cudaDeviceGetAttribute(ctypes.byref(v), attr, device)
+        out[key] = v.value if err == 0 else f"cudaError {err}"
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("pack")
@@ -36,11 +58,14 @@ def main() -> int:
     torch.cuda.set_device(dev)
     path = os.path.join(a.pack, "ngram_embedding.safetensors")
     m = P.Qwen4ExpPLEEXL3TableMethod(path)
-    res = {"path": path, "rows": m.rows, "row_bytes": m.row_bytes, "bits": m.bits, "cases": [], "pass": True}
+    res = {"path": path, "rows": m.rows, "row_bytes": m.row_bytes, "bits": m.bits, "cases": [], "pass": True,
+           "device_attrs": _host_register_attrs(0)}
+    print("device attrs:", res["device_attrs"], flush=True)
     t0 = time.time()
     table = P.HostRegisteredTable(m.path, m.offset, m.rows, m.row_bytes)
     res["register_s"] = round(time.time() - t0, 1)
-    print(f"registered {m.rows} rows x {m.row_bytes} B in {res['register_s']} s", flush=True)
+    res["register_mode"] = table.mode
+    print(f"registered {m.rows} rows x {m.row_bytes} B in {res['register_s']} s ({table.mode})", flush=True)
 
     # the decode reads head_bias / head_offsets from the layer: load them from the table file
     layer = type("L", (), {})()
