@@ -72,6 +72,22 @@ logger = init_logger(__name__)
 # turns those into model-kvscales.safetensors for --kv-cache-dtype int8.
 _KV_AMAX_DUMP = __import__("os").environ.get("VLLM_QWEN4_QSA_KV_AMAX_DUMP", "")
 _KV_AMAX_OWNERS: list = []
+# TP rank of this process's owners, looked up when the first one registers: the
+# atexit dump runs after WorkerProc.shutdown() has destroyed the model-parallel
+# groups, where the lookup asserts (every rank fell back to rank 0 and the last
+# writer overwrote the others' K/V heads).
+_KV_AMAX_RANK: list[int] = []
+
+
+def _kv_amax_register(owner) -> None:
+    if not _KV_AMAX_RANK:
+        try:
+            from vllm.distributed import get_tensor_model_parallel_rank
+
+            _KV_AMAX_RANK.append(get_tensor_model_parallel_rank())
+        except Exception:  # noqa: BLE001  (no TP group: a single-process build)
+            _KV_AMAX_RANK.append(0)
+    _KV_AMAX_OWNERS.append(owner)
 
 
 def _dump_kv_amax() -> None:
@@ -80,12 +96,7 @@ def _dump_kv_amax() -> None:
 
     if not _KV_AMAX_OWNERS:
         return
-    try:
-        from vllm.distributed import get_tensor_model_parallel_rank
-
-        rank = get_tensor_model_parallel_rank()
-    except Exception:  # noqa: BLE001
-        rank = 0
+    rank = _KV_AMAX_RANK[0] if _KV_AMAX_RANK else 0
     table = {
         owner.layer_name: [float(owner._kv_amax[0]), float(owner._kv_amax[1])]
         for owner in _KV_AMAX_OWNERS
@@ -401,7 +412,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         # device-side running amax of the stored K and V rows (opt-in recorder)
         self._kv_amax: torch.Tensor | None = None
         if _KV_AMAX_DUMP and not self.kv_int8:
-            _KV_AMAX_OWNERS.append(self)
+            _kv_amax_register(self)
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
         set_default_quant_scales(self, register_buffer=True)
