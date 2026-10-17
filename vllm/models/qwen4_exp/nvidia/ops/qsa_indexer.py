@@ -287,6 +287,38 @@ def _decode_tiles_per_program(num_requests: int, columns: int) -> int:
     return 8
 
 
+# Pre-Ampere (sm75) profile of the uniform decode scoring kernel (thecyberdevl
+# vllm-flashnext-turing 0029). The default profile (BLOCK_N=64, num_warps=2, one
+# 64-column tile per program at small batch) was tuned on GB300; on Turing it is
+# latency-bound. Measured on 2x RTX 8000, us per launch, default -> 32 columns,
+# one warp, 4 tiles per program: 1 request 226 -> 53 (64K) / 332 -> 79 (128K);
+# 4 requests 506 -> 139 / 993 -> 256; 12 requests 1536 -> 440 / 2974 -> 705,
+# identical output. Worth ~6% of a 2-stream and ~13% of a 4-stream decode step.
+_TURING_DECODE_BLOCK_N = 32
+_TURING_DECODE_TILES = 4
+_TURING_DECODE_WARPS = 1
+
+
+def _is_pre_ampere() -> bool:
+    return bool(
+        current_platform.is_cuda() and not current_platform.has_device_capability(80)
+    )
+
+
+def _decode_profile(
+    num_requests: int, columns: int, cache_dtype: torch.dtype
+) -> tuple[int, int, int]:
+    """(BLOCK_N, TILES_PER_PROG, num_warps) of the uniform decode kernel."""
+    if _is_pre_ampere():
+        return _TURING_DECODE_BLOCK_N, _TURING_DECODE_TILES, _TURING_DECODE_WARPS
+    return (
+        _DECODE_BLOCK_N,
+        _decode_tiles_per_program(num_requests, columns),
+        # tuned on GB300
+        1 if cache_dtype == torch.float8_e4m3fn else 2,
+    )
+
+
 def _qsa_decode_warmup_profiles(
     max_dql: int,
     max_num_reqs: int,
@@ -347,7 +379,9 @@ def warmup_qsa_mqa_paged_decode(
             torch.float32,
             shape=(num_rows, columns),
         )
-        tiles_per_program = _decode_tiles_per_program(num_requests, columns)
+        block_n, tiles_per_program, num_warps = _decode_profile(
+            num_requests, columns, k_cache.dtype
+        )
         _qsa_mqa_paged_uniform_kernel.warmup(
             q_ptr,
             k_cache_ptr,
@@ -365,14 +399,13 @@ def warmup_qsa_mqa_paged_decode(
             NUM_HEADS=num_heads,
             HEAD_DIM=head_dim,
             DECODE_QUERY_LEN=decode_query_len,
-            BLOCK_N=_DECODE_BLOCK_N,
+            BLOCK_N=block_n,
             TILES_PER_PROG=tiles_per_program,
             STAGES=2,
-            # tuned on GB300
-            num_warps=1 if k_cache.dtype == torch.float8_e4m3fn else 2,
+            num_warps=num_warps,
             grid=(
                 num_requests,
-                triton.cdiv(columns, _DECODE_BLOCK_N * tiles_per_program),
+                triton.cdiv(columns, block_n * tiles_per_program),
             ),
         )
     return profiles
@@ -543,10 +576,12 @@ def qsa_select_paged_decode(
 
     columns = page_table.shape[1] * k_cache.shape[1]
     logits = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
-    tiles_per_program = _decode_tiles_per_program(num_requests, columns)
+    block_n, tiles_per_program, num_warps = _decode_profile(
+        num_requests, columns, k_cache.dtype
+    )
     grid = (
         num_requests,
-        triton.cdiv(columns, _DECODE_BLOCK_N * tiles_per_program),
+        triton.cdiv(columns, block_n * tiles_per_program),
     )
     _qsa_mqa_paged_uniform_kernel[grid](
         q,
@@ -563,11 +598,10 @@ def qsa_select_paged_decode(
         NUM_HEADS=q.shape[1],
         HEAD_DIM=q.shape[2],
         DECODE_QUERY_LEN=decode_query_len,
-        BLOCK_N=_DECODE_BLOCK_N,
+        BLOCK_N=block_n,
         TILES_PER_PROG=tiles_per_program,
         STAGES=2,
-        # tuned on GB300
-        num_warps=1 if k_cache.dtype == torch.float8_e4m3fn else 2,
+        num_warps=num_warps,
     )
     _topk(
         logits,
