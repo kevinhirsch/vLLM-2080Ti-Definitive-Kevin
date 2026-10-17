@@ -894,6 +894,7 @@ def test_snapshot_pins_the_script_dir(world, tmp_path):
     lane.mkdir()
     sc = lane / "gate.sh"
     sc.write_text('HERE=$(dirname "${BASH_SOURCE[0]}")\nX=$(cd "$(dirname "$0")" && pwd)\nY=$(dirname "$1")\n')
+    sc.chmod(0o444)  # lanes ship read-only scripts (w8xr4 gpu_smoke.sh)
     w = wc.Window(spec(tmp_path, steps=[{"name": "g", "run": f"bash {sc} arg"}]))
     os.makedirs(w.path("steps"), exist_ok=True)
     cmd, snaps = w.snapshot_scripts({"name": "g"}, f"bash {sc} arg")
@@ -901,3 +902,16 @@ def test_snapshot_pins_the_script_dir(world, tmp_path):
     assert f"HERE={lane}\n" in text and f'X=$(cd "{lane}" && pwd)' in text
     assert 'Y=$(dirname "$1")' in text  # only the script's own location is pinned
     assert sc.read_text().startswith('HERE=$(dirname')  # the original is untouched
+
+
+def test_spec_preflight_failure_refuses_the_window_before_anything_stops(world, tmp_path, monkeypatch):
+    (tmp_path / "rel").mkdir()
+    chk = tmp_path / "chk.py"
+    chk.write_text("import sys\nprint('ERROR missing script /x/y.sh')\nsys.exit(1)\n")
+    monkeypatch.setenv("WINDOWCTL_PREFLIGHT", str(chk))
+    p = tmp_path / "spec.json"
+    s = spec(tmp_path, steps=[{"name": "a", "run": "true"}])
+    p.write_text(json.dumps(s))
+    w = wc.Window(s, spec_path=str(p))
+    problems = w.preflight()
+    assert any("spec preflight failed" in x and "missing script" in x for x in problems)

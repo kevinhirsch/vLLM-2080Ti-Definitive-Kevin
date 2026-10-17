@@ -724,6 +724,19 @@ class Window:
         busy = gpuguard.busy_state()
         if busy.get("busy") and busy.get("window") != self.wid:
             problems.append(f"GPU busy signal held by {busy.get('by')} ({busy.get('reason')})")
+        # Spec preflight (WINDOWCTL_PREFLIGHT=<checker>, set by the lane's launcher): missing scripts, executables, dirs,
+        # releases and the snapshot self-dir trap fail the window here, before production stops (2026-10-17: two
+        # windows died on missing files after the 27B was already down).
+        checker = os.environ.get("WINDOWCTL_PREFLIGHT", "")
+        if checker and self.spec_path:
+            try:
+                r = subprocess.run([sys.executable, "-I", checker, self.spec_path], capture_output=True, text=True,
+                                   timeout=120)
+                if r.returncode == 1:
+                    problems.append("spec preflight failed: " + " | ".join(
+                        ln for ln in r.stdout.splitlines() if "ERROR" in ln)[:2000])
+            except (OSError, subprocess.SubprocessError) as exc:
+                self.log(f"spec preflight could not run ({exc}); continuing")
         floor = float(spec.get("disk_floor_gb", DISK_FLOOR_GB))
         free = free_gb()
         if free < floor:
@@ -1039,6 +1052,7 @@ class Window:
                 snap = self.path("steps", f"{st['name']}.{len(found)}.{os.path.basename(tok)[:-3]}.snap.sh")
                 if not self.dry:
                     shutil.copy2(tok, snap)
+                    os.chmod(snap, 0o644)  # copy2 keeps a 0444 source's mode; the pin below writes the copy
                     _pin_script_dir(snap, os.path.dirname(os.path.realpath(tok)))
                     # read-only AND executable: swap() may put the snapshot in command position ("/x.sh args", no bash);
                     # 0o444 made that rc=126 Permission denied (W8X bench step, 2026-10-13 03:56)
