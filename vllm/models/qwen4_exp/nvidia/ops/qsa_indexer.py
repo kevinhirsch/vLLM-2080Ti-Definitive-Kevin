@@ -14,6 +14,24 @@ from vllm.triton_utils import tl, triton
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 _DECODE_BLOCK_N = 64
 
+# persistent_topk compacts its picks with atomicAdd, so the order of each row (and, at the threshold bin, which tied
+# blocks win) varies run to run, and the sparse attention accumulates over the selected tokens in list order. NM-9
+# was not reproducible run to run (identical-config repeat KLD 0.015) while the QSA-free 27B is (0.0000). Sorting
+# each row fixes the order (and so the attention's summation order). "0" keeps the kernel's order.
+_SORT_SELECTED = __import__("os").environ.get("VLLM_QWEN4_QSA_SORT_SELECTED", "1") != "0"
+
+
+def sort_selected_blocks_(block_indices: torch.Tensor) -> torch.Tensor:
+    """Sort each row of selected block ids ascending in place, invalid (-1) entries kept at the tail.
+
+    The selection is a set (expand_qsa_block_indices reads every entry), so only the order changes: any
+    permutation of a row gives the same output."""
+    big = torch.iinfo(block_indices.dtype).max
+    keyed = torch.where(block_indices < 0, torch.full_like(block_indices, big), block_indices)
+    keyed = keyed.sort(dim=-1).values
+    block_indices.copy_(torch.where(keyed == big, torch.full_like(keyed, -1), keyed))
+    return block_indices
+
 
 @triton.jit
 def _qsa_mqa_paged_uniform_kernel(
@@ -539,6 +557,8 @@ def _topk(
         block_topk,
         logits.shape[1],
     )
+    if _SORT_SELECTED:
+        sort_selected_blocks_(block_indices)
 
 
 def qsa_select_paged_decode(
