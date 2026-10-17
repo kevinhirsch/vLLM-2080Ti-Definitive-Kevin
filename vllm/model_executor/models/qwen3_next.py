@@ -160,6 +160,16 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 quant_config,
                 f"{prefix}.shared_expert.down_proj",
             )
+            if shared_expert_group_size is None:
+                # Formats whose packed tiles constrain a TP shard declare the alignment
+                # (EXL3 pads both dims to 128-multiples and cannot split a padded
+                # multi-shard layer); a misaligned shard then replicates the shared
+                # expert under EP, exactly like the OCP MX group case above.
+                get_alignment = getattr(quant_config, "get_tp_shard_alignment", None)
+                if callable(get_alignment):
+                    shared_expert_group_size = get_alignment(
+                        f"{prefix}.shared_expert.down_proj"
+                    )
             self.replicate_shared_expert = _should_replicate_misaligned_shared_expert(
                 config.shared_expert_intermediate_size,
                 self.tp_size,
