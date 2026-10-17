@@ -239,6 +239,7 @@ def _warm_fused_sigmoid_gating_delta_rule_update_kernel(
     from vllm.third_party.flash_linear_attention.ops.fused_sigmoid_gating import (
         fused_sigmoid_gating_delta_rule_update,
     )
+    from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
     q = torch.empty((1, 1, config.h, config.k), dtype=config.conv_dtype, device=device)
     k = torch.empty_like(q)
@@ -270,6 +271,10 @@ def _warm_fused_sigmoid_gating_delta_rule_update_kernel(
         ssm_state_indices=ssm_state_indices,
         use_qk_l2norm_in_kernel=True,
         is_kda=False,
+        # null_block_id is a constexpr: the Qwen GDN decode calls pass PAD_SLOT_ID, so a warm-up
+        # with the default NULL_BLOCK_ID compiled a variant serving never used (NM-9 W2p: one runtime
+        # JIT of this kernel at the first fp16-state decode).
+        null_block_id=PAD_SLOT_ID,
     )
 
 
