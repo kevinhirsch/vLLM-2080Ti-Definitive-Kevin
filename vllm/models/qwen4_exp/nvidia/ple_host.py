@@ -39,7 +39,7 @@ logger = init_logger(__name__)
 IQ4_NL = 20
 IQ4_NL_BLOCK = (32, 18)  # elements, bytes
 
-# A finished future: start_prefetch's inline gather (during breakable-graph capture) leaves nothing to wait for.
+# A finished future: start_prefetch's capture-time call (no gather) leaves nothing to wait for.
 _DONE: concurrent.futures.Future = concurrent.futures.Future()
 _DONE.set_result(None)
 
@@ -260,6 +260,16 @@ class Qwen4ExpPLEHostEmbedding(Qwen4ExpPLEEmbedding):
         n_rows = ngram_ids.numel()
         if self._pending is not None:
             self._pending.result()
+        if BreakableCUDAGraphCapture.is_active():
+            # Capture-time call of this eager break, made on capture-time buffers. The ids come from the previous
+            # captured segment, which has not executed, so they are not real (W2d: "PLE row id out of range
+            # [0, 320001536): -9223372036854775808.."). A gather thread's CUDA calls during the next segment's
+            # capture would also invalidate it (W2c: cuEventSynchronize from another thread). Do nothing now:
+            # every replay runs this break with real ids and the overlapped thread, and _finalize's capture-time
+            # copy writes don't-care rows into the graph-owned output.
+            self._pending_tokens = num_tokens
+            self._pending = _DONE
+            return
         self._stream.wait_stream(torch.cuda.current_stream())
         ready = torch.cuda.Event()
         with torch.cuda.stream(self._stream):
@@ -269,15 +279,7 @@ class Qwen4ExpPLEHostEmbedding(Qwen4ExpPLEEmbedding):
             ready.record(self._stream)
         ngram_ids.record_stream(self._stream)
         self._pending_tokens = num_tokens
-        if BreakableCUDAGraphCapture.is_active():
-            # This call is an eager break between two captured segments. Capture runs in global mode, so the gather
-            # thread's CUDA calls (event sync, side-stream upload and decode) during the next segment's capture
-            # invalidated it (W2b: cudaErrorStreamCaptureInvalidated, first seen at layer 2's HC mix). Gather inline
-            # while capturing. Replays run this break with no capture active and keep the overlapped thread.
-            self._gather_and_upload(n_rows, num_tokens, ready)
-            self._pending = _DONE
-        else:
-            self._pending = self._executor.submit(self._gather_and_upload, n_rows, num_tokens, ready)
+        self._pending = self._executor.submit(self._gather_and_upload, n_rows, num_tokens, ready)
 
     @eager_break_during_capture
     def _finalize(self, output: torch.Tensor) -> None:
