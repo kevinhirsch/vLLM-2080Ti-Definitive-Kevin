@@ -4,7 +4,7 @@
 Loads E real experts of one layer from the EXL3 pack (trellis/suh/svh/mul1), builds the plugin's fused
 state exactly as Exl3MoEMethod does, routes small batches (distinct top-K per token, one non-local -1
 route) and compares:
-  fused   : apply_exl3_fused_moe -> exllamav3_ext.exl3_moe (the pinned runtime's ABI), deterministic
+  fused   : apply_exl3_fused_moe -> exllamav3_ext.exl3_moe (exllamav3-turing "v2" or upstream >= 1.6 "v3" ABI), deterministic
             (direct_output) and atomic modes
   ref     : apply_exl3_python_loop -> exllamav3 LinearEXL3.forward per expert (the EXL3 GEMM kernels,
             an independent code path)
@@ -94,7 +94,7 @@ def main() -> int:
             if det:
                 again = X.apply_exl3_fused_moe(x, ids, w, layer, inners, None, None).float()
                 repeat_equal = bool(torch.equal(out, again))
-            ok = (X._EXL3_MOE_ABI == "v2" and bool(torch.isfinite(out).all()) and err <= 2e-2
+            ok = (X._EXL3_MOE_ABI in ("v2", "v3") and bool(torch.isfinite(out).all()) and err <= 2e-2
                   and repeat_equal is not False)
             res["pass"] &= ok
             row = {"tokens": tokens, "deterministic": det, "abi": X._EXL3_MOE_ABI, "rel_max_err": err,
