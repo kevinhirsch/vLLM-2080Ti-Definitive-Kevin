@@ -464,6 +464,7 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         num_ngram_heads: int = 1,
         max_total_tokens: int = 0,
         data_parallel_rank: int = 0,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         if not is_uva_available():
             raise RuntimeError("Engram CPU offload requires UVA support")
@@ -473,6 +474,7 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
             params_dtype=params_dtype,
             padding_size=padding_size,
             prefix=prefix,
+            quant_config=quant_config,
             embedding_method=embedding_method,
             num_ngram_heads=num_ngram_heads,
             max_total_tokens=max_total_tokens,
