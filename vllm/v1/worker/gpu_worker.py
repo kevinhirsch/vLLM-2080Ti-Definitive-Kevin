@@ -961,6 +961,13 @@ class Worker(WorkerBase):
         # intra-op parallelism.
         set_torch_threads_for_runtime()
 
+        if os.environ.get("VLLM_QWEN4_QSA_KV_AMAX_DUMP"):
+            # Profile, warm-up and capture runs feed dummy K/V (NaN on NM-9 W2n);
+            # the calibration must only see served requests.
+            from vllm.models.qwen4_exp.nvidia.qsa import kv_amax_reset
+
+            kv_amax_reset()
+
         self._leave_startup_sync_mode()
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,

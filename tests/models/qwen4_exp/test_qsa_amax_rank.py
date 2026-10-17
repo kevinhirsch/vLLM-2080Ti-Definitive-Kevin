@@ -108,3 +108,15 @@ def test_scale_builder_refuses_nan_in_any_rank_file(tmp_path):
                          capture_output=True, text=True)
     assert run.returncode == 0, run.stderr
     assert "1 layers from 2 rank file(s)" in run.stdout
+
+
+def test_reset_at_startup_end_drops_dummy_run_garbage(recorder):
+    owner = _Owner("model.language_model.layers.3.self_attn.attn", 0.0, 0.0)
+    owner._kv_amax = None
+    Q._kv_amax_register(owner)
+    # a warm-up dummy batch: uninitialized K/V
+    Q._kv_amax_record(owner, torch.full((2, 1, 4), float("nan")), torch.full((2, 1, 4), 1e30), 2)
+    Q.kv_amax_reset()
+    assert owner._kv_amax is None
+    Q._kv_amax_record(owner, torch.full((2, 1, 4), -3.0), torch.full((2, 1, 4), 2.0), 2)
+    assert owner._kv_amax.tolist() == [3.0, 2.0]

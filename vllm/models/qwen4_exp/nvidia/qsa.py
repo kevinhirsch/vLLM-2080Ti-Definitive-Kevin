@@ -113,6 +113,15 @@ def _kv_amax_record(owner, key: torch.Tensor, value: torch.Tensor, num_tokens: i
     owner._kv_amax = cur if owner._kv_amax is None else torch.maximum(owner._kv_amax, cur)
 
 
+def kv_amax_reset() -> None:
+    """Forget everything recorded so far. The worker calls this when startup ends:
+    memory profiling, kernel warm-up and graph capture all run dummy batches outside
+    BreakableCUDAGraphCapture whose K/V are uninitialized memory (every layer read
+    NaN on both ranks in NM-9 W2n, 2026-10-17, after the capture-time skip)."""
+    for owner in _KV_AMAX_OWNERS:
+        owner._kv_amax = None
+
+
 def _dump_kv_amax() -> None:
     import json
     import os
