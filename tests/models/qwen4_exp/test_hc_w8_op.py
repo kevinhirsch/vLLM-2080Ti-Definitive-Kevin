@@ -87,15 +87,17 @@ def test_torch_compile_fullgraph_dynamic_compiles_once():
     assert any("qwen4_exp_hc_w8a16_linear" in str(n.target) for n in graphs[0].graph.nodes)
 
 
-def test_kernel_never_specializes_runtime_ints():
+def test_kernel_unspecializes_only_what_varies_at_runtime():
+    """M and x's alignment vary per call; N, K and the strides are per-projection constants whose divisibility
+    Triton needs to vectorize the int8 weight loads (W2l: unspecializing them cut C1 23.4 -> 15.2 tok/s)."""
     import inspect
 
     fn = getattr(_KERNEL, "fn", _KERNEL)
-    params = inspect.signature(fn).parameters
-    ints = [n for n in ("M", "N", "K", "stride_xm", "stride_qn", "stride_sn", "stride_os", "stride_om")]
-    assert set(ints) <= set(W._W8_NO_SPECIALIZE) and "x_ptr" in W._W8_NO_SPECIALIZE
-    assert set(W._W8_NO_SPECIALIZE) <= set(params)
+    assert set(W._W8_NO_SPECIALIZE) <= set(inspect.signature(fn).parameters)
+    assert set(W._W8_NO_SPECIALIZE) == {"x_ptr", "M"}
     for kp in getattr(_KERNEL, "params", ()):  # the real JITFunction when the root conftest imported it first
+        if kp.name in ("N", "K", "stride_qn", "q_ptr"):
+            assert not kp.do_not_specialize, kp.name
         if kp.name in W._W8_NO_SPECIALIZE:
             assert kp.do_not_specialize, kp.name
 

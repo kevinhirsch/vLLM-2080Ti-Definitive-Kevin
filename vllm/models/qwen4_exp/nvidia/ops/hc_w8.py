@@ -24,10 +24,11 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 HC_W8_GROUP = 64
 
-# The runtime ints vary with the token count (M, and with it nothing else here, but specializing any of them on
-# divisibility by 16 compiles a new variant per batch-size class mid-serving: W2j saw 4). x may be a view at any
-# offset. The weights, scales and the fresh partials buffer keep their alignment specialization.
-_W8_NO_SPECIALIZE = ("x_ptr", "M", "N", "K", "stride_xm", "stride_qn", "stride_sn", "stride_os", "stride_om")
+# Only what varies at runtime: M (the token count; specializing it on divisibility by 16 compiled a new variant per
+# batch-size class mid-serving, W2j saw 4) and x's alignment (x may be a view at any offset). N, K and the strides
+# are per-projection constants: their divisibility is what lets Triton vectorize the int8 weight loads, which are
+# nearly all the traffic. Unspecializing them too (W2l ramp-hcw8op) cut C1 from 23.4 to 15.2 tok/s.
+_W8_NO_SPECIALIZE = ("x_ptr", "M")
 
 
 @triton.jit(do_not_specialize=_W8_NO_SPECIALIZE)
