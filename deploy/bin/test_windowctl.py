@@ -884,3 +884,20 @@ def test_bench_marker_wraps_timing_steps_only(world, tmp_path, monkeypatch):
     assert seen["t5-ab-measure"] is True
     assert seen["t5-ab-gate"] is False
     assert not bench.exists()
+
+
+def test_snapshot_pins_the_script_dir(world, tmp_path):
+    """W8X-R4 2026-10-17: gpu_smoke.sh found its siblings via $(dirname "${BASH_SOURCE[0]}"), which pointed at the
+    results dir once windowctl ran the snapshot. The snapshot now carries the original directory instead."""
+    (tmp_path / "rel").mkdir()
+    lane = tmp_path / "lane"
+    lane.mkdir()
+    sc = lane / "gate.sh"
+    sc.write_text('HERE=$(dirname "${BASH_SOURCE[0]}")\nX=$(cd "$(dirname "$0")" && pwd)\nY=$(dirname "$1")\n')
+    w = wc.Window(spec(tmp_path, steps=[{"name": "g", "run": f"bash {sc} arg"}]))
+    os.makedirs(w.path("steps"), exist_ok=True)
+    cmd, snaps = w.snapshot_scripts({"name": "g"}, f"bash {sc} arg")
+    text = open(snaps[str(sc)]).read()
+    assert f"HERE={lane}\n" in text and f'X=$(cd "{lane}" && pwd)' in text
+    assert 'Y=$(dirname "$1")' in text  # only the script's own location is pinned
+    assert sc.read_text().startswith('HERE=$(dirname')  # the original is untouched

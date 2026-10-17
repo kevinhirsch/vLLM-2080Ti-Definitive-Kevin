@@ -600,6 +600,21 @@ def do_capture(spec_cap, stdout_path):
 
 # ---------------------------------------------------------------- the window
 
+# A snapshot runs from the results dir, so a script that finds its siblings with $(dirname "$0") or
+# $(dirname "${BASH_SOURCE[0]}") would look there (W8X-R4 gpu_smoke.sh / fidelity_gate.sh, 2026-10-17). The snapshot gets
+# those expressions replaced by the original script's directory, so every existing lane script is snapshot-safe.
+_SCRIPT_DIR_RE = re.compile(r'\$\(\s*dirname\s+(?:"\$\{BASH_SOURCE(?:\[0\])?\}"|"\$BASH_SOURCE"|\$\{BASH_SOURCE(?:\[0\])?\}|"\$0"|"\$\{0\}"|\$0)\s*\)')
+
+
+def _pin_script_dir(path, src_dir):
+    with open(path, encoding="utf-8", errors="surrogateescape") as fh:
+        text = fh.read()
+    pinned = _SCRIPT_DIR_RE.sub(lambda m: src_dir, text)
+    if pinned != text:
+        with open(path, "w", encoding="utf-8", errors="surrogateescape") as fh:
+            fh.write(pinned)
+
+
 class Window:
     def __init__(self, spec, spec_path=None, dry_run=False, results=None, preset=None):
         validate(spec)
@@ -1024,6 +1039,7 @@ class Window:
                 snap = self.path("steps", f"{st['name']}.{len(found)}.{os.path.basename(tok)[:-3]}.snap.sh")
                 if not self.dry:
                     shutil.copy2(tok, snap)
+                    _pin_script_dir(snap, os.path.dirname(os.path.realpath(tok)))
                     # read-only AND executable: swap() may put the snapshot in command position ("/x.sh args", no bash);
                     # 0o444 made that rc=126 Permission denied (W8X bench step, 2026-10-13 03:56)
                     os.chmod(snap, 0o555)
