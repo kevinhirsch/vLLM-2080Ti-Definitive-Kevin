@@ -125,7 +125,24 @@ def _qsa_mqa_paged_uniform_kernel(
         )
 
 
-@triton.jit(do_not_specialize=["num_rows", "query_offset"])
+# Everything that varies per batch is unspecialized, so one variant per cache layout serves
+# all prefills, compiled at boot (warmup_qsa_mqa_paged_prefill). NM-9 W2p traced eight
+# variants in one night: their TTIR differed only in the 16-divisibility of the metadata
+# pointers (views at batch-dependent offsets), the page-table stride and width (blocks of
+# the longest request), and the logits row stride (logits_width can be width * PAGE_SIZE,
+# PAGE_SIZE 392 or 400). PAGE_SIZE itself stays a constexpr: one value per layout.
+_PREFILL_NO_SPECIALIZE = (
+    "num_rows",
+    "query_offset",
+    "query_start_loc_ptr",
+    "visible_blocks_ptr",
+    "stride_table_req",
+    "page_table_width",
+    "stride_logits_row",
+)
+
+
+@triton.jit(do_not_specialize=_PREFILL_NO_SPECIALIZE)
 def _qsa_mqa_paged_prefill_kernel(
     q_ptr,
     k_cache_ptr,
@@ -429,6 +446,71 @@ def warmup_qsa_mqa_paged_decode(
     return profiles
 
 
+_PREFILL_K_TILES = 16
+
+
+def _prefill_profile(cache_dtype: torch.dtype) -> tuple[int, int, int, int]:
+    """(TILE_R, BLOCK_N, STAGES, num_warps) of the prefill logits kernel; shared by the
+    launch and its warm-up so the two cannot drift."""
+    if not current_platform.has_device_capability(80):
+        # Turing (sm75): 64 KiB smem/block. Measured on Quadro RTX 8000
+        # (Triton 3.7): TILE_R=32 needs 80-96 KiB for any BLOCK_N (the fp32
+        # [BLOCK_N, TILE_R*heads] score tile is staged through smem for the
+        # head reduction); TILE_R=16/BLOCK_N=32 compiles at 48 KiB with 72
+        # registers and no spills, the largest zero-spill profile that fits.
+        return 16, 32, 2, 8
+    if cache_dtype == torch.float8_e4m3fn:
+        # tuned on GB300
+        return 32, 64, 2, 8
+    # tuned on GB300
+    return 64, 64, 2, 4
+
+
+def warmup_qsa_mqa_paged_prefill(
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    *,
+    num_heads: int,
+    head_dim: int,
+    q_dtype: torch.dtype | None = None,
+) -> tuple[int, int, int, int]:
+    """Compile the prefill logits kernel for this cache layout without launching it.
+
+    Every per-batch argument is unspecialized (_PREFILL_NO_SPECIALIZE), so this one variant
+    covers all prefills; returns the profile it compiled."""
+    tile_r, block_n, stages, num_warps = _prefill_profile(k_cache.dtype)
+    page_size = k_cache.shape[1]
+    page_table_width = page_table.shape[1]
+    q_ptr = TritonWarmupTensor(q_dtype or k_cache.dtype, shape=(tile_r, num_heads, head_dim))
+    _qsa_mqa_paged_prefill_kernel.warmup(
+        q_ptr,
+        TritonWarmupTensor(k_cache.dtype, shape=tuple(k_cache.shape)),
+        TritonWarmupTensor(page_table.dtype, shape=(1, page_table_width)),
+        TritonWarmupTensor(torch.int32, shape=(2,)),
+        TritonWarmupTensor(torch.int32, shape=(tile_r,)),
+        TritonWarmupTensor(torch.float32, shape=(tile_r, page_table_width * page_size)),
+        num_heads * head_dim,
+        head_dim,
+        k_cache.stride(0),
+        k_cache.stride(1),
+        page_table.stride(0),
+        page_table_width * page_size,
+        tile_r,
+        0,
+        page_table_width,
+        PAGE_SIZE=page_size,
+        NUM_HEADS=num_heads,
+        HEAD_DIM=head_dim,
+        TILE_R=tile_r,
+        BLOCK_N=block_n,
+        K_TILES=_PREFILL_K_TILES,
+        STAGES=stages,
+        num_warps=num_warps,
+        grid=(1, 1, 1),
+    )
+    return tile_r, block_n, stages, num_warps
+
+
 def _prefill_logits(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -448,20 +530,8 @@ def _prefill_logits(
     logits = torch.empty(
         (num_queries, logits_width), dtype=torch.float32, device=q.device
     )
-    if not current_platform.has_device_capability(80):
-        # Turing (sm75): 64 KiB smem/block. Measured on Quadro RTX 8000
-        # (Triton 3.7): TILE_R=32 needs 80-96 KiB for any BLOCK_N (the fp32
-        # [BLOCK_N, TILE_R*heads] score tile is staged through smem for the
-        # head reduction); TILE_R=16/BLOCK_N=32 compiles at 48 KiB with 72
-        # registers and no spills, the largest zero-spill profile that fits.
-        TILE_R, BLOCK_N, STAGES, num_warps = 16, 32, 2, 8
-    elif k_cache.dtype == torch.float8_e4m3fn:
-        # tuned on GB300
-        TILE_R, BLOCK_N, STAGES, num_warps = 32, 64, 2, 8
-    else:
-        # tuned on GB300
-        TILE_R, BLOCK_N, STAGES, num_warps = 64, 64, 2, 4
-    K_TILES = 16
+    TILE_R, BLOCK_N, STAGES, num_warps = _prefill_profile(k_cache.dtype)
+    K_TILES = _PREFILL_K_TILES
     grid = (
         page_table.shape[0],
         triton.cdiv(min(num_queries, max_query_len), TILE_R),
