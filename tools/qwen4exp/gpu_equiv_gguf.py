@@ -25,12 +25,12 @@ BLOCK = {"Q8_0": (8, 32, 34), "Q4_K": (12, 256, 144), "Q5_K": (13, 256, 176), "Q
 SCALE_AT = {"Q4_K": (0, 2), "Q5_K": (0, 2), "Q6_K": (-2,)}
 
 
-def random_blocks(name, n_elems, rng):
+def random_blocks(name, n_elems, rng, d_range=(0.001, 0.02)):
     _, be, bb = BLOCK[name]
     nb = n_elems // be
     raw = rng.integers(0, 256, size=(nb, bb), dtype=np.uint8)
     for off in SCALE_AT.get(name, (0,)):
-        d = rng.uniform(0.001, 0.02, size=nb).astype(np.float16).view(np.uint8).reshape(nb, 2)
+        d = rng.uniform(*d_range, size=nb).astype(np.float16).view(np.uint8).reshape(nb, 2)
         o = off % bb
         raw[:, o:o + 2] = d
     return raw.reshape(-1)
@@ -91,18 +91,34 @@ def main():
         torch.cuda.synchronize()
         check(f"graph_replay/{name}", torch.equal(cap, eager))
 
-    # MoE: E experts, top-k, a quarter of the ids marked non-local (-1)
+    # K = 640 rows (the expert down projections): 20 IQ4_NL / 10 Q2_0 blocks per row, not a multiple of 256
+    for name in ("IQ4_NL", "Q2_0"):
+        tid, be, bb = BLOCK[name]
+        r640 = random_blocks(name, 2560 * 640, rng)
+        w_ref = torch.from_numpy(ref_dequant(name, r640, 2560 * 640).reshape(2560, 640).astype(np.float32))
+        q = torch.from_numpy(r640.reshape(2560, 640 // be * bb)).to(dev)
+        for T in (1, 8, 64):
+            x = torch.randn(T, 640, dtype=torch.float16, device=dev) * 0.5
+            y = gguf_mul_mat(x, q, tid, 2560).float().cpu()
+            y_ref = x.float().cpu() @ w_ref.T
+            rel = ((y - y_ref).norm() / y_ref.norm().clamp_min(1e-9)).item()
+            check(f"mul_mat_k640/{name}/T{T}", rel <= 3e-2, rel_err=rel)
+
+    # MoE: E experts, top-k, a quarter of the ids marked non-local (-1).
+    # Small scales + small activations keep the fp16 intermediate (silu(gate)*up) far from overflow:
+    # random 3-bit grids at the default scale range overflowed fp16 (NaN) in W1 attempt 2.
     E, H, I, T, K = 16, 2560, 640, 5, 4
-    for t13, t2 in (("IQ2_XXS", "Q2_0"), ("IQ3_S", "IQ4_NL"), ("IQ2_S", "Q2_0"), ("IQ3_XXS", "IQ4_NL")):
+    for t13, t2 in (("IQ2_XXS", "Q2_0"), ("IQ3_S", "IQ4_NL"), ("IQ2_S", "Q2_0"), ("IQ3_XXS", "IQ4_NL"),
+                    ("IQ2_S", "IQ4_NL")):
         id13, be13, bb13 = BLOCK[t13]
         id2, be2, bb2 = BLOCK[t2]
-        r13 = random_blocks(t13, E * 2 * I * H, rng)
-        r2 = random_blocks(t2, E * H * I, rng)
+        r13 = random_blocks(t13, E * 2 * I * H, rng, (0.0005, 0.002))
+        r2 = random_blocks(t2, E * H * I, rng, (0.0005, 0.002))
         w13_ref = torch.from_numpy(ref_dequant(t13, r13, E * 2 * I * H).reshape(E, 2 * I, H))
         w2_ref = torch.from_numpy(ref_dequant(t2, r2, E * H * I).reshape(E, H, I))
         w13 = torch.from_numpy(r13.reshape(E, 2 * I, H // be13 * bb13)).to(dev)
         w2 = torch.from_numpy(r2.reshape(E, H, I // be2 * bb2)).to(dev)
-        x = torch.randn(T, H, dtype=torch.float16, device=dev) * 0.5
+        x = torch.randn(T, H, dtype=torch.float16, device=dev) * 0.1
         ids = torch.randint(0, E, (T, K), device=dev, dtype=torch.int32)
         ids[0, 0] = -1
         ids[2, 1:] = -1
