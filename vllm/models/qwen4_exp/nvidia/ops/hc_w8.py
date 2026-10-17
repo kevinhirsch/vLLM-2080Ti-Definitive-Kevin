@@ -20,11 +20,17 @@ from __future__ import annotations
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import direct_register_custom_op
 
 HC_W8_GROUP = 64
 
+# The runtime ints vary with the token count (M, and with it nothing else here, but specializing any of them on
+# divisibility by 16 compiles a new variant per batch-size class mid-serving: W2j saw 4). x may be a view at any
+# offset. The weights, scales and the fresh partials buffer keep their alignment specialization.
+_W8_NO_SPECIALIZE = ("x_ptr", "M", "N", "K", "stride_xm", "stride_qn", "stride_sn", "stride_os", "stride_om")
 
-@triton.jit
+
+@triton.jit(do_not_specialize=_W8_NO_SPECIALIZE)
 def _w8a16_gemm_kernel(
     x_ptr,
     q_ptr,
@@ -99,27 +105,17 @@ def _split_k(m: int, n: int, k: int, block_m: int, block_n: int, group: int) -> 
     return split
 
 
-def w8a16_linear(
-    x: torch.Tensor,
-    q: torch.Tensor,
-    s: torch.Tensor,
-    group: int = HC_W8_GROUP,
-    out_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    """y = x @ dequant(q, s).T for x [..., K] fp16/bf16, q int8 [N, K], s fp16 [N, K // group]."""
-    lead = x.shape[:-1]
-    x2 = x.reshape(-1, x.shape[-1])
-    if not x2.is_contiguous():
-        x2 = x2.contiguous()
+_BLOCK_M = 16
+_BLOCK_N = 64
+_W8_WARMED: set = set()
+
+
+def _launch(x2: torch.Tensor, q: torch.Tensor, s: torch.Tensor, group: int, split: int) -> torch.Tensor:
     m, k = x2.shape
     n = q.shape[0]
-    assert q.shape == (n, k) and s.shape == (n, k // group)
-    block_m = 16
-    block_n = 64
-    split = _split_k(m, n, k, block_m, block_n, group)
     k_per_split = triton.cdiv(k // group, split) * group
-    partial = torch.empty((split, m, n), dtype=torch.float32, device=x.device)
-    grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n), split)
+    partial = torch.empty((split, m, n), dtype=torch.float32, device=x2.device)
+    grid = (triton.cdiv(m, _BLOCK_M), triton.cdiv(n, _BLOCK_N), split)
     _w8a16_gemm_kernel[grid](
         x2,
         q,
@@ -134,14 +130,83 @@ def w8a16_linear(
         partial.stride(0),
         partial.stride(1),
         GROUP=group,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
+        BLOCK_M=_BLOCK_M,
+        BLOCK_N=_BLOCK_N,
         K_PER_SPLIT=k_per_split,
         num_warps=4,
         num_stages=2,
     )
+    return partial
+
+
+def _warm_up(x2: torch.Tensor, q: torch.Tensor, s: torch.Tensor, group: int) -> int:
+    """Compile every split-K variant this [N, K] projection can use, once per shape and dtype, at the first eager
+    call (K_PER_SPLIT is a constexpr picked from the token count, so new batch sizes would otherwise JIT-compile
+    mid-serving). Skipped while a CUDA graph is captured. Returns the number of launches."""
+    n, k = q.shape
+    key = (n, k, group, x2.dtype, str(x2.device))
+    if key in _W8_WARMED:
+        return 0
+    if x2.is_cuda and torch.cuda.is_current_stream_capturing():
+        return 0
+    _W8_WARMED.add(key)
+    groups = k // group
+    splits, split = [], 1
+    while True:  # every power of two _split_k can return: it doubles while split * 2 <= groups
+        splits.append(split)
+        if split * 2 > groups:
+            break
+        split *= 2
+    seen = set()
+    probe = x2.new_zeros((1, k))
+    for sp in splits:
+        k_per_split = triton.cdiv(groups, sp) * group
+        if k_per_split in seen:
+            continue
+        seen.add(k_per_split)
+        _launch(probe, q, s, group, sp)
+    return len(seen)
+
+
+def _w8a16_linear_impl(x: torch.Tensor, q: torch.Tensor, s: torch.Tensor, group: int) -> torch.Tensor:
+    lead = x.shape[:-1]
+    x2 = x.reshape(-1, x.shape[-1])
+    if not x2.is_contiguous():
+        x2 = x2.contiguous()
+    m, k = x2.shape
+    n = q.shape[0]
+    assert q.shape == (n, k) and s.shape == (n, k // group)
+    _warm_up(x2, q, s, group)
+    split = _split_k(m, n, k, _BLOCK_M, _BLOCK_N, group)
+    partial = _launch(x2, q, s, group, split)
     y = partial[0] if split == 1 else partial.sum(dim=0)  # deterministic reduction
-    return y.to(out_dtype or x.dtype).reshape(*lead, n)
+    return y.to(x.dtype).reshape(*lead, n)
+
+
+def _w8a16_linear_fake(x: torch.Tensor, q: torch.Tensor, s: torch.Tensor, group: int) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], q.shape[0]))
+
+
+# Opaque to torch.compile, like every other HC op here (ops/hc.py, low_latency_gemm.py): the split-K choice is
+# Python on the token count, which Dynamo would otherwise specialize or break the graph on. W2j measured the raw
+# call path at C1 23.4 tok/s against 44.5 for the fp16 projections.
+direct_register_custom_op(
+    op_name="qwen4_exp_hc_w8a16_linear",
+    op_func=_w8a16_linear_impl,
+    fake_impl=_w8a16_linear_fake,
+)
+
+
+def w8a16_linear(
+    x: torch.Tensor,
+    q: torch.Tensor,
+    s: torch.Tensor,
+    group: int = HC_W8_GROUP,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """y = x @ dequant(q, s).T for x [..., K] fp16/bf16, q int8 [N, K], s fp16 [N, K // group]."""
+    y = torch.ops.vllm.qwen4_exp_hc_w8a16_linear(x, q, s, group)
+    return y if out_dtype is None or out_dtype == y.dtype else y.to(out_dtype)
 
 
 class HCW8LinearMethod:
