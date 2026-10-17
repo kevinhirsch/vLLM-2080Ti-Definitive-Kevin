@@ -58,6 +58,7 @@ from .model import (
     Qwen4ExpSparseMoeBlock,
 )
 from .qsa import finalize_qsa_kv_cache_scales
+from .hyperconnection import convert_hc_weights_w8
 
 
 def _remap_ignored_layers(
@@ -364,6 +365,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         loaded = loader.load_weights(weights, mapper=mapper)
         # Draft QSA layers own their own int8 main-cache scales.
         finalize_qsa_kv_cache_scales(self)
+        convert_hc_weights_w8(self)
         return loaded
 
 

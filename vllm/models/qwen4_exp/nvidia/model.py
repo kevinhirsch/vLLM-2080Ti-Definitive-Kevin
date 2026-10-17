@@ -80,6 +80,7 @@ from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .ple_layer import Qwen4ExpPLELayer
 from .qsa import Qwen4ExpQSAAttention, finalize_qsa_kv_cache_scales
+from .hyperconnection import convert_hc_weights_w8
 
 
 def without_modelopt_fp4(
@@ -642,6 +643,8 @@ class Qwen4ExpModel(nn.Module):
         # int8 main cache only: turn the loaded fp8 k/v scales into the int8
         # storage scales (no-op for fp16/bf16 caches).
         finalize_qsa_kv_cache_scales(self)
+        # opt-in VLLM_QWEN4_HC_W8=1: int8 HC projections (no-op otherwise)
+        convert_hc_weights_w8(self)
         return loaded
 
 

@@ -22,6 +22,8 @@ Typical usage inside a transformer decoder layer::
     )
 """
 
+import os
+
 import torch
 from torch import nn
 
@@ -205,3 +207,43 @@ __all__ = [
     "GroupedGemmaRMSNorm",
     "HyperConnectionConfig",
 ]
+
+
+def convert_hc_weights_w8(module: nn.Module) -> int:
+    """Opt-in (``VLLM_QWEN4_HC_W8=1``): group-wise int8 HC projections, after weight loading.
+
+    Quantizes every GatedResidual projection under ``module`` (int8, one fp16 scale per
+    64 inputs; ~0.7% relative error on the real Flash-Next HC weights), swaps its
+    ``quant_method`` for the W8A16 Triton GEMM and frees the F16 weight. That halves both
+    the per-token bytes (HC is ~46% of C1 decode bytes, replicated per rank) and the
+    VRAM they hold. Returns the number of converted projections; 0 when disabled.
+    """
+    if os.environ.get("VLLM_QWEN4_HC_W8", "0") != "1":
+        return 0
+    from .ops.hc_w8 import HC_W8_GROUP, HCW8LinearMethod, quantize_w8_groupwise
+
+    method = HCW8LinearMethod()
+    converted = 0
+    for sub in module.modules():
+        if not isinstance(sub, GatedResidual):
+            continue
+        for name in ("input_mix_weight_down_block_inject", "input_mix_weight_down", "input_mix_weight_up"):
+            lin = getattr(sub, name, None)
+            if lin is None or getattr(lin, "hc_w8_q", None) is not None:
+                continue
+            weight = lin.weight.data
+            if name == "input_mix_weight_down_block_inject" and sub.pad_size:
+                # the physical padding rows are never loaded (uninitialized); their
+                # outputs are split off and dropped, so zero them before quantizing
+                weight = weight.clone()
+                weight[sub.lora_rank + sub.hc_count:] = 0
+            q, s = quantize_w8_groupwise(weight, HC_W8_GROUP)
+            lin.register_buffer("hc_w8_q", q, persistent=False)
+            lin.register_buffer("hc_w8_s", s, persistent=False)
+            lin.weight = nn.Parameter(
+                torch.empty(0, dtype=lin.weight.dtype, device=lin.weight.device),
+                requires_grad=False,
+            )
+            lin.quant_method = method
+            converted += 1
+    return converted
