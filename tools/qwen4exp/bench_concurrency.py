@@ -69,6 +69,19 @@ def stream_one(base, model, i, a):
 
 def measure(base, model, c, a):
     reps, err = [], None
+    # One unmeasured rep at this concurrency first. A new batch shape JIT-compiles its Triton kernels, which made
+    # W1 v10's first C4 rep run at 27 tok/s against 43-48 for the next two. That 21 tok/s spread exceeded the
+    # 20 tok/s gain over C2, so a linear curve read as "not rising" and the ramp stopped at C3.
+    warm_s = None
+    if a.warmup_tokens > 0:
+        wa = argparse.Namespace(**{**vars(a), "tokens": a.warmup_tokens, "rep": f"c{c}warm"})
+        t0 = time.perf_counter()
+        try:
+            with cf.ThreadPoolExecutor(c) as ex:
+                list(ex.map(lambda i: stream_one(base, model, i, wa), range(c)))
+        except Exception as e:  # noqa: BLE001 - failing even the warm-up is the breaking point
+            return {"conc": c, "error": "warm-up: " + repr(e)[:280], "reps": []}
+        warm_s = time.perf_counter() - t0
     for rep_i in range(a.reps):
         a.rep = f"c{c}r{rep_i}"  # distinct-context fillers never repeat across points or reps
         t0 = time.perf_counter()
@@ -87,7 +100,7 @@ def measure(base, model, c, a):
                      "ttft_max": max(o["ttft"] or 0 for o in outs), "wall_s": wall})
         if err:
             break
-    row = {"conc": c, "error": err, "reps": reps}
+    row = {"conc": c, "error": err, "reps": reps, "warmup_s": warm_s}
     if reps:
         agg = [r["agg_tok_s"] for r in reps]
         row.update(agg_tok_s=statistics.median(agg), agg_spread=max(agg) - min(agg),
@@ -117,6 +130,8 @@ def main():
     ap.add_argument("--distinct-context", action="store_true",
                     help="unique filler per stream and rep (no prefix sharing): the KV memory-wall case")
     ap.add_argument("--reps", type=int, default=3)
+    ap.add_argument("--warmup-tokens", type=int, default=16,
+                    help="output tokens of the unmeasured warm-up rep at each concurrency (0 = none)")
     ap.add_argument("--request-timeout-s", type=float, default=900)
     ap.add_argument("--slo-tok-s", type=float, default=30.0)
     ap.add_argument("--slo-ttft-s", type=float, default=2.0)
