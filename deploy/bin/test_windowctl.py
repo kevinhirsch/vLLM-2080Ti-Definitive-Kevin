@@ -175,6 +175,23 @@ def test_captured_variables_are_usable_only_after_their_step(tmp_path):
         wc.validate(early)
 
 
+def test_validate_refuses_expandable_segments_unless_the_step_opts_out(tmp_path):
+    """NM-9 W2 (20:45) and kvq-kld-rerun (01:03): expandable_segments killed the engine at CUDA-graph capture
+    (custom_all_reduce.cuh:170). validate refuses it on boot and run steps; an eager-only step opts out."""
+    env = {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+    boot = spec(tmp_path, steps=[{"name": "b", "boot": {"release": str(tmp_path / "rel"), "env": dict(env)}}])
+    with pytest.raises(wc.SpecError, match="custom_all_reduce.cuh:170"):
+        wc.validate(boot)
+    run = spec(tmp_path, steps=[{"name": "r", "run": "true", "env": {"PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512, expandable_segments: True"}}])
+    with pytest.raises(wc.SpecError, match="expandable_segments"):
+        wc.validate(run)
+    opted = spec(tmp_path, steps=[{"name": "b", "boot": {"release": str(tmp_path / "rel"), "env": dict(env)},
+                                   "allow_expandable_segments": True}])
+    assert wc.validate(opted)
+    other = spec(tmp_path, steps=[{"name": "r", "run": "true", "env": {"PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512"}}])
+    assert wc.validate(other)
+
+
 def test_render_truthy_and_capture(tmp_path):
     assert wc.render({"a": ["x {{V}}"]}, {"V": 3}) == {"a": ["x 3"]}
     with pytest.raises(wc.SpecError):

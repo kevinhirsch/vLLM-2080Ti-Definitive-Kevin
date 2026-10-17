@@ -507,6 +507,19 @@ def validate(spec):
             b = st["boot"]
             if not isinstance(b, dict) or len([k for k in ("release", "tree", "default") if k in b]) != 1:
                 errs.append(f"step {name}: boot needs exactly one of release / tree / default")
+        if not st.get("allow_expandable_segments"):
+            # 2026-10-16/17: twice in one night (NM-9 W2 20:45, kvq-kld-rerun 01:03) the engine died at CUDA-graph capture,
+            # custom_all_reduce.cuh:170 'invalid argument': VMM (expandable) allocations cannot be exported with
+            # cudaIpcGetMemHandle, so the custom all-reduce cannot register graph buffers. vllm-qwen27b.env says DO NOT
+            # set it. An eager-only (no graphs, or no custom all-reduce) step opts out: allow_expandable_segments: true.
+            envs = [st.get("env") or {}]
+            if isinstance(st.get("boot"), dict):
+                envs.append(st["boot"].get("env") or {})
+            if any("expandable_segments:true" in str(e.get("PYTORCH_CUDA_ALLOC_CONF", "")).replace(" ", "").lower()
+                   for e in envs if isinstance(e, dict)):
+                errs.append(f"step {name}: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True breaks the custom all-reduce's "
+                            "CUDA-graph capture on this fork (custom_all_reduce.cuh:170); raise headroom with the GPU "
+                            "utilization instead, or set allow_expandable_segments: true on an eager-only step")
         if st.get("on_fail", "abort") not in ("abort", "continue"):
             errs.append(f"step {name}: on_fail must be abort|continue")
         used = _names_in({k: v for k, v in st.items() if k != "capture"})
