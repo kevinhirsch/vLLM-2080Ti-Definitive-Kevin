@@ -10,6 +10,7 @@ reads (finalize_kv_cache_scales: s_int8 = s * 448 / 127).
 """
 import glob
 import json
+import math
 import os
 import re
 import sys
@@ -29,6 +30,8 @@ for path in files:
         if m is None:
             continue
         i = int(m.group(1))
+        if not all(math.isfinite(a) for a in (k_amax, v_amax)):  # max() would drop a NaN silently
+            sys.exit(f"{path}: layer {i} amax K={k_amax} V={v_amax} (the recorder saw non-finite K/V)")
         cur = merged.setdefault(i, [0.0, 0.0])
         cur[0], cur[1] = max(cur[0], k_amax), max(cur[1], v_amax)
 tensors = {}

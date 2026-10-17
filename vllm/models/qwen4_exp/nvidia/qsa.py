@@ -9,7 +9,10 @@ from typing import ClassVar, cast
 import torch
 from torch import nn
 
-from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.compilation.breakable_cudagraph import (
+    BreakableCUDAGraphCapture,
+    eager_break_during_capture,
+)
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -88,6 +91,26 @@ def _kv_amax_register(owner) -> None:
         except Exception:  # noqa: BLE001  (no TP group: a single-process build)
             _KV_AMAX_RANK.append(0)
     _KV_AMAX_OWNERS.append(owner)
+
+
+def _kv_amax_record(owner, key: torch.Tensor, value: torch.Tensor, num_tokens: int) -> None:
+    """Fold this step's |K| and |V| maxima into owner._kv_amax.
+
+    Skipped while a breakable CUDA graph is being captured: add_eager runs the op
+    once at capture time on static buffers that the recorded (not executed) segment
+    before it never wrote, so K/V hold garbage there (every layer read NaN on both
+    ranks in NM-9 W2l, 2026-10-17). A NaN from a real step still propagates, so
+    kvscales_from_amax.py refuses it loudly.
+    """
+    if not num_tokens or BreakableCUDAGraphCapture.is_active():
+        return
+    cur = torch.stack(
+        (
+            key[:num_tokens].abs().amax().float(),
+            value[:num_tokens].abs().amax().float(),
+        )
+    )
+    owner._kv_amax = cur if owner._kv_amax is None else torch.maximum(owner._kv_amax, cur)
 
 
 def _dump_kv_amax() -> None:
@@ -578,16 +601,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 self.kv_cache,
                 main_metadata.slot_mapping,
             )
-            if _KV_AMAX_DUMP and num_tokens:
-                cur = torch.stack(
-                    (
-                        key[:num_tokens].abs().amax().float(),
-                        value[:num_tokens].abs().amax().float(),
-                    )
-                )
-                self._kv_amax = (
-                    cur if self._kv_amax is None else torch.maximum(self._kv_amax, cur)
-                )
+            if _KV_AMAX_DUMP:
+                _kv_amax_record(self, key, value, num_tokens)
         impl.forward_qsa(
             self,
             query,

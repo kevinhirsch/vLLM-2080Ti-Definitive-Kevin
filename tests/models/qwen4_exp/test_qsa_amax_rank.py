@@ -60,3 +60,51 @@ def test_owner_without_samples_is_left_out(recorder, monkeypatch):
     Q._dump_kv_amax()
     assert json.loads((recorder / "kvamax.rank0.json").read_text()) == {
         "model.language_model.layers.3.self_attn.attn": [4.0, 5.0]}
+
+
+def test_capture_time_eager_call_is_not_recorded(monkeypatch):
+    """add_eager runs the QSA op once while capturing, on buffers no kernel wrote yet: garbage must not enter."""
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+    owner = _Owner("model.language_model.layers.3.self_attn.attn", 0.0, 0.0)
+    owner._kv_amax = None
+    garbage = torch.full((4, 1, 8), float("nan"))
+    monkeypatch.setattr(BreakableCUDAGraphCapture._tls, "active", object(), raising=False)
+    Q._kv_amax_record(owner, garbage, garbage, 4)
+    assert owner._kv_amax is None
+    monkeypatch.setattr(BreakableCUDAGraphCapture._tls, "active", None)
+    k = torch.tensor([[[1.0, -3.0]], [[2.0, 0.5]], [[99.0, 99.0]]])  # row 2 is padding past num_tokens
+    v = torch.tensor([[[0.25, -0.5]], [[0.1, 0.2]], [[99.0, 99.0]]])
+    Q._kv_amax_record(owner, k, v, 2)
+    assert owner._kv_amax.tolist() == [3.0, 0.5]
+    Q._kv_amax_record(owner, k * 2, v, 2)
+    assert owner._kv_amax.tolist() == [6.0, 0.5]
+
+
+def test_nan_from_a_real_step_still_propagates():
+    owner = _Owner("model.language_model.layers.3.self_attn.attn", 0.0, 0.0)
+    owner._kv_amax = None
+    Q._kv_amax_record(owner, torch.ones(2, 1, 4), torch.ones(2, 1, 4), 2)
+    Q._kv_amax_record(owner, torch.full((2, 1, 4), float("nan")), torch.ones(2, 1, 4), 2)
+    assert torch.isnan(owner._kv_amax[0]) and owner._kv_amax[1] == 1.0
+
+
+def test_scale_builder_refuses_nan_in_any_rank_file(tmp_path):
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    tool = Path(__file__).resolve().parents[3] / "tools" / "qwen4exp" / "kvscales_from_amax.py"
+    good = {"language_model.model.layers.3.self_attn.attn": [4.0, 2.0]}
+    bad = {"language_model.model.layers.3.self_attn.attn": [float("nan"), 2.0]}
+    (tmp_path / "kvamax.rank0.json").write_text(json.dumps(bad))  # json writes NaN; max(0.0, nan) would keep 0.0
+    (tmp_path / "kvamax.rank1.json").write_text(json.dumps(good))
+    run = subprocess.run([sys.executable, str(tool), str(tmp_path / "kvamax"), str(tmp_path)],
+                         capture_output=True, text=True)
+    assert run.returncode != 0 and "non-finite" in run.stderr
+    assert not (tmp_path / "model-kvscales.safetensors").exists()
+    (tmp_path / "kvamax.rank0.json").write_text(json.dumps(good))
+    run = subprocess.run([sys.executable, str(tool), str(tmp_path / "kvamax"), str(tmp_path)],
+                         capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    assert "1 layers from 2 rank file(s)" in run.stdout
