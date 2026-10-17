@@ -967,6 +967,14 @@ class Worker(WorkerBase):
             from vllm.models.qwen4_exp.nvidia.qsa import kv_amax_reset
 
             kv_amax_reset()
+        if os.environ.get("VLLM_EXL3_MOE_ROUTE_STATS"):
+            # same reason for the EXL3 MoE route recorder (out-of-tree vllm-exl3 plugin)
+            try:
+                from vllm_exl3.exl3 import route_stats_startup_done
+            except ImportError:
+                pass
+            else:
+                route_stats_startup_done()
 
         self._leave_startup_sync_mode()
         return CompilationTimes(
