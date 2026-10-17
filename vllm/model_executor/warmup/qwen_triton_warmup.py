@@ -22,6 +22,12 @@ _QWEN_MODEL_TYPES = frozenset(
         "qwen3_5_text",
         "qwen3_5_moe",
         "qwen3_5_moe_text",
+        # Qwen3.8-Flash-Next (NM-9) uses the same Qwen GDN layers. Left out, nothing
+        # warmed them: each kernel compiled at its first serving call, hidden while the
+        # Triton cache already held the variant, and a new cache layout (int8 KV moves
+        # the GDN state page stride, a constexpr) compiled mid-serving (W2p 2026-10-17).
+        "qwen4_exp",
+        "qwen4_exp_text",
     }
 )
 
@@ -172,7 +178,7 @@ def _warm_causal_conv1d_fwd_kernel(
     from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
         causal_conv1d_fn,
     )
-    from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
+    from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
     x_storage = torch.empty(
         (1, config.conv_dim), dtype=config.conv_dtype, device=device
@@ -183,7 +189,9 @@ def _warm_causal_conv1d_fwd_kernel(
         dtype=config.conv_dtype,
         device=device,
     )
-    cache_indices = torch.full((1,), NULL_BLOCK_ID, dtype=torch.int32, device=device)
+    # null_block_id is a constexpr: warm the value every serving call passes (PAD_SLOT_ID),
+    # and point the one sequence at it so the warm-up writes no real cache block.
+    cache_indices = torch.full((1,), PAD_SLOT_ID, dtype=torch.int32, device=device)
     has_initial_state = torch.empty(1, dtype=torch.bool, device=device)
     query_start_loc = torch.tensor([0, 1], dtype=torch.int32, device=device)
 
@@ -197,7 +205,7 @@ def _warm_causal_conv1d_fwd_kernel(
         has_initial_state=has_initial_state,
         activation="silu",
         pad_slot_id=PAD_SLOT_ID,
-        null_block_id=NULL_BLOCK_ID,
+        null_block_id=PAD_SLOT_ID,
         metadata=None,
         validate_data=False,
     )
@@ -250,9 +258,12 @@ def _warm_fused_sigmoid_gating_delta_rule_update_kernel(
         dtype=config.state_dtype,
         device=device,
     )
+    from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+
     cu_seqlens = torch.tensor([0, 1], dtype=torch.int32, device=device)
-    ssm_state_indices = torch.empty((1, 1), dtype=torch.int32, device=device)
-    ssm_state_indices.zero_()
+    # As for the conv kernel: serving passes null_block_id=PAD_SLOT_ID (a constexpr), and a
+    # PAD index makes the warm-up read and write no state.
+    ssm_state_indices = torch.full((1, 1), PAD_SLOT_ID, dtype=torch.int32, device=device)
 
     fused_sigmoid_gating_delta_rule_update(
         A_log=config.a_log,
@@ -270,6 +281,7 @@ def _warm_fused_sigmoid_gating_delta_rule_update_kernel(
         ssm_state_indices=ssm_state_indices,
         use_qk_l2norm_in_kernel=True,
         is_kda=False,
+        null_block_id=PAD_SLOT_ID,
     )
 
 
