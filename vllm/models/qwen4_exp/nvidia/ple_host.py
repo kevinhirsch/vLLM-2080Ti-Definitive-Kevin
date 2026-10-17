@@ -534,6 +534,10 @@ class Qwen4ExpPLEUVAEmbedding(Qwen4ExpPLEEmbedding):
     def allocate_embedding_weight(self, num_embeddings: int, embedding_dim: int, dtype: torch.dtype):
         return torch.empty(0, embedding_dim, dtype=dtype)
 
+    def start_prefetch(self, hidden_states: torch.Tensor, ngram_ids: torch.Tensor) -> None:
+        """No prefetch (supports_prefetch is False): forward gathers the rows inline, on the GPU."""
+        return None
+
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         """[tokens, heads] n-gram row ids -> [tokens, heads, dim] embeddings, all on the GPU."""
         num_tokens = input_.shape[0]

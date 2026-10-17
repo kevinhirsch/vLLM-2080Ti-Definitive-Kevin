@@ -3,7 +3,9 @@
 The UVA gather kernel runs under TRITON_INTERPRET on CPU tensors (on the GPU the table is a CUDA view of
 pinned host memory). Ids outside the table are clamped: at capture time and for padded slots they are not
 real hashes. The MemAvailable guard refuses to pin a table that does not fit. With UVA on, the method picks
-the UVA embedding and the config hook no longer forces PIECEWISE (the lookup is capturable GPU work).
+the UVA embedding and the config hook no longer forces PIECEWISE (the lookup is capturable GPU work). Every PLE
+embedding class a method can select is instantiable (W2i: the UVA class missed the abstract start_prefetch and
+the engine failed to build the model).
 """
 import os
 import types
@@ -50,3 +52,23 @@ def test_method_and_config_follow_the_switch(monkeypatch, tmp_path):
     assert method.embedding_cls is ple_host.Qwen4ExpPLEUVAEmbedding
     mcfg._qwen4_exp_piecewise_for_host_ple(vc)
     assert vc.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
+
+
+
+def test_every_ple_embedding_class_is_concrete():
+    import inspect
+
+    from vllm.models.qwen4_exp.nvidia import ngram_embedding as NE
+
+    base = NE.Qwen4ExpPLEEmbedding
+    classes = {c for m in (ple_host, NE) for _, c in inspect.getmembers(m, inspect.isclass)
+               if issubclass(c, base) and c is not base}
+    assert {ple_host.Qwen4ExpPLEUVAEmbedding, ple_host.Qwen4ExpPLEHostEmbedding} <= classes
+    for c in classes:
+        assert not c.__abstractmethods__, (c.__name__, sorted(c.__abstractmethods__))
+
+
+def test_uva_embedding_never_prefetches():
+    cls = ple_host.Qwen4ExpPLEUVAEmbedding
+    assert cls.supports_prefetch is False  # the n-gram layer then calls forward(ngram_ids), never start_prefetch
+    assert cls.start_prefetch(object(), torch.empty(0), torch.empty(0)) is None
