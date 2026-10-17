@@ -863,6 +863,8 @@ def _qwen4_exp_host_ple_table(vllm_config: "VllmConfig") -> str | None:
     stream (models/qwen4_exp/nvidia/ple_host.py): an EXL3 pack's ``ngram_embedding.safetensors``
     (exl3_ngram_trellis) and a GGUF file's IQ4_NL ``per_layer_token_embd``."""
     model_config = vllm_config.model_config
+    if os.environ.get("VLLM_QWEN4_PLE_UVA", "0") == "1":
+        return None  # rows are read on the GPU from pinned host memory: ordinary, capturable GPU work
     if model_config.quantization == "exl3":
         path = os.path.join(model_config.model, "ngram_embedding.safetensors")
         return path if os.path.exists(path) else None

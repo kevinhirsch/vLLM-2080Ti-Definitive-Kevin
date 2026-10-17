@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import mmap
 import os
 import struct
+import warnings
 from typing import ClassVar
 
 import numpy as np
@@ -31,6 +33,7 @@ from torch import nn
 from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture, eager_break_during_capture
 from vllm.logger import init_logger
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.triton_utils import tl, triton
 
 from .ngram_embedding import Qwen4ExpPLEEmbedding, Qwen4ExpPLEEmbeddingMethod
 
@@ -42,6 +45,92 @@ IQ4_NL_BLOCK = (32, 18)  # elements, bytes
 # A finished future: start_prefetch's capture-time call (no gather) leaves nothing to wait for.
 _DONE: concurrent.futures.Future = concurrent.futures.Future()
 _DONE.set_result(None)
+
+
+def ple_uva_enabled() -> bool:
+    """``VLLM_QWEN4_PLE_UVA=1``: read host-table rows straight from pinned host memory on the GPU (see
+    Qwen4ExpPLEUVAEmbedding) instead of the CPU gather thread. It pins the whole table, so it is opt-in."""
+    return os.environ.get("VLLM_QWEN4_PLE_UVA", "0") == "1"
+
+
+def _mem_available_bytes() -> int:
+    with open("/proc/meminfo") as f:
+        for line in f:
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    return 0
+
+
+_CUDA_HOST_REGISTER_MAPPED = 0x02
+_CUDA_HOST_REGISTER_READ_ONLY = 0x08
+
+
+class HostRegisteredTable:
+    """A checkpoint table mapped read-only and registered with CUDA (mapped + read-only), so kernels read its
+    rows over PCIe through unified addressing.
+
+    The pages are the file's page-cache pages (MAP_SHARED, read-only). Every rank that registers the same file
+    pins the same physical pages, so the table occupies host RAM once. Registration faults in and pins every
+    page, which reads the whole table from disk if it is not cached. If MemAvailable cannot hold the table,
+    this refuses up front instead of letting the OOM killer choose."""
+
+    def __init__(self, path: str, offset: int, rows: int, row_bytes: int) -> None:
+        if row_bytes % 2:
+            raise ValueError(f"{path}: row of {row_bytes} B is not int16-word aligned")
+        nbytes = rows * row_bytes
+        avail = _mem_available_bytes()
+        if avail < nbytes:
+            raise RuntimeError(
+                f"VLLM_QWEN4_PLE_UVA: the PLE table ({nbytes / 2**30:.1f} GiB, {path}) must be pinned in host RAM, "
+                f"but MemAvailable is {avail / 2**30:.1f} GiB. Stop other engines or unset VLLM_QWEN4_PLE_UVA "
+                f"(the CPU-gather path pins only staging buffers)."
+            )
+        self.path, self.offset, self.rows, self.row_bytes = path, offset, rows, row_bytes
+        self.array = np.memmap(path, dtype=np.uint8, mode="r", offset=offset, shape=(rows, row_bytes))
+        base = self.array.ctypes.data
+        page = mmap.PAGESIZE
+        self._reg_start = base - base % page
+        end = base + nbytes
+        self._reg_len = end + (-end) % page - self._reg_start
+        err = torch.cuda.cudart().cudaHostRegister(
+            self._reg_start, self._reg_len, _CUDA_HOST_REGISTER_MAPPED | _CUDA_HOST_REGISTER_READ_ONLY)
+        if int(err) != 0:
+            raise RuntimeError(f"cudaHostRegister({path}, {self._reg_len / 2**30:.1f} GiB, mapped|read-only) "
+                               f"failed with cudaError {int(err)}")
+        with warnings.catch_warnings():  # a read-only mapping: torch warns that the tensor is not writable
+            warnings.simplefilter("ignore", UserWarning)
+            self.host = torch.from_numpy(self.array.view(np.int16).reshape(rows, row_bytes // 2))
+        if not self.host.is_pinned():
+            raise RuntimeError(f"{path}: registered table is not reported as pinned host memory")
+        from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+        self.device_view = get_accelerator_view_from_cpu_tensor(self.host)  # same pages, a CUDA view (UVA)
+        logger.info("PLE table %s: %.1f GiB pinned in place (read-only, mapped), %.1f GiB MemAvailable left",
+                    path, self._reg_len / 2**30, _mem_available_bytes() / 2**30)
+
+
+@triton.jit
+def _uva_row_gather_kernel(table_ptr, ids_ptr, out_ptr, n_rows, ROW_WORDS: tl.constexpr, BLOCK: tl.constexpr):
+    """out[i] = table[clamp(ids[i])]: one program per row, int16 words, read from host memory over UVA.
+    Clamping keeps capture-time and padded ids (not real hashes) inside the table."""
+    i = tl.program_id(0)
+    rid = tl.load(ids_ptr + i)
+    rid = tl.minimum(tl.maximum(rid, 0), n_rows - 1)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < ROW_WORDS
+    words = tl.load(table_ptr + rid * ROW_WORDS + offs, mask=mask)
+    tl.store(out_ptr + i * ROW_WORDS + offs, words, mask=mask)
+
+
+def uva_gather_rows(table: torch.Tensor, ids: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """``out[i] = table[ids[i]]`` for an int16 [rows, words] table (a CUDA view of pinned host memory on the
+    GPU; any tensor under TRITON_INTERPRET). ids are clamped into the table."""
+    n = ids.numel()
+    words = table.shape[1]
+    if n:
+        _uva_row_gather_kernel[(n,)](table, ids, out, table.shape[0], ROW_WORDS=words,
+                                     BLOCK=triton.next_power_of_2(words))
+    return out
 
 
 class HostRowGather:
@@ -71,7 +160,7 @@ class Qwen4ExpPLEHostTableMethod(Qwen4ExpPLEEmbeddingMethod):
 
     @property
     def embedding_cls(self):
-        return Qwen4ExpPLEHostEmbedding
+        return Qwen4ExpPLEUVAEmbedding if ple_uva_enabled() else Qwen4ExpPLEHostEmbedding
 
     def create_weights(
         self,
@@ -297,3 +386,72 @@ class Qwen4ExpPLEHostEmbedding(Qwen4ExpPLEEmbedding):
         output = self._prefetch_out.new_empty((hidden_states.shape[0], self._output_dim))
         self._finalize(output)
         return output
+
+
+class Qwen4ExpPLEUVAEmbedding(Qwen4ExpPLEEmbedding):
+    """Host-table PLE rows read by the GPU directly from pinned host memory (``VLLM_QWEN4_PLE_UVA=1``).
+
+    The lookup is ordinary GPU work: a UVA row gather into a static device buffer, then the table's own decode
+    kernel. CUDA graphs therefore capture it, FULL decode graphs included. The CPU-gather path
+    (Qwen4ExpPLEHostEmbedding) needs eager breaks, so it fits only breakable PIECEWISE graphs, and those split
+    every step at each GDN, QSA and PLE layer (about 52 segments per size on Flash-Next).
+    Cost: the whole table is pinned in place, 24.4 GiB for the EXL3 Flash-Next pack, one physical copy for all
+    ranks. The GPU reads the rows and does all the math; the CPU computes nothing."""
+
+    supports_prefetch: ClassVar[bool] = False
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        *,
+        params_dtype: torch.dtype,
+        padding_size: int,
+        prefix: str,
+        embedding_method: Qwen4ExpPLEHostTableMethod,
+        num_ngram_heads: int = 1,
+        max_total_tokens: int = 0,
+        data_parallel_rank: int = 0,
+        quant_config=None,
+    ) -> None:
+        super().__init__(
+            num_embeddings,
+            embedding_dim,
+            params_dtype=params_dtype,
+            padding_size=padding_size,
+            prefix=prefix,
+            embedding_method=embedding_method,
+            num_ngram_heads=num_ngram_heads,
+            max_total_tokens=max_total_tokens,
+            data_parallel_rank=data_parallel_rank,
+        )
+        if self.etp_data_parallel_size != 1:
+            raise NotImplementedError("host-table PLE does not support ETP across data parallel ranks")
+        m = embedding_method
+        self.method = m
+        self.table = HostRegisteredTable(m.path, m.offset, m.rows, m.row_bytes)
+        self.num_ngram_heads = num_ngram_heads
+        self._output_dim = num_ngram_heads * embedding_dim
+        self._params_dtype = params_dtype
+        max_rows = max(1, max_total_tokens) * num_ngram_heads
+        device = torch.empty(0).device  # the model-init device context (cuda:<rank>)
+        self._rows_dev = torch.empty(max_rows, m.row_bytes // 2, dtype=torch.int16, device=device)
+        logger.info(
+            "PLE table from %s @%d: %d rows x %d B (%s), UVA gather from pinned host memory, %d heads/token",
+            m.path, m.offset, m.rows, m.row_bytes, type(m).__name__, num_ngram_heads,
+        )
+
+    def allocate_embedding_weight(self, num_embeddings: int, embedding_dim: int, dtype: torch.dtype):
+        return torch.empty(0, embedding_dim, dtype=dtype)
+
+    def forward(self, input_: torch.Tensor) -> torch.Tensor:
+        """[tokens, heads] n-gram row ids -> [tokens, heads, dim] embeddings, all on the GPU."""
+        num_tokens = input_.shape[0]
+        ids = input_.reshape(-1)
+        if ids.dtype != torch.int64:
+            ids = ids.long()
+        n = ids.numel()
+        rows = uva_gather_rows(self.table.device_view, ids, self._rows_dev[:n])
+        emb = self.method.decode(self, rows.view(torch.uint8), ids, num_tokens, self._output_dim,
+                                 self._params_dtype)
+        return emb.view(num_tokens, self.num_ngram_heads, -1)
