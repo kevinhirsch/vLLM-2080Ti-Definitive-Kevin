@@ -269,8 +269,9 @@ def wait_health(budget_s, poll_s=4.0, clock=time.time, sleep=time.sleep):
 
 
 def overnight_ok(now=None):
-    """True inside the overnight window (01:00-06:00 local). WINDOWCTL_ALLOW_DAYTIME=1 overrides, for a run Kevin
-    approved explicitly at that moment (never set it in a spec or a daemon)."""
+    """True inside the overnight window (01:00-06:00 local). WINDOWCTL_ALLOW_DAYTIME=1 overrides. Kevin 2026-10-17
+    lifted overnight-only ("full permission ... as soon as possible and immediately"): the coexec window daemon sets
+    it for every queued window and pauses on windows/HOLD; specs still never set it themselves."""
     if os.environ.get("WINDOWCTL_ALLOW_DAYTIME") == "1":
         return True
     h = time.localtime(now if now is not None else time.time()).tm_hour
