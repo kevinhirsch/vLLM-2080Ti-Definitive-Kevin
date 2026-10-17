@@ -838,3 +838,24 @@ def test_reaching_six_am_aborts_between_steps_and_restores(world, tmp_path):
     s = w.run()
     assert s["status"] == "overnight-end", s.get("why")
     assert s["restore"]["ok"]
+
+
+def test_a_step_never_runs_past_the_window_deadline(world, tmp_path, monkeypatch):
+    """W2p 2026-10-17: the deadline (06:00) was only checked between steps, so a 3600 s ramp that started at 05:20
+    ran past 06:00 with production down. A run step's timeout is now capped at the window's remaining budget."""
+    (tmp_path / "rel").mkdir()
+    seen = {}
+    real = world.unit_run
+
+    def run(lane, job, cmd, timeout_s=None, **kw):
+        seen[job] = timeout_s
+        return real(lane, job, cmd, timeout_s=timeout_s, **kw)
+    monkeypatch.setattr(unitrun, "run", run)
+    s = spec(tmp_path, max_s=600, steps=[
+        {"name": "long", "run": "true", "timeout_s": 3600},
+        {"name": "short", "run": "true", "timeout_s": 30},
+    ])
+    out = wc.Window(s).run()
+    assert out["status"] == "ok", out.get("why")
+    assert 60 <= seen["t5-ab-long"] <= 600  # capped at what is left of the 600 s budget
+    assert seen["t5-ab-short"] == 30  # a step that fits keeps its own timeout

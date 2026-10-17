@@ -1043,7 +1043,14 @@ class Window:
         out = self.path("steps", f"{st['name']}.log")
         if self.dry:
             return {"rc": 0, "dry": True, "argv": argv, "env": env}
-        res = unitrun.run(self.lane, f"{self.wid}-{st['name']}", argv, timeout_s=int(st.get("timeout_s", 1800)), env=env,
+        timeout_s = int(st.get("timeout_s", 1800))
+        # Never past the window's deadline (06:00 for overnight windows; set when the window opened): the between-step
+        # check cannot stop a step that is already running, so W2p's 3600 s ramp ran past 06:00 with the 27B down.
+        left = int(self.t0 + self.max_s - time.time())
+        if left < timeout_s:
+            self.log(f"step {st['name']}: timeout {timeout_s} s capped at the window's remaining {max(60, left)} s")
+            timeout_s = max(60, left)
+        res = unitrun.run(self.lane, f"{self.wid}-{st['name']}", argv, timeout_s=timeout_s, env=env,
                           cwd=rendered.get("cwd"), out=out)
         missing = [p for p in (rendered.get("outputs") or []) if not os.path.exists(p)]
         res["missing_outputs"] = missing
