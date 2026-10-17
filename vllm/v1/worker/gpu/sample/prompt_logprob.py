@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable
 
 import numpy as np
@@ -196,6 +197,18 @@ def get_prompt_logprobs_token_ids(
     return token_ids
 
 
+def _auto_prompt_logprobs_chunk(prompt_logits: torch.Tensor) -> int:
+    """Prompt tokens per logits chunk that fit the GPU memory free right now.
+
+    Per prompt token a chunk holds the gathered logits row (vocab x itemsize) plus
+    this rank's shard and its contiguous all-gather input (together at most another
+    row). Top-k ids and logsumexp scalars are negligible. Clamped to [16, 1024]."""
+    vocab = int(prompt_logits.shape[-1])
+    per_token = 2 * vocab * prompt_logits.element_size()
+    free = torch.cuda.mem_get_info(prompt_logits.device)[0] if prompt_logits.is_cuda else 1 << 40
+    return int(min(1024, max(16, free // max(1, per_token))))
+
+
 def compute_prompt_logprobs_with_chunking(
     prompt_token_ids: torch.Tensor,
     prompt_hidden_states: torch.Tensor,
@@ -204,15 +217,23 @@ def compute_prompt_logprobs_with_chunking(
     logprobs_mode: LogprobsMode = "raw_logprobs",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Since materializing the full prompt logits can take too much memory,
-    # we compute it in chunks.
-    CHUNK_SIZE = 1024
+    # we compute it in chunks. VLLM_PROMPT_LOGPROBS_CHUNK_SIZE: tokens per
+    # chunk (default 1024), or "auto" to size each chunk from the free GPU
+    # memory. The engine's memory profile never includes prompt logprobs, so
+    # a packed KV pool can leave less room than a 1024-token chunk needs
+    # (NM-9: 486 MiB gather, 277 MiB free).
+    chunk_env = os.environ.get("VLLM_PROMPT_LOGPROBS_CHUNK_SIZE", "1024").strip()
+    auto = chunk_env == "auto"
+    chunk_size = 16 if auto else max(1, int(chunk_env))
     token_ids = []
     scores = []
     ranks = []
     logits_mode = logprobs_mode in ("raw_logits", "processed_logits")
     prompt_token_ids = prompt_token_ids.to(torch.int64)
-    for start_idx in range(0, prompt_token_ids.shape[0], CHUNK_SIZE):
-        end_idx = start_idx + CHUNK_SIZE
+    start_idx = 0
+    n_total = prompt_token_ids.shape[0]
+    while start_idx < n_total:
+        end_idx = start_idx + chunk_size
         # NOTE(woosuk): logits_fn can be slow because it involves all-gather.
         prompt_logits = logits_fn(prompt_hidden_states[start_idx:end_idx])
         requested_num = (
@@ -229,6 +250,9 @@ def compute_prompt_logprobs_with_chunking(
         token_ids.append(result.logprob_token_ids)
         scores.append(result.logprobs)
         ranks.append(result.selected_token_ranks)
+        start_idx = end_idx
+        if auto:
+            chunk_size = _auto_prompt_logprobs_chunk(prompt_logits)
 
     token_ids = torch.cat(token_ids, dim=0) if len(token_ids) > 1 else token_ids[0]
     scores = torch.cat(scores, dim=0) if len(scores) > 1 else scores[0]
