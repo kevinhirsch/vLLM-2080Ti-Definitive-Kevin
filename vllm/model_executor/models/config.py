@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
@@ -855,6 +856,51 @@ def _strip_qwen4_exp_mrope(model_config: "ModelConfig") -> None:
             rope_parameters.pop("mrope_interleaved", None)
 
 
+def _qwen4_exp_host_ple_table(vllm_config: "VllmConfig") -> str | None:
+    """The PLE table a Qwen4Exp checkpoint streams from host memory, if any.
+
+    These are the formats whose rows a CPU thread gathers from an mmap and then uploads and decodes on a side
+    stream (models/qwen4_exp/nvidia/ple_host.py): an EXL3 pack's ``ngram_embedding.safetensors``
+    (exl3_ngram_trellis) and a GGUF file's IQ4_NL ``per_layer_token_embd``."""
+    model_config = vllm_config.model_config
+    if model_config.quantization == "exl3":
+        path = os.path.join(model_config.model, "ngram_embedding.safetensors")
+        return path if os.path.exists(path) else None
+    if model_config.quantization == "gguf":
+        return model_config.model
+    return None
+
+
+def _qwen4_exp_piecewise_for_host_ple(vllm_config: "VllmConfig") -> None:
+    """Drop any FULL component of the cudagraph mode when the PLE table lives on the host.
+
+    The host gather runs as eager breaks between breakable PIECEWISE graph segments. A FULL graph runs those
+    breaks inside the graph by design, which leaves the gather thread waiting on a captured event:
+    907 CUDA_ERROR_CAPTURED_EVENT from cuEventSynchronize, then the capture is invalidated (NM-9 W2e,
+    2026-10-16). NONE (eager) and PIECEWISE are kept as they are."""
+    if not vllm_config.model_config.hf_text_config.ple_layer_ids:
+        return
+    table = _qwen4_exp_host_ple_table(vllm_config)
+    if table is None:
+        return
+    from vllm.config.compilation import CUDAGraphMode
+
+    compilation_config = vllm_config.compilation_config
+    mode = compilation_config.cudagraph_mode
+    if mode is None or mode in (
+        CUDAGraphMode.FULL,
+        CUDAGraphMode.FULL_DECODE_ONLY,
+        CUDAGraphMode.FULL_AND_PIECEWISE,
+    ):
+        logger.warning(
+            "Qwen4Exp host-table PLE (%s): cudagraph_mode %s -> PIECEWISE, because FULL graphs "
+            "cannot capture the host row gather",
+            table,
+            mode,
+        )
+        compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+
+
 class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConfig):
     """Apply the Qwen3.5 hybrid-cache contract to Qwen4Exp."""
 
@@ -895,6 +941,7 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
                 "Qwen4Exp speculative decoding supports only its native MTP "
                 "checkpoint and linear n-gram proposers"
             )
+        _qwen4_exp_piecewise_for_host_ple(vllm_config)
 
 
 class Qwen4ExpForCausalLMConfig(Qwen4ExpForConditionalGenerationConfig):
