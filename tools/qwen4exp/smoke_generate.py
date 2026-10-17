@@ -48,6 +48,8 @@ def main():
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--max-tokens", type=int, default=32)
+    ap.add_argument("--no-content", action="store_true",
+                    help="random-weight smoke (--load-format dummy, synthetic GGUF): skip the content check")
     ap.add_argument("--nll-ref", default=None, help="smoke.json of a reference arm: report the NLL delta")
     a = ap.parse_args()
     base = f"http://127.0.0.1:{a.port}"
@@ -69,7 +71,7 @@ def main():
                          "tok_s": round(n / dt, 2) if dt > 0 else None})
         same = outs[0]["text"] == outs[1]["text"]
         want = EXPECT.get(prompt)
-        content_ok = True if want is None else any(w in outs[0]["text"].lower() for w in want)
+        content_ok = True if (want is None or a.no_content) else any(w in outs[0]["text"].lower() for w in want)
         ok = same and all(o["finite"] for o in outs) and outs[0]["completion_tokens"] > 0 and content_ok
         res["pass"] &= ok
         res["runs"].append({"prompt": prompt, "deterministic": same, "content_ok": content_ok, "pass": ok,
