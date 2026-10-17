@@ -56,9 +56,8 @@ from .model import (
     Qwen4ExpDecoderLayer,
     Qwen4ExpMixtureOfExperts,
     Qwen4ExpSparseMoeBlock,
+    finalize_qwen4_exp_weights,
 )
-from .qsa import finalize_qsa_kv_cache_scales
-from .hyperconnection import convert_hc_weights_w8
 
 
 def _remap_ignored_layers(
@@ -362,11 +361,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             self,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        loaded = loader.load_weights(weights, mapper=mapper)
-        # Draft QSA layers own their own int8 main-cache scales.
-        finalize_qsa_kv_cache_scales(self)
-        convert_hc_weights_w8(self)
-        return loaded
+        # Post-load transforms (the draft's own int8 KV scales, HC W8) run from
+        # Qwen4ExpMTP.process_weights_after_loading, once every weight is in.
+        return loader.load_weights(weights, mapper=mapper)
 
 
 class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
@@ -462,6 +459,9 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         return loader.load_weights(remap_weight_names(), mapper=mapper)
+
+    def process_weights_after_loading(self) -> None:
+        finalize_qwen4_exp_weights(self)
 
 
 __all__ = ["Qwen4ExpMTP", "Qwen4ExpMultiTokenPredictor"]

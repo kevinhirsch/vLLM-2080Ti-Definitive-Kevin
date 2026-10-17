@@ -656,16 +656,32 @@ class Qwen4ExpModel(nn.Module):
             ignore_unexpected_prefixes=ignore_prefixes,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        loaded = loader.load_weights(
+        # Post-load transforms (int8 KV scales, HC W8) run from the top-level
+        # model's process_weights_after_loading, not here: AutoWeightsLoader
+        # calls this once per contiguous run of model.* names, and the EXL3
+        # Flash-Next pack has three (lm_head and the n-gram table split them).
+        return loader.load_weights(
             weights,
             mapper=mapper,
         )
-        # int8 main cache only: turn the loaded fp8 k/v scales into the int8
-        # storage scales (no-op for fp16/bf16 caches).
-        finalize_qsa_kv_cache_scales(self)
-        # opt-in VLLM_QWEN4_HC_W8=1: int8 HC projections (no-op otherwise)
-        convert_hc_weights_w8(self)
-        return loaded
+
+
+def finalize_qwen4_exp_weights(module: nn.Module) -> None:
+    """Post-load transforms that need every checkpoint weight in place.
+
+    Called from the model-level ``process_weights_after_loading`` hook, which vLLM
+    runs once after the whole checkpoint is loaded. A submodule's ``load_weights``
+    is not that point: AutoWeightsLoader calls it once per contiguous run of its
+    weight names, and other names (``lm_head``, a separate table file) can split
+    the run. Running these there converted layers whose weights had not arrived
+    yet (NM-9 W2h: the HC W8 arm then failed to load a weight into the emptied
+    parameter). Both transforms are idempotent.
+    """
+    # int8 main cache only: turn the loaded fp8 k/v scales into the int8
+    # storage scales (no-op for fp16/bf16 caches).
+    finalize_qsa_kv_cache_scales(module)
+    # opt-in VLLM_QWEN4_HC_W8=1: int8 HC projections (no-op otherwise)
+    convert_hc_weights_w8(module)
 
 
 class Qwen4ExpForCausalLM(
@@ -898,6 +914,9 @@ class Qwen4ExpForCausalLM(
         )
         return loader.load_weights(weights, mapper=mapper)
 
+    def process_weights_after_loading(self) -> None:
+        finalize_qwen4_exp_weights(self)
+
 
 class Qwen4ExpProcessingInfo(Qwen3VLProcessingInfo):
     def get_hf_config(self) -> Qwen4ExpConfig:
@@ -1092,6 +1111,9 @@ class Qwen4ExpForConditionalGeneration(
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         return loader.load_weights(weights, mapper=mapper)
+
+    def process_weights_after_loading(self) -> None:
+        finalize_qwen4_exp_weights(self)
 
     @classmethod
     def get_mamba_state_dtype_from_config(

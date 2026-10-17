@@ -210,7 +210,11 @@ __all__ = [
 
 
 def convert_hc_weights_w8(module: nn.Module) -> int:
-    """Opt-in (``VLLM_QWEN4_HC_W8=1``): group-wise int8 HC projections, after weight loading.
+    """Opt-in (``VLLM_QWEN4_HC_W8=1``): group-wise int8 HC projections, after ALL weights load.
+
+    Call it from the model-level ``process_weights_after_loading`` hook (see
+    ``finalize_qwen4_exp_weights``), never from a submodule's ``load_weights``: that runs
+    once per contiguous run of weight names, before later runs have loaded their weights.
 
     Quantizes every GatedResidual projection under ``module`` (int8, one fp16 scale per
     64 inputs; ~0.7% relative error on the real Flash-Next HC weights), swaps its
