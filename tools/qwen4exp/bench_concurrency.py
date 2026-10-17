@@ -8,12 +8,16 @@ curve), with the per-stream SLO marked: decode >= --slo-tok-s tok/s per stream a
 (--slo-ttft-long-s for prompts of 28K+ tokens).
 
 Each stream sends the same-shaped request (varied topic, --prompt-tokens of filler, --tokens output, ignore_eos,
-greedy); all streams of a point start together.
+greedy); all streams of a point start together. By default the filler is the SAME text for every stream, i.e. one
+shared prefix (agent lanes sharing a system prompt: the prefix cache serves it once). --distinct-context gives every
+stream of every rep its own filler from the first token (no prefix sharing at all: each lane pays its full context in
+KV), which is the memory-wall case; run both to bracket real traffic.
 Usage: bench_concurrency.py --port 8011 --out res.json [--start 1] [--tokens 256] [--reps 3] [--prompt-tokens 0]
 """
 import argparse
 import concurrent.futures as cf
 import json
+import random
 import statistics
 import sys
 import time
@@ -24,10 +28,25 @@ TOPICS = ["rust borrow checker", "the French revolution", "photosynthesis", "TCP
           "plate tectonics", "compiler register allocation", "the Silk Road", "CRISPR", "black holes",
           "double-entry bookkeeping", "transformer attention", "medieval castles"]
 FILLER = ("The quick brown fox jumps over the lazy dog while the committee reviews the quarterly report. ")
+WORDS = ("amber basalt cedar delta ember fjord granite harbor iris juniper kelp lagoon mesa nectar orchid prairie "
+         "quartz reef sierra tundra umber valley willow xenon yarrow zephyr anchor beacon canyon dune estuary glacier "
+         "heron inlet jetty knoll ledge marsh oasis pinnacle quarry ridge summit thicket upland vista wharf").split()
+
+
+def _filler(a, i):
+    """--prompt-tokens of filler; shared by default, unique per (rep, stream) with --distinct-context."""
+    if not a.prompt_tokens:
+        return ""
+    if not a.distinct_context:
+        return FILLER * (a.prompt_tokens // 20)
+    rng = random.Random(f"{a.nonce}-{getattr(a, 'rep', 0)}-{i}")
+    # ~1.3 tokens per word for this vocabulary; the session tag leads so no two streams share a first block
+    words = [rng.choice(WORDS) for _ in range(int(a.prompt_tokens / 1.3))]
+    return f"[session {a.nonce}-{getattr(a, 'rep', 0)}-{i}] " + " ".join(words) + "."
 
 
 def stream_one(base, model, i, a):
-    pad = FILLER * (a.prompt_tokens // 20) if a.prompt_tokens else ""
+    pad = _filler(a, i)
     body = {"model": model, "prompt": f"{pad}\nWrite a detailed technical essay about {TOPICS[i % len(TOPICS)]} "
             f"(variant {i}).\n\n", "max_tokens": a.tokens, "temperature": 0.0, "ignore_eos": True, "stream": True}
     req = urllib.request.Request(base + "/v1/completions", data=json.dumps(body).encode(),
@@ -50,7 +69,8 @@ def stream_one(base, model, i, a):
 
 def measure(base, model, c, a):
     reps, err = [], None
-    for _ in range(a.reps):
+    for rep_i in range(a.reps):
+        a.rep = f"c{c}r{rep_i}"  # distinct-context fillers never repeat across points or reps
         t0 = time.perf_counter()
         try:
             with cf.ThreadPoolExecutor(c) as ex:
@@ -94,6 +114,8 @@ def main():
     ap.add_argument("--start", type=int, default=1)
     ap.add_argument("--tokens", type=int, default=256)
     ap.add_argument("--prompt-tokens", type=int, default=0)
+    ap.add_argument("--distinct-context", action="store_true",
+                    help="unique filler per stream and rep (no prefix sharing): the KV memory-wall case")
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--request-timeout-s", type=float, default=900)
     ap.add_argument("--slo-tok-s", type=float, default=30.0)
@@ -101,6 +123,7 @@ def main():
     ap.add_argument("--slo-ttft-long-s", type=float, default=8.0)
     ap.add_argument("--points", default="", help="explicit comma list instead of the ramp (e.g. for a latency map)")
     a = ap.parse_args()
+    a.nonce = f"{time.time_ns():x}"
     base = f"http://127.0.0.1:{a.port}"
     model = json.loads(urllib.request.urlopen(base + "/v1/models", timeout=30).read())["data"][0]["id"]
     stream_one(base, model, 0, argparse.Namespace(**{**vars(a), "tokens": 16}))  # warm-up (graphs, Triton JIT)
