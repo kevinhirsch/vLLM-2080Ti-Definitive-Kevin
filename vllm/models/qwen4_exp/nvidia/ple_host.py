@@ -65,14 +65,91 @@ _CUDA_HOST_REGISTER_MAPPED = 0x02
 _CUDA_HOST_REGISTER_READ_ONLY = 0x08
 
 
-class HostRegisteredTable:
-    """A checkpoint table mapped read-only and registered with CUDA (mapped + read-only), so kernels read its
-    rows over PCIe through unified addressing.
+def _clear_cuda_last_error() -> None:
+    """Reset this thread's CUDA runtime error after an expected failure (cudaGetLastError reads and clears)."""
+    import ctypes
 
-    The pages are the file's page-cache pages (MAP_SHARED, read-only). Every rank that registers the same file
-    pins the same physical pages, so the table occupies host RAM once. Registration faults in and pins every
-    page, which reads the whole table from disk if it is not cached. If MemAvailable cannot hold the table,
-    this refuses up front instead of letting the OOM killer choose."""
+    for name in ("libcudart.so.13", "libcudart.so.12", "libcudart.so"):
+        try:
+            lib = ctypes.CDLL(name, mode=os.RTLD_NOLOAD | ctypes.RTLD_GLOBAL)  # the runtime torch already loaded
+        except OSError:
+            continue
+        lib.cudaGetLastError()
+        return
+
+
+def _memfd_create(name: str) -> int:
+    """memfd_create(2); os.memfd_create is missing from some CPython builds (python-build-standalone)."""
+    if hasattr(os, "memfd_create"):
+        return os.memfd_create(name, 0)
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    fd = libc.memfd_create(name.encode(), 0)
+    if fd < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, f"memfd_create({name}): {os.strerror(err)}")
+    return fd
+
+
+def _shared_table_copy(path: str, offset: int, nbytes: int) -> tuple[mmap.mmap, int]:
+    """A copy of the table in a memfd that every rank of one engine shares, so it occupies RAM once.
+
+    The first rank to take the lock creates the memfd, copies the table into it and publishes its
+    /proc/<pid>/fd path; the other ranks open that path. All ranks are children of one EngineCore, so the
+    parent pid keys the rendezvous. Shared-memory pages, unlike page-cache pages of a file, may be pinned
+    long term."""
+    import fcntl
+    import hashlib
+    import tempfile
+
+    key = hashlib.sha1(f"{os.path.realpath(path)}:{offset}:{nbytes}".encode()).hexdigest()[:12]
+    base = os.path.join(tempfile.gettempdir(), f"nm9-ple-{os.getppid()}-{key}")
+    with open(base + ".lock", "a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        info = None
+        if os.path.exists(base + ".json"):
+            info = json.load(open(base + ".json"))
+            if not os.path.exists(f"/proc/{info['pid']}/fd/{info['fd']}"):
+                info = None
+        if info is not None:
+            fd = os.open(f"/proc/{info['pid']}/fd/{info['fd']}", os.O_RDWR)
+            return mmap.mmap(fd, nbytes, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE), fd
+        avail = _mem_available_bytes()
+        if avail < nbytes:
+            raise RuntimeError(
+                f"VLLM_QWEN4_PLE_UVA: the PLE table ({nbytes / 2**30:.1f} GiB, {path}) must be copied into "
+                f"pinned shared memory, but MemAvailable is {avail / 2**30:.1f} GiB. Stop other engines or "
+                f"unset VLLM_QWEN4_PLE_UVA (the CPU-gather path pins only staging buffers).")
+        fd = _memfd_create(f"nm9-ple-{key}")
+        os.ftruncate(fd, nbytes)
+        dst = mmap.mmap(fd, nbytes, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+        view = memoryview(dst)
+        chunk = 256 << 20
+        with open(path, "rb", buffering=0) as src:
+            src.seek(offset)
+            done = 0
+            while done < nbytes:
+                n = src.readinto(view[done:min(done + chunk, nbytes)])
+                if not n:
+                    raise OSError(f"{path}: short read at table byte {done} of {nbytes}")
+                done += n
+        view.release()
+        with open(base + ".json.tmp", "w") as f:
+            json.dump({"pid": os.getpid(), "fd": fd}, f)
+        os.replace(base + ".json.tmp", base + ".json")
+        return dst, fd
+
+
+class HostRegisteredTable:
+    """The checkpoint's PLE table in host memory registered with CUDA (mapped), so kernels read its rows over
+    PCIe through unified addressing.
+
+    First choice: the file's own page-cache pages, mapped read-only and registered read-only, with no copy.
+    Where the platform refuses that (Linux forbids long-term pins of file-backed pages; cudaError 801 on
+    HNET00's Turing), the table is copied once into a memfd that every rank of the engine shares, and that
+    copy is registered. Either way the table occupies RAM once for all ranks. If MemAvailable cannot hold
+    it, this refuses up front instead of letting the OOM killer choose."""
 
     def __init__(self, path: str, offset: int, rows: int, row_bytes: int) -> None:
         if row_bytes % 2:
@@ -83,21 +160,27 @@ class HostRegisteredTable:
             raise RuntimeError(
                 f"VLLM_QWEN4_PLE_UVA: the PLE table ({nbytes / 2**30:.1f} GiB, {path}) must be pinned in host RAM, "
                 f"but MemAvailable is {avail / 2**30:.1f} GiB. Stop other engines or unset VLLM_QWEN4_PLE_UVA "
-                f"(the CPU-gather path pins only staging buffers)."
-            )
+                f"(the CPU-gather path pins only staging buffers).")
         self.path, self.offset, self.rows, self.row_bytes = path, offset, rows, row_bytes
+        cudart = torch.cuda.cudart()
+        self.mode = "file pages, read-only"
+        self._mm = self._fd = None
         self.array = np.memmap(path, dtype=np.uint8, mode="r", offset=offset, shape=(rows, row_bytes))
-        base = self.array.ctypes.data
-        page = mmap.PAGESIZE
-        self._reg_start = base - base % page
-        end = base + nbytes
-        self._reg_len = end + (-end) % page - self._reg_start
-        err = torch.cuda.cudart().cudaHostRegister(
-            self._reg_start, self._reg_len, _CUDA_HOST_REGISTER_MAPPED | _CUDA_HOST_REGISTER_READ_ONLY)
-        if int(err) != 0:
-            raise RuntimeError(f"cudaHostRegister({path}, {self._reg_len / 2**30:.1f} GiB, mapped|read-only) "
-                               f"failed with cudaError {int(err)}")
-        with warnings.catch_warnings():  # a read-only mapping: torch warns that the tensor is not writable
+        start, length = self._page_span(self.array.ctypes.data, nbytes)
+        err = int(cudart.cudaHostRegister(start, length, _CUDA_HOST_REGISTER_MAPPED | _CUDA_HOST_REGISTER_READ_ONLY))
+        if err != 0:
+            _clear_cuda_last_error()  # else a later cudaPeekAtLastError (extension launch checks) reports it
+            del self.array
+            self._mm, self._fd = _shared_table_copy(path, offset, nbytes)
+            self.array = np.frombuffer(self._mm, dtype=np.uint8, count=nbytes).reshape(rows, row_bytes)
+            start, length = self._page_span(self.array.ctypes.data, nbytes)
+            err2 = int(cudart.cudaHostRegister(start, length, _CUDA_HOST_REGISTER_MAPPED))
+            if err2 != 0:
+                raise RuntimeError(f"cudaHostRegister({path}: read-only file pages failed with cudaError {err}; "
+                                   f"the shared copy failed with cudaError {err2})")
+            self.mode = f"shared memfd copy (read-only file pin: cudaError {err})"
+        self._reg_start, self._reg_len = start, length
+        with warnings.catch_warnings():  # read-only mapping case: torch warns that the tensor is not writable
             warnings.simplefilter("ignore", UserWarning)
             self.host = torch.from_numpy(self.array.view(np.int16).reshape(rows, row_bytes // 2))
         if not self.host.is_pinned():
@@ -105,8 +188,15 @@ class HostRegisteredTable:
         from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
         self.device_view = get_accelerator_view_from_cpu_tensor(self.host)  # same pages, a CUDA view (UVA)
-        logger.info("PLE table %s: %.1f GiB pinned in place (read-only, mapped), %.1f GiB MemAvailable left",
-                    path, self._reg_len / 2**30, _mem_available_bytes() / 2**30)
+        logger.info("PLE table %s: %.1f GiB pinned (%s), %.1f GiB MemAvailable left",
+                    path, length / 2**30, self.mode, _mem_available_bytes() / 2**30)
+
+    @staticmethod
+    def _page_span(base: int, nbytes: int) -> tuple[int, int]:
+        page = mmap.PAGESIZE
+        start = base - base % page
+        end = base + nbytes
+        return start, end + (-end) % page - start
 
 
 @triton.jit
