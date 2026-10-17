@@ -197,16 +197,42 @@ def get_prompt_logprobs_token_ids(
     return token_ids
 
 
-def _auto_prompt_logprobs_chunk(prompt_logits: torch.Tensor) -> int:
-    """Prompt tokens per logits chunk that fit the GPU memory free right now.
+def _tp_min(value: int) -> int:
+    """The smallest ``value`` across the tensor-parallel group.
 
-    Per prompt token a chunk holds the gathered logits row (vocab x itemsize) plus
-    this rank's shard and its contiguous all-gather input (together at most another
-    row). Top-k ids and logsumexp scalars are negligible. Clamped to [16, 1024]."""
+    Every rank must use the same chunk: each chunk's logits_fn all-gathers, so
+    ranks that size chunks from their own free memory issue mismatched
+    collectives and hang (NM-9 W2h: 795 vs 1024 rows, the workers stalled until
+    the 5-minute RPC timeout killed the engine). One CPU-group all-reduce."""
+    from vllm.distributed import parallel_state as ps
+
+    if not ps.model_parallel_is_initialized():
+        return value
+    tp = ps.get_tp_group()
+    if tp.world_size == 1:
+        return value
+    t = torch.tensor([value], dtype=torch.int64)
+    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=tp.cpu_group)
+    return int(t.item())
+
+
+def _free_device_bytes(t: torch.Tensor) -> int:
+    return torch.cuda.mem_get_info(t.device)[0] if t.is_cuda else 1 << 40
+
+
+def _auto_prompt_logprobs_chunk(prompt_logits: torch.Tensor) -> int:
+    """Prompt tokens per logits chunk that fit the GPU memory free right now, the
+    same on every tensor-parallel rank.
+
+    Per prompt token a chunk holds this rank's logits shard, the all-gather buffer
+    and its rearranged copy (up to 3 rows of vocab x itemsize), plus an fp32 row
+    of top-k / log-softmax scratch. NM-9 W2h measured the old 2-row estimate short:
+    rank 1 sized 795 rows from 0.79 GB free, then needed ~0.99 GB. Uses 90% of the
+    free memory; clamped to [16, 1024]."""
     vocab = int(prompt_logits.shape[-1])
-    per_token = 2 * vocab * prompt_logits.element_size()
-    free = torch.cuda.mem_get_info(prompt_logits.device)[0] if prompt_logits.is_cuda else 1 << 40
-    return int(min(1024, max(16, free // max(1, per_token))))
+    per_token = vocab * (3 * prompt_logits.element_size() + 4)
+    free = _free_device_bytes(prompt_logits)
+    return _tp_min(int(min(1024, max(16, int(free * 0.9) // max(1, per_token)))))
 
 
 def compute_prompt_logprobs_with_chunking(
@@ -218,9 +244,11 @@ def compute_prompt_logprobs_with_chunking(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Since materializing the full prompt logits can take too much memory,
     # we compute it in chunks. VLLM_PROMPT_LOGPROBS_CHUNK_SIZE: tokens per
-    # chunk (default 1024), or "auto" to size each chunk from the free GPU
-    # memory. The engine's memory profile never includes prompt logprobs, so
-    # a packed KV pool can leave less room than a 1024-token chunk needs
+    # chunk (default 1024), or "auto": a 16-token first chunk, then one size
+    # for the rest of the prompt from the free GPU memory, agreed across the
+    # tensor-parallel ranks (each chunk all-gathers, so every rank must run the
+    # same chunks). The engine's memory profile never includes prompt logprobs,
+    # so a packed KV pool can leave less room than a 1024-token chunk needs
     # (NM-9: 486 MiB gather, 277 MiB free).
     chunk_env = os.environ.get("VLLM_PROMPT_LOGPROBS_CHUNK_SIZE", "1024").strip()
     auto = chunk_env == "auto"
@@ -251,8 +279,11 @@ def compute_prompt_logprobs_with_chunking(
         scores.append(result.logprobs)
         ranks.append(result.selected_token_ranks)
         start_idx = end_idx
-        if auto:
+        if auto and start_idx < n_total:
+            # once per call, after the first chunk: every rank then runs the
+            # same chunks (n_total is the same on every rank)
             chunk_size = _auto_prompt_logprobs_chunk(prompt_logits)
+            auto = False
 
     token_ids = torch.cat(token_ids, dim=0) if len(token_ids) > 1 else token_ids[0]
     scores = torch.cat(scores, dim=0) if len(scores) > 1 else scores[0]
