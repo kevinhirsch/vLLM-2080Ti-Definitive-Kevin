@@ -520,6 +520,11 @@ def build(sha: str, *, label: str | None = None, from_tree: str = DEFAULT_FROM, 
             log(f"[2/7] compiled artifacts from {from_tree}")
             artifacts = copy_artifacts(from_tree, stage)
             flashqla = copy_flashqla(from_tree, stage)
+            if flashqla is None and os.environ.get("RELEASE_ALLOW_NO_FLASHQLA") != "1":
+                # 2026-10-17: the --from tree had lost .deps/; the releases built from it had no FlashQLA and the 27B
+                # crashed both TP workers at GDN init (W8X-R4, t75 A/B/A). Refuse instead of building it silently.
+                raise ReleaseError(f"{from_tree}/{FLASHQLA} is missing: the release would not boot the 27B "
+                                   "(set RELEASE_ALLOW_NO_FLASHQLA=1 for a release that never boots it)")
             log("[3/7] venv snapshot (hard links)")
             src_venv = os.path.realpath(os.path.join(from_tree, ".venv"))
             vmeta = snapshot_venv(src_venv, root)
