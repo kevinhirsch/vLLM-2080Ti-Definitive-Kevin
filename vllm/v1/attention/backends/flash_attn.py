@@ -53,6 +53,10 @@ if is_flash_attn_varlen_func_available():
         get_scheduler_metadata,
         reshape_and_cache_flash,
     )
+else:
+    # No FlashAttention varlen kernel (e.g. SM75): backends that subclass this one for their own attention kernel
+    # (Qwen4Exp QSA) still write the paged KV cache through the _C cache op, which needs no FlashAttention.
+    from vllm._custom_ops import reshape_and_cache_flash
 import vllm.envs as envs
 from vllm.config import (
     VllmConfig,
