@@ -31,12 +31,16 @@ def main() -> None:
 
     kw = dict(model=a.config_dir, dtype=a.dtype, load_format="dummy", enforce_eager=True,
               max_model_len=4096, max_num_batched_tokens=4096, gpu_memory_utilization=0.5,
-              mamba_cache_mode="align", language_model_only=False,
+              mamba_cache_mode="align", language_model_only=bool(os.environ.get("NM9_LMO")),
               engram_config={"cpu_offload": False})
     if a.quantization:
         kw["quantization"] = a.quantization
     if a.hf_overrides:
         kw["hf_overrides"] = json.loads(a.hf_overrides)
+    if os.environ.get("NM9_FAKE_SM75"):  # plugins that validate the device at registration (vllm-exl3-turing)
+        import vllm_exl3.turing as _t
+
+        _t.validate_runtime = lambda: _t.load_extension()
     vllm_config = EngineArgs(**kw).create_engine_config()
     # No GPU here: layers that ask the platform for "the current device" get the meta device.
     from vllm.platforms import current_platform

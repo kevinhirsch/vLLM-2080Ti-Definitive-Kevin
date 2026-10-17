@@ -187,11 +187,11 @@ class GGUFConfig(QuantizationConfig):
 
     def get_qwen4exp_ple_method(self, prefix: str) -> QuantizeMethodBase | None:
         """PLE n-gram table hook (``ngram_embedding.py``): the GGUF's IQ4_NL ``per_layer_token_embd`` stays in
-        the file and is gathered on the host (``ple_gguf.py``). ``None`` (no table in the GGUF, or no GGUF
+        the file and is gathered on the host (``ple_host.py``). ``None`` (no table in the GGUF, or no GGUF
         file, e.g. ``--load-format dummy`` smoke tests) = the regular unquantized table."""
         if not self.gguf_file:
             return None
-        from vllm.models.qwen4_exp.nvidia.ple_gguf import Qwen4ExpPLEGGUFTableMethod
+        from vllm.models.qwen4_exp.nvidia.ple_host import Qwen4ExpPLEGGUFTableMethod
 
         info = self.gguf_model().tensors.get("per_layer_token_embd.weight")
         if info is None:

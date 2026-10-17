@@ -226,6 +226,16 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
         ple_method = getattr(quant_config, "get_qwen4exp_ple_method", None)
         if ple_method is not None:
             return ple_method(prefix) or Qwen4ExpPLEUnquantizedEmbeddingMethod()
+        if quant_config.get_name() == "exl3":
+            # turboderp's EXL3 packs ship the table as ngram_embedding.safetensors
+            # (exl3_ngram_trellis): stream it from the file, decode on GPU.
+            from vllm.config import get_current_vllm_config
+
+            from .ple_host import exl3_ple_method_for
+
+            method = exl3_ple_method_for(get_current_vllm_config().model_config.model)
+            if method is not None:
+                return method
         if _supports_custom_ple_embedding(quant_config):
             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
         if isinstance(quant_config, ModelOptMixedPrecisionConfig):

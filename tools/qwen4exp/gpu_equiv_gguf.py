@@ -52,7 +52,7 @@ def main():
     out_path = sys.argv[1]
     from vllm.model_executor.layers.quantization import gguf_ops
     from vllm.model_executor.layers.quantization.gguf import _gguf_moe, gguf_mul_mat  # noqa: F401
-    from vllm.models.qwen4_exp.nvidia.ple_gguf import HostRowGather
+    from vllm.models.qwen4_exp.nvidia.ple_host import HostRowGather
 
     dev = torch.device("cuda", 0)
     rng = np.random.default_rng(0)
