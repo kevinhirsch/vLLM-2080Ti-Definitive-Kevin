@@ -10,6 +10,37 @@ Not a fork release. This branch carries the HNET00 estate's gateway, window-cont
 2026-10-20) is in [`deploy/docs/CHANGELOG-frontier-pastnative-20260816.md`](deploy/docs/CHANGELOG-frontier-pastnative-20260816.md),
 grouped by component.
 
+### Pushed 2026-10-20 (gateway update)
+
+- **Strict tool-call history on the remote path** (lane GW-STRICT, via gw-combined): requests forwarded to the paid
+  remote get their tool-call history repaired to the strict form DeepSeek requires (orphaned tool results, missing
+  call ids), logged as `strict tool history: client=... changes=N`. Local requests are untouched. No switch.
+- **Repetition retry** (lane GW-REP-RETRY, via gw-combined): `SHIM_REPETITION_RETRY=off|shadow|live` (default `off`).
+  When a local request carrying tools comes back cut by the repetition guard with no tool call, `live` re-issues it once
+  with thinking off and hands the client the retry. Turned on in production 2026-10-20 at Kevin's request.
+- **`SHIM_LOCAL_ONLY_CLIENTS`** (new): a comma-separated list of X-Client values served exactly like the `estate-local`
+  alias. They never reach the paid remote: not for congestion, not during a planned window, not when the local engine
+  is down (they are held instead). Set to the agent lanes (`openhands-coordinator`, `openhands-coordinator-deep`,
+  `lane-medic`) because Kevin revoked remote use for lanes on 2026-10-20.
+- **`gateway_config_schema.py`**: registers six settings the code already read but the schema lacked:
+  `SHIM_LOCAL_ONLY_CLIENTS`, `SHIM_LOCAL_ONLY_HOLD_SECS`, `SHIM_DRAIN_WAIT_S`, `SHIM_REPETITION_RETRY`,
+  `SHIM_AGENT_CONTEXT_TOKENS`, `SHIM_AGENT_CONTEXT_MODELS`. `test_gateway_config_schema` passes again; it was red since
+  `b19cb65f4f`, my miss.
+- **Tests:**
+  - `test_gateway_flow.py`: two tests updated to the 2026-10-19 behaviour (a local-only caller is held through a planned
+    window instead of refused at once), and two added (served locally when the window ends; listed clients never reach
+    the remote). They take 7 s instead of 3.5 min.
+  - `golden/routing_golden.json`: regenerated. Exactly three scenarios changed, all to the intended hold behaviour
+    (`local_down_estate_local_503`, `offline_window_local_pin_503`, `offline_window_no_remote_503`).
+  - `test_strict_tool_history.py` and `test_rep_retry.py` (56 tests) come with the two fixes, plus
+    `conftest_rep_retry*.py`. In `conftest.py` the compat plugin is registered and the flight recorder goes to a temp dir.
+- **Known test debt, failing identically on the code before this change** (left for a separate fix):
+  - `test_gateway_spend_authority.py`: 3 failures, explicit-remote 429 cases;
+  - `test_gateway_spend_v6.py`: 1 failure, pro alias;
+  - `test_gateway_local_first.py` and `test_no_production_ledger_touch.py`: hang (each over 5 min).
+  - The cause is the same: the live gateway was edited outside the repo for weeks and synced back on 2026-10-19 without
+    updating these tests.
+
 ### Pushed 2026-10-20 (8 commits, `c467b05dad..a4c72e8bb8`)
 
 - **Gateway, bounded graceful stop** (`b19cb65f4f`). On the stop signal, every queued request that was never admitted

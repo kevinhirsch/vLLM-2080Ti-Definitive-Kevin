@@ -470,6 +470,17 @@ REP_GUARD       = _env_flag(os.environ.get("SHIM_REP_GUARD", "1"), True)
 REP_MIN_PATTERN = int(os.environ.get("SHIM_REP_MIN_PATTERN", "8"))
 REP_MAX_PATTERN = int(os.environ.get("SHIM_REP_MAX_PATTERN", "64"))
 REP_MIN_COUNT   = int(os.environ.get("SHIM_REP_MIN_COUNT", "6"))
+# [GW-REP-RETRY, 2026-10-19] repetition-guard cut retry. Measured 2026-10-19: 12 agent turns cut at
+# 1.3K-4.0K output tokens came back as ordinary replies with finish_reason=repetition and no
+# tool call, so the agent stopped mid-task. When a LOCAL request that carried tools finishes that
+# way, re-issue it ONCE with thinking off + Qwen's non-thinking sampling profile (the EXP-026
+# recipe measured to reduce loops) and return that response instead.
+#  SHIM_REPETITION_RETRY=off|shadow|live  off (default): nothing changes. shadow: change nothing,
+#      log what live would have done (telemetry field rep_retry=shadow). live: re-issue + return
+#      the retry (streaming splices into the open client stream like the reasoning watchdog;
+#      if content was already streamed to the client it falls back to shadow for that request).
+# Never retries twice; never retries a request without tools; every other request is byte-for-byte unchanged.
+REP_RETRY = os.environ.get("SHIM_REPETITION_RETRY", "off").strip().lower()
 # [LANE RA / L143] cross-turn identical tool-call loop note (see repeated_tool_call_note()).
 REPEAT_NOTE     = _env_flag(os.environ.get("SHIM_REPEAT_NOTE", "1"), True)
 REPEAT_NOTE_MIN = int(os.environ.get("SHIM_REPEAT_NOTE_MIN", "3"))
@@ -512,6 +523,16 @@ def effective_force_remote():
 # leaves the remote configured for the moment it is wanted again. It OUTRANKS FORCE_REMOTE: if
 # both are somehow set, local wins, because the mode that cannot spend money is the safe one.
 LOCAL_ONLY = 1 if _env_flag(os.environ.get("SHIM_LOCAL_ONLY", "0"), False) else 0
+# 2026-10-20 (coordinator; Kevin: "remote privileges are revoked until further notice"): X-Client values listed here
+# (comma-separated, case-insensitive, exact match) are served exactly like the estate-local alias. They never reach the
+# paid remote: not for congestion, not during a planned local-offline window, not when the local engine is down (they are
+# held for it instead). Empty = no change. The agent lanes (openhands-coordinator*, lane-medic) are on it since 2026-10-20.
+LOCAL_ONLY_CLIENTS = frozenset(c.strip().lower() for c in os.environ.get("SHIM_LOCAL_ONLY_CLIENTS", "").split(",") if c.strip())
+
+
+def _client_local_only(request):
+    """True when this request's X-Client is on SHIM_LOCAL_ONLY_CLIENTS."""
+    return bool(LOCAL_ONLY_CLIENTS) and (request.headers.get("X-Client") or "").strip().lower() in LOCAL_ONLY_CLIENTS
 # PEAK-AWARE overflow bias (2026-08-13, DeepSeek peak/off-peak pricing eff. Aug 16):
 # during remote-provider PEAK hours (UTC ranges like "1-4,6-10"), BACKGROUND requests
 # wait the full LOCAL_WAIT for a local lane instead of fast-overflowing at BG_WAIT —
@@ -651,6 +672,7 @@ _CFG = {
     "SHIM_WARM_PRIORITY_MIN_CREDIT": ("WARM_PRIORITY_MIN_CREDIT", int),
     "SHIM_WARM_PRIORITY_MAX_COMPUTED": ("WARM_PRIORITY_MAX_COMPUTED", int),
     "SHIM_REASONING_WATCHDOG": ("REASONING_WATCHDOG", lambda v: str(v).strip().lower()),
+    "SHIM_REPETITION_RETRY": ("REP_RETRY", lambda v: str(v).strip().lower()),
     "SHIM_REASONING_BUDGET_TOKENS": ("REASONING_BUDGET_TOKENS", int),
     "SHIM_REASONING_CHARS_PER_TOKEN": ("REASONING_CHARS_PER_TOKEN", float),
     "SHIM_THINK_BUDGET_EXPLICIT": ("THINK_BUDGET_EXPLICIT", int),
@@ -4708,6 +4730,9 @@ def _telemetry_note_request(info, resp=None):
             "context_prompt_tokens": info.get("context_prompt_tokens"),
             "context_compacted": bool(info.get("context_compacted")),
             "context_omitted": info.get("context_omitted", 0),
+            # GW-STRICT: repairs made to the remote body's tool-call history (0/absent = untouched).
+            # Present only when it fired, so every other row stays byte-identical.
+            **({"tool_history_changes": int(info["tool_history_changes"])} if info.get("tool_history_changes") else {}),
             # [RA / L143] identical-call loop note: present only when it fired (keeps every other row byte-identical)
             **({"repeat_tool_note": info["repeat_tool_note"]} if info.get("repeat_tool_note") else {}),
             "stream_watchdog": bool(info.get("stream_watchdog")),
@@ -8111,6 +8136,54 @@ def nonthinking_sampling_profile(body):
         return body
 
 
+# [GW-REP-RETRY, 2026-10-19] Repetition-guard cut retry helpers. A LOCAL request that carried
+# tools and was cut by the repetition guard (repetition_guard()) comes back as an ordinary
+# reply with finish_reason=repetition and no tool call, so the agent stops mid-task. These
+# helpers detect that cut and build the retry body (thinking off + the non-thinking sampling
+# profile, EXP-026 -- measured to reduce loops). All are pure / exception-safe: they return
+# False / the body unchanged on anything they cannot parse, so they can only ever fire on
+# a clearly-identified repetition cut and never break forwarding.
+def _request_has_tools(body):
+    """True if the request body declares a non-empty `tools` array. Never raises;
+    anything that cannot be parsed (including a non-dict) is False."""
+    try:
+        j = json.loads(body) if isinstance(body, (bytes, bytearray, str)) else body
+        return bool((j or {}).get("tools"))
+    except Exception:
+        return False
+
+
+def _rep_cut_response(data):
+    """True if a NON-STREAMING local response was cut by the repetition guard:
+    finish_reason=repetition AND no tool call. Returns False for anything that
+    cannot be parsed, so this can only ever fire on a clearly-identified cut."""
+    try:
+        d = json.loads(data)
+        ch = (d.get("choices") or [{}])[0]
+        if ch.get("finish_reason") != "repetition":
+            return False
+        m = ch.get("message") or {}
+        return not m.get("tool_calls")
+    except Exception:
+        return False
+
+
+def _rep_retry_body(body):
+    """Build the repetition-retry body: the SAME request with thinking OFF
+    (chat_template_kwargs.enable_thinking=False) plus Qwen's non-thinking
+    sampling profile (nonthinking_sampling_profile, EXP-026). Returns the
+    rewritten body bytes; never raises (any error returns body unchanged)."""
+    try:
+        j = json.loads(body)
+        ctk = j.get("chat_template_kwargs") or {}
+        ctk["enable_thinking"] = False
+        j["chat_template_kwargs"] = ctk
+        b = json.dumps(j).encode()
+        return nonthinking_sampling_profile(b)
+    except Exception:
+        return body
+
+
 def bound_local_output(body):
     """Ensure a request routed to LOCAL has a bounded max_tokens. Absent/0 (unbounded) OR an
     oversized explicit ceiling (e.g. Hermes's 65536 — a ceiling, not real usage: typical turns
@@ -8315,6 +8388,87 @@ def remap_for_remote(body, remote_model=None, remote_max_output=None):
     if REMOTE_NO_THINK and "deepseek" in (REMOTE_BASE or "").lower():
         j["thinking"] = {"type": "disabled"}
     return json.dumps(j).encode()
+
+
+STRICT_ORPHAN_TOOL_PREFIX = "[gateway: result of a tool call that is not in this history] "
+STRICT_MISSING_RESULT = "[gateway: no result was recorded for this call]"
+
+
+def _strict_orphan_to_user(msg):
+    """A `tool` message no assistant turn claims becomes a `user` message; its content is kept verbatim."""
+    out = {k: v for k, v in msg.items() if k not in ("role", "tool_call_id")}
+    content = msg.get("content")
+    out["role"] = "user"
+    out["content"] = STRICT_ORPHAN_TOOL_PREFIX + (content if isinstance(content, str) else json.dumps(content))
+    return out
+
+
+def _call_ids(msg):
+    """tool_call ids of an assistant message, in order; [] for anything else or malformed."""
+    if not isinstance(msg, dict) or msg.get("role") != "assistant":
+        return []
+    calls = msg.get("tool_calls")
+    if not isinstance(calls, list):
+        return []
+    ids = []
+    for c in calls:
+        if isinstance(c, dict) and c.get("id") is not None:
+            ids.append(str(c["id"]))
+    return ids
+
+
+def strict_tool_history(messages):
+    """Return (messages, changes) with a tool-call history strict providers accept.
+
+    DeepSeek rejects the whole request when a `tool` message does not directly follow (only
+    `tool` messages between) an assistant message whose tool_calls carries its tool_call_id:
+    400 "Messages with role 'tool' must be a response to a preceding message with 'tool_calls'".
+    vLLM accepts the same history, so a client that crashed mid tool call breaks on failover
+    only. Two repairs, so no content is ever dropped:
+      * an orphan `tool` message becomes `user` with STRICT_ORPHAN_TOOL_PREFIX and its content;
+      * an assistant tool call with no `tool` message before the next non-tool message gets an
+        inserted `tool` message STRICT_MISSING_RESULT, right after that turn's real results.
+    A valid history is returned as the SAME list and objects with changes == 0. Never raises:
+    a malformed message is passed through untouched.
+    """
+    try:
+        if not isinstance(messages, list):
+            return messages, 0
+        out = []
+        changes = 0
+        pending = []          # ids of the open assistant turn's calls (empty = no turn is open)
+        answered = set()
+        for msg in messages:
+            role = msg.get("role") if isinstance(msg, dict) else None
+            if role == "tool":
+                cid = msg.get("tool_call_id")
+                cid = None if cid is None else str(cid)
+                if cid is not None and cid in pending:
+                    out.append(msg)
+                    answered.add(cid)
+                    continue
+                out.append(_strict_orphan_to_user(msg))
+                changes += 1
+                continue
+            for call_id in pending:
+                if call_id not in answered:
+                    out.append({"role": "tool", "tool_call_id": call_id,
+                                "content": STRICT_MISSING_RESULT})
+                    changes += 1
+            pending, answered = ([], set())
+            out.append(msg)
+            if role == "assistant":
+                pending = _call_ids(msg)
+        for call_id in pending:
+            if call_id not in answered:
+                out.append({"role": "tool", "tool_call_id": call_id,
+                            "content": STRICT_MISSING_RESULT})
+                changes += 1
+        if changes:
+            return out, changes
+        return messages, 0
+    except Exception:
+        return messages, 0
 
 
 async def local_healthy():
@@ -8914,6 +9068,46 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
                 if _skw:
                     _active_set(request, **_skw)
             ct = up.headers.get("Content-Type", "application/json").split(";")[0]
+            # [GW-REP-RETRY, 2026-10-19] Repetition-guard cut retry, NON-STREAMING. A LOCAL request that
+            # carried tools and finished finish_reason=repetition with no tool call was cut
+            # mid-generation by the repetition guard, so the agent would stop mid-task. When
+            # SHIM_REPETITION_RETRY=live, re-issue the SAME request ONCE with thinking off + the
+            # non-thinking sampling profile (EXP-026, measured to reduce loops) and return that
+            # response instead. shadow (or live where the re-issue fails / is itself cut) returns
+            # the original cut response unchanged. Never retries twice; never a tools-less or
+            # remote request; every other request is byte-for-byte unchanged.
+            if (REP_RETRY in ("shadow", "live") and up.status < 400
+                    and base.rstrip("/") == LOCAL.rstrip("/")
+                    and _request_has_tools(body) and _rep_cut_response(data)):
+                if REP_RETRY == "live":
+                    log.warning("repetition cut (finish_reason=repetition, no tool call) on local "
+                                  "tools request -> retry no-think + non-thinking profile")
+                    try:
+                        up2 = await _open(session, base, path, _rep_retry_body(body), key, False)
+                        data2 = await up2.read()
+                        if up2.status < 400 and not _rep_cut_response(data2):
+                            _active_set(request, rep_retry="live")
+                            ct2 = up2.headers.get("Content-Type", "application/json").split(";")[0]
+                            return "ok", web.Response(body=data2, status=up2.status, content_type=ct2,
+                                                       headers=_route_receipt())
+                        if up2.status < 400:
+                            log.warning("repetition-retry response ALSO cut by repetition -> "
+                                          "returning it as-is, flagged")
+                            _active_set(request, rep_retry="live-also-cut")
+                            ct2 = up2.headers.get("Content-Type", "application/json").split(";")[0]
+                            return "ok", web.Response(body=data2, status=up2.status, content_type=ct2,
+                                                       headers=_route_receipt())
+                        else:
+                            log.warning("repetition-retry upstream %d -> returning original cut "
+                                          "response", up2.status)
+                            _active_set(request, rep_retry="live-failed")
+                    except Exception as e:
+                        log.warning("repetition-retry failed (%s) -> returning original cut response", e)
+                        _active_set(request, rep_retry="live-failed")
+                else:  # shadow
+                    log.warning("repetition cut (finish_reason=repetition, no tool call) on local "
+                                  "tools request -> would retry no-think + non-thinking profile (shadow)")
+                    _active_set(request, rep_retry="shadow")
             return "ok", web.Response(body=data, status=up.status, content_type=ct,
                                        headers=_route_receipt())
         finally:
@@ -9072,6 +9266,48 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
     _scan_tail[0] = bytes(buf[buf.rfind(b"\n") + 1:])[-(1 << 20):]   # partial last line -> next chunk
     _shape.feed(buf)
 
+    _rep_stream = {"armed": (not _is_remote_relay and REP_RETRY in ("shadow", "live")
+                       and _request_has_tools(body)), "done": False}
+
+    async def _rep_retry_stream():
+        """Abort the cut generation (closing the connection makes vLLM abort the request
+        and free its lane) and stream the same request with thinking OFF + the non-thinking
+        sampling profile into the already-open client stream."""
+        try:
+            up.close()
+        except Exception:
+            pass
+        _scan_tail[0] = b""
+        _shape.tail = b""
+        s2 = aiohttp.ClientSession()
+        up2 = None
+        try:
+            up2 = await _open(s2, base, path, _rep_retry_body(body), key, True)
+            if up2.status >= 400:
+                txt = (await up2.read())[:300].decode("utf-8", "replace")
+                await resp.write(('data: {"error":{"message":%s}}\n\n' % json.dumps(
+                    "repetition retry failed: %s %s" % (up2.status, txt))).encode())
+                return False
+            while True:
+                ch2 = await asyncio.wait_for(up2.content.readany(), timeout=STREAM_IDLE_TIMEOUT_SECS)
+                if not ch2:
+                    break
+                await resp.write(ch2)
+                _chunk_ct[0] += 1
+                _scan_usage_stream(ch2)
+                _scan_content_shape(ch2)
+                _shape.feed(ch2)
+            return True
+        except Exception as e:
+            try:
+                await resp.write(('data: {"error":{"message":%s}}\n\n' % json.dumps(
+                    "repetition retry interrupted: %s" % e)).encode())
+            except Exception:
+                pass
+            return False
+        finally:
+            await _drop_upstream(s2, up2)
+
     if phase == "clean_end":
         # upstream finished before any 'meaningful' chunk — deliver as-is (short/empty response),
         # don't fail over (avoids double-generating a real-but-tiny answer).
@@ -9087,6 +9323,21 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
             _outkw["finish_reason"] = _exact_finish[0]
         _shape.close()
         _outkw.update(_shape_kw(_shape, body, local=not _is_remote_relay))
+        # [GW-REP-RETRY, 2026-10-19] clean_end: the stream ended before any meaningful chunk,
+        # so no content was streamed to the client -- a rep cut here can splice the retry.
+        _rep_finish_ce = _shape.finish or _exact_finish[0]
+        if (_rep_stream["armed"] and not _rep_stream["done"]
+                and _rep_finish_ce == "repetition" and not _shape.tools):
+            _rep_stream["done"] = True
+            if REP_RETRY == "live":
+                log.warning("repetition cut (finish_reason=repetition, no tool call) on local "
+                              "tools stream -> retry no-think + non-thinking profile (splice)")
+                _active_set(request, rep_retry="live",
+                          rep_retry_ok=await _rep_retry_stream())
+            else:  # shadow
+                log.warning("repetition cut (finish_reason=repetition, no tool call) on local "
+                              "tools stream -> would retry no-think + non-thinking profile (shadow)")
+                _active_set(request, rep_retry="shadow")
         # gw-admission-computed-token-cost: local only -- prefix caching is a local-engine
         # concept, and remote's own cache accounting (if any) isn't comparable to it.
         if not _is_remote_relay and _exact_ptok[0] is not None:
@@ -9105,6 +9356,15 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
     resp = _mk_resp()
     if not await _prepare_stream_response(resp, request, bytes(buf), session, up):
         return "ok", resp
+    # [GW-REP-RETRY, 2026-10-19] Repetition-guard cut retry, STREAMING. A LOCAL stream that carried
+    # tools and finished finish_reason=repetition with no tool call was cut mid-generation
+    # by the repetition guard, so the agent would stop mid-task. When SHIM_REPETITION_RETRY=live
+    # and NO content was already streamed to the client, re-issue the SAME request ONCE with
+    # thinking off + the non-thinking sampling profile (EXP-026) and splice its answer into
+    # the already-open client stream (like the reasoning watchdog). If content WAS already
+    # streamed, fall back to shadow (log + count, no re-issue). shadow (or live-fallback) logs what live
+    # would have done. Never retries twice; never a tools-less or remote stream; every other
+    # stream is byte-for-byte unchanged.
     # [GW2 / L95] long-empty-generation watchdog: armed for a LOCAL stream whose request still has thinking on.
     _rw = {"armed": (not _is_remote_relay and REASONING_WATCHDOG in ("shadow", "retry")
                      and REASONING_BUDGET_TOKENS > 0 and not _thinking_disabled(body)),
@@ -9194,6 +9454,32 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
             await resp.write(f'data: {{"error":{{"message":"stream interrupted: {e}"}}}}\n\n'.encode())
         except Exception:
             pass
+    # [GW-REP-RETRY, 2026-10-19] Repetition-guard cut retry, STREAMING (detection at stream end).
+    # A LOCAL stream that carried tools and finished finish_reason=repetition with no
+    # tool call was cut mid-generation by the repetition guard, so the agent would stop
+    # mid-task. live + no content/tool call already streamed -> splice the retry into the
+    # open client stream (seamless, like the reasoning watchdog). live + content already
+    # streamed -> fall back to shadow (cannot cleanly splice). shadow -> log + count only.
+    # Never retries twice; never a tools-less or remote stream; every other stream is
+    # byte-for-byte unchanged.
+    _rep_finish = _shape.finish or _exact_finish[0]
+    if (_rep_stream["armed"] and not _rep_stream["done"]
+            and _rep_finish == "repetition" and not _shape.tools):
+        _rep_stream["done"] = True
+        if REP_RETRY == "live":
+            if not _saw_content[0]:
+                log.warning("repetition cut (finish_reason=repetition, no tool call) on local "
+                              "tools stream -> retry no-think + non-thinking profile (splice)")
+                _active_set(request, rep_retry="live",
+                          rep_retry_ok=await _rep_retry_stream())
+            else:
+                log.warning("repetition cut (finish_reason=repetition, no tool call) on local "
+                              "tools stream -> content already streamed, fall back to shadow")
+                _active_set(request, rep_retry="live-fallback-shadow")
+        else:  # shadow
+            log.warning("repetition cut (finish_reason=repetition, no tool call) on local "
+                          "tools stream -> would retry no-think + non-thinking profile (shadow)")
+            _active_set(request, rep_retry="shadow")
     await _finish_stream_response(resp, request, session, up)
     if _scan_tail[0]:
         _scan_usage(_scan_tail[0])       # a final line the stream ended without a newline on
@@ -9495,6 +9781,14 @@ async def _forward_remote(request, path, body, streaming, endpoint=None, model=N
     relay_body = remap_for_remote(prepared, model, max_output)
     if streaming:
         relay_body = _with_stream_usage(relay_body)   # v6: settle needs the provider's usage
+    # GW-STRICT: last transform before the wire. A client that crashed mid tool call (or a buggy
+    # one) sends a `tool` message DeepSeek 400s while vLLM accepts it; the failover must not be
+    # the thing that breaks the request, so the remote body gets a valid tool-call history.
+    relay_body, _strict_changes = _strict_remote_body(relay_body)
+    if _strict_changes:
+        log.info("remote %s strict tool history: client=%s changes=%d provider=%s",
+                 path, _client_label(request), _strict_changes, ep.get("name", "default"))
+        _active_set(request, tool_history_changes=int(_strict_changes))
     _active_set(request, remote_sent=True)            # v6: from here the provider may bill
     kind, payload = await _relay(request, base, path, relay_body, key, streaming,
                                  provider_name=model)
@@ -9567,6 +9861,26 @@ def _with_stream_usage(relay_body):
         return json.dumps(j).encode()
     except Exception:
         return relay_body
+
+
+def _strict_remote_body(body):
+    """(body, changes): strict_tool_history() applied to a JSON request body.
+
+    Remote only: the difference between vLLM (accepts an orphan `tool` message) and DeepSeek
+    (400s the whole request) is created by the failover, so the failover is what hides it.
+    Returns the SAME body object when nothing changed, and the original body on any parse error.
+    """
+    try:
+        j = json.loads(body)
+    except Exception:
+        return body, 0
+    if not isinstance(j, dict) or not isinstance(j.get("messages"), list):
+        return body, 0
+    messages, changes = strict_tool_history(j["messages"])
+    if not changes:
+        return body, 0
+    j["messages"] = messages
+    return json.dumps(j).encode(), changes
 
 
 async def handle_completions(request):
@@ -9825,6 +10139,10 @@ async def _route_completions(request, _no_overflow=False):
     alias_local_only = alias_kind == "builtin-local"
     alias_force_remote = alias_kind == "builtin-remote"
     _pin_name = "estate-local"
+    if _client_local_only(request):
+        # SHIM_LOCAL_ONLY_CLIENTS: served exactly like estate-local (never the paid remote; held when local is away).
+        alias_local_only, alias_force_remote = True, False
+        _pin_name = "client %s (local only)" % (request.headers.get("X-Client") or "").strip()
     custom_endpoint = alias.get("endpoint") if alias_kind == "custom-remote" else None
     _active_set(request, alias=alias.get("name"), alias_kind=alias_kind)
     # K4 PROBE synth: a trivial "Reply with the single word: X" liveness probe is answered here while the engine has

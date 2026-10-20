@@ -129,6 +129,12 @@ _k("SHIM_REMOTE_DEAD_SECS", "float", "300", "After a hard provider refusal, trea
 _k("SHIM_FORCE_REMOTE", "bool", "0", "Send everything remote (lease-bounded; see FORCE_REMOTE_UNTIL_EPOCH).", gname="FORCE_REMOTE", tunable=True, money=True, kill=True)
 _k("SHIM_FORCE_REMOTE_UNTIL_EPOCH", "float", "0", "Expiry of the force-remote lease (written by the gateway).", unit="epoch s", gname="FORCE_REMOTE_UNTIL_EPOCH", money=True)
 _k("SHIM_LOCAL_ONLY", "bool", "0", "Never overflow to remote.", gname="LOCAL_ONLY", tunable=True, kill=True)
+_k("SHIM_LOCAL_ONLY_CLIENTS", "str", "", "X-Client values served local-only like estate-local: never the paid remote; held when local is away (comma-separated).", gname="LOCAL_ONLY_CLIENTS", money=True)
+_k("SHIM_LOCAL_ONLY_HOLD_SECS", "float", "1800", "How long a local-only request is held through a planned window or engine restart (0 = refuse at once).", unit="s", gname="LOCAL_ONLY_HOLD_SECS")
+_k("SHIM_DRAIN_WAIT_S", "float", "600", "Graceful stop: longest wait for requests already sent upstream; queued waiters get 503 at once.", unit="s", gname="GRACEFUL_DRAIN_WAIT_S")
+_k("SHIM_REPETITION_RETRY", "str", "off", "Retry once (thinking off) a local tool turn cut by the repetition guard: off | shadow | live.", gname="REP_RETRY", tunable=True)
+_k("SHIM_AGENT_CONTEXT_TOKENS", "int", "131072", "Context window advertised in /v1/models for the agent model names (display only).", unit="tokens", gname="AGENT_CONTEXT_TOKENS")
+_k("SHIM_AGENT_CONTEXT_MODELS", "str", "qwen3.6:27b", "Engine model names that advertise the agent context budget (comma-separated, display only).", gname="AGENT_CONTEXT_ENGINE_NAMES")
 _k("SHIM_PEAK_HOURS_UTC", "hours", "1-4,6-10", "Provider peak-price hours (UTC ranges).", gname="PEAK_HOURS", tunable=True, money=True)
 # ---- spend (money; Only Money Pauses) ----
 _k("SHIM_SPEND_CAP_USD", "float", "25.0", "Hard daily remote spend cap.", unit="USD/day", gname="SPEND_CAP_USD", tunable=True, money=True, owner="R2")

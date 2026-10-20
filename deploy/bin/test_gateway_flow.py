@@ -656,18 +656,50 @@ class Routing(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await self.go(who), "remote", who)
             self.assertEqual(self.admitted, [])                                      # nothing touched the engine
             self.assertEqual(self.events[-1], ("remote", "local-offline"))
-            # a caller that must stay local (pinned / estate-local) is told to retry, not spent on
-            r = await self.go("local-pin-coder")
-            self.assertEqual(r.status, 503)
-            self.assertIn("Retry-After", r.headers)
-            self.assertEqual((await shim._route_completions(Request("x", model="estate-local"))).status, 503)
+            # a caller that must stay local (pinned / estate-local) is never spent on: since 2026-10-19 it is HELD for the
+            # window (up to LOCAL_ONLY_HOLD_SECS) and told to retry only if the window outlasts the hold
+            with patch.object(shim, "LOCAL_ONLY_HOLD_SECS", 0.01):
+                r = await self.go("local-pin-coder")
+                self.assertEqual(r.status, 503)
+                self.assertIn("Retry-After", r.headers)
+                self.assertEqual((await shim._route_completions(Request("x", model="estate-local"))).status, 503)
+            self.assertEqual(remote_calls, ["halo-hermes", "card-repair-engine", "overseer-refine-overflow", "ubuntuide01 pi / x"])
 
     async def test_planned_offline_window_without_a_remote_holds_callers_with_retry_after(self):
         with patch.dict(shim._OFFLINE, dict(until=time.time() + 100, lease="L", reason="bench", by="EF2", t0=time.time(),
-                                            ttl_s=100, refused=0)):
+                                            ttl_s=100, refused=0)), patch.object(shim, "LOCAL_ONLY_HOLD_SECS", 0.01):
             r = await self.go("halo-hermes")
         self.assertEqual(r.status, 503)
         self.assertEqual(r.headers["X-Gateway-Offline"], "active")
+        self.assertEqual(self.admitted, [])
+
+    async def test_a_held_caller_is_served_locally_when_the_window_ends_during_the_hold(self):
+        with patch.dict(shim._OFFLINE, dict(until=time.time() + 0.5, lease="L", reason="bench", by="EF2", t0=time.time(),
+                                            ttl_s=1, refused=0)), patch.object(shim, "LOCAL_ONLY_HOLD_SECS", 10):
+            r = await asyncio.wait_for(self.go("local-pin-coder"), 15)
+        self.assertEqual(r, "local-pin-coder")                                      # admitted to the engine after the window
+        self.assertEqual(self.admitted, ["local-pin-coder"])
+
+    async def test_local_only_clients_never_reach_the_remote(self):
+        """SHIM_LOCAL_ONLY_CLIENTS (Kevin 2026-10-20: remote revoked for the lanes): a listed X-Client is treated like
+        estate-local in a planned window, with the remote valve open and budget available; an unlisted one still overflows."""
+        remote_calls = []
+
+        async def fwd(request, path, body, streaming, endpoint=None, model=None):
+            remote_calls.append(request.headers["X-Client"])
+            return "remote"
+
+        with patch.dict(shim._OFFLINE, dict(until=time.time() + 100, lease="L", reason="bench", by="EF2", t0=time.time(),
+                                            ttl_s=100, refused=0)), \
+                patch.object(shim, "remote_ok", lambda: True), patch.object(shim, "_spend_allows_overflow", lambda p, m: True), \
+                patch.object(shim, "_automatic_remote_budget_allows", lambda p, m: True), \
+                patch.object(shim, "_forward_remote", fwd), patch.object(shim, "REMOTE_ENABLED", True), \
+                patch.object(shim, "LOCAL_ONLY_CLIENTS", frozenset({"openhands-coordinator"})), \
+                patch.object(shim, "LOCAL_ONLY_HOLD_SECS", 0.01):
+            r = await self.go("openhands-coordinator")
+            self.assertEqual(r.status, 503)                                          # held, then told to retry
+            self.assertEqual(await self.go("halo-hermes"), "remote")                 # unlisted clients unchanged
+        self.assertEqual(remote_calls, ["halo-hermes"])
         self.assertEqual(self.admitted, [])
 
     async def test_a_waiter_is_sent_to_the_valve_when_a_window_opens_under_it(self):

@@ -6121,8 +6121,8 @@
    }
   },
   "events": [],
-  "polls": 0,
-  "queued_s": 0.0,
+  "polls": 1800,
+  "queued_s": 1800.0,
   "response": {
    "error": {
     "type": "local_unavailable"
@@ -11115,7 +11115,16 @@
   ]
  },
  "offline_window_local_pin_503": {
-  "calls": [],
+  "calls": [
+   {
+    "body": "d08fe4c55eb16874",
+    "conc": 1,
+    "key": false,
+    "path": "/v1/chat/completions",
+    "stream": false,
+    "to": "local"
+   }
+  ],
   "counters": {
    "active_left": 0,
    "baseline_inflight": [
@@ -11141,26 +11150,34 @@
     "alias_kind": "native",
     "cls": "kevin",
     "cost_est": 0.0,
-    "d": "rejected-bg",
+    "d": "local",
     "maxtok": 4000,
     "ptok": 7,
-    "r": "local-offline",
+    "r": "-",
     "stream": false,
     "units": 1,
     "waited": 0
    }
   ],
-  "polls": 0,
-  "queued_s": 0.0,
+  "polls": 600,
+  "queued_s": 600.0,
   "response": {
-   "error": {
-    "type": "local_offline_window"
+   "body": {
+    "choices": [
+     {
+      "finish_reason": "stop",
+      "message": {
+       "content": "ok",
+       "role": "assistant"
+      }
+     }
+    ],
+    "usage": {
+     "completion_tokens": 3,
+     "prompt_tokens": 50
+    }
    },
-   "headers": {
-    "Retry-After": "60",
-    "X-Gateway-Offline": "active"
-   },
-   "status": 503
+   "status": 200
   },
   "telemetry": [
    {
@@ -11168,17 +11185,17 @@
     "alias": "qwen-local",
     "alias_kind": "native",
     "bg": false,
-    "cached_actual": null,
+    "cached_actual": 0,
     "charged_usd": null,
     "client": "a-local-pin",
-    "computed_actual": null,
+    "computed_actual": 50,
     "content_empty": null,
     "content_len": null,
     "context_compacted": false,
-    "context_limit": null,
+    "context_limit": 524288,
     "context_omitted": 0,
-    "context_prompt_tokens": null,
-    "context_provider": null,
+    "context_prompt_tokens": 7,
+    "context_provider": "local",
     "cost_basis": null,
     "cost_est": 0.0,
     "cost_policy": null,
@@ -11186,26 +11203,26 @@
     "est_computed": 7,
     "est_tokens": 7,
     "finish_reason": null,
-    "flow_adjacent": null,
+    "flow_adjacent": false,
     "flow_class": "kevin",
-    "flow_expected_wait": null,
+    "flow_expected_wait": 0.0,
     "flow_held": null,
     "has_tool_calls": null,
     "ip": "127.0.0.1",
     "maxtok": 4000,
     "model": "qwen-local",
-    "outtok": null,
+    "outtok": 3,
     "outtok_lb": null,
     "pm_age_s": null,
     "pm_credit": 0,
-    "predicted_occupancy_s": null,
+    "predicted_occupancy_s": 66.681,
     "preview": "review this function please",
     "ptok": 7,
-    "ptok_est_err": null,
-    "ptok_exact": null,
-    "ptok_exact_src": null,
+    "ptok_est_err": -43,
+    "ptok_exact": 50,
+    "ptok_exact_src": "engine",
     "queue_plus_prefill": null,
-    "reason": "local-offline",
+    "reason": "-",
     "reasoning_chars": null,
     "reasoning_chars_at_output": null,
     "reasoning_watchdog": null,
@@ -11221,8 +11238,8 @@
     "request_body_sha256": "8e9b27cf182682bf1d2416613ca3c2c3ba9888f22fe6fa3cd3c45bf39a07826a",
     "request_id": null,
     "request_id_source": null,
-    "route": "rejected-bg",
-    "status": 503,
+    "route": "local",
+    "status": 200,
     "stream": false,
     "stream_idle_timeout_s": null,
     "stream_watchdog": false,
@@ -11237,7 +11254,16 @@
   ]
  },
  "offline_window_no_remote_503": {
-  "calls": [],
+  "calls": [
+   {
+    "body": "d08fe4c55eb16874",
+    "conc": 1,
+    "key": false,
+    "path": "/v1/chat/completions",
+    "stream": false,
+    "to": "local"
+   }
+  ],
   "counters": {
    "active_left": 0,
    "baseline_inflight": [
@@ -11263,26 +11289,34 @@
     "alias_kind": "native",
     "cls": "kevin",
     "cost_est": 0.0,
-    "d": "rejected-bg",
+    "d": "local",
     "maxtok": 4000,
     "ptok": 7,
-    "r": "local-offline",
+    "r": "-",
     "stream": false,
     "units": 1,
     "waited": 0
    }
   ],
-  "polls": 0,
-  "queued_s": 0.0,
+  "polls": 600,
+  "queued_s": 600.0,
   "response": {
-   "error": {
-    "type": "local_offline_window"
+   "body": {
+    "choices": [
+     {
+      "finish_reason": "stop",
+      "message": {
+       "content": "ok",
+       "role": "assistant"
+      }
+     }
+    ],
+    "usage": {
+     "completion_tokens": 3,
+     "prompt_tokens": 50
+    }
    },
-   "headers": {
-    "Retry-After": "60",
-    "X-Gateway-Offline": "active"
-   },
-   "status": 503
+   "status": 200
   },
   "telemetry": [
    {
@@ -11290,17 +11324,17 @@
     "alias": "qwen-local",
     "alias_kind": "native",
     "bg": false,
-    "cached_actual": null,
+    "cached_actual": 0,
     "charged_usd": null,
     "client": "golden-interactive",
-    "computed_actual": null,
+    "computed_actual": 50,
     "content_empty": null,
     "content_len": null,
     "context_compacted": false,
-    "context_limit": null,
+    "context_limit": 524288,
     "context_omitted": 0,
-    "context_prompt_tokens": null,
-    "context_provider": null,
+    "context_prompt_tokens": 7,
+    "context_provider": "local",
     "cost_basis": null,
     "cost_est": 0.0,
     "cost_policy": null,
@@ -11308,26 +11342,26 @@
     "est_computed": 7,
     "est_tokens": 7,
     "finish_reason": null,
-    "flow_adjacent": null,
+    "flow_adjacent": false,
     "flow_class": "kevin",
-    "flow_expected_wait": null,
+    "flow_expected_wait": 0.0,
     "flow_held": null,
     "has_tool_calls": null,
     "ip": "127.0.0.1",
     "maxtok": 4000,
     "model": "qwen-local",
-    "outtok": null,
+    "outtok": 3,
     "outtok_lb": null,
     "pm_age_s": null,
     "pm_credit": 0,
-    "predicted_occupancy_s": null,
+    "predicted_occupancy_s": 66.681,
     "preview": "review this function please",
     "ptok": 7,
-    "ptok_est_err": null,
-    "ptok_exact": null,
-    "ptok_exact_src": null,
+    "ptok_est_err": -43,
+    "ptok_exact": 50,
+    "ptok_exact_src": "engine",
     "queue_plus_prefill": null,
-    "reason": "local-offline",
+    "reason": "-",
     "reasoning_chars": null,
     "reasoning_chars_at_output": null,
     "reasoning_watchdog": null,
@@ -11343,8 +11377,8 @@
     "request_body_sha256": "8e9b27cf182682bf1d2416613ca3c2c3ba9888f22fe6fa3cd3c45bf39a07826a",
     "request_id": null,
     "request_id_source": null,
-    "route": "rejected-bg",
-    "status": 503,
+    "route": "local",
+    "status": 200,
     "stream": false,
     "stream_idle_timeout_s": null,
     "stream_watchdog": false,
