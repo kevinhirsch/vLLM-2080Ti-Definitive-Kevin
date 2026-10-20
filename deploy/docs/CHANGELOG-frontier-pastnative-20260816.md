@@ -1,0 +1,303 @@
+# Branch changelog: frontier-pastnative-20260816
+
+Every non-merge commit on this branch since the last `CHANGELOG.md` edit (`0e2cae4724`, 2026-08-17), generated
+from `git log --no-merges 0e2cae4724..HEAD` on 2026-10-20 so nothing is missed. 274 commits, plus 50 merge commits.
+Grouped by component (first matching rule); within a group, oldest first. Hashes are abbreviated.
+
+## Window controller (windowctl) (18)
+
+- 2026-10-03 `1c0212c5a4` windowctl: take Lane LV's engine liveness hold for the window (owner-pid scoped), name it on every restart, release it in restore
+- 2026-10-03 `4bd8d0c13c` windowctl: auto-pause the engine watchdog timer around engine stops, snaprun for the framework + every script it runs, K2 quietbench spec; lead ids L146/L147
+- 2026-10-03 `670f66344e` windowctl: dependency-free YAML subset parser for window specs (the test gate venv has no PyYAML)
+- 2026-10-03 `55e2032fbc` windowctl: re-open (and adopt) the offline window when the gateway forgot it; CR2 short-first A/B spec = first live window
+- 2026-10-03 `a3463b441a` windowctl: never take local offline without a healthy remote valve; abort + restore local when it fails mid-window
+- 2026-10-03 `6fe7bb0892` windowctl: allow_no_remote (GW2/L172) also disables the remote-valve gate and watch; balance exhaustion is a remote-health failure
+- 2026-10-03 `f83d6afc8e` gpucap: enforced GPU memory cap for lane GPU jobs; unitrun/windowctl: stop systemd expanding $ in command lines; K5 spec -> 40b3467c1d + CTA
+- 2026-10-13 `415780486f` windowctl: run-step script snapshots are executable (0o555); validate refuses steps that call the offline gateway
+- 2026-10-13 `3e9d7a2678` windowctl: a promotion's restore floor is the promoted release's own KV pool
+- 2026-10-16 `4c7e1485ec` windowctl: overnight-only windows and give up after 2 failed boots (Kevin 2026-10-16)
+- 2026-10-17 `a00591ff4c` windowctl: refuse PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+- 2026-10-17 `d992a44835` windowctl: a free-space floor before the window opens and between steps
+- 2026-10-17 `c467b05dad` windowctl: cap every run step's timeout at the window's remaining budget
+- 2026-10-17 `532a427439` windowctl: record Kevin's 2026-10-17 lift of overnight-only windows
+- 2026-10-17 `a4ee7b0418` windowctl: write a timing marker around every run step
+- 2026-10-17 `36f6d67b32` windowctl: script snapshots keep their own directory
+- 2026-10-17 `b76f80968a` windowctl: spec preflight before production stops; pin read-only scripts
+- 2026-10-20 `b19cb65f4f` Gateway: bounded graceful stop; windowctl: reject specs that shadow builtin vars
+
+## Gateway (keepalive-shim), routing, admission, spend (79)
+
+- 2026-08-18 `b2868b682b` gateway: reconcile live-vs-deploy shim drift + add routing test net (was zero)
+- 2026-08-19 `e582930d1a` gateway: fix broken DeepSeek failover for tool-using agents (Hermes RCA)
+- 2026-08-17 `aa0e9e3485` exp-038: resolve cubic PR #2 review — engine/worker/router correctness + driver robustness
+- 2026-09-08 `e4ed196532` gateway: reconcile live-vs-deploy shim drift (pre-dashboard-redesign)
+- 2026-09-08 `a68b9133a7` gateway: redesign /gateway/dashboard - tighter copy, tooltips, pagination, mobile
+- 2026-09-11 `e788e325a2` Sync repo to the deployed shim (LOCAL_ONLY mode + config-owner guard + NO_THINK_IPS fix)
+- 2026-09-25 `b1847e2bd1` Sync repo to the deployed shim (sha256 a0a4b173..., live since 2026-09-17: gateway aliases + context limits)
+- 2026-09-25 `8108bcd356` gateway: one atomic daily remote-spend authority (R2)
+- 2026-09-25 `1488512c63` shim tests: the reservation-cap test leaves room for the context safety margin
+- 2026-09-25 `25ce87677b` gateway spend authority v2: every paid route capped, durable, credentialed, day-complete
+- 2026-09-25 `9a1a1cd2e3` gateway spend authority v5: real (cache-aware) prices, overflow falls back to local
+- 2026-09-25 `2c021d2aaf` gateway local-first: predictive overflow reasons go remote only when local is saturated (L1)
+- 2026-09-25 `42b3b260ea` gateway spend authority v6: no custom exemption, governed v4-pro alias, CAS replace, failure-aware settlement
+- 2026-09-25 `8f9f2ee535` shim tests: ratchet -- no shim test or tool may touch the production spend ledger
+- 2026-10-01 `4f32a0dab2` Fence duplicate gateway processes from daily spend ledger
+- 2026-10-01 `56175a6e47` Reserve gateway admission for Halo local control
+- 2026-10-01 `2eda793af2` gateway: cache-aware prefill cost model (content-addressed, local-learned, self-correcting)
+- 2026-10-01 `d41d3c88e5` gateway: cost model learns from the body the engine sees; prefix counts only after first token
+- 2026-10-01 `c48c2252e5` gateway: prefill backlog ends at first token, not at stream end
+- 2026-10-02 `9a14c8854f` gateway: prefill admission window (bounded engine prefill queue), background waits instead of overflowing
+- 2026-10-02 `7bbb042629` gateway: remote breaker on provider 402; no paid failover when remote is unavailable
+- 2026-10-02 `854b51ab62` gateway: no first-token abort of local work when no remote can take it
+- 2026-10-02 `826d7d02cb` CF: capacity-aware flow at the gateway - work classes, class-ceilinged engine admission (fair queuing, EDF, prefix affinity/hold), deadline-aware admission, remote-as-valve facts, planned local-offline window, /gateway/capacity + /gateway/offline
+- 2026-10-02 `09dc349d70` CF: flow hooks fail open to legacy admission; declared deadlines count service time; flow_drill harness (real shim, stub engine/remote, time-compressed)
+- 2026-10-02 `a9e3a43a21` gateway: the stalled-delivery overflow brake never blocks Halo or Kevin
+- 2026-10-02 `2babb97efe` gateway: the stalled-delivery brake guards optional overflow only, never work that only remote can serve
+- 2026-10-02 `738c4113ae` gateway-offline: persist the lease (offline-lease.json, mode 600), close without --lease, TERM/HUP still close the window; tests
+- 2026-10-02 `df67e9fefc` gateway: capacity model derived from the LIVE engine (KV pool, token budget, prefill rate, block size)
+- 2026-10-02 `1d066a13fc` gateway: text-only guard for the local engine (+ modalities on /v1/models); watchdog probe gets priority -1
+- 2026-10-02 `e10762659a` gateway-offline: split 'run ... -- CMD' ourselves (argparse nargs=* rejected the trailing '-- cmd'); tests: three leaked temp dirs now cleaned so the production-ledger ratchet is green (L54)
+- 2026-10-02 `6b9e7916e9` gateway: SHIM_LOCAL_CONTEXT_LIMIT / SHIM_MAX_LOCAL_TOKENS derive from the engine's live max_model_len (/v1/models), configured value as fallback
+- 2026-10-02 `2e89542375` gateway spend: charge ACTUAL usage at dynamic prices (ledger over-counted 2.6x)
+- 2026-10-02 `78cce8c4df` gateway dashboard: standalone page file (gateway_dashboard.html) served per request with inline fallback; publish ships it; process_uptime/stats_since on /gateway/stats; ?fast=/?slow= trim on /gateway/telemetry; preview proxy; tests
+- 2026-10-03 `75c03dde90` gateway dashboard: audit (63 items), screenshots, state fixes (unreachable gateway, unknown values), prefill/pill layout
+- 2026-10-03 `44e752b1ad` gateway dashboard: show spend.reconciliation and spend.pricing (dynamic-pricing lane), metered-vs-estimate bases, refreshed screenshots and audit
+- 2026-10-03 `c98f0a3082` gateway dashboard DB2: work class on every route, light /gateway/lanes, 60 s windowed TTFT/inter-token from gateway telemetry, reason shares over 15 min / 24 h / all time
+- 2026-10-03 `e998b41c91` gateway: rebuild the routing ring from the request log at startup (remote_use windows survive restarts; restored rows have unknown headroom, reported as restored/covered_s)
+- 2026-10-03 `b34967b543` gateway: persist hardware/engine telemetry (hw-YYYYMMDD.jsonl) + /gateway/telemetry/history + 24 h / 7 d dashboard charts
+- 2026-10-03 `571fcf1add` gateway LF: local-first derived from the caller's patience and real output; offline window checked before the predictive guards
+- 2026-10-03 `a30c90140a` gateway CR: chain-route telemetry + warm-continuation engine priority (all default off)
+- 2026-10-03 `9bf4a555af` gateway GW2: local finish_reason + tool-call argument validity telemetry (L94); reasoning-budget stream watchdog off|shadow|retry + explicit-thinking sampler budget knob (L95)
+- 2026-10-03 `ca388009f3` gateway GW2: engine-exact ptok_exact + cached tokens on local rows; /gateway/stats estimate_error
+- 2026-10-03 `fb39f73e35` gateway GW2/L100: Lane CR knobs hot-reloadable (SHIM_CHAIN_TELEMETRY, SHIM_WARM_PRIORITY, _MIN_CREDIT, _MAX_COMPUTED) so the warm-priority A/B alternates arms without restarts
+- 2026-10-03 `c7f0004fb1` gateway GW2: engine-anchored cache credit in SHADOW (SHIM_CREDIT_ANCHOR=off|shadow)
+- 2026-10-03 `b33be77fc5` gateway GW2 (class hunt): lossless stream scan corrects false content_empty / has_tool_calls
+- 2026-10-03 `35febb5c6b` gateway CFG: typed config schema, startup validation, /gateway/config/effective, shim.env linter
+- 2026-10-03 `46cf9ff9aa` CFG: config_drift_report.py -- vault docs and dashboard labels vs measured config
+- 2026-10-03 `8ce7b7c31d` dashboard: interactive_never_overflow hint was inverted (said 0 = never overflow, default)
+- 2026-10-03 `a001369981` CFG schema: GW2 keys (SHIM_CREDIT_ANCHOR; CHAIN_TELEMETRY / WARM_PRIORITY* now dashboard-tunable)
+- 2026-10-03 `06e32b4c86` RL L106: lane jobs in their own systemd user units; collector names the unit of a foreign Xid; GPU gate + busy signal
+- 2026-10-03 `e2b2d6ac94` RL L104/L107: immutable engine releases + release-aware serve scripts (PYTHONPATH override honored)
+- 2026-10-03 `8545610305` RL L105: one window framework (windowctl.py) + K5 window ported to a spec + the release migration window
+- 2026-10-03 `5c2812f9c3` serve v02 (RT/L123): --disable-uvicorn-access-log by default (V02_ACCESS_LOG=1 re-enables)
+- 2026-10-03 `988216932d` gateway GW2: /tokenize memo + off-loop warm step; engine prefix-cache probe client (SHIM_CREDIT_PROBE=off|shadow|live, default off)
+- 2026-10-03 `a676350001` gateway SH: golden characterization of handle_completions/_route_completions + admission (110 scenarios)
+- 2026-10-03 `6675c7ea5e` gateway SH: golden adds malformed-body scenarios (pins 4 bare-500 crashes before the fix)
+- 2026-10-03 `8077bc7356` gateway SH (class: request without the gateway's own answer): bad-body 400, router-crash JSON 500, named outcomes
+- 2026-10-03 `9e0dbcc299` LV/L141: a planned stop's ledger signature is 'planned'; the observed exit shape moves to exit_signature
+- 2026-10-03 `b22fb6c9ed` GW2/L100: warm_priority_ab.py -- 1 h ABAB SHIM_WARM_PRIORITY A/B via hot config (abort to OFF on any engine preemption or offline window; finally OFF) + per-arm analysis
+- 2026-10-03 `37b431d63e` gateway SH: golden follows K4's probe alias fix (native/default probes now synthesized; 2 scenarios renamed)
+- 2026-10-03 `1f3228d14f` gateway CFG: QoL interactive overflow (SHIM_QOL_OVERFLOW=off|shadow|on, default off) + 7-day replay
+- 2026-10-03 `5babb89ed9` gateway SH (classes: swallowed exceptions, unbounded tables, counts presented as fact)
+- 2026-10-03 `26b041afe5` gateway SH (class: inconsistent bool parsing): one flag reader for 26 env readers + 20 dashboard casts
+- 2026-10-03 `ede3881099` gateway SH (class: request dropped): bad SHIM_FLIGHTREC_MIN_TOK no longer kills every big local request
+- 2026-10-03 `dd47542b83` gateway: note cross-turn identical tool-call loops in the newest tool result (L143)
+- 2026-10-03 `e7d0a55e28` CFG: QoL remote TTFT per size band AND provider price period; effective config no longer flags unit-Environment keys as pending
+- 2026-10-03 `8bf3949ffe` gateway RA: repeat-note flags use SH's single bool reader (_env_flag/_cfg_flag)
+- 2026-10-03 `208e22b450` publisher: config schema install moves out of _install_dashboard() -- tests were writing the LIVE schema
+- 2026-10-03 `c279223260` ratchet: any test/tool WRITE to the deployed gateway files (shim, dashboard, config schema, shim.env, aliases, admin token) is a hit
+- 2026-10-03 `96e687a76f` gateway GW2: planned offline windows survive gateway restarts; no publish restart inside a window
+- 2026-10-03 `5b624b1851` gateway+dashboard SH (L161, truth in labels): input tokens = engine/provider counts + a separately shown estimate
+- 2026-10-03 `ac9da8f579` qol_replay --shadow: score the LIVE predictor from logged qol_* fields (the 24 h on-gate)
+- 2026-10-03 `c77fea961b` gateway GW2: own_uncached_tokens() -- probe > anchored > model own-prefill figure for consumers (CFG QoL), read from what _credit_sources recorded (no re-probe)
+- 2026-10-03 `0bc307825d` QoL: own uncached tokens = engine probe > anchored credit > cost model (GW2's order), computed once per request
+- 2026-10-03 `0ebfc6f4a6` EF2 (L136): watchdog wedge streak is per engine generation and breaks when the API is down
+- 2026-10-03 `953a373897` QoL: own uncached tokens via GW2's own_uncached_tokens() (single source of truth: probe > anchor > model)
+- 2026-10-03 `e05935a1f5` gateway GW2/L172: 402 Insufficient Balance opens a persistent BALANCE breaker closed only by evidence
+- 2026-10-03 `c068fe129c` gateway SH stage 0: module manifest in the publisher + verified module loading in the shim (no code moved yet)
+- 2026-10-20 `a4c72e8bb8` Model switch and dashboard work found uncommitted since 2026-10-10
+
+## Engine liveness, watchdog, faults (LV, EF) (26)
+
+- 2026-08-16 `0d0c10ab51` guard: env-gated block_table bounds check before TQ continuation dequant (Xid31 candidate-1 instrumentation)
+- 2026-08-17 `db318e88b2` exp045b: instrument the max-model-len-gated Xid31 crash class (staged, env-gated)
+- 2026-08-18 `b1fe470baa` s4_v3_window: reproduce §11.6 boot faithfully (default fp16 KV + PIECEWISE)
+- 2026-08-24 `dba38709fe` EXP-046: FlashQLA varlen unbatching (env-gated, default off) + correctness/speed probe
+- 2026-08-16 `896b1013f1` guard: env-gated block_table write-side bounds check (Xid31 candidate-1, P1)
+- 2026-08-24 `6403e7892a` chore(retention-interval): rebase onto frontier-pastnative-20260816, confirm dense default, drop stray .bak files
+- 2026-09-28 `4a47e5173a` fix(watchdog): require engine progress stall before restart
+- 2026-10-01 `bb3a7d54ea` Bound watchdog remediation and WireGuard restart loops
+- 2026-10-01 `d4cb92f546` Key watchdog canaries to content rather than timestamps
+- 2026-10-02 `7611a28466` engine faults (lane EF): scheduler progress-invariant guard (preempt+recompute instead of engine death), keep spec accepted-count across batch drop, mixed-batch attribution fences, fault collector + prefix rewarm
+- 2026-10-02 `f2b503c06f` engine (lane EF2): short-first interleave + prefill/decode time-slice in the mamba-align scheduler (HOL blocking), engine actuator + fault->Halo hand-off collector, drain-first planned restarts
+- 2026-10-02 `8a9f0b143d` RS: fault collector records a watchdog wedge BEFORE the kill (pre-kill + dedupe), reconcile/backfill of lost deaths, xid linkage, event_log record per death; actuator skips no-op flag restarts and reconciles on every engine start
+- 2026-10-02 `0727c98659` RS: watchdog confirms a wedge in 2 probes (not 5) when a kernel Xid corroborates it (cuts ~3 min of full outage per CUDA fault); drain backfill tool
+- 2026-10-03 `02927cf42b` FX2: L63 offline-strategy drain keeps waiting past --drain-s while engine tokens advance (hard cap 600 s, stall = stop, reasons recorded); L64 watchdog skips its probe POST when generation tokens advanced since the last tick (max 9 in a row)
+- 2026-10-03 `abe842c303` K4: micro fast lane v2 -- learned tiny lane for short-output call types + gateway-answered liveness probe
+- 2026-10-03 `4345cc43b6` S4: fault collector attributes a kernel Xid to the engine only when its pid is in the engine's process tree
+- 2026-10-03 `07a03013c7` AU: failed boots are their own fault class; warm-up hook stops waiting when the engine dies
+- 2026-10-03 `0d1ef3c2c6` K4: probe synth accepts every local-capable _resolve_alias kind (default, builtin-local, native)
+- 2026-10-03 `3096dfb698` LV: gateway publish judges "Halo run live" by the incident supervisor's own lease-backed rule; takes the liveness quiesce hold
+- 2026-10-03 `422bbae70a` LV: one engine-liveness authority with a declared state machine; watchdog, windows, collector, estate-watchdog delegate
+- 2026-10-03 `520f187d37` LV: CRASH_LOOP/BREAKER_OPEN also file a Kevin need (hand-offs have no consumer yet); engine_status shows liveness state + holds
+- 2026-10-03 `a03af0e133` LV: watchdog unit no longer Wants= the engine; hold run hands its lease to the child; one rule for implicit holds
+- 2026-10-03 `7a610a74cf` EF2: Xid archiver matches only NVRM Xid lines (the r8169 'XID 641' NIC banner at every boot made false xid-* incidents)
+- 2026-10-03 `22abf0fc6e` EF2: fault collector keeps the journal's fault signature when the watchdog wedge-kills an engine whose core already died
+- 2026-10-03 `c87bdbee8e` LV: tests for EF2's ported watchdog/Xid fixes; class fix: liveness-authority recoveries are FAULTs, not planned stops
+- 2026-10-03 `ba26effbd6` LV: DEAD_CORE state -- /health 503 (vLLM EngineDeadError) behind a live API is recovered in two ticks, not ~5 min
+
+## Releases and builds (release.py, JIT, FlashQLA) (7)
+
+- 2026-08-16 `c7ea63516a` exp-038: stage0 driver — tiny max_model_len + pin flashqla_legacy for throwaway boots
+- 2026-08-24 `95e43ef180` docs: 0.2.x memo — toolchain EC resolved (GCC15/Py3.12/driver 595.84 CUDA13.2-capable; build-only change)
+- 2026-08-26 `1b2010744c` tools: fix flashqla_varlen_probe import after rebase rename (GDNLinearAttentionBackend -> ChunkGatedDeltaRule)
+- 2026-08-26 `df8b510489` instrument: env-gated FLASHQLA varlen-fallback frequency+shape counter
+- 2026-10-03 `aae18471a5` AU: measured engine health after planned restarts + host rebuildable from repo
+- 2026-10-03 `54d01cf74d` release.py --jit-ext MODULE.py:ENV[:DIR]: prebuild a lane's JIT extension inside the release; windowctl boots export its build dir
+- 2026-10-17 `873d5fbd8d` release.py: refuse a build whose --from tree has no FlashQLA
+
+## Engine and kernels (vLLM fork) (49)
+
+- 2026-08-17 `9d35130b56` bench: fail the MTP requal stage when spec counters are contaminated by concurrent traffic
+- 2026-08-16 `7a9b2ac029` EXP-040: raise SM75 custom-allreduce cap 8->32MiB (routes chunked-prefill allreduces off NCCL onto NVLink custom kernel)
+- 2026-08-16 `c197e8ab97` docs: frontier session 2 (2026-08-16 evening) — k3v4 524K ship, MTP dense-draft fix (+54%), 16-lane knee, EXP-038 all 4 stages proven, overlay refutation
+- 2026-07-16 `a0c9ed4497` Fix MTP Mamba align prefix cache retention
+- 2026-08-17 `ade8d3abb0` kv-cache: exclude the turboquant workspace arena from profiled non-KV memory (deterministic single-count of the reserve)
+- 2026-08-16 `447a313d5d` feat(exp-038): GDN snapshot/park PoC — snapshot_mamba_state (Stage 0)
+- 2026-08-16 `0792241f21` exp-038: Stage-2 — restore + byte-exact continuation driver (zero-kernel variant)
+- 2026-08-16 `4444d3262f` exp-038: Stage-3 FORK smoke driver (zero-kernel variant) — restore same pinned handle into 2 co-scheduled children; assert both ride the cache + byte-exact vs reference + vs each other
+- 2026-08-16 `10151c1709` exp-038: Stage-3 PASS — fork into 2 children; max logprob delta 1.16e-02 (batch numerics), tokens byte-exact 3-way, distinct mamba slots, shared attn refcnt
+- 2026-08-17 `848dbcda84` exp-038: fork v2 — non-blocking server-layer fork (/tq/fork2)
+- 2026-08-17 `199e9f9f76` stage6 fork2: hardware PASS 4/4 (stop-correct children, all-full-blocks cache adoption); verdict thresholds corrected (partial block can never cache; adequate token budget)
+- 2026-08-18 `f879ea2774` tq/fork2: per-child SSE streaming (stream:true) — local-model implementation vs trusted gate
+- 2026-08-17 `2fc2d5de14` EXP-039 (S4): reserve spec-decode verify workspace to fix K=16 profiling OOM
+- 2026-08-17 `92f1c51b16` EXP-039 (S4): fix spec-verify reserve wiring diagnosis + relieve upstream cudagraph-profiling OOM
+- 2026-08-18 `b7ee478698` EXP-039 v3 (S4): GPU-side draft merge — async-safe scoped drafter (VLLM_S4_GPU_MERGE)
+- 2026-08-23 `af2e218f70` test(offloading): add retain_mamba_align_mtp_cache_block to the scheduler stub
+- 2026-08-23 `d1aa9a73ac` integrate upstream #107 (autotune-pin portion only): pinned SM75-optimal GDN Triton configs
+- 2026-08-24 `92606fe2f9` scheduler: read VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK via the envs module (port from PR #126 review)
+- 2026-08-24 `4dbb4699cc` kv-cache: tolerate required-below-allocated in Mamba align allocate (S4/MTP-cap crash RCA)
+- 2026-08-24 `6b6b03e5a8` spec-verify reserve: DP-aware last-stage mask (cubic #131 P2)
+- 2026-08-24 `847ba607db` GDN: port vllm-project#51508 — skip stale zero-accept async rows
+- 2026-08-24 `7c9d3fd7f9` docs: M-2 draft go/no-go memo for the 0.2.x (vLLM v0.27.1) migration
+- 2026-08-24 `0dee84f716` M-7: fail fast at boot on VLLM_MTP_DRAFT_CAP != num_speculative_tokens
+- 2026-08-24 `42b62ff51b` test: cover #51508 port test debt (stale zero-accept spec rows)
+- 2026-08-24 `811955dcea` docs: F-1 phase 1 research on vLLM PR #53479 (mamba align partial-prefix hits)
+- 2026-08-24 `7a4e8bd080` docs: upstream vllm-project/vllm harvest sweep (2026-08-24)
+- 2026-08-24 `b2f67a76e4` docs: F-2 phase 1 — TurboQuant decode depth-cost research
+- 2026-08-24 `a6177540bb` fix(prefix-cache): drop final matched Mamba block under eagle/MTP (vllm-project/vllm#43650)
+- 2026-08-24 `abfe260975` fix(gdn): align Qwen GDN gates with speculative tokens (vllm-project/vllm#51812)
+- 2026-08-24 `d73c35b1a0` perf+fix(gdn): collapse redundant mask compute + reset spec-decode count on empty draft schedule (vllm-project/vllm#52078, #53077)
+- 2026-08-24 `7a9f10f679` fix(structured-output): stop XGrammar token batches at termination (vllm-project/vllm#52805)
+- 2026-08-16 `283936fa60` feat(kv-cache): port VLLM_PREFIX_CACHE_RETENTION_INTERVAL for Mamba/GDN groups (upstream #45845)
+- 2026-08-24 `c96fbe66d1` engine: re-hydrate parent VLLM_* env in EngineCore spawn (silent feature-loss class)
+- 2026-08-24 `831c58792a` Add tq_depth_probe.py: standalone TQ decode depth-cost kernel timing probe
+- 2026-08-24 `425ef82260` F-2: query-row KV-tile reuse in TurboQuant stage-1 spec-verify decode
+- 2026-08-24 `56c2d85843` F-2 attempt 2: row-unrolled q-tile stage-1 kernel + probe check-mode NaN fix
+- 2026-08-25 `702aba1d87` F-2: env knob for qtile stage-1 launch warps (VLLM_TURBOQUANT_STAGE1_QTILE_WARPS)
+- 2026-08-25 `462226f3b9` turboquant: make continuation-workspace reserve env an explicit override
+- 2026-08-25 `da86aaf88f` docs: F-5 K=3 tiny-prompt decode deadlock RCA (analysis-only, 2026-08-24)
+- 2026-08-27 `25436c5a0c` F-1: port vLLM #53479 partial prefix-cache hits (fork-adapted, opt-in)
+- 2026-09-04 `8807643cf3` deploy/env: sync vllm-qwen27b.env with the live production env (2026-08-27 state)
+- 2026-09-04 `a4bb751df7` F-1 lookup lane: read-side counterpart to VLLM_MAMBA_ALIGN_RETAIN_MTP_CACHE_BLOCK
+- 2026-09-04 `fcfd4cd3a9` F-1 provenance lane: per-block write-provenance for the retained-MTP-boundary relaxation
+- 2026-09-04 `6ef37c72e3` turboquant: chunked continuation-dequant behind VLLM_TURBOQUANT_CONTINUATION_CHUNK_TOKENS
+- 2026-09-05 `3df24b53da` test(mamba): pin the scheduler invariant that keeps padded prefill tails off the chunk-scan path (lane mamba-55178)
+- 2026-09-05 `37c739fcf7` Mamba1: refuse speculative decoding at engine start; pin the #55178 routing invariant
+- 2026-09-30 `a08ecb86cb` fix(runtime): recover missing NVIDIA module after kernel update
+- 2026-10-02 `5038d5dfca` CF: callers that hang up are detected (aiohttp does not cancel the handler): queued requests are dropped before any prefill and an upstream call in prefill is aborted; queued work flips to the valve when local dies; demand window configurable; drill follow arm
+- 2026-10-02 `66f96ba47e` CF: pure per-request prefill speed (queue excluded) alongside the aggregate rate; class by model alias (FLOW_MODEL_MAP)
+
+## Model switching and serve scripts (4)
+
+- 2026-08-17 `cc4bc44ba3` kv-cache: add back only the continuation-reserve portion of the workspace arena
+- 2026-08-16 `c3dcab9917` exp-038: Stage-5 STAGED — HTTP routes (/tq/pin,/tq/fork,/tq/unpin) on the OpenAI server
+- 2026-08-24 `42913e7b41` port #131 review fixes to consolidated: PP last-stage reserve gating + diagnostic on kv_cache_memory_bytes path + accurate <=0 reason
+- 2026-09-15 `9943c2a9d5` Reserve bounded generation memory across every local gateway lane
+
+## Qualification, tests and review gates (40)
+
+- 2026-08-17 `e67248171c` review round 2: strip-equality code-args gate, G1 doc bar, alignment helper
+- 2026-08-17 `be780da470` bench: single-source garble signatures in bench_lib (review: copies had diverged)
+- 2026-08-17 `5266e74e56` review round 3: truncation-proof G1, scoped named-tool fallback, margins
+- 2026-08-17 `6c23269097` review round 4: local-host restart gate, ship-run telemetry, duplicate-wrap guard
+- 2026-08-17 `caf74d07de` review round 5: fail-fast --ref validation, local-host gate, G1 template bar
+- 2026-08-17 `965ba056f2` exp-038: resolve cubic PR #2 re-review (6 findings) — presence-check prompt_token_ids, isolate unpin cleanup, reject bool park_slot, reclaim park slot on snapshot failure, docstring
+- 2026-08-17 `ac405ee4b5` stage4: cleanup handler catches BaseException so an interrupt during unpin cannot mask the primary fork error (review)
+- 2026-08-17 `009bf83848` exp045b: resolve cubic PR #4 review findings
+- 2026-08-17 `6e9a501e9c` EXP-039 (S4): fix gate-open draft misalignment (stale token stream)
+- 2026-08-17 `2e09db65ca` docs: EXP-039 A/B result, root cause, fix & corrected re-test protocol
+- 2026-08-17 `4bbb11c8b1` EXP-039 (S4): resolve cubic PR#3 review findings
+- 2026-08-17 `a129e8895a` EXP-039 (S4): resolve cubic PR #3 re-review (3 findings) — keep last-good metrics on scrape miss, narrow vocab_size guard to missing model_config, drop dead n_chunks counter
+- 2026-08-23 `94cb6d962a` review-resolution wave: apply 49 triaged cubic fixes + retention-attr test stubs
+- 2026-08-16 `c538464327` fix(guard): correct + actually-live block_table write-side bound (P1 review fix)
+- 2026-08-16 `f46d8952ac` fix(guard): shrink seq_len with cached_len in pages>width early-out (P2 review fix)
+- 2026-08-24 `eb4f206f65` M-7 guard: apply all 5 cubic review findings from closed PR #136
+- 2026-08-26 `de522fa735` test(F-1): TDD scaffolding for post-#53479-port boundary-stop behavior
+- 2026-09-05 `48093b3605` test(2080ti): gate rotary dispatch cases on device availability
+- 2026-09-18 `f9db1a6fe1` stop pytest collection from executing a jinja fixture that exits
+- 2026-09-28 `1f7f0c88cc` fix(gateway): price DeepSeek cache hits at weekday peak rates
+- 2026-09-28 `4866b3abd8` fix(gateway): make estate-local local on every branch
+- 2026-09-28 `fa0946f9f0` feat(gateway): expose cache cost and duplicate request evidence
+- 2026-09-28 `179b7b0238` fix(gateway): prioritize Halo control inference
+- 2026-09-30 `ee1d110fcf` Reject impossible prompts before gateway routing
+- 2026-10-01 `467def9406` Drain accepted gateway calls before governed restart
+- 2026-10-01 `9af4cca05b` Refuse unsafe rollback when gateway release cannot drain
+- 2026-10-01 `7b2d5bead0` Close duplicate-owner test pipes after process exits
+- 2026-10-01 `6730a43505` feat(gateway): safely bootstrap first drain-aware release
+- 2026-10-01 `ecd4402469` Always close gateway upstream sessions on client disconnect
+- 2026-10-01 `3f18f7eaae` Quiesce Halo runs before governed gateway restart
+- 2026-10-02 `610168f3ec` RS: gateway drain ledger (every drain = open/close JSONL with reason, holder, active, refused count by client, how it ended), 503 names the reason and never overshoots the fence, restart-recovery pairing; callers identify themselves
+- 2026-10-02 `ed84d1c339` RS: gateway timeout ledger (first-header / first-token / stream-idle: layer, deadline, wait, prompt size, outcome)
+- 2026-10-02 `ac41788c53` RS: persist the remote 402 breaker across gateway restarts (854b51ab62 verification: the first requests after every publish saw remote_ok()==True and were first-token-aborted)
+- 2026-10-02 `11746ee9ff` CF: planned local-offline window CLI; engine-actuator planned restarts open an offline window (remote valve) instead of a refusing drain fence, falling back to the drain when the gateway has no /gateway/offline
+- 2026-10-02 `88a6e326b5` CF: robot work (flow class runner/background) waits locally up to min(its deadline, BG_WAIT_LOCAL) before the valve - the legacy is_background() test does not know the overseer-* clients
+- 2026-10-03 `bd013e68c3` FX2: bench_lib warns once when benching the engine (:8001) directly with no gateway offline window open (wire to existing gateway-offline.py run)
+- 2026-10-03 `691bda67e9` FX2: bench_guard.py -- engine-direct benches exit 3 unless a gateway offline window is open (or BENCH_DIRECT_OK=1)
+- 2026-10-03 `c4a859baa6` RT: bounded retention for gateway runtime state (telemetry, incident bundles, publish backups, logs, compile cache)
+- 2026-10-03 `17c77304da` live_guard: tests can no longer write or exec under the live engine/gateway dirs; live tools refuse mutations from test runs
+- 2026-10-19 `c18b8e8a5c` Sync the gateway with the live HNET00 copy; windowctl drain floor
+
+## Other (51)
+
+- 2026-08-16 `0cfb0742f8` EXP-017 SUCCESS: past-native context works — Qwen3.8-27B correct at 352k tokens (90k past native 262144) on 2x2080Ti
+- 2026-08-16 `5fd26a0744` docs: frontier session 2026-08-16 — past-native recipe, changelog, upstream PR plan
+- 2026-08-17 `bded2c6b39` docs: frontier session 3 (2026-08-17) — PR #111 hardening, 741K pool, drafter v2 811 tok/s, boundary hunt, PR mining
+- 2026-08-17 `b4429cc47b` deploy: consolidate localflow orchestrator + qwen38-evalkit into the fork
+- 2026-08-17 `7f418f875d` README: exhaustive rewrite — measured numbers, fork deltas, primitives, ops, branch map
+- 2026-08-20 `c64de53e65` config: hard-fail explicit --async-scheduling + suffix overlay (#21)
+- 2026-08-16 `848fd4496c` exp-038: Stage-0 PASS — driver snapshots mid-generation (requests[] drops on finish); 96 tensors byte-exact both ranks
+- 2026-08-16 `a807bdc953` exp-038: Stage-1 — attn KV block pin/unpin (EngineCore utility + client plumbing)
+- 2026-08-16 `3e4856ee03` exp-038: Stage-2 verdict recalibrated (Fable adjudication) — num_cached_tokens is the restore-vs-recompute discriminator; PASS at 2080/2112 cached, byte-exact, churn-surviving
+- 2026-08-16 `81158824dd` exp-038: Stage-4 STAGED — scheduler-level fork_from_handle API (fork WITHOUT resubmit)
+- 2026-08-16 `89b29a6a3a` EXP-039 (S4): scoped re-emission drafter + design doc
+- 2026-08-16 `97381ce1e4` EXP-039 (S4): wire scoped drafter into gpu_model_runner + config
+- 2026-08-16 `b9765a7d7b` EXP-039 (S4): replay-shaped micro-bench (tools/s4_replay_bench.py)
+- 2026-08-18 `9ef48a7574` tools: s4_v3_window.sh — A/B/C window driver per exp039-v3-gpu-merge.md §8
+- 2026-08-18 `e4b1ff2cf4` s4_v3_window: run from the worktree (cwd shadows PYTHONPATH under python -m), clean stale arm results, PID-scoped trap
+- 2026-08-18 `34f085471c` s4_v3_window: venv bin on PATH — minimal boot JIT-compiles via ninja at sampler warmup
+- 2026-08-18 `0c20bcabde` s4_v3_window: arm Z discriminator (S4 fully off) + VRAM-release wait between arms
+- 2026-08-18 `3023b61e7a` s4_v3_window: setsid + process-group reap + pre-boot VRAM guard
+- 2026-08-19 `cd13d3c89a` EXP-039 v3 window RESULT: NEGATIVE — async-on width mismatch @ gpu_model_runner.py:4618
+- 2026-08-19 `818cf1e246` EXP-039 S4: fix numpy>=2.0 uint64 crash in _hash_tail (the v3 async blocker)
+- 2026-08-19 `079c48420f` EXP-039 v3 window r2: crash FIXED, verdict DECISIVE NEGATIVE
+- 2026-08-23 `bbc67c5eb5` tools: update-from-remote.sh — fast local update from the fork (+ upstream status)
+- 2026-08-23 `d17e0ca2f2` README: full rewrite — consolidated lineage, validated claims only (each with shape+date)
+- 2026-08-23 `c8e360b3c7` integrate upstream #124: shm_broadcast deadlock fixes (reader notify-drain + writer full-buffer notify)
+- 2026-08-23 `1e951ef729` integrate upstream #123 + #121 (code portion): Responses-API robustness
+- 2026-08-24 `6cc94a8ce2` EXP-039 window r3: v2 RE-PROVEN at HEAD (quote 181.4, gen unharmed 72.75); v3 RETIRED (dominated everywhere)
+- 2026-08-24 `f85c78b91c` docs: M-4 rank-layout hazard audit (0 HAZARDs found)
+- 2026-08-24 `d113f01048` docs: F-3 phase 1 — DFlash2 draft-head port research
+- 2026-08-16 `ecced00145` guard: always-on pages>width early-out + reader-guard width fix (P2+P3)
+- 2026-08-24 `9eff274cae` tools: add multiturn_replay_bench.py, the F-1/M-3 acceptance instrument
+- 2026-08-24 `a91d14d3e2` docs: wider-fork benchmark recon — beat-board vs external SM75/Turing serving numbers
+- 2026-08-24 `af851c874d` tq_depth_probe: SDPA fallback mask must match query dtype (half)
+- 2026-08-24 `87ef0be2f2` M-7 guard: S4 exemption — cap<K is design-required and runtime-safe under the scoped drafter
+- 2026-08-24 `b6baf79db2` EXP-021: author mixed-precision (int4/int8/skip) self-quant job for Qwen3.8-27B
+- 2026-08-25 `6a82e79efc` reconcile rebase: restore fork content lost to conflict attrition; keep exact v0.1.17 deltas
+- 2026-08-25 `05140bf7a9` gptq: match dynamic rules against unfused shard names for fused layers
+- 2026-08-25 `315866591f` docs(F-3): TnzGit independent DFlash2 port study synthesis — revised port estimate
+- 2026-08-26 `ad8212acb8` docs(M-8): route-claim conformance table 2026-08-26 — FP16-KV PASS, INT8-KV PASS, FP8/offload honest-SKIP
+- 2026-08-26 `a2d1ed9762` docs(F-1): port-prep correspondence table + upstream drift notes for PR #53479
+- 2026-08-26 `f60c8acd7c` docs(F-1): correct CI-staleness claim in hunk-drift-notes
+- 2026-08-27 `f103d4818f` replay bench: count reasoning_content toward TTFT first-token
+- 2026-09-04 `8c066366db` docs(readme): refresh to current v0.1.17/K=3 prod truth
+- 2026-09-30 `deb7c3a145` guard paid full-remote mode with one-hour lease
+- 2026-09-30 `b6f5c6d0af` make full-local block every paid alias
+- 2026-09-30 `f7fa3c1f63` Brake automatic remote overflow when estate delivery stalls
+- 2026-10-01 `1c59126c71` Atomically attribute remote settlements and bound paid holds
+- 2026-10-01 `e05d968726` Make private WireGuard cleanup hardening reproducible
+- 2026-10-03 `24f67b0a4f` FX2: planned-restart drain also waits on the engine's own num_requests_running/waiting (catches direct :8001 callers), bounded by the drain budget
+- 2026-10-03 `0be26b2f70` FX2: remote_pricing_check.py -- weekly report-only cron wrapper (fact + Halo hand-off + vault note; never applies prices; optional date-only restamp when the page matches)
+- 2026-10-03 `e54900f659` L77: leases are released on SIGTERM/SIGHUP/SIGINT and stale leases are taken over
+- 2026-10-03 `54231a03dd` engine CFG: engine_config_check.py -- resolved config chain, intended-vs-actual drift, whereis-knob

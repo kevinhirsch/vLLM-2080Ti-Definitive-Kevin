@@ -3,6 +3,43 @@
 This changelog tracks the fork release version for vLLM 2080 Ti Definitive
 Edition. It is separate from the upstream vLLM package version.
 
+## Unreleased: branch `frontier-pastnative-20260816`
+
+Not a fork release. This branch carries the HNET00 estate's gateway, window-controller and release tooling.
+**Complete list:** every commit on the branch since the last changelog entry (274 commits, 2026-08-17 to
+2026-10-20) is in [`deploy/docs/CHANGELOG-frontier-pastnative-20260816.md`](deploy/docs/CHANGELOG-frontier-pastnative-20260816.md),
+grouped by component.
+
+### Pushed 2026-10-20 (8 commits, `c467b05dad..a4c72e8bb8`)
+
+- **Gateway, bounded graceful stop** (`b19cb65f4f`). On the stop signal, every queued request that was never admitted
+  gets an immediate 503 with `Retry-After`. The stop then waits only for requests already sent upstream, for at most
+  `SHIM_DRAIN_WAIT_S` (default 600 s). After that it cancels the remaining handler tasks. A restart on 2026-10-19 had
+  held the stop for 7 minutes.
+- **windowctl rejects specs that shadow built-in variables** (`b19cb65f4f`): `RESULTS`, `WINDOW`, `LANE`, `STEP`,
+  `PROD_ROOT`. Test added.
+- **Gateway synced with the live HNET00 copy** (`c18b8e8a5c`). The repo copy had been stale since 2026-10-03. This
+  brings in `keepalive-shim.py`, `gateway_config_schema.py` and the new `experiment_controls.py`, including:
+  - local-only requests are held through planned windows instead of refused;
+  - an anti-starvation rule: a class's oldest waiter, held only by the capacity check for `FLOW_STARVE_S`, blocks
+    younger admissions until it fits.
+  - `spend_reconcile.py` was deliberately not synced: the repo version is newer than the live one.
+- **windowctl drain floor** (`c18b8e8a5c`). Accepted local work gets at least `WINDOWCTL_DRAIN_FLOOR_S` (default
+  300 s) before the engine stops. The drain time is added to the window budget, and the lease outlives the drain.
+- **release.py refuses a build whose source tree has no FlashQLA** (`873d5fbd8d`). Such releases crashed at GDN
+  init. `RELEASE_ALLOW_NO_FLASHQLA=1` opts out.
+- **windowctl spec preflight before production stops** (`b76f80968a`). `WINDOWCTL_PREFLIGHT=<checker>` refuses a
+  window before the engine stops. Read-only script snapshots are made writable before pinning.
+- **windowctl script snapshots keep their own directory** (`36f6d67b32`). `$(dirname "$0")` and
+  `$(dirname "${BASH_SOURCE[0]}")` resolve to the original script's directory.
+- **windowctl timing marker** (`a4ee7b0418`). `WINDOWCTL_BENCH_FILE` exists while a run step measures; steps opt out
+  with `"timing": false`.
+- **windowctl records the 2026-10-17 lift of overnight-only windows** (`532a427439`). The window daemon sets
+  `WINDOWCTL_ALLOW_DAYTIME` and pauses on `windows/HOLD`.
+- **Model switching and gateway dashboard** (`a4c72e8bb8`). This work was found uncommitted in the working tree,
+  last edited 2026-10-10. It covers `model_switch.py`, the rewritten `switch-model.sh`, model selection in
+  `serve-hauhaucs-v02.sh`, the dashboard changes, and their tests. Committed as found; 138 tests pass.
+
 ## v0.1.17 - 2026-08-24
 
 - Merges [PR #125](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/125), deduplicating named-tool streaming fallback output and preserving `finish_reason=length` for truncated tool calls.
