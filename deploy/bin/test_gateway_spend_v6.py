@@ -143,8 +143,14 @@ class Routing(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sent[0][1]["model"], "deepseek-v4-pro")
         self.assertAlmostEqual(self.led.snapshot()["spent"], (10_000 * 0.01 + 1_000 * 0.5 + 100 * 2.0) / 1e6, places=9)
         self.led.settle("pre", 1.0)
-        with patch.object(shim, "REMOTE_PRICES_JSON", PRO_PRICES):
+        # cap exhausted: with the remote-alias degrade off (kill switch) the pro alias is refused with a 429; with it on
+        # (the default since GW3) it is served locally and nothing more reaches the paid remote. Updated 2026-10-20.
+        with patch.object(shim, "REMOTE_PRICES_JSON", PRO_PRICES), patch.object(shim, "REMOTE_ALIAS_DEGRADE", False):
             self.assertEqual((await shim.handle_completions(Request("estate-remote-pro"))).status, 429)
+        with patch.object(shim, "REMOTE_PRICES_JSON", PRO_PRICES):
+            self.assertEqual((await shim.handle_completions(Request("estate-remote-pro"))).status, 200)
+        self.assertEqual([b for b, _ in self.sent[1:]], [shim.LOCAL])       # the degraded request went to the local engine
+        self.assertEqual(sum(1 for b, _ in self.sent if b != shim.LOCAL), 1)  # still only the first, budgeted remote send
 
     async def test_a_disconnect_after_sending_charges_the_hold(self):
         async def reset(request, *a, **k):

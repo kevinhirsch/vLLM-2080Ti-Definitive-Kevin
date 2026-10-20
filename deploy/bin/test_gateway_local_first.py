@@ -375,7 +375,11 @@ class Routing(RoutingBase):
         authority (_spend_allows_overflow) still governs; the brake does not."""
         self.ptok = 3_000
         braked = lambda *a: False
-        with patch.object(shim, "_automatic_remote_budget_allows", braked), patch.object(shim, "LOCAL_FIRST", False):
+        # Since 2026-10-19 estate-local and pinned callers are held up to LOCAL_ONLY_HOLD_SECS (default 1800 s) for the
+        # local engine instead of an instant 503, so this test waited 30 min. A short hold keeps it fast; what it pins
+        # is unchanged: they still end in a 503 and never reach remote.
+        with patch.object(shim, "_automatic_remote_budget_allows", braked), patch.object(shim, "LOCAL_FIRST", False), \
+                patch.object(shim, "LOCAL_ONLY_HOLD_SECS", 0.01):
             # optional overflow stays braked (unchanged)
             with patch.object(shim, "perf_breaker_active", lambda: True):
                 self.assertEqual(await self.route(max_tokens=1200), "local")
@@ -408,17 +412,25 @@ class Routing(RoutingBase):
         self.assertEqual(self.events, [("remote", "cap")])
 
     async def test_estate_local_never_overflows_when_admission_fills(self):
+        # Since 2026-10-19 a request that cannot overflow (estate-local, local-pin) waits for a local slot with the
+        # no-overflow admission wait instead of the 6 s overflow timer; with the lane limit at 0 that wait never ends.
+        # A short admission wait keeps the test fast; what it pins is unchanged: never forwarded, ends in a 503.
         with patch.object(shim, "admission_lane_limit", lambda *a, **k: 0), \
-                patch.object(shim, "local_saturation", lambda *a, **k: []):
+                patch.object(shim, "local_saturation", lambda *a, **k: []), \
+                patch.object(shim, "admission_wait_seconds", lambda *a, **k: 0.05):
             response = await self.route(model="estate-local")
         self.assertEqual(response.status, 503)
         self.assertEqual(self.calls, [])
         self.assertEqual(self.events, [("held", "cap")])
 
     async def test_halo_control_uses_protected_place_when_ordinary_budget_is_full(self):
+        # Since 2026-10-19 an ordinary estate-local request waits for a local slot (no-overflow admission wait) instead
+        # of failing at once, so with the budget full it waited ~30 min. A short wait keeps the test fast; what it pins
+        # is unchanged: the ordinary request ends in a 503 unforwarded, Halo's control request takes the protected place.
         with patch.object(shim, "_inflight", 14), \
                 patch.object(shim, "TINY_EXTRA_LANES", 1), \
-                patch.object(Request, "remote", "10.0.1.95"):
+                patch.object(Request, "remote", "10.0.1.95"), \
+                patch.object(shim, "admission_wait_seconds", lambda *a, **k: 0.05):
             response = await self.route(model="estate-local")
             self.assertEqual(response.status, 503)
             self.assertEqual(self.calls, [])

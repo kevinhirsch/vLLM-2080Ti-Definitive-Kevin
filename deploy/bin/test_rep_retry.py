@@ -12,7 +12,7 @@ import os
 
 import pytest
 
-from conftest import FakeRequest, FakeUpstream
+from conftest_rep_retry import FakeRequest, FakeUpstream
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 

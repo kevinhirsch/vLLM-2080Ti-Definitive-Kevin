@@ -380,22 +380,40 @@ class Seam(unittest.IsolatedAsyncioTestCase):
         return resp.status, json.loads(resp.body)
 
     async def test_cap_exhausted_estate_remote_is_refused_before_forwarding(self):
+        # Degrade off (SHIM_REMOTE_ALIAS_DEGRADE=0, the kill switch): refused with a 429 before anything is forwarded.
+        # Degrade on (the default since GW3, Kevin's "Local First Remote For Spikes"): served LOCALLY, never by the
+        # paid remote. Updated 2026-10-20: this test predated the degrade and asserted the 429 unconditionally.
         self.led.settle("earlier", 0.99)
-        resp = await shim.handle_completions(Request())
+        with patch.object(shim, "REMOTE_ALIAS_DEGRADE", False):
+            resp = await shim.handle_completions(Request())
         self.assertEqual(resp.status, 429)
         self.assertEqual(json.loads(resp.body)["error"]["type"], "spend_cap_exhausted")
         self.relay.assert_not_called()
+        resp = await shim.handle_completions(Request())
+        self.assertEqual(resp.status, 200)
+        self.assertTrue(self.relay.call_args_list)
+        self.assertTrue(all(c.args[1] == shim.LOCAL for c in self.relay.call_args_list))
 
     async def test_explicit_remote_routes_are_refused_with_429_when_the_cap_is_exhausted(self):
+        # Degrade off: 429 for the forced window and for route-intent. Degrade on (default): route-intent is served
+        # locally; the forced window still answers 429 (an operator's explicit choice is never silently degraded).
         self.led.settle("earlier", 0.99)
-        with patch.object(shim, "FORCE_REMOTE", 1), \
-                patch.object(shim, "FORCE_REMOTE_UNTIL_EPOCH", shim.time.time() + 60):  # forced window
-            resp = await shim.handle_completions(Request(model="qwen-local"))
-        self.assertEqual(resp.status, 429)
-        resp = await shim.handle_completions(Request(model="qwen-local",
-                                                     headers={"X-Gateway-Route-Intent": "overflow"}))
-        self.assertEqual(resp.status, 429)
+        with patch.object(shim, "REMOTE_ALIAS_DEGRADE", False):
+            with patch.object(shim, "FORCE_REMOTE", 1), \
+                    patch.object(shim, "FORCE_REMOTE_UNTIL_EPOCH", shim.time.time() + 60):  # forced window
+                resp = await shim.handle_completions(Request(model="qwen-local"))
+            self.assertEqual(resp.status, 429)
+            resp = await shim.handle_completions(Request(model="qwen-local",
+                                                         headers={"X-Gateway-Route-Intent": "overflow"}))
+            self.assertEqual(resp.status, 429)
         self.relay.assert_not_called()
+        with patch.object(shim, "FORCE_REMOTE", 1), \
+                patch.object(shim, "FORCE_REMOTE_UNTIL_EPOCH", shim.time.time() + 60):
+            resp = await shim.handle_completions(Request(model="qwen-local"))
+        self.assertEqual(resp.status, 429)      # the forced window is an operator's explicit choice: never degraded
+        resp = await shim.handle_completions(Request(model="qwen-local", headers={"X-Gateway-Route-Intent": "overflow"}))
+        self.assertEqual(resp.status, 200)
+        self.assertTrue(all(c.args[1] == shim.LOCAL for c in self.relay.call_args_list))
 
     async def test_cap_exhausted_and_local_down_overflow_is_a_retryable_503(self):
         self.led.settle("earlier", 0.99)
@@ -654,9 +672,13 @@ class ThroughputGuard(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((resp.status, self.calls), (200, ["remote"]))
 
     async def test_cap_exhausted_estate_remote_is_429(self):
-        resp = await shim.handle_completions(Request(model="estate-remote", max_tokens=1000))
+        # Degrade off: 429 and nothing forwarded. Degrade on (default): served locally, never remote.
+        with patch.object(shim, "REMOTE_ALIAS_DEGRADE", False):
+            resp = await shim.handle_completions(Request(model="estate-remote", max_tokens=1000))
         self.assertEqual(resp.status, 429)
         self.assertEqual(self.calls, [])
+        resp = await shim.handle_completions(Request(model="estate-remote", max_tokens=1000))
+        self.assertEqual((resp.status, self.calls), (200, ["local"]))
 
     async def test_cap_exhausted_and_local_down_is_a_retryable_503(self):
         with patch.object(shim, "local_healthy", AsyncMock(return_value=False)):

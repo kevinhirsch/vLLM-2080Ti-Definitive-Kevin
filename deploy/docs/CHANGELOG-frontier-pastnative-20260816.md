@@ -301,3 +301,9 @@ Grouped by component (first matching rule); within a group, oldest first. Hashes
 - 2026-10-03 `0be26b2f70` FX2: remote_pricing_check.py -- weekly report-only cron wrapper (fact + Halo hand-off + vault note; never applies prices; optional date-only restamp when the page matches)
 - 2026-10-03 `e54900f659` L77: leases are released on SIGTERM/SIGHUP/SIGINT and stale leases are taken over
 - 2026-10-03 `54231a03dd` engine CFG: engine_config_check.py -- resolved config chain, intended-vs-actual drift, whereis-knob
+
+## After this list was generated
+
+Each later push has its own section in `CHANGELOG.md` (Unreleased).
+- 2026-10-20 `765600de46` Gateway: strict remote tool history, repetition retry, local-only clients; schema and tests
+- 2026-10-20 the "gateway test debt cleared" commit: tests only, the full `deploy/bin` suite passes (1,093)

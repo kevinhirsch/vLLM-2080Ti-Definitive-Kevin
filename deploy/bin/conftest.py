@@ -9,4 +9,9 @@ import tempfile
 pytest_plugins = ["live_guard", "conftest_rep_retry_compat"]
 # The strict-tool-history suite drives the real remote path, whose flight recorder defaults to the LIVE engine tree;
 # SHIM_FLIGHTREC_DIR (the shim's own override) keeps those files in a temp dir so live_guard stays clean.
-os.environ.setdefault("SHIM_FLIGHTREC_DIR", tempfile.mkdtemp(prefix="deploy-bin-tests-flightrec-"))
+if "SHIM_FLIGHTREC_DIR" not in os.environ:
+    import atexit
+    import shutil
+    os.environ["SHIM_FLIGHTREC_DIR"] = tempfile.mkdtemp(prefix="deploy-bin-tests-flightrec-")
+    # test_no_production_ledger_touch requires every temp dir a run creates to be cleaned up
+    atexit.register(shutil.rmtree, os.environ["SHIM_FLIGHTREC_DIR"], True)

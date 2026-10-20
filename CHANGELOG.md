@@ -10,6 +10,38 @@ Not a fork release. This branch carries the HNET00 estate's gateway, window-cont
 2026-10-20) is in [`deploy/docs/CHANGELOG-frontier-pastnative-20260816.md`](deploy/docs/CHANGELOG-frontier-pastnative-20260816.md),
 grouped by component.
 
+### Pushed 2026-10-20 (gateway test debt cleared)
+
+Tests only; no gateway code changed. The full `deploy/bin` suite now passes: **1,093 passed, 657 subtests, about
+2 min**. Before this push, 4 tests failed and 2 files hung for 5+ minutes each (the "known test debt" below). Every
+fix updates a stale test to behaviour Kevin decided earlier; none relaxes what a test pins.
+- **`test_gateway_spend_authority.py`** (3 tests) and **`test_gateway_spend_v6.py`** (1 test): they predated the
+  remote-alias degrade (GW3, "Local First Remote For Spikes", on by default), so they asserted a 429 unconditionally.
+  Each now pins both settings. With the degrade off (`SHIM_REMOTE_ALIAS_DEGRADE=0`, the kill switch), the request
+  gets a 429 and nothing is forwarded. With it on, an explicit remote alias, route-intent overflow or an exhausted
+  pro alias is served by the local engine and never by the paid remote. An operator's forced-remote window still
+  answers 429: an explicit choice is never silently degraded. 43 and 24 pass.
+- **`test_gateway_local_first.py`** (3 tests that hung): since 2026-10-19, a caller that cannot overflow
+  (`estate-local`, local pin) waits for a local slot, or is held through a planned window for up to
+  `LOCAL_ONLY_HOLD_SECS` (1,800 s), instead of being refused at once. So these tests each waited about 30 minutes.
+  - `test_estate_local_never_overflows_when_admission_fills` and
+    `test_halo_control_uses_protected_place_when_ordinary_budget_is_full` patch `admission_wait_seconds` to 0.05 s.
+  - `test_stall_brake_never_refuses_work_that_only_remote_can_serve` patches `LOCAL_ONLY_HOLD_SECS` to 0.01 s.
+  - They still pin the same outcomes: the request ends in a 503, unforwarded and never remote, and Halo's control
+    request takes the protected place.
+  - The file passes, 31 tests in 2.3 s.
+- **`test_no_production_ledger_touch.py`** (the ledger ratchet) passes, 2 tests in about 57 s. It had two separate
+  problems:
+  - **Hang:** it re-runs every test module in a subprocess, so it hung on the local-first hangs above.
+  - **Temp dir left behind:** `conftest.py` created its flight-recorder temp dir (`SHIM_FLIGHTREC_DIR`) without
+    removing it. The ratchet requires every temp dir a run creates to be cleaned up, so `conftest.py` now removes
+    that dir at exit.
+- **`test_rep_retry.py`** now imports its fakes from `conftest_rep_retry` (the module that defines them).
+  - It used to import them from `conftest`, which never defined them; the pytest plugin
+    `conftest_rep_retry_compat.py` published them there at startup.
+  - The ratchet runs the modules under plain unittest, which loads no pytest plugin, so the import failed there.
+  - The plugin keeps only the `shim` / `patch_stream` fixtures.
+
 ### Pushed 2026-10-20 (gateway update)
 
 - **Strict tool-call history on the remote path** (lane GW-STRICT, via gw-combined): requests forwarded to the paid
@@ -34,7 +66,8 @@ grouped by component.
     (`local_down_estate_local_503`, `offline_window_local_pin_503`, `offline_window_no_remote_503`).
   - `test_strict_tool_history.py` and `test_rep_retry.py` (56 tests) come with the two fixes, plus
     `conftest_rep_retry*.py`. In `conftest.py` the compat plugin is registered and the flight recorder goes to a temp dir.
-- **Known test debt, failing identically on the code before this change** (left for a separate fix):
+- **Known test debt, failing identically on the code before this change** (all fixed in the next push, "gateway test
+  debt cleared", above):
   - `test_gateway_spend_authority.py`: 3 failures, explicit-remote 429 cases;
   - `test_gateway_spend_v6.py`: 1 failure, pro alias;
   - `test_gateway_local_first.py` and `test_no_production_ledger_touch.py`: hang (each over 5 min).
