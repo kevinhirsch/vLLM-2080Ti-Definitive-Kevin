@@ -412,10 +412,10 @@ dl.gl dt{display:inline;font-weight:650} dl.gl dd{display:inline;margin:0 0 0 4p
 <section class="sec" id="settings" aria-labelledby="h-set">
  <h2 id="h-set">Settings</h2>
  <p class="lede">Changes apply live and are saved to shim.env. <span id="authbadge" class="pill">&hellip;</span></p>
- <details class="dd" id="d-model"><summary>Local model <span class="sub">switch the served checkpoint &middot; the engine restarts &middot; overflow covers the gap</span></summary><div class="in">
-  <p class="sm dim">Scans <span id="mdir" class="mono"></span>. Any HF checkpoint works. Switching restarts the engine (about 40 s warm, 4&ndash;5 min cold); traffic falls back to remote until it is healthy.</p>
+ <details class="dd" id="d-model"><summary>Local model <span class="sub">switch the served checkpoint &middot; the engine restarts</span></summary><div class="in">
+  <p class="sm dim">Scans <span id="mdir" class="mono"></span>. Switching requires a configured serving profile. Accepted local requests finish before the engine reloads. Remote overflow covers the reload only when available.</p>
   <div class="tw"><table><thead><tr><th></th><th>Model</th><th class="num">Size</th><th>Format</th><th></th></tr></thead><tbody id="lm"></tbody></table></div>
-  <div style="margin-top:8px"><span id="lmmsg" class="dim"></span></div>
+  <div style="margin-top:8px"><span id="lmmsg" class="dim" role="status" aria-live="polite"></span></div>
  </div></details>
  <details class="dd"><summary>Admin access <span class="sub">who can change settings</span></summary><div class="in" id="authcard">
   <div id="authtext" class="sm dim"></div>
@@ -1734,22 +1734,70 @@ async function setMode(m){
     const d=await r.json();if(S.cfg)S.cfg.mode=(d.config&&d.config.mode)||m;VER.config++;FS.config.due=0;FS.capacity.due=0;FS.stats.due=0;schedule();}
   catch(e){const el=$('#modemsg');if(el)el.textContent='Mode change failed: '+e.message;}
 }
+/*MODEL-SWITCH-START*/
+const MODEL_SWITCH_POLL_MS=5000,MODEL_SWITCH_TIMEOUT_MS=20*60*1000;
+let localSwitchPending=null,localModelsLoading=null;
+const modelPath=p=>typeof p==='string'?p.replace(/\/+$/,''):'';
+function nativeModelRoots(d){
+  // Stable served aliases survive switches. Only the engine's checkpoint roots identify what is loaded.
+  return d&&Array.isArray(d.data)?Array.from(new Set(d.data.map(m=>modelPath(m.root)).filter(p=>p.startsWith('/')))):[];
+}
+function switchButtons(){
+  $$('#lm button[data-act="switchmodel"]').forEach(b=>{b.disabled=!!localSwitchPending;});
+}
+async function modelRead(url,health=false){
+  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),10000);
+  try{const r=await fetch(url,{cache:'no-store',signal:controller.signal});if(health)return r.ok;
+    const d=await r.json();if(!r.ok)throw new Error(d.error||('HTTP '+r.status));return d;
+  }finally{clearTimeout(timer);}
+}
 async function loadLocalModels(){
-  try{const d=await(await fetch('/gateway/models/local')).json();
+  // Share an outstanding refresh so opening the controls cannot race the switch poller.
+  if(localModelsLoading)return localModelsLoading;
+  localModelsLoading=(async()=>{
+    const [list,native,health]=await Promise.allSettled([modelRead('/gateway/models/local'),modelRead('/v1/models'),modelRead('/health/local',true)]);
+    const roots=native.status==='fulfilled'?nativeModelRoots(native.value):[];
+    const healthy=health.status==='fulfilled'&&health.value===true;
+    if(list.status!=='fulfilled'){
+      if(!localSwitchPending)$('#lmmsg').textContent='Could not load local models: '+list.reason.message;
+      return {roots,healthy,error:list.reason.message};
+    }
+    const d=list.value;
     $('#mdir').textContent=d.models_dir||'';
-    $('#lm').innerHTML=(d.models||[]).map(m=>{
-      const badge=m.live?'<span class="pill local">LIVE</span>':'';
-      const btn=m.servable&&!m.live?'<button class="btn" data-act="switchmodel" data-p="'+esc(m.path)+'">Switch</button>':(m.servable?'<span class="dim">current</span>':'<span class="dim">not servable</span>');
+    $('#lm').innerHTML=(Array.isArray(d.models)?d.models:[]).map(m=>{
+      const live=healthy&&roots.includes(modelPath(m.path));
+      const badge=live?'<span class="pill local">LIVE</span>':'';
+      const btn=m.servable&&!live?'<button class="btn" data-act="switchmodel" data-p="'+esc(m.path)+'"'+(localSwitchPending?' disabled':'')+'>Switch</button>':(live?'<span class="dim">current</span>':'<span class="dim">not servable</span>');
       return '<tr><td>'+badge+'</td><td class="mono">'+esc(m.name)+'</td><td class="num">'+esc(m.gb)+' GB</td><td class="dim sm">'+esc(m.desc)+'</td><td>'+btn+'</td></tr>';}).join('')||'<tr><td colspan="5" class="dim">no checkpoints found</td></tr>';
-  }catch(e){}
+    return {roots,healthy,error:native.status==='rejected'?native.reason.message:health.status==='rejected'?health.reason.message:null};
+  })();
+  try{return await localModelsLoading;}finally{localModelsLoading=null;}
 }
 async function switchLocal(p){
-  if(!confirm('Switch the local engine to:\n\n'+p+'\n\nThe engine restarts. Traffic falls back to the paid provider until it is healthy.'))return;
-  $('#lmmsg').textContent='switching… engine restarting';
-  try{const r=await adminFetch('/gateway/models/local',{method:'POST',body:JSON.stringify({path:p})});const d=await r.json();
-    $('#lmmsg').textContent=d.error?('Failed: '+d.error):('Switching to '+d.switching_to+' ('+d.quant+'). '+d.note);setTimeout(loadLocalModels,15000);}
-  catch(e){$('#lmmsg').textContent='Failed: '+e;}
+  if(localSwitchPending)return;
+  if(!confirm('Switch the local engine to:\n\n'+p+'\n\nAccepted local requests finish before the engine reloads. Remote overflow is used only when available.'))return;
+  localSwitchPending={path:modelPath(p),started:Date.now()};switchButtons();
+  $('#lmmsg').textContent='Submitting switch request…';
+  try{
+    const r=await adminFetch('/gateway/models/local',{method:'POST',body:JSON.stringify({path:p})}),d=await r.json();
+    if(!r.ok||d.error||d.refused)throw new Error(d.error||d.refused||('HTTP '+r.status));
+    $('#lmmsg').textContent='Switch accepted. Waiting for '+p+' to finish loading…';
+    while(Date.now()-localSwitchPending.started<MODEL_SWITCH_TIMEOUT_MS){
+      const view=await loadLocalModels();
+      if(view.healthy&&view.roots.includes(localSwitchPending.path)){
+        $('#lmmsg').textContent='Switched: '+p+' is loaded.';
+        ['models','stats','capacity'].forEach(k=>{if(FS[k])FS[k].due=0;});
+        return;
+      }
+      const elapsed=Math.floor((Date.now()-localSwitchPending.started)/1000);
+      $('#lmmsg').textContent='Switch accepted; waiting for the requested checkpoint ('+elapsed+' s).'+(view.error?' Engine status is temporarily unavailable.':'');
+      await new Promise(resolve=>setTimeout(resolve,MODEL_SWITCH_POLL_MS));
+    }
+    throw new Error('The switch was not confirmed within 20 minutes. Check the engine and gateway logs before retrying; the request may still finish.');
+  }catch(e){$('#lmmsg').textContent='Switch failed: '+e.message;}
+  finally{localSwitchPending=null;switchButtons();}
 }
+/*MODEL-SWITCH-END*/
 function gotoSetting(field){
   const el=document.getElementById('f_'+field);
   if(el){const d=$('#d-form');d.open=true;el.scrollIntoView({block:'center'});el.focus();const lab=el.closest('label')||el;lab.classList.add('flash');setTimeout(()=>lab.classList.remove('flash'),1700);return;}
@@ -1789,6 +1837,7 @@ $('#h_limit').addEventListener('change',()=>{hPage=1;hDue=0;histTick();});
 $('#h_prev').addEventListener('click',()=>{if(hPage>1){hPage--;hDue=0;histTick();}});$('#h_next').addEventListener('click',()=>{hPage++;hDue=0;histTick();});
 $('#cfg_filter').addEventListener('input',()=>R.find(x=>x.name==='tel_config').fn());
 $('#save').addEventListener('click',saveCfg);
+$('#d-model').addEventListener('toggle',()=>{if($('#d-model').open)loadLocalModels();});
 $('#f_preset').addEventListener('change',e=>{const v=e.target.value;if(!v)return;const [b,m]=v.split('|');$('#f_remote_base').value=b;$('#f_remote_model').value=m;});
 $('#forget_token').addEventListener('click',()=>{try{localStorage.removeItem('shim_admin_token');}catch(e){}$('#forget_token').textContent='Forgotten. The next save will ask again.';});
 $('#pause').addEventListener('click',()=>{paused=!paused;$('#pause').setAttribute('aria-pressed',paused);$('#pause').textContent=paused?'Resume':'Pause';freshTick();});
