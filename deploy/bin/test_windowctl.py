@@ -167,6 +167,14 @@ def test_validate_rejects_unknown_variables_dupes_and_ambiguous_steps(tmp_path):
     assert "{{NOPE}}" in msg and "duplicate name a" in msg and "exactly one of" in msg and "boot needs exactly one" in msg
 
 
+def test_validate_rejects_vars_that_shadow_builtins(tmp_path):
+    # env_for() applies the builtins after the spec vars; a spec var named LANE was silently replaced by the window's own
+    # lane dir and window 1541-9486b failed its pre-check (2026-10-19)
+    bad = spec(tmp_path, vars={"LANE": str(tmp_path), "OUT": str(tmp_path / "out")})
+    with pytest.raises(wc.SpecError, match="shadow builtin"):
+        wc.validate(bad)
+
+
 def test_captured_variables_are_usable_only_after_their_step(tmp_path):
     ok = spec(tmp_path)
     assert wc.validate(ok)

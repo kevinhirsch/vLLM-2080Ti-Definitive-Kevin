@@ -1373,6 +1373,49 @@ def _drain_restore():
     return True
 
 
+# GRACEFUL STOP (2026-10-20): aiohttp's graceful shutdown waits for EVERY handler task, including requests that are
+# still only queued for admission. Nothing is admitted while the gateway is stopping, so those waiters could only ever
+# leave by timing out -- a restart on 2026-10-19 17:53 held the stop for 7 minutes. On the stop signal every unadmitted
+# waiter is released at once with a 503; the stop then waits only for requests already sent upstream, and only until
+# SHIM_DRAIN_WAIT_S elapses.
+_DRAIN_STOPPING = False
+GRACEFUL_DRAIN_WAIT_S = float(os.environ.get("SHIM_DRAIN_WAIT_S", "600"))
+_DRAIN_RETRY_AFTER_S = 15
+
+
+def _stopping_response(message):
+    """The one answer for work the stop will not drain: an arrival after the fence, a waiter that was queued, or a
+    request held for the local engine. Nothing was sent upstream, so this costs the drain nothing."""
+    return web.json_response({"error": {"type": "gateway_stopping", "message": message}},
+                             status=503, headers={"Retry-After": str(_DRAIN_RETRY_AFTER_S), "X-Gateway-Drain": "stopping"})
+
+
+async def _on_shutdown(app):
+    """First stop-signal hook: start the bounded in-flight drain, then release every unadmitted waiter."""
+    global _DRAIN_STOPPING
+    _DRAIN_STOPPING = True
+    log.info("graceful stop: releasing queued waiters, draining in-flight requests for up to %.0fs", GRACEFUL_DRAIN_WAIT_S)
+    app["drain_watchdog"] = asyncio.create_task(_graceful_drain_watchdog())
+
+
+async def _graceful_drain_watchdog():
+    """Stop waits for accepted upstream work, but not without bound: every drainable waiter polls at SLOT_POLL, so its
+    exit (and the release of its aiohttp task) is at most one tick after the watcher wakes. Work already sent upstream
+    gets GRACEFUL_DRAIN_WAIT_S and is then cancelled, because aiohttp would otherwise wait out its own 1800 s."""
+    await asyncio.sleep(GRACEFUL_DRAIN_WAIT_S)
+    left = len(_ACTIVE)
+    if left:
+        # Cancel the handler tasks themselves: aiohttp decides the stop is over when the task it awaits ends, and a
+        # relay parked on a silent upstream (or a client that stopped reading) has no deadline of its own. aiohttp runs
+        # each request in a `_handle_request` task that awaits the router's handler, so name both links of that chain.
+        handlers = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()
+                    and getattr(t.get_coro(), "__name__", "") in ("handle_completions", "_handle_request")]
+        for t in handlers:
+            t.cancel()
+        log.warning("graceful stop: drain bound %.0fs reached with %d in-flight request(s); cancelled %d handler task(s)",
+                    GRACEFUL_DRAIN_WAIT_S, left, len(handlers))
+
+
 async def gateway_drain(request):
     """Admin-controlled, leased admission fence for lossless gateway publication."""
     global _DRAIN_UNTIL, _DRAIN_LEASE, _DRAIN_REASON, _DRAIN_REC, _DRAIN_DURABLE, _DRAIN_INVALID
@@ -8742,12 +8785,15 @@ async def _await_unless_gone(request, awaitable, timeout=None, poll=0.5):
 
 async def _hold_for_local_engine(request, max_s):
     """Hold a request that cannot leave the local engine until the engine can take work again (no planned offline
-    window and healthy). Returns "ok", "gone" (the caller hung up) or "timeout". Admits nothing itself."""
+    window and healthy). Returns "ok", "gone" (the caller hung up), "stopping" (the gateway is being shut down) or
+    "timeout". Admits nothing itself."""
     t0 = time.monotonic()
     _active_set(request, phase="held")
     while time.monotonic() - t0 < max_s:
         if _client_gone(request):
             return "gone"
+        if _DRAIN_STOPPING:
+            return "stopping"   # never admitted, so the stop has nothing to drain here: leave like a queued waiter
         if not _local_offline() and await local_healthy():
             return "ok"
         await asyncio.sleep(1.0)
@@ -9544,6 +9590,9 @@ async def handle_completions(request):
                + (f" (reason: {reason}; held {int(time.time() - since)}s; by {_DRAIN_REC['by']})" if since else ""))
         return web.json_response({"error": {"type": "gateway_draining", "message": msg}},
                                  status=503, headers={"Retry-After": str(wait), "X-Gateway-Drain": "active"})
+    if _DRAIN_STOPPING:
+        # The graceful stop began: a request the stop will not drain gets the same answer a post-fence arrival gets.
+        return _stopping_response("gateway is stopping; no new work is admitted, retry once it is back")
     _drain_reap()
     try:
         j = json.loads(body)
@@ -10017,6 +10066,9 @@ async def _route_completions(request, _no_overflow=False):
         if _held == "gone":
             record_event("gone", "local-offline-held", request, units, 0, **ev)
             return _gone_response(request)
+        if _held == "stopping":
+            record_event("rejected-stop", "gateway-stopping", request, units, 0, **ev)
+            return _stopping_response("gateway is stopping; this request was never admitted and can be retried once it is back")
         if _held == "ok":
             log.info("route %s held through the planned local-offline window -> resuming normal routing", path)
     if _local_offline():
@@ -10081,6 +10133,9 @@ async def _route_completions(request, _no_overflow=False):
             if _held == "gone":
                 record_event("gone", "local-down-held", request, units, 0, **ev)
                 return _gone_response(request)
+            if _held == "stopping":
+                record_event("rejected-stop", "gateway-stopping", request, units, 0, **ev)
+                return _stopping_response("gateway is stopping; this request was never admitted and can be retried once it is back")
             if _held != "ok":
                 return web.json_response({"error": {"message": _pin_name + " requires the local engine, which is currently unavailable",
                                                       "type": "local_unavailable"}}, status=503)
@@ -10265,6 +10320,7 @@ async def _route_completions(request, _no_overflow=False):
         INTERACTIVE_NEVER_OVERFLOW)
     admitted = False
     t_admit0 = time.time()
+    stopping = False         # the graceful stop began while this request was still queued
     # lane CFG QoL: an interactive request that may overflow is judged by its PREDICTED wait, not a timer.
     _qol_live = (QOL_OVERFLOW in ("shadow", "on") and not background and overflow_ok and not alias_local_only
                  and not local_pin)
@@ -10336,6 +10392,9 @@ async def _route_completions(request, _no_overflow=False):
             if _client_gone(request):
                 client_gone_queued = True
                 break           # the caller hung up while queued: admit nothing, prefill nothing
+            if _DRAIN_STOPPING:
+                stopping = True  # the gateway is stopping: this request was never admitted, so it will not be now
+                break
             if ((_local_offline() or not _health["ok"]) and overflow_ok and not alias_local_only and not local_pin
                     and not (background and BG_LOCAL_ONLY and not _local_offline())):
                 break           # a planned offline window opened, or local died, under a waiter: the valve takes it
@@ -10389,6 +10448,12 @@ async def _route_completions(request, _no_overflow=False):
         log.info("route %s caller hung up after %.1fs queued -> dropped before any prefill", path, waited)
         record_event("gone", "queued", request, units, waited, **ev)
         return _gone_response(request)
+
+    if stopping:
+        # Refused exactly like a request that arrives after the fence: nothing was sent upstream, so nothing is drained.
+        log.info("route %s waited=%.1fs -> gateway stopping, never admitted", path, waited)
+        record_event("rejected-stop", "gateway-stopping", request, units, waited, **ev)
+        return _stopping_response("gateway is stopping; this request was never admitted and can be retried once it is back")
 
     if not admitted:
         # distinguish WHY we couldn't admit: lane-count vs total-context (size-aware) cap
@@ -13328,6 +13393,9 @@ async def _on_cleanup(app):
     jf = app.get("jsonl_flusher")       # TELEMETRY-HISTORY
     if jf:
         jf.cancel()
+    dw = app.get("drain_watchdog")      # GRACEFUL STOP: the stop is over, the drain bound no longer applies
+    if dw:
+        dw.cancel()
     _save_stats()
     if _JSONL_PENDING:   # best-effort final flush at shutdown -- same posture as _save_stats()
         try:
@@ -13355,6 +13423,8 @@ async def _gateway_root_redirect(request):
 def make_app():
     app = web.Application(client_max_size=1024**3)
     app.on_startup.append(_on_startup)
+    # GRACEFUL STOP: _on_shutdown is appended first, so it runs before aiohttp reaches the end of the request handlers.
+    app.on_shutdown.append(_on_shutdown)
     app.on_cleanup.append(_on_cleanup)
     app.router.add_get("/health", h_health)
     app.router.add_get("/health/local", h_health_local)

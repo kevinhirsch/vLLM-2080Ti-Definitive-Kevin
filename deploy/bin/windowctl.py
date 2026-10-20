@@ -493,6 +493,10 @@ def validate(spec):
         errs.append("ttl_s must be 30..3600 (the gateway's limit; the framework renews it)")
     if spec.get("on_new_xid", "abort") not in ("abort", "continue"):
         errs.append("on_new_xid must be abort|continue")
+    shadow = sorted(set(BUILTINS) & set((spec.get("vars") or {}).keys()))
+    if shadow:   # env_for() sets the builtins after the spec vars, so a var with a builtin's name is silently replaced
+        errs.append(f"vars {', '.join(shadow)} shadow builtin template variable(s) ({', '.join(BUILTINS)}); "
+                    f"rename them (window 1541-9486b failed on {{{{LANE}}}} = the window's own lane dir, 2026-10-19)")
     known = set(BUILTINS) | set((spec.get("vars") or {}).keys())
     known |= {release_var(st["name"]) for st in spec.get("steps") or [] if isinstance(st, dict) and st.get("name")
               and isinstance(st.get("boot"), dict) and "release" in st["boot"]}
