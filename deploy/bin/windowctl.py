@@ -104,6 +104,12 @@ SPEND_FILE = os.environ.get("GATEWAY_SPEND_FILE", f"{BASE}/gateway-spend.json")
 PLANNED = f"{BASE}/planned-restart.json"
 LOCK = os.environ.get("WINDOWCTL_LOCK", f"{BASE}/window.lock")
 MARKER = os.environ.get("WINDOWCTL_MARKER", f"{BASE}/window-active.json")
+# 2026-10-19: requests the gateway accepted before a window opened must finish before the engine stops. Specs said
+# wait_s 30 (copied from a template), shorter than one agent turn, so engine-stop cut in-flight streams; OpenHands got
+# empty replies ("did not include a function call") and lanes stalled (the 10-19 window starts at 15:14 and 15:42 cut
+# 7 lane requests). The drain ends as soon as nothing is active (new work is already held), so the floor costs nothing
+# when the engine is idle, and open_gateway adds the time it takes to the window budget.
+DRAIN_FLOOR_S = int(os.environ.get("WINDOWCTL_DRAIN_FLOOR_S", "300"))
 GATEWAY = os.environ.get("GATEWAY", "http://127.0.0.1:8000")
 ENGINE = os.environ.get("ENGINE_URL", "http://127.0.0.1:8001")
 ENGINE_UNIT = os.environ.get("ENGINE_UNIT", "vllm-qwen27b")
@@ -783,13 +789,20 @@ class Window:
 
     def open_gateway(self):
         go = gateway_offline_mod()
-        st, lease = go.open_window(f"{self.wid}: {self.spec['reason']}"[:120], self.by, int(self.spec.get("ttl_s", 1800)),
-                                   int(self.spec.get("wait_s", 90)), mode="run")
+        wait_s = max(int(self.spec.get("wait_s", 90)), DRAIN_FLOOR_S)
+        t_open = time.time()
+        ttl = min(3600, max(int(self.spec.get("ttl_s", 1800)), wait_s + 120))  # the lease outlives the drain
+        st, lease = go.open_window(f"{self.wid}: {self.spec['reason']}"[:120], self.by, ttl, wait_s, mode="run")
         if not lease:
             raise WindowAbort("refused", f"gateway offline window not opened: {json.dumps(st)[:300]}")
         self.state["lease"] = lease
+        drained = time.time() - t_open
+        if drained > 5:  # the drain is not the window's work: give its time back to the budget
+            self.max_s += drained
+            self.state["deadline"] = self.t0 + self.max_s
         self.save_state()
-        self.log(f"gateway offline window open (local_active={st.get('local_active')})")
+        self.log(f"gateway offline window open (local_active={st.get('local_active')}, drained {drained:.0f} s "
+                 f"of at most {wait_s} s)")
         threading.Thread(target=self._renew_loop, daemon=True).start()
 
     def _renew_loop(self):

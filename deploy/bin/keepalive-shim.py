@@ -28,6 +28,8 @@ NEVER manages the vLLM process (that's vllm-qwen27b.service + its watchdog).
 """
 import asyncio, os, sys, json, time, logging, collections, subprocess, re, hmac, math, hashlib
 import fcntl
+import contextlib
+import stat
 import threading
 import copy
 import datetime
@@ -128,11 +130,7 @@ def _fmt_seq(value, sep):
 # loud warning), booleans are canonicalised to 1/0 (a dashboard-persisted "False" used to come back as ON after a
 # restart), and shim.env duplicates / unknown keys are logged. Fail safe: if the module is missing or raises, the
 # gateway runs exactly as before. Effective values: GET /gateway/config/effective.
-# Lane SH (2026-10-03): every module that ships beside this file (gateway_safe_publish.GATEWAY_MODULES) is loaded
-# through _load_gateway_module(): from THIS file's directory by path (the live dir is never put on sys.path -- it
-# holds many stray .py files), executing exactly the bytes it hashed, so GET /gateway/modules can prove which code
-# the running process loaded and the publisher can verify it after a restart.
-_GATEWAY_MODULES_LOADED = {}      # filename -> {"sha256", "loaded", "required", "error"}; one row per manifest file
+_GATEWAY_MODULES_LOADED = {}
 
 
 def _load_gateway_module(fname, modname, required=True):
@@ -156,6 +154,7 @@ def _load_gateway_module(fname, modname, required=True):
         return None
 
 
+
 def _load_cfg_schema():
     try:
         _mod = _load_gateway_module("gateway_config_schema.py", "gateway_config_schema", required=False)
@@ -170,6 +169,8 @@ def _load_cfg_schema():
 
 
 _cfgschema = _load_cfg_schema()
+# Governed publication requires an exact startup-loaded controls module hash.
+_gateway_controls = _load_gateway_module("experiment_controls.py", "experiment_controls", required=True)
 
 
 # Lane SH (2026-10-03): ONE boolean reader. Before, 26 import-time readers and 19 dashboard casts used four different
@@ -217,6 +218,11 @@ REMOTE_MODEL = os.environ.get("SHIM_REMOTE_MODEL", "deepseek-v4-flash")
 # deployment can change the engine's output guard without lying about its context window.
 LOCAL_CONTEXT_LIMIT = int(os.environ.get("SHIM_LOCAL_CONTEXT_LIMIT", "524288"))
 REMOTE_CONTEXT_LIMIT = int(os.environ.get("SHIM_REMOTE_CONTEXT_LIMIT", "128000"))
+# 2026-10-19: advertise accurate per-model context in /v1/models so a harness sets its compaction correctly:
+# estate/estate-local/halo/halo-local = local agent budget; estate-remote/halo-remote = remote model context (DeepSeek 1M).
+# Routing is unchanged (these are display fields). Deliberate long-context local engine names stay at full max_model_len.
+AGENT_CONTEXT_TOKENS = int(os.environ.get("SHIM_AGENT_CONTEXT_TOKENS", "131072"))
+AGENT_CONTEXT_ENGINE_NAMES = {m.strip() for m in os.environ.get("SHIM_AGENT_CONTEXT_MODELS", "qwen3.6:27b").split(",") if m.strip()}
 CONTEXT_SAFETY_MARGIN = int(os.environ.get("SHIM_CONTEXT_SAFETY_MARGIN", "1024"))
 CONTEXT_COMPACTION_ENABLED = _env_flag(os.environ.get("SHIM_CONTEXT_COMPACTION", "1"), True)
 CONTEXT_COMPACTION_KEEP = int(os.environ.get("SHIM_CONTEXT_COMPACTION_KEEP", "12"))
@@ -235,6 +241,12 @@ CHARS_PER_TOK = 3.5
 # Exact tokenisation for routing decisions. See _tokenize_exact().
 EXACT_TOKENS      = _env_flag(os.environ.get("SHIM_EXACT_TOKENS", "1"), True)
 MIN_CHARS_PER_TOK = float(os.environ.get("SHIM_MIN_CHARS_PER_TOK", "2.0"))
+# [L104 / lane A6] _est_tokens used to ignore assistant tool_call name+arguments (and history reasoning) although the chat
+# template renders them: pi undercounts by 2.6K tokens on average, growing with size (exact/estimate 1.06 < 10K -> 1.25 > 60K).
+# SHIM_EST_TOOLCALLS=1 counts them (tool_calls at CHARS_PER_TOK like the tool definitions; reasoning_content only for turns after
+# the last user message, as the Qwen templates keep). Off by default: GW2 measured that exact sizes alone raise threshold flips
+# until the L105 cache-credit fix is live, so flip it together with or after that.
+EST_TOOLCALLS = _env_flag(os.environ.get("SHIM_EST_TOOLCALLS", "0"), False)
 TOKENIZE_TIMEOUT  = float(os.environ.get("SHIM_TOKENIZE_TIMEOUT", "5"))
 # Adaptive first-token deadline: base + est_prompt_tokens/prefill_rate. Big-context prefills
 # legitimately take a while, so this scales with prompt size; a WEDGED backend (accepts the
@@ -393,6 +405,8 @@ PREFIX_MODEL_MAX_NODES = int(os.environ.get("SHIM_PREFIX_MODEL_MAX_NODES", "6000
 #                          (set to the engine's --prefix-match-unit when it runs VLLM_GDN_TAIL_PUBLISH=copy).
 CHAIN_TELEMETRY = _env_flag(os.environ.get("SHIM_CHAIN_TELEMETRY", "0"), False)
 WARM_PRIORITY = _env_flag(os.environ.get("SHIM_WARM_PRIORITY", "0"), False)
+# Opt-in class-bounded local engine QoS; no header grants negative priority.
+LOCAL_WORK_CLASS_PRIORITY = _env_flag(os.environ.get("SHIM_LOCAL_WORK_CLASS_PRIORITY", "0"), False)
 WARM_PRIORITY_MIN_CREDIT = int(os.environ.get("SHIM_WARM_PRIORITY_MIN_CREDIT", "4096"))
 WARM_PRIORITY_MAX_COMPUTED = int(os.environ.get("SHIM_WARM_PRIORITY_MAX_COMPUTED", "1700"))
 WARM_PRIORITY_VALUE = int(os.environ.get("SHIM_WARM_PRIORITY_VALUE", "-10"))
@@ -439,6 +453,10 @@ BG_WAIT     = float(os.environ.get("SHIM_BG_WAIT_SECS", "5"))
 # interactive traffic's behavior is completely unchanged either way.
 BG_LOCAL_ONLY    = _env_flag(os.environ.get("SHIM_BG_LOCAL_ONLY", "1"), True)
 BG_WAIT_LOCAL    = float(os.environ.get("SHIM_BG_WAIT_LOCAL_SECS", "120"))
+# 2026-10-19 (coordinator): how long a request that cannot leave the local engine (estate-local, local-pin, or no remote
+# can take it) is HELD through a planned offline window or an engine restart instead of getting an instant 503 that its
+# client retries every <=60 s. 0 restores the old refusal. Matches the OpenHands client timeout (1800 s).
+LOCAL_ONLY_HOLD_SECS = float(os.environ.get("SHIM_LOCAL_ONLY_HOLD_SECS", "1800"))
 BG_REJECT_RETRY_SECS = int(os.environ.get("SHIM_BG_REJECT_RETRY_SECS", "300"))
 # Background turns don't need chain-of-thought: thinking mode makes a cron status report
 # generate 2-3K reasoning tokens and hold a local lane for minutes. Injecting
@@ -628,6 +646,7 @@ _CFG = {
     "SHIM_STREAM_IDLE_TIMEOUT_SECS": ("STREAM_IDLE_TIMEOUT_SECS", float),
     # [GW2 / L100] Lane CR knobs, hot-reloadable so the warm-priority A/B can alternate arms without restarts
     "SHIM_CHAIN_TELEMETRY": ("CHAIN_TELEMETRY", lambda v: _cfg_flag(v)),
+    "SHIM_EST_TOOLCALLS": ("EST_TOOLCALLS", lambda v: _cfg_flag(v)),     # [L104] hot-reloadable with the L105 credit fix
     "SHIM_WARM_PRIORITY": ("WARM_PRIORITY", lambda v: _cfg_flag(v)),
     "SHIM_WARM_PRIORITY_MIN_CREDIT": ("WARM_PRIORITY_MIN_CREDIT", int),
     "SHIM_WARM_PRIORITY_MAX_COMPUTED": ("WARM_PRIORITY_MAX_COMPUTED", int),
@@ -1179,6 +1198,14 @@ _ACTIVE = {}          # id(request) -> {name, ip, ua, ep, model, ptok, maxtok, s
 _DRAIN_UNTIL = 0.0
 _DRAIN_LEASE = None
 _DRAIN_REASON = None
+# A governed publication survives replacement of this process. Ordinary drains
+# keep their historical TTL; a durable publication stays fenced until its exact
+# lease is explicitly closed after qualification or recovery.
+_DRAIN_DURABLE = False
+_DRAIN_INVALID = None
+DURABLE_DRAIN_PROTOCOL = 1
+DRAIN_STATE_FILE = os.environ.get("SHIM_DRAIN_STATE_FILE") or os.path.join(os.path.dirname(STATS_FILE), "gateway-drain-state.json")
+PUBLISH_STATE_ROOT = os.environ.get("SHIM_PUBLISH_STATE_ROOT") or os.path.join(os.path.dirname(STATS_FILE), "gateway-publications")
 # RS (2026-10-02): every drain is one durable record. Before this a drain left NO trace of who raised it, why, how long it held,
 # or how many requests it refused (the 503 reason text was a constant), so "why was the estate down 20 min?" was unanswerable.
 # Events are append-only JSONL: {"event":"open"|"close", ...}; `close.how` is delete | expired | gateway-restart.
@@ -1218,6 +1245,8 @@ def _drain_reap(now=None):
 def _drain_startup_recover():
     """A previous gateway process may have died/been replaced while a drain was open (every publish does exactly that):
     close it in the ledger as `gateway-restart` so open/close always pair."""
+    if _drain_restore():
+        return
     try:
         last = None
         with open(_DRAIN_LEDGER) as fh:
@@ -1234,12 +1263,119 @@ def _drain_startup_recover():
 
 
 def _draining(now=None):
-    return (time.time() if now is None else now) < _DRAIN_UNTIL
+    return bool(_DRAIN_DURABLE or _DRAIN_INVALID) or (time.time() if now is None else now) < _DRAIN_UNTIL
+
+
+def _drain_persist():
+    """Persist before admitting a durable drain; write failures cannot open work."""
+    row = {"v": 1, "durable": True, "lease": _DRAIN_LEASE, "until": _DRAIN_UNTIL,
+           "reason": _DRAIN_REASON, "record": _DRAIN_REC}
+    path = DRAIN_STATE_FILE
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp.%d" % os.getpid()
+    try:
+        with open(tmp, "x") as out:
+            os.chmod(tmp, 0o600)
+            json.dump(row, out, sort_keys=True)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, path)
+        fd = os.open(os.path.dirname(path), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+
+
+def _publication_drain_fallback():
+    """An unfinished publisher journal fences restart even after partial DELETE.
+
+    Only private, owned, confined journals may reconstruct their exact lease.
+    Unknown journals fence admission without inventing an owner or expiry.
+    """
+    global _DRAIN_DURABLE, _DRAIN_INVALID, _DRAIN_UNTIL, _DRAIN_LEASE, _DRAIN_REASON, _DRAIN_REC
+    root = os.path.realpath(PUBLISH_STATE_ROOT)
+    pointer = os.path.join(root, "active.json")
+    try:
+        if not os.path.lexists(pointer):
+            return False
+        def private_json(path):
+            info = os.lstat(path)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077):
+                raise ValueError("untrusted publication journal")
+            with open(path) as source:
+                return json.load(source)
+        active = private_json(pointer)
+        receipt = active["receipt"]
+        if (not isinstance(receipt, str) or os.path.realpath(receipt) != receipt
+                or os.path.basename(receipt) != "state.json"
+                or os.path.dirname(os.path.dirname(receipt)) != root):
+            raise ValueError("unconfined publication journal")
+        row = private_json(receipt)
+        if (row.get("v") != 1 or row.get("transaction") != os.path.basename(os.path.dirname(receipt))
+                or not isinstance(row.get("source_head"), str) or not re.fullmatch(r"[0-9a-f]{40}", row["source_head"])
+                or row["source_head"] != active.get("source_head")):
+            raise ValueError("invalid publication journal")
+        if row.get("status") in ("published", "rolled-back"):
+            expected = "candidate" if row["status"] == "published" else "previous"
+            canary = row.get("generation_canary") or {}
+            if (row.get("qualified") != expected or canary.get("ok") is not True
+                    or canary.get("runtime_unchanged") is not True or canary.get("finish_reason") != "stop"
+                    or isinstance(canary.get("completion_tokens"), bool)
+                    or not isinstance(canary.get("completion_tokens"), int) or canary["completion_tokens"] <= 0):
+                raise ValueError("unqualified publication completion")
+            return False
+        lease = row.get("lease")
+        if not isinstance(lease, str) or not re.fullmatch(r"[0-9a-f]{32}", lease):
+            raise ValueError("unfinished publication has no identifiable drain")
+        _DRAIN_DURABLE, _DRAIN_INVALID = True, None
+        _DRAIN_LEASE, _DRAIN_UNTIL = lease, time.time() + 1800
+        _DRAIN_REASON = "unfinished governed gateway publication"
+        _DRAIN_REC = {"t0": time.time(), "reason": _DRAIN_REASON, "by": "gateway_safe_publish recovery",
+                      "ttl_s": 1800, "active_at_open": 0, "refused": 0, "refused_by_client": {}}
+        _drain_persist()
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+        _DRAIN_INVALID = type(error).__name__
+    return True
+
+
+def _drain_restore():
+    """Unknown persisted state is an admission fence, never evidence of no owner."""
+    global _DRAIN_DURABLE, _DRAIN_INVALID, _DRAIN_UNTIL, _DRAIN_LEASE, _DRAIN_REASON, _DRAIN_REC
+    try:
+        with open(DRAIN_STATE_FILE) as source:
+            row = json.load(source)
+    except FileNotFoundError:
+        return _publication_drain_fallback()
+    except (OSError, ValueError) as error:
+        _DRAIN_INVALID = type(error).__name__
+        return True
+    try:
+        rec = row["record"]
+        until = row["until"]
+        if (row.get("v") != 1 or row.get("durable") is not True
+                or not isinstance(row.get("lease"), str) or not re.fullmatch(r"[0-9a-f]{32}", row["lease"])
+                or isinstance(until, bool) or not isinstance(until, (int, float)) or not math.isfinite(until) or until <= 0
+                or not isinstance(rec, dict) or not isinstance(rec.get("by"), str)
+                or not isinstance(rec.get("refused_by_client"), dict)
+                or not isinstance(rec.get("refused"), int) or rec["refused"] < 0
+                or not isinstance(rec.get("t0"), (int, float)) or not math.isfinite(rec["t0"])
+                or not isinstance(rec.get("ttl_s"), int) or not 30 <= rec["ttl_s"] <= 1800
+                or not isinstance(rec.get("active_at_open"), int) or rec["active_at_open"] < 0):
+            raise ValueError("invalid durable drain state")
+        _DRAIN_DURABLE, _DRAIN_INVALID = True, None
+        _DRAIN_LEASE, _DRAIN_UNTIL, _DRAIN_REASON, _DRAIN_REC = row["lease"], until, row.get("reason"), rec
+    except (KeyError, TypeError, ValueError) as error:
+        _DRAIN_INVALID = type(error).__name__
+    return True
 
 
 async def gateway_drain(request):
     """Admin-controlled, leased admission fence for lossless gateway publication."""
-    global _DRAIN_UNTIL, _DRAIN_LEASE, _DRAIN_REASON, _DRAIN_REC
+    global _DRAIN_UNTIL, _DRAIN_LEASE, _DRAIN_REASON, _DRAIN_REC, _DRAIN_DURABLE, _DRAIN_INVALID
     if request.method == "GET":
         _drain_reap()
         return web.json_response({"draining": _draining(), "active": len(_ACTIVE),
@@ -1247,7 +1383,9 @@ async def gateway_drain(request):
                                   "reason": _DRAIN_REASON if _draining() else None,
                                   "by": _DRAIN_REC["by"] if _DRAIN_REC else None,
                                   "since": _DRAIN_REC["t0"] if _DRAIN_REC else None,
-                                  "refused": _DRAIN_REC["refused"] if _DRAIN_REC else None})
+                                  "refused": _DRAIN_REC["refused"] if _DRAIN_REC else None,
+                                  "durable": _DRAIN_DURABLE, "invalid_state": _DRAIN_INVALID,
+                                  "lease_sha256": hashlib.sha256(_DRAIN_LEASE.encode()).hexdigest() if _DRAIN_LEASE else None})
     if not _admin_ok(request):
         return web.json_response({"error": "admin token required"}, status=401)
     if request.method == "DELETE":
@@ -1257,17 +1395,44 @@ async def gateway_drain(request):
             body = None
         if not isinstance(body, dict) or body.get("lease") != _DRAIN_LEASE or not _DRAIN_LEASE:
             return web.json_response({"error": "drain lease mismatch"}, status=409)
+        if _DRAIN_DURABLE:
+            try:
+                os.unlink(DRAIN_STATE_FILE)
+                fd = os.open(os.path.dirname(DRAIN_STATE_FILE), os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except OSError:
+                # A missing/unreadable durable file cannot be called an owned
+                # release. Recreate it after unlink-success/fsync-failure if
+                # possible; the unfinished publication journal also fences a
+                # replacement process if the filesystem remains unavailable.
+                with contextlib.suppress(OSError):
+                    _drain_persist()
+                return web.json_response({"error": "durable drain release failed"}, status=503)
         _DRAIN_UNTIL, _DRAIN_LEASE, _DRAIN_REASON = 0.0, None, None
+        _DRAIN_DURABLE, _DRAIN_INVALID = False, None
         _drain_close_record("delete")
         return web.json_response({"draining": False, "active": len(_ACTIVE)})
     try:
         body = await request.json()
         ttl = int(body.get("ttl_s"))
-        if not isinstance(body, dict) or not 30 <= ttl <= 1800:
+        if not isinstance(body, dict) or not 30 <= ttl <= 1800 or not isinstance(body.get("durable", False), bool):
             raise ValueError("ttl_s outside [30, 1800]")
     except (ValueError, TypeError, AttributeError):
         return web.json_response({"error": "ttl_s must be 30..1800 seconds"}, status=400)
     _drain_reap()
+    if body.get("durable") and not SHIM_ADMIN_TOKEN:
+        return web.json_response({"error": "configured admin token required for durable drain"}, status=401)
+    if _DRAIN_DURABLE and body.get("lease") == _DRAIN_LEASE and not _DRAIN_INVALID:
+        _DRAIN_UNTIL = time.time() + ttl
+        try:
+            _drain_persist()
+        except OSError:
+            return web.json_response({"error": "durable drain renewal failed"}, status=503)
+        return web.json_response({"draining": True, "durable": True, "active": len(_ACTIVE),
+                                  "until": _DRAIN_UNTIL, "lease": _DRAIN_LEASE})
     if _draining():
         return web.json_response({"error": "another drain lease is active", "active": len(_ACTIVE),
                                   "until": _DRAIN_UNTIL, "reason": _DRAIN_REASON,
@@ -1278,10 +1443,16 @@ async def gateway_drain(request):
     by = str(body.get("by") or request.headers.get("X-Client") or request.headers.get("User-Agent") or "?")[:80]
     _DRAIN_REC = {"t0": time.time(), "reason": _DRAIN_REASON, "by": by, "ttl_s": ttl, "active_at_open": len(_ACTIVE),
                   "refused": 0, "refused_by_client": {}}
+    _DRAIN_DURABLE = bool(body.get("durable"))
+    if _DRAIN_DURABLE:
+        try:
+            _drain_persist()
+        except OSError:
+            return web.json_response({"error": "durable drain persistence failed; admission remains fenced"}, status=503)
     _drain_ledger_write({"event": "open", "t": round(_DRAIN_REC["t0"], 3), "reason": _DRAIN_REASON, "by": by, "ttl_s": ttl,
                          "active": len(_ACTIVE)})
     return web.json_response({"draining": True, "active": len(_ACTIVE),
-                              "until": _DRAIN_UNTIL, "lease": _DRAIN_LEASE})
+                              "until": _DRAIN_UNTIL, "lease": _DRAIN_LEASE, "durable": _DRAIN_DURABLE})
 _CLIENT_NAMES_FILE = "/home/kevin/.local/share/vllm-qwen27b/clients.map"   # "<ip or X-Client> = <friendly name>"
 _client_names_cache = {"t": 0.0, "map": {}}
 
@@ -3968,12 +4139,13 @@ def _cap_exhausted_unavailable(why):
                              status=503, headers={"Retry-After": "60"})
 
 
-def _spend_allows_overflow(ptok, maxtok):
+def _spend_allows_overflow(ptok, maxtok, model=None):
     """May an OVERFLOW (gateway-chosen, not caller-requested) request go remote right now?
     False when the cap is exhausted or the ledger is unusable -- the router then serves it
-    locally (queueing for a lane) instead of refusing it."""
+    locally (queueing for a lane) instead of refusing it. `model` prices a non-default row
+    (estate-remote-pro) exactly as the hold will."""
     try:
-        return _spend().can_hold(_spend_hold_estimate(ptok, maxtok))
+        return _spend().can_hold(_spend_hold_estimate(ptok, maxtok, model))
     except Exception as _e:
         _swallowed("_spend_allows_overflow", _e)
         return False
@@ -4012,6 +4184,61 @@ def _stall_brake_not_applied(why, client):
     Counted so the capacity surface shows how much stalled-state traffic the gateway carried rather than refused."""
     _STALL_BRAKE_NOT_APPLIED[why] += 1
     log.info("stalled-delivery brake not applied (%s, client=%s): remote is the only place this can be served", why, client)
+
+
+# ---- lane GW3 (2026-10-03): an explicit remote request is served LOCALLY when the remote cannot be used ----
+# Kevin's rule "Local First Remote For Spikes": remote is an optional valve, never a dependency. Halo's mind sends
+# model "estate-remote" (the builtin-remote alias, its top tier); with the provider out of balance the gateway still
+# forwarded it and _forward_remote answered 503 "no remote overflow configured" -- 16 requests with 28.9K-token prompts
+# thrown away in one day. "Usable" is the capacity mode's predicate (flow_mode_now: configured, not full-local, no open
+# breaker/dead window, balance not exhausted, daily cap has room), asked through the same two primitives the router
+# uses (remote_ok + _spend_allows_overflow) so it cannot disagree with them; test_gateway_remote_alias_degrade pins
+# the equivalence with flow_mode_now()["remote_usable"].
+REMOTE_ALIAS_DEGRADE = _env_flag(os.environ.get("SHIM_REMOTE_ALIAS_DEGRADE", "1"), True)      # kill: SHIM_REMOTE_ALIAS_DEGRADE=0
+_REMOTE_ALIAS_DEGRADED = collections.Counter()
+
+
+def remote_unusable_reason(body, ptok, maxtok, model=None, reserved=False):
+    """None when a paid remote call for this request can go out right now; else why not (a short slug)."""
+    if not remote_ok():
+        if not REMOTE_ENABLED:
+            return "no-remote-configured"
+        if LOCAL_ONLY:
+            return "full-local"
+        if _REMOTE_BALANCE["exhausted"]:
+            return "balance-exhausted"
+        return "breaker-open"
+    if reserved:        # the caller's reservation already holds the money; the ledger arbitrates any shortfall
+        return None
+    try:
+        upper = _spend_prompt_token_upper(body, ptok)       # what _spend_hold_for will actually hold against
+    except Exception:
+        upper = ptok
+    room = _spend_allows_overflow(upper, maxtok, model) if model else _spend_allows_overflow(upper, maxtok)
+    return None if room else "cap-no-room"
+
+
+def _degrade_remote_alias(request, body, kind, why, rewrite=True):
+    """Mark the request degraded and return its body re-addressed to the local served model."""
+    _REMOTE_ALIAS_DEGRADED[f"{kind}:{why}"] += 1
+    _active_set(request, degraded=f"{kind}-local", degraded_reason=why)
+    log.warning("route %s %s: remote unusable (%s) -> served locally", request.path, kind, why)
+    if not rewrite:
+        return body
+    try:
+        j = json.loads(body)
+        j["model"] = _local_model_name()
+        return json.dumps(j).encode()
+    except Exception as _e:
+        _swallowed("_degrade_remote_alias", _e)
+        return body
+
+
+def _degraded_headers(info):
+    if info and info.get("degraded"):
+        return {"X-Gateway-Degraded": str(info["degraded"]),
+                "X-Gateway-Degraded-Reason": str(info.get("degraded_reason") or "")}
+    return {}
 
 
 def _spend_hold_for(request, body, prices=None, model=None):
@@ -4190,7 +4417,10 @@ def _note_payload_outcome(request, payload, stream):
         kw = {"http_status": getattr(payload, "status", None)}
         if not stream:
             body = getattr(payload, "body", None)
-            if isinstance(body, (bytes, bytearray)):
+            # usage lives only in a JSON object answer; a plain-text/empty error body has none and is not a failure to count
+            # (A6: it made _note_payload_outcome the loudest entry of /gateway/internal-errors, 20 hits of pure noise)
+            ok_status = not isinstance(kw["http_status"], int) or kw["http_status"] < 400
+            if isinstance(body, (bytes, bytearray)) and ok_status and bytes(body[:64]).lstrip()[:1] == b"{":
                 u = (json.loads(body).get("usage") or {})
                 if "completion_tokens" in u:
                     kw["outtok"] = int(u["completion_tokens"])
@@ -4934,6 +5164,10 @@ def record_event(decision, reason, request, units, waited, ptok=0, maxtok=0, str
     # A post-commit stream watchdog has a more specific outcome than the admission reason
     # (usually "-" for a normal local request). Preserve it in the receipt and history.
     final_reason = "stream-idle-timeout" if prior.get("stream_watchdog") else reason
+    # lane GW3: a request the gateway re-addressed to local because its remote was unusable is recorded under that
+    # reason (route stays local) so Halo and the Medic can count it; the admission reason rides along as "ar".
+    if prior.get("degraded") and decision in ("local", "held") and reason != "local-failed" and not prior.get("stream_watchdog"):
+        final_reason = str(prior["degraded"]).replace("-local", "-degraded")      # remote-alias-local -> remote-alias-degraded
     _active_set(request, route=decision, reason=final_reason,
                 phase=("done" if decision in ("local", "held") else "remote"))
     _stats["total"] += 1
@@ -4967,6 +5201,8 @@ def record_event(decision, reason, request, units, waited, ptok=0, maxtok=0, str
                         "ptok": ptok, "maxtok": maxtok, "stream": stream,
                         "alias": _rinfo.get("alias"), "alias_kind": _rinfo.get("alias_kind"),
                         "cls": _rinfo.get("flow_class"),
+                        "degraded": _rinfo.get("degraded"), "degraded_why": _rinfo.get("degraded_reason"),
+                        "ar": reason if final_reason != reason else None,
                         "ttft": _rinfo.get("ttft"), "outtok": _outtok, "outtok_lb": _outtok_lb,
                         "cost_est": (_remote_cost_estimate(ptok, _outtok if _outtok is not None else _outtok_lb)
                                      if decision == "remote" else 0.0)})
@@ -5853,6 +6089,23 @@ def flow_pick(now=None):
         else:
             blocked[(t.cls, why)] += 1
             t.held = why
+    # [2026-10-19 coordinator] Anti-starvation for "fits". Eligibility skips a ticket that does not fit right now, and
+    # FIFO then admits younger, smaller tickets of the same class into the gaps, so a large cold prompt (a lane's whole
+    # context after an engine restart) can wait without bound: 10-19 17:5x, a 111K-token lane request waited 17 min
+    # while 40-s-old warm requests were admitted. Once a class's OLDEST waiter has been held only by "fits" for
+    # FLOW_STARVE_S, admit nothing younger in that class until it fits. While nothing local is in flight the hold
+    # lifts, so a request that cannot fit even in an idle engine never blocks its class.
+    if by_cls and _inflight > 0:
+        oldest = {}
+        for t in _FLOW["waiters"]:
+            o = oldest.get(t.cls)
+            if o is None or t.seq < o.seq:
+                oldest[t.cls] = t
+        for cls, o in oldest.items():
+            if (cls in by_cls and o not in by_cls[cls] and o.held == "fits"
+                    and now - o.t_enq > FLOW_STARVE_S):
+                del by_cls[cls]
+                blocked[(cls, "starving-head")] += 1
     pick = None
     if by_cls:
         order = {c: i for i, c in enumerate(FLOW_CLASSES)}
@@ -6325,6 +6578,7 @@ def flow_capacity_facts(now=None, cls=None, ptok=None):
         "offline_window": _offline_status(),
         "counters": dict(_FLOW_STATS),
         "stall_brake_not_applied": dict(_STALL_BRAKE_NOT_APPLIED),
+        "remote_alias_degraded": dict(_REMOTE_ALIAS_DEGRADED),
         "cannot_measure": ([] if eng else ["engine /metrics scrape failing: throughput and engine queue unknown"]),
     }
     if cls in FLOW_CLASSES:
@@ -6406,7 +6660,7 @@ def apply_config(fields):
 # ---------------- model aliases and provider registry ----------------
 # Aliases are resolved here, at the gateway boundary.  Callers never receive credentials and
 # never choose a provider by URL; they choose a stable model name and this process resolves it.
-_BUILTIN_ALIASES = {"estate", "estate-local", "estate-remote", "estate-remote-pro"}
+_BUILTIN_ALIASES = {"estate", "estate-local", "estate-remote", "estate-remote-pro", "halo", "halo-local", "halo-remote"}
 # R2 v6: the default provider's top model under the SAME spend authority. It is refused (fail
 # closed) until its per-type prices are configured in SHIM_REMOTE_PRICES_JSON.
 REMOTE_PRO_MODEL = os.environ.get("SHIM_REMOTE_PRO_MODEL", "deepseek-v4-pro")
@@ -6535,6 +6789,12 @@ def _resolve_alias(model):
                 out["model"] = model
             return out
     if name == "estate-local":
+        return {"name": name, "kind": "builtin-local"}
+    if name == "halo":
+        return {"name": name, "kind": "default"}
+    if name == "halo-remote":
+        return {"name": name, "kind": "builtin-remote"}
+    if name == "halo-local":
         return {"name": name, "kind": "builtin-local"}
     rec = _ALIASES.get(name)
     if rec:
@@ -6685,6 +6945,42 @@ def _crash_adaptive_note_local_completion(ptok):
                     "big-prompt local completions", restored, BIG_PROMPT_RESTORE_N)
 
 
+def _history_extra_chars(msgs):
+    """[L104] Characters the chat template renders that `content` does not carry: assistant tool_calls (function name +
+    arguments, string or object) and the reasoning of turns after the last user message (earlier reasoning is dropped by the
+    Qwen templates). Never raises: a malformed history counts what it can."""
+    if not isinstance(msgs, list):
+        return 0
+    last_user = -1
+    for i, m in enumerate(msgs):
+        if isinstance(m, dict) and m.get("role") == "user":
+            last_user = i
+    n = 0
+    for i, m in enumerate(msgs):
+        if not isinstance(m, dict):
+            continue
+        tcs = m.get("tool_calls")
+        for tc in (tcs if isinstance(tcs, list) else []):
+            fn = tc.get("function") if isinstance(tc, dict) else None
+            if not isinstance(fn, dict):
+                continue
+            n += len(fn.get("name") or "") if isinstance(fn.get("name"), str) else 0
+            a = fn.get("arguments")
+            if isinstance(a, str):
+                n += len(a)
+            elif a is not None:
+                try:
+                    n += len(json.dumps(a))
+                except (TypeError, ValueError):
+                    pass
+        if i > last_user:
+            for k in ("reasoning_content", "reasoning"):
+                if isinstance(m.get(k), str):
+                    n += len(m[k])
+                    break
+    return n
+
+
 def _est_tokens(body):
     try:
         j = json.loads(body)
@@ -6710,8 +7006,9 @@ def _est_tokens(body):
     tools = j.get("tools")
     if tools:
         chars += len(json.dumps(tools))
+    extra = _history_extra_chars(msgs) if EST_TOOLCALLS else 0          # [L104] tool_call args + live reasoning
     if not EXACT_TOKENS:
-        return int(chars / CHARS_PER_TOK)
+        return int((chars + extra) / CHARS_PER_TOK)
     # A char count can only ever correspond to FEWER tokens than chars/MIN_CHARS_PER_TOK.
     # If even that pessimistic bound is under every decision threshold, the exact number
     # cannot change any routing decision, so skip the round-trip. This is an optimisation
@@ -6723,6 +7020,8 @@ def _est_tokens(body):
     # only counts message text, not tool schemas
     if exact is not None and tools:
         exact += int(len(json.dumps(tools)) / CHARS_PER_TOK)
+    if exact is not None and extra:
+        exact += int(extra / CHARS_PER_TOK)                   # /tokenize of _prompt_text() saw neither tool_calls nor reasoning
     return exact if exact is not None else int(chars / CHARS_PER_TOK)
 
 
@@ -6782,7 +7081,7 @@ def _tokenize_exact(text):
             _TOK_MEMO.move_to_end(key)
             _TOK_STATS["memo_hits"] += 1
             return hit
-    if time.time() < _tok_fail_until:
+    if time.monotonic() < _tok_fail_until:
         return None
     try:
         t0 = time.perf_counter()
@@ -6804,7 +7103,7 @@ def _tokenize_exact(text):
                 _TOK_MEMO.popitem(last=False)
         return n
     except Exception as e:
-        _tok_fail_until = time.time() + 60
+        _tok_fail_until = time.monotonic() + 60
         log.warning("tokenize failed (%s) -> falling back to estimate for 60s", str(e)[:80])
         return None
 
@@ -7448,6 +7747,21 @@ def _halo_control_request(request, body):
         return False
 
 
+def _local_work_class_priority(request, original_body, shaped_body, background, halo_control, *, warm=False):
+    """A positive bulk-class default, with warm affinity bounded inside its class.
+
+    Admission labels are caller supplied; this policy must not grant negative
+    priority. Explicit body priorities and exact Halo control retain precedence.
+    Feature off and flow shadow/off preserve the existing warm-priority behavior.
+    """
+    if (not LOCAL_WORK_CLASS_PRIORITY or FLOW_MODE != "enforce"
+            or halo_control or "priority" in shaped_body):
+        return None
+    cls = flow_class_of(request, original_body, background, halo_control)
+    priority = {"runner": 10, "background": 20}.get(cls)
+    return priority - int(warm) if priority is not None else None
+
+
 def _prepare_local_body(request, body, background):
     """The one and only body transform for a request being sent to the LOCAL engine.
 
@@ -7475,9 +7789,16 @@ def _prepare_local_body(request, body, background):
             if WARM_PRIORITY and not halo_control and "priority" not in local_alias_body:
                 try:
                     if request.get("cr_warm_priority"):
-                        local_alias_body["priority"] = WARM_PRIORITY_VALUE     # [LANE CR] warm continuation
+                        work_priority = _local_work_class_priority(
+                            request, body, local_alias_body, background, halo_control, warm=True)
+                        local_alias_body["priority"] = (
+                            WARM_PRIORITY_VALUE if work_priority is None else work_priority)
                 except Exception as _e:
                     _swallowed("_prepare_local_body", _e)
+            work_priority = _local_work_class_priority(
+                request, body, local_alias_body, background, halo_control)
+            if work_priority is not None:
+                local_alias_body["priority"] = work_priority
             if halo_control:
                 # vLLM priority scheduling preempts bulk FCFS work for the one
                 # control decision that keeps the estate supervised. A bounded
@@ -7910,9 +8231,11 @@ def _prepare_provider_context(body, context_limit, provider_max_output=None):
 
 def _context_error(meta, provider):
     return web.json_response({"error": {"message":
-        f"context exceeds {provider} capacity: prompt={meta.get('prompt_tokens', 0)} + "
-        f"output={meta.get('output_tokens', 0)} + margin={CONTEXT_SAFETY_MARGIN} > "
-        f"limit={meta.get('limit', 0)}", "type": "context_length_exceeded",
+        f"This model's maximum context length is {meta.get('limit', 0)} tokens. However, you requested "
+        f"{meta.get('total_tokens') or (meta.get('prompt_tokens', 0) + meta.get('output_tokens', 0))} tokens "
+        f"({meta.get('prompt_tokens', 0)} in the messages, {meta.get('output_tokens', 0)} in the completion). "
+        f"Please reduce the length of the messages or completion. (gateway {provider}, margin {CONTEXT_SAFETY_MARGIN})",
+        "type": "context_length_exceeded",
         "provider": provider, "compaction_attempted": CONTEXT_COMPACTION_ENABLED}}, status=413)
 
 
@@ -8326,8 +8649,8 @@ def _nonstream_shape_kw(data, body, local):
         return {}
 
 
-async def _prepare_stream_response(resp, request, initial, session):
-    """A disconnected caller must not strand the upstream ClientSession."""
+async def _prepare_stream_response(resp, request, initial, session, up=None):
+    """A disconnected caller must not strand the upstream ClientSession (nor its un-released response: pass `up`)."""
     try:
         try:
             request["gw_stream_prepared"] = True     # lane SH: _router_crash_response must not answer twice
@@ -8339,21 +8662,22 @@ async def _prepare_stream_response(resp, request, initial, session):
         return True
     except (ConnectionResetError, BrokenPipeError):
         _active_set(request, client_disconnected=True)
-        await session.close()
+        await _drop_upstream(session, up)
         return False
     except BaseException:
-        await session.close()
+        await _drop_upstream(session, up)
         raise
 
 
-async def _finish_stream_response(resp, request, session):
-    """Close upstream even when write_eof sees a closed client transport."""
+async def _finish_stream_response(resp, request, session, up=None):
+    """Close upstream even when write_eof sees a closed client transport. `up` (the upstream response) is closed first: a client
+    that hung up mid-stream leaves it un-released, and session.close() alone made its GC log 'Unclosed connection'."""
     try:
         await resp.write_eof()
     except (ConnectionResetError, BrokenPipeError):
         _active_set(request, client_disconnected=True)
     finally:
-        await session.close()
+        await _drop_upstream(session, up)
 
 
 # RS (2026-10-02): one durable record per GATEWAY-layer timeout (first response header, first token, stream idle). Without it a
@@ -8396,16 +8720,16 @@ async def _await_unless_gone(request, awaitable, timeout=None, poll=0.5):
     """Await `awaitable` (an upstream call) but give up -- and cancel it, which closes the upstream connection and so
     aborts the engine's prefill -- as soon as the caller hangs up. Same TimeoutError contract as asyncio.wait_for."""
     task = asyncio.ensure_future(awaitable)
-    t_end = None if timeout is None else time.time() + timeout
+    t_end = None if timeout is None else time.monotonic() + timeout        # [L164] monotonic: an NTP step must not expire an upstream wait
     try:
         while True:
-            wait = poll if t_end is None else max(0.01, min(poll, t_end - time.time()))
+            wait = poll if t_end is None else max(0.01, min(poll, t_end - time.monotonic()))
             done, _ = await asyncio.wait({task}, timeout=wait)
             if done:
                 return task.result()
             if _client_gone(request):
                 raise _ClientGone()
-            if t_end is not None and time.time() >= t_end:
+            if t_end is not None and time.monotonic() >= t_end:
                 raise asyncio.TimeoutError()
     finally:
         if not task.done():
@@ -8416,10 +8740,37 @@ async def _await_unless_gone(request, awaitable, timeout=None, poll=0.5):
                 pass
 
 
+async def _hold_for_local_engine(request, max_s):
+    """Hold a request that cannot leave the local engine until the engine can take work again (no planned offline
+    window and healthy). Returns "ok", "gone" (the caller hung up) or "timeout". Admits nothing itself."""
+    t0 = time.monotonic()
+    _active_set(request, phase="held")
+    while time.monotonic() - t0 < max_s:
+        if _client_gone(request):
+            return "gone"
+        if not _local_offline() and await local_healthy():
+            return "ok"
+        await asyncio.sleep(1.0)
+    return "timeout"
+
+
 def _gone_response(request):
     _active_set(request, client_disconnected=True, flow_held="client-gone")
     _FLOW_STATS["client_gone"] += 1
     return web.Response(status=499, text="client closed request")
+
+
+async def _drop_upstream(session, up=None):
+    """Abandon an upstream exchange: close the response FIRST (its pooled Connection is released/aborted, which also aborts the
+    engine's work), then the session. session.close() alone shuts the sockets but leaves the response's Connection wrapper
+    un-released, so its GC logged 'ERROR Unclosed connection' (20/day live on 2026-10-03, local :8001 and the remote provider,
+    right after client-gone / first-token-timeout exits of the first-token gate)."""
+    if up is not None:
+        try:
+            up.close()
+        except Exception as _e:
+            _swallowed("relay:drop_upstream", _e)
+    await session.close()
 
 
 async def _relay(request, base, path, body, key, streaming, concurrency=1, provider_name=None):
@@ -8430,7 +8781,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
             committed (so the caller may fail over) — including a streaming upstream that
             dies during prefill before producing any token (the FIRST-TOKEN GATE).
     """
-    t_relay_start = time.time()   # TELEMETRY: TTFT reference point -- see DESIGN.md (c)
+    t_relay_start = time.monotonic()   # TELEMETRY: TTFT reference point -- see DESIGN.md (c)
     session = aiohttp.ClientSession()
 
     def _route_receipt():
@@ -8450,6 +8801,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
             "X-Gateway-Context-Prompt": str(info.get("context_prompt_tokens") or ""),
             "X-Gateway-Context-Compacted": "1" if info.get("context_compacted") else "0",
             "X-Gateway-Context-Omitted": str(info.get("context_omitted") or "0"),
+            **_degraded_headers(info),
         }
     try:
         if streaming:
@@ -8497,7 +8849,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
                                 headers=_route_receipt())
             return "ok", resp
         except Exception as e:
-            await session.close()
+            await _drop_upstream(session, up)
             return "fail", (up.status, f"streaming 4xx read error: {e}", False)
 
     if streaming and up.status == 200:
@@ -8519,7 +8871,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
             return "ok", web.Response(body=data, status=up.status, content_type=ct,
                                        headers=_route_receipt())
         finally:
-            await session.close()
+            await _drop_upstream(session, up)
 
     # streaming with FIRST-TOKEN GATE: buffer upstream chunks WITHOUT committing to the
     # client until real generation has started. If the upstream dies before that (e.g. an
@@ -8638,7 +8990,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
             buf.extend(chunk)
             _chunk_ct[0] += 1
             if _t_first[0] is None:
-                _t_first[0] = time.time()
+                _t_first[0] = time.monotonic()
             if (_looks_meaningful(buf.decode("utf-8", "replace"))
                     or len(buf) >= FIRST_GATE_MAX_BYTES or _chunk_ct[0] >= FIRST_GATE_MAX_CHUNKS):
                 return "commit"
@@ -8650,15 +9002,15 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
     try:
         phase = await _await_unless_gone(request, _read_until_commit(), timeout=deadline)
     except _ClientGone:
-        await session.close()
+        await _drop_upstream(session, up)
         return "ok", _gone_response(request)
     except asyncio.TimeoutError:
-        await session.close()
+        await _drop_upstream(session, up)
         _timeout_note(request, "gateway:first-token", deadline, base, body, concurrency=concurrency, outcome="failover",
                       bytes_before=len(buf))
         return "fail", (up.status, f"no first token within {deadline:.0f}s (busy/wedged)", False)
     except Exception as e:
-        await session.close()
+        await _drop_upstream(session, up)
         return "fail", (up.status, f"pre-commit stream error: {e}", True)
 
     # TELEMETRY: time to first streamed byte after the upstream POST was issued (excludes the
@@ -8678,9 +9030,9 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
         # upstream finished before any 'meaningful' chunk — deliver as-is (short/empty response),
         # don't fail over (avoids double-generating a real-but-tiny answer).
         resp = _mk_resp()
-        if not await _prepare_stream_response(resp, request, bytes(buf), session):
+        if not await _prepare_stream_response(resp, request, bytes(buf), session, up):
             return "ok", resp
-        await _finish_stream_response(resp, request, session)
+        await _finish_stream_response(resp, request, session, up)
         _outkw = {"outtok_lb": _chunk_ct[0],
                   "content_empty": not _saw_content[0], "has_tool_calls": _saw_tool_call[0]}
         if _exact_outtok[0] is not None:
@@ -8705,7 +9057,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
     # committed to the client: flush buffered first chunk(s), then stream the rest. A mid-stream
     # error past this point can only be reported inline (client already receiving output).
     resp = _mk_resp()
-    if not await _prepare_stream_response(resp, request, bytes(buf), session):
+    if not await _prepare_stream_response(resp, request, bytes(buf), session, up):
         return "ok", resp
     # [GW2 / L95] long-empty-generation watchdog: armed for a LOCAL stream whose request still has thinking on.
     _rw = {"armed": (not _is_remote_relay and REASONING_WATCHDOG in ("shadow", "retry")
@@ -8722,6 +9074,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
         _scan_tail[0] = b""
         _shape.tail = b""
         s2 = aiohttp.ClientSession()
+        up2 = None
         try:
             up2 = await _open(s2, base, path, strip_thinking(body), key, True)
             if up2.status >= 400:
@@ -8747,7 +9100,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
                 pass
             return False
         finally:
-            await s2.close()
+            await _drop_upstream(s2, up2)
 
     # TELEMETRY: exact output-token count when the client asked for stream_options.include_usage
     # and the usage trailer didn't already arrive within the gate phase above (long streams) --
@@ -8795,7 +9148,7 @@ async def _relay(request, base, path, body, key, streaming, concurrency=1, provi
             await resp.write(f'data: {{"error":{{"message":"stream interrupted: {e}"}}}}\n\n'.encode())
         except Exception:
             pass
-    await _finish_stream_response(resp, request, session)
+    await _finish_stream_response(resp, request, session, up)
     if _scan_tail[0]:
         _scan_usage(_scan_tail[0])       # a final line the stream ended without a newline on
     _outkw = {"outtok_lb": _chunk_ct[0],
@@ -8943,6 +9296,24 @@ def _flightrec_dir():
     return os.environ.get("SHIM_FLIGHTREC_DIR", "/home/kevin/.local/share/vllm-qwen27b/flightrec")
 
 
+def _write_private(fn, data):
+    """Create `fn` 0600 from the first byte (prompt bodies: open()+chmod() left a window with the umask's mode, and a chmod of a file a
+    concurrent cleanup already trimmed raised FileNotFoundError)."""
+    fd = os.open(fn, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+
+
+def _trim_flightrec_ring(fr, keep=40):
+    """Keep the newest `keep` files. Runs in the default thread pool, so concurrent writers pick the same stale victims: a file that
+    is already gone is the goal, not an error (live: 14 x 'flightrec: [Errno 2] No such file' warnings on 2026-10-03)."""
+    for o in sorted(os.listdir(fr))[:-keep]:
+        try:
+            os.unlink(os.path.join(fr, o))
+        except FileNotFoundError:
+            pass
+
+
 def _write_remote_flightrec(fr, req_fn, req_body, resp_fn, resp_body):
     """Blocking file I/O for the REMOTE-path flight recorder -- must run off the event loop
     (ASYNC230), exactly like _write_flightrec() below it. Shares that function's directory and
@@ -8967,12 +9338,8 @@ def _write_remote_flightrec(fr, req_fn, req_body, resp_fn, resp_body):
     for fn, data in ((req_fn, req_body), (resp_fn, resp_body)):
         if fn is None or data is None:
             continue
-        with open(fn, "wb") as f:
-            f.write(data)
-        os.chmod(fn, 0o600)
-    olds = sorted(os.listdir(fr))
-    for o in olds[:-40]:
-        os.unlink(os.path.join(fr, o))
+        _write_private(fn, data)
+    _trim_flightrec_ring(fr)
 
 
 async def _note_remote_response(request, payload, body):
@@ -8998,6 +9365,12 @@ async def _note_remote_response(request, payload, body):
     try:
         resp_body = getattr(payload, "body", None)
         if not isinstance(resp_body, (bytes, bytearray)):
+            return
+        # A provider ERROR (400 json-mode, 429 concurrency, 402 balance, 5xx) has no content to classify. It used to be logged as
+        # 'remote returned EMPTY content', stamped content_empty=True on the request-log row, and its body written into the
+        # 40-file flight-recorder ring (where the Xid repro payloads live). The failure is already recorded by remote_status/outcome.
+        _st = getattr(payload, "status", None)
+        if isinstance(_st, int) and _st >= 400:
             return
         try:
             parsed = json.loads(resp_body)
@@ -9294,12 +9667,8 @@ def _write_flightrec(fr, fn, body):
         os.makedirs(fr, mode=0o700, exist_ok=True)
     except OSError:
         pass
-    with open(fn, "wb") as f:
-        f.write(body)
-    os.chmod(fn, 0o600)
-    olds = sorted(os.listdir(fr))
-    for o in olds[:-40]:
-        os.unlink(os.path.join(fr, o))
+    _write_private(fn, body)
+    _trim_flightrec_ring(fr)
 
 
 def _bg_reject_response():
@@ -9336,8 +9705,9 @@ async def _route_completions(request, _no_overflow=False):
     if ptok > provider_ceiling:
         _active_set(request, est_tokens=ptok, route="rejected", reason="prompt-exceeds-all-providers")
         return web.json_response({"error": {"message":
-            f"prompt estimate {ptok} exceeds every configured provider context ({provider_ceiling}); "
-            "rotate or compact the client session before retrying",
+            f"This model's maximum context length is {provider_ceiling} tokens. However, your messages resulted "
+            f"in {ptok} tokens. Please reduce the length of the messages. (gateway: exceeds every configured "
+            "provider; rotate or compact the session before retrying)",
             "type": "context_length_exceeded", "code": "prompt_exceeds_all_providers"}}, status=413)
     try:
         maxtok = int(json.loads(body).get("max_tokens") or 0)
@@ -9405,6 +9775,7 @@ async def _route_completions(request, _no_overflow=False):
     alias_kind = alias.get("kind")
     alias_local_only = alias_kind == "builtin-local"
     alias_force_remote = alias_kind == "builtin-remote"
+    _pin_name = "estate-local"
     custom_endpoint = alias.get("endpoint") if alias_kind == "custom-remote" else None
     _active_set(request, alias=alias.get("name"), alias_kind=alias_kind)
     # K4 PROBE synth: a trivial "Reply with the single word: X" liveness probe is answered here while the engine has
@@ -9532,11 +9903,29 @@ async def _route_completions(request, _no_overflow=False):
         return web.json_response({"error": {"message": f"gateway alias {alias.get('name')} is disabled",
                                               "type": "alias_disabled"}}, status=409)
     if alias_force_remote:
-        log.info("route %s alias=estate-remote -> remote(alias)", path)
-        record_event("remote", "alias", request, units, 0, **ev)
-        if alias.get("model"):
-            return await _forward_remote(request, path, body, streaming, model=alias["model"])
-        return await _forward_remote(request, path, body, streaming)
+        # lane GW3: the remote is a valve, not a dependency. When it cannot take this request (balance exhausted, breaker
+        # open, none configured, daily cap without room) serve it LOCALLY through the normal path -- admission, capacity
+        # and deadlines all apply -- instead of forwarding into a certain 503/429. The caller's work is not thrown away.
+        _why_down = (remote_unusable_reason(body, ptok, maxtok, alias.get("model"), bool(alias.get("reservation")))
+                     if REMOTE_ALIAS_DEGRADE else None)
+        if _why_down is None:
+            log.info("route %s alias=estate-remote -> remote(alias)", path)
+            record_event("remote", "alias", request, units, 0, **ev)
+            if alias.get("model"):
+                _resp = await _forward_remote(request, path, body, streaming, model=alias["model"])
+            else:
+                _resp = await _forward_remote(request, path, body, streaming)
+            # The first call after the balance runs out is the one that learns it (402 arms the breaker). Do not hand
+            # that request the raw 402 either: the breaker is open now, so a second pass serves it locally.
+            if (REMOTE_ALIAS_DEGRADE and not _no_overflow and getattr(_resp, "status", None) == 402
+                    and remote_unusable_reason(body, ptok, maxtok, alias.get("model"),
+                                               bool(alias.get("reservation"))) in ("balance-exhausted", "breaker-open")):
+                log.warning("route %s alias=%s got 402 from the remote -> re-routing locally", path, alias.get("name"))
+                return await _route_completions(request, _no_overflow=True)
+            return _resp
+        body = _degrade_remote_alias(request, body, "remote-alias", _why_down)
+        alias_force_remote, alias_local_only = False, True
+        _pin_name = "estate-remote (remote unusable: %s; served locally)" % _why_down
 
     # TEXT-ONLY GUARD (lane GW): the local engine does not take image/video/audio parts. Decide here, once, instead of
     # letting the engine answer 400 "At most 0 image(s)": the remote vision provider when one is declared and the hard
@@ -9594,9 +9983,14 @@ async def _route_completions(request, _no_overflow=False):
     # explicit brain escalation), but the gateway still checks overflow_ok and local-pin before
     # making the provider decision.  This keeps routing authority in one place.
     if remote_intent and automatic_paid_ok and remote_ok() and not local_pin and not alias_local_only:
-        log.info("route %s gateway route intent=%s -> remote(intent)", path, route_intent)
-        record_event("remote", "intent", request, units, 0, **ev)
-        return await _forward_remote(request, path, body, streaming)
+        # lane GW3: remote_ok() already sent an unusable remote (balance/breaker/none) down to the local path; the one
+        # case it let through into a guaranteed 429 was a daily cap with no room for this request. Same answer: local.
+        _why_down = remote_unusable_reason(body, ptok, maxtok) if REMOTE_ALIAS_DEGRADE else None
+        if _why_down is None:
+            log.info("route %s gateway route intent=%s -> remote(intent)", path, route_intent)
+            record_event("remote", "intent", request, units, 0, **ev)
+            return await _forward_remote(request, path, body, streaming)
+        _degrade_remote_alias(request, body, "remote-intent", _why_down, rewrite=False)
 
     # size cap: too-big-for-this-box requests OOM local even at budget=1 -> send straight to remote
     if overflow_ok and not local_pin and not alias_local_only and over_local_cap(body):
@@ -9616,6 +10010,16 @@ async def _route_completions(request, _no_overflow=False):
             log.info("route %s planned local-offline window (%s) -> remote(local-offline)", path, _OFFLINE["reason"])
             record_event("remote", "local-offline", request, units, 0, **ev)
             return await _overflow_forward()
+        # 2026-10-19 (coordinator): HOLD, do not refuse. Callers that cannot leave the local engine were told to retry for
+        # the whole window: 2,456 of the day's 4,137 rejections (Applicant 1,489). Hold until the window ends (bounded by
+        # LOCAL_ONLY_HOLD_SECS; a caller that hangs up is dropped), then route normally. Nothing reaches the engine early.
+        _held = await _hold_for_local_engine(request, LOCAL_ONLY_HOLD_SECS) if LOCAL_ONLY_HOLD_SECS > 0 else "off"
+        if _held == "gone":
+            record_event("gone", "local-offline-held", request, units, 0, **ev)
+            return _gone_response(request)
+        if _held == "ok":
+            log.info("route %s held through the planned local-offline window -> resuming normal routing", path)
+    if _local_offline():
         _OFFLINE["refused"] += 1
         record_event("rejected-bg", "local-offline", request, units, 0, **ev)
         left = max(5, min(60, int(_OFFLINE["until"] - time.time())))
@@ -9648,9 +10052,9 @@ async def _route_completions(request, _no_overflow=False):
     if not await local_healthy():
         if background and BG_LOCAL_ONLY and remote_ok():
             _active_set(request, phase="held")
-            held_deadline = time.time() + BG_WAIT_LOCAL
+            held_deadline = time.monotonic() + BG_WAIT_LOCAL      # [L164] monotonic
             held_waited = 0.0
-            while not _health["ok"] and time.time() < held_deadline:
+            while not _health["ok"] and time.monotonic() < held_deadline:
                 await asyncio.sleep(SLOT_POLL)
                 held_waited += SLOT_POLL
                 await local_healthy()   # refresh cached health while holding
@@ -9672,8 +10076,15 @@ async def _route_completions(request, _no_overflow=False):
             record_event("remote", "local-down", request, units, 0, **ev)
             return await _overflow_forward()
         elif alias_local_only:
-            return web.json_response({"error": {"message": "estate-local requires the local engine, which is currently unavailable",
-                                                  "type": "local_unavailable"}}, status=503)
+            # 2026-10-19 (coordinator): hold through an engine restart instead of an instant 503 (see LOCAL_ONLY_HOLD_SECS).
+            _held = await _hold_for_local_engine(request, LOCAL_ONLY_HOLD_SECS) if LOCAL_ONLY_HOLD_SECS > 0 else "off"
+            if _held == "gone":
+                record_event("gone", "local-down-held", request, units, 0, **ev)
+                return _gone_response(request)
+            if _held != "ok":
+                return web.json_response({"error": {"message": _pin_name + " requires the local engine, which is currently unavailable",
+                                                      "type": "local_unavailable"}}, status=503)
+            log.info("route %s estate-local held %s through local-down -> resuming normal routing", path, _held)
         elif remote_ok():
             # local DOWN and the remote cap has no room for this overflow: nothing can serve it now
             return _cap_exhausted_unavailable("local engine is down and the daily remote cap is exhausted")
@@ -9820,7 +10231,7 @@ async def _route_completions(request, _no_overflow=False):
                 if alias_local_only:
                     record_event("held", "local-failed", request, units, 0, **ev)
                     return web.json_response({"error": {
-                        "message": "estate-local local attempt failed; paid failover is disabled",
+                        "message": _pin_name + " local attempt failed; paid failover is disabled",
                         "type": "local_only_unavailable"}}, status=503)
                 if not remote_ok():
                     record_event("held", "local-failed", request, units, 0, **ev)
@@ -9847,8 +10258,11 @@ async def _route_completions(request, _no_overflow=False):
     lane_limit = admission_lane_limit(background, effective_budget(), FG_RESERVED,
                                       halo_control=halo_control,
                                       tiny_extra_lanes=TINY_EXTRA_LANES)
+    # 2026-10-19 (coordinator): pass whether this request can REALLY overflow. estate-local / local-pin requests had
+    # overflow_ok=True here, got the 6 s overflow timer, and were then refused by the local-only rule: ~1,940 503s a day.
     deadline = time.time() + admission_wait_seconds(
-        background, overflow_ok, is_peak(), LOCAL_WAIT, BG_WAIT, INTERACTIVE_NEVER_OVERFLOW)
+        background, overflow_ok and not alias_local_only and not local_pin, is_peak(), LOCAL_WAIT, BG_WAIT,
+        INTERACTIVE_NEVER_OVERFLOW)
     admitted = False
     t_admit0 = time.time()
     # lane CFG QoL: an interactive request that may overflow is judged by its PREDICTED wait, not a timer.
@@ -10005,7 +10419,7 @@ async def _route_completions(request, _no_overflow=False):
         if alias_local_only:
             record_event("held", reason, request, units, waited, **ev)
             return web.json_response({"error": {
-                "message": "estate-local capacity unavailable; paid overflow is disabled",
+                "message": _pin_name + " capacity unavailable; paid overflow is disabled",
                 "type": "local_only_unavailable"}}, status=503)
         record_event("remote", reason, request, units, waited, **ev)
         return await _overflow_forward()
@@ -10061,7 +10475,7 @@ async def _route_completions(request, _no_overflow=False):
         if alias_local_only:
             record_event("held", "local-failed", request, units, waited, **ev)
             return web.json_response({"error": {
-                "message": "estate-local local attempt failed; paid failover is disabled",
+                "message": _pin_name + " local attempt failed; paid failover is disabled",
                 "type": "local_only_unavailable"}}, status=503)
         if not remote_ok():
             record_event("held", "local-failed", request, units, waited, **ev)
@@ -10146,22 +10560,46 @@ def _alias_model_rows():
     """
     now = int(time.time())
     rows = []
+    LOCAL_NAMES = ("estate-local", "halo-local")
+    REMOTE_NAMES = ("estate-remote", "estate-remote-pro", "halo-remote")
+    CTX = {"estate": AGENT_CONTEXT_TOKENS, "estate-local": AGENT_CONTEXT_TOKENS,
+           "halo": AGENT_CONTEXT_TOKENS, "halo-local": AGENT_CONTEXT_TOKENS,
+           "estate-remote": REMOTE_CONTEXT_LIMIT, "estate-remote-pro": REMOTE_CONTEXT_LIMIT,
+           "halo-remote": REMOTE_CONTEXT_LIMIT}
     for name, kind in (("estate", "gateway-default"),
                        ("estate-local", "gateway-local"),
                        ("estate-remote", "gateway-remote"),
-                       ("estate-remote-pro", "gateway-remote-pro")):
-        mods = local_input_modalities() if name == "estate-local" else sorted(set(local_input_modalities()) | set(remote_input_modalities()))
-        if name in ("estate-remote", "estate-remote-pro"):
+                       ("estate-remote-pro", "gateway-remote-pro"),
+                       ("halo", "gateway-default"),
+                       ("halo-local", "gateway-local"),
+                       ("halo-remote", "gateway-remote")):
+        if name in LOCAL_NAMES:
+            mods = local_input_modalities()
+        elif name in REMOTE_NAMES:
             mods = remote_input_modalities()
-        rows.append({"id": name, "object": "model", "created": now,
-                     "owned_by": "gateway", "gateway_alias": kind, **_modalities_fields(mods)})
+        else:
+            mods = sorted(set(local_input_modalities()) | set(remote_input_modalities()))
+        row = {"id": name, "object": "model", "created": now,
+               "owned_by": "gateway", "gateway_alias": kind, **_modalities_fields(mods)}
+        _ctx = CTX.get(name)
+        if _ctx:
+            row["max_model_len"] = _ctx
+            row["context_length"] = _ctx
+            row["gateway_context"] = ("local 4-lane budget (queue, no overflow)" if name in ("estate-local", "halo-local")
+                                      else "local-first then remote overflow" if name in ("estate", "halo")
+                                      else "remote model")
+        rows.append(row)
     for name, rec in sorted(_ALIASES.items()):
         if not rec.get("enabled", True):
             continue
-        rows.append({"id": name, "object": "model", "created": now,
-                     "owned_by": "gateway", "gateway_alias": "custom-remote",
-                     "gateway_target": rec.get("model") or "",
-                     **_modalities_fields(["text", "image"] if rec.get("vision") else ["text"])})
+        _arow = {"id": name, "object": "model", "created": now,
+                 "owned_by": "gateway", "gateway_alias": "custom-remote",
+                 "gateway_target": rec.get("model") or "",
+                 **_modalities_fields(["text", "image"] if rec.get("vision") else ["text"])}
+        if rec.get("context_limit"):
+            _arow["max_model_len"] = int(rec["context_limit"])
+            _arow["context_length"] = int(rec["context_limit"])
+        rows.append(_arow)
     return rows
 
 
@@ -10182,6 +10620,10 @@ async def h_models(request):
         if isinstance(r, dict):
             for k, v in _modalities_fields(local_input_modalities()).items():
                 r.setdefault(k, v)
+            if AGENT_CONTEXT_TOKENS > 0 and r.get("id") in AGENT_CONTEXT_ENGINE_NAMES:
+                _eng = int(r.get("max_model_len") or AGENT_CONTEXT_TOKENS)
+                r["max_model_len"] = min(_eng, AGENT_CONTEXT_TOKENS)
+                r["context_length"] = min(_eng, AGENT_CONTEXT_TOKENS)
     seen = {r.get("id") for r in local_rows}
     rows = list(local_rows) + [r for r in _alias_model_rows() if r["id"] not in seen]
     if not rows:
@@ -10372,6 +10814,7 @@ async def gateway_modules(request):
     """Lane SH: which code this process is running -- its own file's sha256 and every module it loaded beside itself
     (sha256 of the exact bytes executed). gateway_safe_publish verifies these against the sources after a restart."""
     return web.json_response({"gateway_sha256": GATEWAY_SHA256, "modules": _GATEWAY_MODULES_LOADED})
+
 
 
 async def gateway_internal_errors(request):
@@ -12930,8 +13373,8 @@ def make_app():
     app.router.add_post("/gateway/models/local", gateway_models_local)
     app.router.add_get("/gateway/config", gateway_config)
     app.router.add_get("/gateway/config/effective", gateway_config_effective)   # lane CFG: typed effective config
+    app.router.add_get("/gateway/modules", gateway_modules)
     app.router.add_get("/gateway/internal-errors", gateway_internal_errors)    # lane SH: swallowed exceptions
-    app.router.add_get("/gateway/modules", gateway_modules)                    # lane SH: loaded code (publish readback)
     app.router.add_get("/gateway/spend", gateway_spend)                        # R2 spend authority
     app.router.add_post("/gateway/spend/reserve", gateway_spend_reserve)
     app.router.add_post("/gateway/spend/finalize", gateway_spend_finalize)
