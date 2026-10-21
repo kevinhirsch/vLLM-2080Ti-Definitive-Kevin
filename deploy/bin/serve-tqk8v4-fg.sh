@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# EXP-036 MTP draft-load A/B launcher (maintenance window only)
 # Auto-generated from the validated live TQK8V4-fast server (ground-truth argv).
 # Env is supplied by systemd EnvironmentFile (vllm-qwen27b.env).
 # 2026-07-17: --chat-template overrides the model's built-in Qwen 3.6 template with
@@ -6,10 +7,7 @@
 #   formatting / reasoning-hallucination bugs. ROLLBACK: delete the two --chat-template
 #   lines below and restart; the model's own chat_template.jinja takes over again.
 set -euo pipefail
-export VLLM_SUFFIX_OVERLAY=0
-export VLLM_MTP_DRAFT_CAP=3
-export VLLM_SUFFIX_COVER_MIN=4
-export VLLM_SUFFIX_OVERLAY_MIN=2
+# 2026-08-24 EXP-048 r6: K=3, ALL EXP-036 header exports removed (cap!=2 crashes/deadlocks [M-7]; QWOPUS ignore_torch_compile deadlocks K=3 chained forwards; SUFFIX trio unproven-at-K3 and arm H ran without them). Arm-H-exact env. Rollback: cp the newest BANKED-k2-pre-k3-* over this file and restart.
 
 # 2026-07-17 chaos-tested envelope (2x2080Ti, util 0.88, WORKSPACE_RESERVE 262144):
 #   - gpu-memory-utilization 0.88 (0.92 OOM'd under 2-concurrent: 19 MiB free).
@@ -38,32 +36,34 @@ ARGS=(
   --generation-config
   /home/kevin/.local/share/vllm-qwen27b/gencfg
   --gpu-memory-utilization
-  0.82
+  0.84
   --quantization
   gptq_marlin
   --compilation-config
-  '{"cudagraph_mode":"PIECEWISE"}'
+  '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[4],"max_cudagraph_capture_size":4}'
+  --speculative-config
+  '{"method":"mtp","num_speculative_tokens":3}'
   --max-model-len
-  256000
+  524288
+  --hf-overrides
+  '{"rope_parameters":{"rope_type":"yarn","factor":2.0,"original_max_position_embeddings":262144,"mrope_interleaved":true,"mrope_section":[11,11,10],"partial_rotary_factor":0.25,"rope_theta":10000000}}'
   --enable-chunked-prefill
   --max-num-seqs
-  8
+  16
   --max-num-batched-tokens
-  2560
+  3584
+  --scheduling-policy
+  priority
   --kv-cache-dtype
-  turboquant_k8v4
+  turboquant_k3v4_nc
   --mamba-cache-mode
   align
   --enable-prefix-caching
   --enable-prompt-tokens-details
-  --language-model-only
-  --skip-mm-profiling
-  # Pin structured outputs to llguidance. Default "auto" can select xgrammar,
-  # which has the documented crash with spec-decode + Int4 (vLLM #11484) — a
-  # trap that re-arms itself the day MTP comes back. guidance handles named
-  # tool_choice / guided_json on both the MTP-off and requal variants.
-  --structured-outputs-config
-  '{"backend":"guidance"}'
+  --limit-mm-per-prompt
+  '{"image": 4}'
+  --mm-processor-kwargs
+  '{"max_pixels": 1000000}'
   --chat-template
   /home/kevin/.local/share/vllm-qwen27b/chat_template-froggeric-v22-official.jinja
   --reasoning-parser
@@ -74,5 +74,14 @@ ARGS=(
   --additional-config
   '{"gdn_prefill_backend":"flashqla_legacy"}'
 )
+
+# 2026-09-05: optional extra CLI flags from the EnvironmentFile (VLLM_SERVE_EXTRA_ARGS), so a
+# frontier window can A/B a CLI-only setting by editing vllm-qwen27b.env instead of this file
+# (first use: window 92, VLLM_SERVE_EXTRA_ARGS=--no-async-scheduling). Unset/empty = argv
+# byte-identical to before this hook. Word-split on purpose: flags only, never paths with spaces.
+if [ -n "${VLLM_SERVE_EXTRA_ARGS:-}" ]; then
+  # shellcheck disable=SC2206
+  ARGS+=( ${VLLM_SERVE_EXTRA_ARGS} )
+fi
 
 exec "${ARGS[@]}"
