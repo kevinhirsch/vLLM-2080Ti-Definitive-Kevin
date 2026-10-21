@@ -15,3 +15,10 @@ if "SHIM_FLIGHTREC_DIR" not in os.environ:
     os.environ["SHIM_FLIGHTREC_DIR"] = tempfile.mkdtemp(prefix="deploy-bin-tests-flightrec-")
     # test_no_production_ledger_touch requires every temp dir a run creates to be cleaned up
     atexit.register(shutil.rmtree, os.environ["SHIM_FLIGHTREC_DIR"], True)
+# EB-122 (2026-10-21): no test may reach the production engine on :8001. An imported shim's upstream points at a port
+# nothing listens on, and its local-only hold is 2 s. So a test that forgets to stub the engine fails in seconds, the
+# same with the 27B up or down. Before this, such a test passed only while the 27B was up, and hung for up to 30
+# minutes while it was down. Tests that need an engine start their own stub. DEPLOY_BIN_TESTS_REAL_ENGINE=1 opts out.
+if os.environ.get("DEPLOY_BIN_TESTS_REAL_ENGINE") != "1":
+    os.environ.setdefault("SHIM_UPSTREAM", "http://127.0.0.1:9")
+    os.environ.setdefault("SHIM_LOCAL_ONLY_HOLD_SECS", "2")

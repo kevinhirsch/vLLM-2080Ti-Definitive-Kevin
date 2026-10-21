@@ -10,6 +10,17 @@ Not a fork release. This branch carries the HNET00 estate's gateway, window-cont
 2026-10-20) is in [`deploy/docs/CHANGELOG-frontier-pastnative-20260816.md`](deploy/docs/CHANGELOG-frontier-pastnative-20260816.md),
 grouped by component.
 
+### Pushed 2026-10-21, second push (the suite never reaches the production engine, EB-122)
+
+- **Suite-wide engine guard in `deploy/bin/conftest.py`.**
+  - An imported shim's upstream (`SHIM_UPSTREAM`) points at a port nothing listens on, and its local-only hold is
+    2 s. Opt out with `DEPLOY_BIN_TESTS_REAL_ENGINE=1`.
+  - So a test that forgets to stub the engine now fails in about 2 seconds, the same with the 27B up or down. Before,
+    such a test passed only while the 27B was up, and hung for up to 30 minutes while it was down.
+  - Proof: the spend test as it was before the first push fails in 2.2 s under the guard.
+- **`test_engine_guard.py`** checks that the guard is in force and that the guarded upstream refuses at once.
+- **Full deploy/bin suite with the guard and the engine down:** 1,110 passed, 0 failed.
+
 ### Pushed 2026-10-21 (the live ops layer under git, EB-103)
 
 On 2026-10-21 the serving host's live ops layer (`~/.local/share/vllm-qwen27b`) was re-hashed against all 323 refs.
