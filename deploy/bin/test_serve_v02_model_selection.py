@@ -29,7 +29,7 @@ else:
     config = tmp_path / "selection.json"
     env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "V02_ROOT": str(root),
            "V02_OVERRIDE_ENV": str(override), "V02_RELEASES": str(tmp_path / "releases"),
-           "V02_MODEL_CONFIG": str(config)}
+           "V02_MODEL_CONFIG": str(config), "V02_GPU_WAIT_S": "0"}   # hermetic: never wait on the real GPUs
     def run(selection=None, ssd=False):
         if selection is None:
             config.unlink(missing_ok=True)
