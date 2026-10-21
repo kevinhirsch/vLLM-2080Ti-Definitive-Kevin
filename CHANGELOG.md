@@ -47,6 +47,12 @@ since `765600de46`. Still off this branch, now on it:
   - Its allowlist, `deploy/env/live-layer-allow.txt`, is read from the ref, so it is reviewed.
   - It marks state, logs, banked copies and retired launchers `ignore`, and the private host files `local`.
   - It runs nightly inside the host's backup job and reports to estate-events only when the result changes.
+- **The spend tests no longer need the 27B running (EB-122).**
+  - `test_gateway_spend_authority.py` (Seam) and `test_gateway_spend_v6.py` (Routing) let the shim probe the real
+    engine on :8001. So whenever the 27B was down for a GPU window, three tests got 503 on their local path, and so did
+    the production-ledger ratchet that reruns them.
+  - They now stub the engine's health the way the suite's other routing tests do. The full suite passes with the
+    engine down.
 
 ### Pushed 2026-10-20 (gateway test debt cleared)
 

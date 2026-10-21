@@ -92,7 +92,10 @@ class Routing(unittest.IsolatedAsyncioTestCase):
                                 remote_ok=lambda: True, is_peak=lambda: False,
                                 record_event=lambda d, r, request, *a, **k: shim._active_set(request, route=d, reason=r),
                                 _note_remote_response=AsyncMock(), _note_payload_outcome=lambda *a, **k: None,
-                                _telemetry_note_request=lambda *a, **k: None).items():
+                                _telemetry_note_request=lambda *a, **k: None,
+                                # EB-122: hermetic. Without these the shim probes the real engine on :8001, so the
+                                # degraded (local) path answered 503 whenever the 27B was down (a GPU window).
+                                local_healthy=AsyncMock(return_value=True), _health={"ok": True}).items():
             self.stack.enter_context(patch.object(shim, name, value))
 
     async def test_a_custom_endpoint_with_no_cost_policy_fails_closed(self):
