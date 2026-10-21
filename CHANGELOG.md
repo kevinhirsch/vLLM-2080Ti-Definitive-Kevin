@@ -10,6 +10,44 @@ Not a fork release. This branch carries the HNET00 estate's gateway, window-cont
 2026-10-20) is in [`deploy/docs/CHANGELOG-frontier-pastnative-20260816.md`](deploy/docs/CHANGELOG-frontier-pastnative-20260816.md),
 grouped by component.
 
+### Pushed 2026-10-21 (the live ops layer under git, EB-103)
+
+On 2026-10-21 the serving host's live ops layer (`~/.local/share/vllm-qwen27b`) was re-hashed against all 323 refs.
+The gateway was already in sync: the live 13,804-line `keepalive-shim.py` has been byte-identical to this branch's
+since `765600de46`. Still off this branch, now on it:
+- **`gpu-boot-gate.sh`**: production's `serve-hauhaucs-v02.sh` sources it, but it existed only on the unmerged
+  `lane-a6`/`lane-bs3` chain and on the host, so a rebuild from this branch booted without the gate.
+  - Added the live copy, identical to `lane-a6`, with its test.
+  - `serve-profile-v02.sh` gets the live copy, which wires the same gate.
+  - `test_serve_v02_pythonpath.py` and `test_serve_v02_model_selection.py` get `lane-bs3`'s hermetic
+    `V02_GPU_WAIT_S=0`. Without it, 5 tests wait on the real GPUs.
+- **`serve-tqk8v4-fg.sh`**: the copy that last ran on the 0.1.x line (2026-09-28, EXP-048 r6). Not on today's path.
+- **Engine env: the live file is the truth** (decided 2026-10-21; no production change).
+  - `deploy/env/vllm-qwen27b.env` now matches what production has run on. This branch's copy (synced 2026-09-04
+    from the 08-27 state) lacked:
+    - `VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE=off` (the 2026-09-07 Xid-31 mitigation)
+    - `VLLM_PREFIX_CACHE_USE_RETAINED_MTP_BLOCK=0`
+    - `VLLM_TURBOQUANT_FLASHINFER_PREFILL_PLAN_CACHE_MAXSIZE=128`
+    - `VLLM_SCHED_SHORT_FIRST_RUN=3`
+  - The five variables only the old copy set are **not deployed and need an A/B to adopt** (EB-104). On 2026-10-21,
+    production release `w8x-r4full-adepth-af95f8d682` read none of them in its Python, C/C++/CUDA sources or built
+    libraries, so discarding them is likely:
+    - `VLLM_FLASHQLA_VARLEN_LOOP=1`
+    - `VLLM_TURBOQUANT_STAGE1_QTILE=1`
+    - `VLLM_TURBOQUANT_CONTINUATION_BOUNDS_CHECK=1`
+    - `VLLM_TURBOQUANT_CONTINUATION_SDPA_MAX_QK_CELLS=16777216`
+    - `VLLM_TURBOQUANT_CONTINUATION_SDPA_Q_CHUNK=512`
+- **Code public, config private** (Kevin, 2026-10-21). The serving host's own files stay on the host and in its
+  nightly backup: `clients.map`, `lanes.dirs`, `MODEL-SWITCHING.md`, `v02.override.env`, `v02.model.json`, and the
+  secret carriers `shim.env` and `gateway-aliases.json`. Only redacted examples with RFC 5737 placeholders are in git,
+  in `deploy/env/host-local/`. `shim.env.example` is rebuilt from the live settings (103 were missing), with
+  `SHIM_REMOTE_KEY` blank and client addresses replaced by placeholders.
+- **`deploy/bin/live_drift_check.py`**: a read-only check that the live layer still matches a git ref (exit 1 on drift
+  or untracked files), with 7 tests.
+  - Its allowlist, `deploy/env/live-layer-allow.txt`, is read from the ref, so it is reviewed.
+  - It marks state, logs, banked copies and retired launchers `ignore`, and the private host files `local`.
+  - It runs nightly inside the host's backup job and reports to estate-events only when the result changes.
+
 ### Pushed 2026-10-20 (gateway test debt cleared)
 
 Tests only; no gateway code changed. The full `deploy/bin` suite now passes: **1,093 passed, 657 subtests, about
