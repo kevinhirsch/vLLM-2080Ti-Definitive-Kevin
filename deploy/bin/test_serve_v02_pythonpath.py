@@ -22,7 +22,8 @@ def run(script, tmp_path, override="", env_extra=None):
     ov = tmp_path / "override.env"
     ov.write_text(override)
     env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "V02_OVERRIDE_ENV": str(ov),
-           "V02_RELEASES": str(tmp_path / "releases"), **(env_extra or {})}
+           "V02_RELEASES": str(tmp_path / "releases"), "V02_GPU_WAIT_S": "0",   # hermetic: never wait on the real GPUs
+           **(env_extra or {})}
     if script == "serve-profile-v02.sh":
         args = tmp_path / "args"
         args.write_text("-m vllm.entrypoints.openai.api_server --port 1")
