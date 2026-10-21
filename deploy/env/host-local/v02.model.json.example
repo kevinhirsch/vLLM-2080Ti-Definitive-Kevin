@@ -1,0 +1,7 @@
+{
+  "model": "/path/to/models/<model-directory>",
+  "served_model_name": [
+    "estate-local",
+    "qwen-local"
+  ]
+}

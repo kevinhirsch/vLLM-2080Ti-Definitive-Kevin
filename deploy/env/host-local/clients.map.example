@@ -1,0 +1,6 @@
+# <ip or X-Client value> = <friendly name> -- shown on the gateway dashboard and in its request log.
+# Example only (RFC 5737 documentation addresses); the real map stays on the serving host.
+192.0.2.10 = example-agent-host
+192.0.2.20 = example-scheduler
+192.0.2.30 = example-app-server
+127.0.0.1 = serving host (local)

@@ -1,0 +1,6 @@
+# Lane roots for the gateway dashboard ("Background tasks" → Agent lanes, /gateway/lanes).
+# One directory per line. Every immediate subdirectory of a root is shown as an agent lane;
+# a lane's STATUS file (first line: "RUNNING|DONE|BLOCKED | HH:MM | what") is its live heartbeat.
+# Claude Code background agents are discovered automatically from their transcripts — they do not need a lane.
+# Edit freely — the shim re-reads this file on every refresh; no restart needed.
+/srv/lanes

@@ -1,0 +1,14 @@
+{
+ "aliases": [
+  {
+   "base": "https://openrouter.ai/api/v1",
+   "context_limit": 200000,
+   "enabled": true,
+   "key": "",
+   "max_output": 4096,
+   "model": "openrouter/free",
+   "name": "estate-openrouter-free"
+  }
+ ],
+ "version": 1
+}
