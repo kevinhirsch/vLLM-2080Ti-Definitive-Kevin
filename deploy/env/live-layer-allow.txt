@@ -1,0 +1,71 @@
+# Allowlist for deploy/bin/live_drift_check.py (EB-103, 2026-10-21): files in ~/.local/share/vllm-qwen27b that are
+# not installed from git, or whose drift is expected. Read from the git ref being checked, so changes are reviewed.
+#   ignore <glob>  never compared: runtime state, logs, locks, banked copies, retired launchers
+#   local <glob>   host-local by policy ("code public, config private", Kevin 2026-10-21): private host config and
+#                  secret carriers; never compared, never in git (redacted examples: deploy/env/host-local/)
+#   report <glob>  compared and printed, but drift does not fail the check
+# Everything else in the live directory must come from git by install.sh's mapping, or the check fails.
+
+# Runtime state, logs and locks written by the gateway, the actuator, the watchdog and the model switcher
+ignore *.lock
+ignore *.pid
+ignore *.log
+ignore *.jsonl
+ignore *.out
+ignore active-serve
+ignore diag.env                     # written by engine-actuator.py
+ignore gateway-stats.json
+ignore gateway-spend.json
+ignore gpu-busy.json
+ignore liveness-*.json
+ignore model-switch.previous.json
+ignore offline-*.json
+ignore planned-restart.last.json
+ignore recorded-fault.last.json
+ignore remote-dead-until.json
+ignore remote-pricing.json
+ignore restart-job.json
+ignore retention-*.json
+ignore spend-reconciliation.json
+ignore watchdog-state.json
+ignore wedge-restart.last.json
+ignore window-active.json
+
+# Host-local by policy: secret carriers, and host config that names the network, clients, paths and models.
+# Redacted examples are in git (deploy/env/shim.env.example, deploy/env/host-local/*.example*).
+local shim.env
+local gateway-aliases.json
+local admin.token
+local clients.map
+local lanes.dirs
+local MODEL-SWITCHING.md
+local v02.override.env               # edited live by GPU windows and by hand
+local v02.model.json                 # written by model_switch.py
+
+# Banked copies of earlier versions, kept by hand for rollback
+ignore *.bak*
+ignore *.pre-*
+ignore *.staged-*.py
+ignore *.BANKED-*
+ignore *.before-*
+ignore *.bootstrap-*
+ignore serve-tqk8v4-fg.sh.*
+
+# Stray test copies from before install.sh stopped shipping test_* (2026-10-03); the repo keeps the real ones
+ignore test_*.py
+
+# Retired launchers from the August 2026 0.1.x experiments: never in git, not on the production path
+# (production: vllm-qwen27b.service -> serve-active.sh -> active-serve -> serve-hauhaucs-v02.sh)
+ignore serve-ab-on.sh
+ignore serve-ab-off.sh
+ignore serve-abliterated.sh
+ignore serve-burst-a.sh
+ignore serve-burst-b.sh
+ignore serve-forensic-eager.sh
+ignore serve-inst.sh
+ignore serve-k16-verify.sh
+ignore serve-k8chain.sh
+ignore serve-mtp-test.sh
+ignore serve-patched-test.sh
+ignore serve-PROFILE-copyburst.sh
+ignore serve-small-8002.sh
